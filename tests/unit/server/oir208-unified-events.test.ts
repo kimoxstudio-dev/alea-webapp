@@ -254,9 +254,15 @@ function buildSupabaseMock() {
 }
 
 describe('OIR-208: Unified Events', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     resetFixtures()
     vi.clearAllMocks()
+    // Dual-mock coexistence: Drizzle for migrated paths (club-events-service),
+    // Supabase for unmigrated paths (availability tests reading event_room_blocks)
+    const { getAdminDb, getDb } = await import('@/lib/db')
+    const { createSupabaseServerAdminClient, createSupabaseServerClient } = vi.mocked(await import('@/lib/supabase/server'))
+    vi.mocked(getAdminDb).mockImplementation(() => createSupabaseServerAdminClient())
+    vi.mocked(getDb).mockImplementation(() => createSupabaseServerClient())
   })
 
   describe('Visibility Toggle (visibleOnLanding)', () => {
