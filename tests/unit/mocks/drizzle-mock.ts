@@ -360,7 +360,7 @@ const builtInFixtures: Record<string, any[]> = {
       categoryEn: 'Strategy',
       players: '2-4',
       playTime: '45-60 min',
-      weight: 2.5,
+      weight: '2.5',
       sortOrder: 1,
       active: true,
       createdAt: '2026-04-01T00:00:00Z',
@@ -405,13 +405,21 @@ function createDispatchingSelectMock() {
           currentTable = table
         } else if (table && typeof table === 'object') {
           // Drizzle table object: try ._ first (metadata), fall back to .name
-          currentTable = table._.name ?? table.name ?? null
+          currentTable = table?._?.name ?? table?.name ?? null
         }
 
         const fixture = getFixture(currentTable || 'unknown')
 
+        // Create a chainable where that returns an object with orderBy support
+        const createChainableWhereResult = () => ({
+          orderBy: vi.fn(() => Promise.resolve(fixture)),
+          then: (onFulfilled: any, onRejected: any) =>
+            Promise.resolve(fixture).then(onFulfilled, onRejected),
+          catch: (onRejected: any) => Promise.resolve(fixture).catch(onRejected),
+        })
+
         return {
-          where: vi.fn(() => Promise.resolve(fixture)),
+          where: vi.fn(() => createChainableWhereResult()),
           orderBy: vi.fn(() => Promise.resolve(fixture)),
           innerJoin: vi.fn(() => ({
             where: vi.fn(() => Promise.resolve(fixture)),
