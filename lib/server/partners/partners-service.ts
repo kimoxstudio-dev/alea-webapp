@@ -1,25 +1,37 @@
 import 'server-only'
+import { asc, eq } from 'drizzle-orm'
 import type { AdminPartner, Partner } from '@/lib/types'
-import { getDb, getAdminDb } from '@/lib/db'
+import { getDrizzleAdminDb, getDrizzleDb } from '@/lib/db'
+import { partners } from '@/lib/db/schema'
 import { serviceError } from '@/lib/server/shared/service-error'
-import type { Tables } from '@/lib/supabase/types'
 import type { SessionUser } from '@/lib/server/auth/auth'
 import { validateOptionalUrl } from '@/lib/validations/url'
 
-type PartnerRow = Tables<'partners'>
+type PartnerRow = typeof partners.$inferSelect
 
-const PUBLIC_PARTNER_COLUMNS = 'id, name, img_url, link_url, desc_es, desc_en, sort_order'
-const ADMIN_PARTNER_COLUMNS = 'id, name, img_url, link_url, desc_es, desc_en, sort_order, active'
+/**
+ * Runs a Drizzle query, translating any thrown DB/driver error into a
+ * uniform 500 ServiceError. Business-logic outcomes (e.g. "no row
+ * returned" -> 404, validation -> 400) are handled by callers, outside this
+ * wrapper, so their specific status codes aren't swallowed into a 500.
+ */
+async function runQuery<T>(query: Promise<T>): Promise<T> {
+  try {
+    return await query
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+}
 
-function toPartner(row: Pick<PartnerRow, 'id' | 'name' | 'img_url' | 'link_url' | 'desc_es' | 'desc_en' | 'sort_order'>): Partner {
+function toPartner(row: Pick<PartnerRow, 'id' | 'name' | 'imgUrl' | 'linkUrl' | 'descEs' | 'descEn' | 'sortOrder'>): Partner {
   return {
     id: row.id,
     name: row.name,
-    imageUrl: row.img_url,
-    linkUrl: row.link_url,
-    descriptionEs: row.desc_es,
-    descriptionEn: row.desc_en,
-    sortOrder: row.sort_order,
+    imageUrl: row.imgUrl,
+    linkUrl: row.linkUrl,
+    descriptionEs: row.descEs,
+    descriptionEn: row.descEn,
+    sortOrder: row.sortOrder,
   }
 }
 
@@ -29,22 +41,25 @@ function toAdminPartner(row: PartnerRow): AdminPartner {
 
 /**
  * Public read of active partners (colaboradores) for the landing page,
- * ordered the same way the board arranges them in the dashboard. Uses the
- * RLS-respecting client since this is unauthenticated, publicly readable
- * content — the "partners_select_active" RLS policy additionally restricts
- * anon/authenticated visibility to active rows.
+ * ordered the same way the board arranges them in the dashboard.
+ *
+ * KIM-434 (F3c) PR2 note: this now reads via the Drizzle/Neon seam
+ * (`getDrizzleDb()`). Neon has no RLS, so unlike the legacy Supabase path
+ * this used to take, the "public read" scoping (RLS's "partners_select_active"
+ * policy previously restricted anon/authenticated visibility to active rows)
+ * is now enforced here, in the service layer, via the explicit
+ * `eq(partners.active, true)` filter below.
  */
 export async function listPartners(): Promise<Partner[]> {
-  const supabase = await getDb()
-  const { data, error } = await supabase
-    .from('partners')
-    .select(PUBLIC_PARTNER_COLUMNS)
-    .order('sort_order', { ascending: true })
-    .order('name', { ascending: true })
+  const db = getDrizzleDb()
+  const rows = await runQuery(
+    db
+      .select()
+      .from(partners)
+      .where(eq(partners.active, true))
+      .orderBy(asc(partners.sortOrder), asc(partners.name)),
+  )
 
-  if (error) serviceError('Internal server error', 500)
-
-  const rows = (data ?? []) as PartnerRow[]
   return rows.map((row) => toPartner(row))
 }
 
@@ -146,11 +161,11 @@ function resolveBilingualEnFallback(
 
 interface PartnerFieldSet {
   name: string
-  img_url: string
-  link_url: string | null
-  desc_es: string | null
-  desc_en: string | null
-  sort_order: number
+  imgUrl: string
+  linkUrl: string | null
+  descEs: string | null
+  descEn: string | null
+  sortOrder: number
   active: boolean
 }
 
@@ -167,32 +182,32 @@ function resolvePartnerFields(body: PartnerInput, current: PartnerRow | null): P
     : requireNonEmptyString(current?.name, 'name')
 
   const imgUrl = body.imageUrl !== undefined
-    ? requireImageUrl(body.imageUrl, current?.img_url ?? null)
-    : requireImageUrl(current?.img_url, current?.img_url ?? null)
+    ? requireImageUrl(body.imageUrl, current?.imgUrl ?? null)
+    : requireImageUrl(current?.imgUrl, current?.imgUrl ?? null)
 
-  const linkUrl = body.linkUrl !== undefined ? validateOptionalUrl(body.linkUrl, 'linkUrl') : (current?.link_url ?? null)
-  const descEs = body.descriptionEs !== undefined ? optionalString(body.descriptionEs, 'descriptionEs') : (current?.desc_es ?? null)
+  const linkUrl = body.linkUrl !== undefined ? validateOptionalUrl(body.linkUrl, 'linkUrl') : (current?.linkUrl ?? null)
+  const descEs = body.descriptionEs !== undefined ? optionalString(body.descriptionEs, 'descriptionEs') : (current?.descEs ?? null)
   const descEn = resolveBilingualEnFallback(
     'descriptionEn',
     descEs,
     body.descriptionEn,
     body.descriptionEn !== undefined,
-    current ? { es: current.desc_es, en: current.desc_en } : null,
+    current ? { es: current.descEs, en: current.descEn } : null,
   )
 
   const sortOrder = body.sortOrder !== undefined
     ? (optionalInteger(body.sortOrder, 'sortOrder') ?? 0)
-    : (current?.sort_order ?? 0)
+    : (current?.sortOrder ?? 0)
 
   const active = body.active !== undefined ? parseBooleanFlag(body.active) : (current?.active ?? true)
 
   return {
     name,
-    img_url: imgUrl,
-    link_url: linkUrl,
-    desc_es: descEs,
-    desc_en: descEn,
-    sort_order: sortOrder,
+    imgUrl,
+    linkUrl,
+    descEs,
+    descEn,
+    sortOrder,
     active,
   }
 }
@@ -201,16 +216,11 @@ function resolvePartnerFields(body: PartnerInput, current: PartnerRow | null): P
 export async function listAdminPartners(session: SessionUser): Promise<AdminPartner[]> {
   requireAdminSession(session)
 
-  const admin = getAdminDb()
-  const { data, error } = await admin
-    .from('partners')
-    .select(ADMIN_PARTNER_COLUMNS)
-    .order('sort_order', { ascending: true })
-    .order('name', { ascending: true })
+  const db = getDrizzleAdminDb()
+  const rows = await runQuery(
+    db.select().from(partners).orderBy(asc(partners.sortOrder), asc(partners.name)),
+  )
 
-  if (error) serviceError('Internal server error', 500)
-
-  const rows = (data ?? []) as PartnerRow[]
   return rows.map((row) => toAdminPartner(row))
 }
 
@@ -220,74 +230,55 @@ export async function createPartner(session: SessionUser, body: PartnerInput): P
   // Validate EVERYTHING — fields and the URL allowlist — before any DB write.
   const fields = resolvePartnerFields(body, null)
 
-  const admin = getAdminDb()
-  const { data, error } = await admin
-    .from('partners')
-    .insert(fields)
-    .select(ADMIN_PARTNER_COLUMNS)
-    .maybeSingle()
-
-  if (error) {
-    const pgCode = (error as { code?: string }).code
+  const db = getDrizzleAdminDb()
+  let row: PartnerRow | undefined
+  try {
+    ;[row] = await db.insert(partners).values(fields).returning()
+  } catch (err) {
+    const pgCode = (err as { code?: string }).code
     if (pgCode === '23514' || pgCode === '22P02' || pgCode === '23502') {
       serviceError('Invalid partner data', 400)
     }
     serviceError('Internal server error', 500)
   }
-  if (!data) serviceError('Internal server error', 500)
+  if (!row) serviceError('Internal server error', 500)
 
-  return toAdminPartner(data as PartnerRow)
+  return toAdminPartner(row)
 }
 
 export async function updatePartner(session: SessionUser, id: string, body: PartnerInput): Promise<AdminPartner> {
   requireAdminSession(session)
 
-  const admin = getAdminDb()
-  const { data: currentData, error: fetchError } = await admin
-    .from('partners')
-    .select(ADMIN_PARTNER_COLUMNS)
-    .eq('id', id)
-    .maybeSingle()
+  const db = getDrizzleAdminDb()
+  const [current] = await runQuery(db.select().from(partners).where(eq(partners.id, id)))
 
-  if (fetchError) serviceError('Internal server error', 500)
-  const current = currentData as PartnerRow | null
   if (!current) serviceError('Partner not found', 404)
 
   // Validate EVERYTHING before the UPDATE below.
   const fields = resolvePartnerFields(body, current)
 
-  const { data, error } = await admin
-    .from('partners')
-    .update(fields)
-    .eq('id', id)
-    .select(ADMIN_PARTNER_COLUMNS)
-    .maybeSingle()
-
-  if (error) {
-    const pgCode = (error as { code?: string }).code
+  let row: PartnerRow | undefined
+  try {
+    ;[row] = await db.update(partners).set(fields).where(eq(partners.id, id)).returning()
+  } catch (err) {
+    const pgCode = (err as { code?: string }).code
     if (pgCode === '23514' || pgCode === '22P02' || pgCode === '23502') {
       serviceError('Invalid partner data', 400)
     }
     serviceError('Internal server error', 500)
   }
-  if (!data) serviceError('Partner not found', 404)
+  if (!row) serviceError('Partner not found', 404)
 
-  return toAdminPartner(data as PartnerRow)
+  return toAdminPartner(row)
 }
 
 export async function deletePartner(session: SessionUser, id: string): Promise<void> {
   requireAdminSession(session)
 
-  const admin = getAdminDb()
-  const { data, error } = await admin
-    .from('partners')
-    .select('id')
-    .eq('id', id)
-    .maybeSingle()
+  const db = getDrizzleAdminDb()
+  const [row] = await runQuery(
+    db.delete(partners).where(eq(partners.id, id)).returning({ id: partners.id }),
+  )
 
-  if (error) serviceError('Internal server error', 500)
-  if (!data) serviceError('Partner not found', 404)
-
-  const { error: deleteError } = await admin.from('partners').delete().eq('id', id)
-  if (deleteError) serviceError('Internal server error', 500)
+  if (!row) serviceError('Partner not found', 404)
 }

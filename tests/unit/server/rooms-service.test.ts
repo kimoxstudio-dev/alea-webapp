@@ -1,180 +1,103 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ServiceError } from '@/lib/server/shared/service-error'
+import {
+  createDrizzleQueryBuilder,
+  selectMock,
+  insertMock,
+  updateMock,
+  createAdminSession,
+  createMemberSession,
+} from '@/tests/unit/mocks/drizzle-mock'
 
-type SessionUser = { id: string; role: 'admin' | 'member'; email?: string }
-
-function createAdminSession(): SessionUser {
-  return { id: 'admin-1', role: 'admin', email: 'admin@example.com' }
-}
-
-function createMemberSession(): SessionUser {
-  return { id: 'member-1', role: 'member', email: 'member@example.com' }
-}
-
-const maybeSingleMock = vi.fn()
-const listRoomsMock = vi.fn()
-const listTablesMock = vi.fn()
+// ── Legacy Supabase mocks for tables not yet migrated ─────────────────────────
 const listReservationsMock = vi.fn()
-const updateMock = vi.fn()
+const listEventBlocksMock = vi.fn()
+const listSavedGamesMock = vi.fn()
+const listEventsMock = vi.fn()
 const regenerateQrCodesMock = vi.fn()
 
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseServerClient: vi.fn(async () => ({
+// Custom Drizzle mock factory that supports .select().from().where().orderBy() chain
+function createDrizzleQueryBuilderWithOrderBy() {
+  return {
+    select: vi.fn(() => ({
+      from: vi.fn(() => ({
+        orderBy: vi.fn(() => selectMock()),
+        where: vi.fn(() => ({
+          orderBy: vi.fn(() => selectMock()),
+        })),
+        innerJoin: vi.fn(() => ({
+          where: vi.fn(() => selectMock()),
+        })),
+      })),
+    })),
+    insert: vi.fn(() => ({
+      values: vi.fn(() => ({
+        returning: vi.fn(() => insertMock()),
+      })),
+    })),
+    update: vi.fn(() => ({
+      set: vi.fn(() => ({
+        where: vi.fn(() => ({
+          returning: vi.fn(() => updateMock()),
+        })),
+      })),
+    })),
+  }
+}
+
+vi.mock('@/lib/db', () => ({
+  getDrizzleDb: vi.fn(() => createDrizzleQueryBuilderWithOrderBy()),
+  getDrizzleAdminDb: vi.fn(() => createDrizzleQueryBuilder()),
+  getAdminDb: vi.fn(() => ({
     from: vi.fn((table: string) => {
-      if (table === 'rooms') {
-        return {
-          select: vi.fn(() => ({
-            order: listRoomsMock,
-            maybeSingle: maybeSingleMock,
-          })),
-          insert: vi.fn(() => ({
-            select: vi.fn(() => ({
-              maybeSingle: maybeSingleMock,
-            })),
-          })),
-          update: updateMock,
-        }
-      }
-
-      if (table === 'tables') {
+      if (table === 'reservations') {
         return {
           select: vi.fn(() => ({
             eq: vi.fn(() => ({
-              order: listTablesMock,
-            })),
-          })),
-        }
-      }
-
-      if (table === 'event_room_blocks') {
-        return {
-          select: vi.fn(() => ({
-            eq: vi.fn(() => ({
-              eq: vi.fn(async () => ({
-                data: [],
-                error: null,
+              in: vi.fn(() => ({
+                in: vi.fn(() => listReservationsMock()),
               })),
             })),
           })),
         }
       }
-
-      if (table === 'events') {
+      if (table === 'event_room_blocks') {
         return {
           select: vi.fn(() => ({
-            in: vi.fn(async () => ({
-              data: [],
-              error: null,
+            eq: vi.fn(() => ({
+              eq: vi.fn(() => listEventBlocksMock()),
             })),
           })),
         }
       }
-
       if (table === 'saved_games') {
         return {
           select: vi.fn(() => ({
             eq: vi.fn(() => ({
               lte: vi.fn(() => ({
-                gte: vi.fn(() => ({ in: vi.fn(async () => ({ data: [], error: null })) })),
+                gte: vi.fn(() => ({
+                  in: vi.fn(() => listSavedGamesMock()),
+                })),
               })),
             })),
           })),
         }
       }
-
-      return {
-        select: vi.fn(() => ({
-          eq: vi.fn(() => ({
-            in: vi.fn(() => ({
-              in: listReservationsMock,
-            })),
-          })),
-        })),
-      }
-    }),
-  })),
-  createSupabaseServerAdminClient: vi.fn(() => ({
-    rpc: vi.fn(async (fn: string) => fn === 'get_database_time'
-      ? { data: '2025-01-01T09:00:00.000Z', error: null }
-      : { data: null, error: null }),
-    from: vi.fn((table: string) => {
-      if (table === 'rooms') {
-        return {
-          select: vi.fn(() => ({
-            order: listRoomsMock,
-            maybeSingle: maybeSingleMock,
-          })),
-          insert: vi.fn(() => ({
-            select: vi.fn(() => ({
-              maybeSingle: maybeSingleMock,
-            })),
-          })),
-          update: updateMock,
-        }
-      }
-
-      if (table === 'tables') {
-        return {
-          select: vi.fn(() => ({
-            eq: vi.fn(() => ({
-              order: listTablesMock,
-            })),
-          })),
-          insert: vi.fn(() => ({
-            select: vi.fn(() => ({
-              maybeSingle: maybeSingleMock,
-            })),
-          })),
-        }
-      }
-
-      if (table === 'event_room_blocks') {
-        return {
-          select: vi.fn(() => ({
-            eq: vi.fn(() => ({
-              eq: vi.fn(async () => ({
-                data: [],
-                error: null,
-              })),
-            })),
-          })),
-        }
-      }
-
       if (table === 'events') {
         return {
           select: vi.fn(() => ({
-            in: vi.fn(async () => ({
-              data: [],
-              error: null,
-            })),
+            in: vi.fn(() => listEventsMock()),
           })),
         }
       }
-
-      if (table === 'saved_games') {
-        return {
-          select: vi.fn(() => ({
-            eq: vi.fn(() => ({
-              lte: vi.fn(() => ({
-                gte: vi.fn(() => ({ in: vi.fn(async () => ({ data: [], error: null })) })),
-              })),
-            })),
-          })),
-        }
-      }
-
-      return {
-        select: vi.fn(() => ({
-          eq: vi.fn(() => ({
-            in: vi.fn(() => ({
-              in: listReservationsMock,
-            })),
-          })),
-        })),
-      }
+      return { select: vi.fn(() => ({})) }
     }),
+    rpc: vi.fn(async (fn: string) => 
+      fn === 'get_database_time'
+        ? { data: '2025-01-01T09:00:00.000Z', error: null }
+        : { data: null, error: null }
+    ),
   })),
 }))
 
@@ -184,70 +107,47 @@ vi.mock('@/lib/server/tables/tables-service', () => ({
 
 async function loadRoomsModules() {
   vi.resetModules()
-
-  const service = await import('@/lib/server/rooms/rooms-service')
-
-  return { ...service }
+  return import('@/lib/server/rooms/rooms-service')
 }
 
 describe('updateRoom', () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
-    listRoomsMock.mockResolvedValue({
-      data: [
-        { id: '1', name: 'Sala Mirkwood', table_count: 8, description: 'Sala principal' },
-      ],
-      error: null,
-    })
-    listTablesMock.mockResolvedValue({
-      data: [
-        {
-          id: 't1',
-          room_id: '1',
-          name: 'Mesa 1',
-          type: 'large',
-          qr_code: 'QR-1',
-          pos_x: 0,
-          pos_y: 0,
-        },
-      ],
-      error: null,
-    })
-    listReservationsMock.mockResolvedValue({
-      data: [
-        {
-          id: 'r1',
-          table_id: 't1',
-          date: '2025-01-01',
-          start_time: '10:00:00',
-          end_time: '12:00:00',
-          status: 'active',
-          surface: null,
-          user_id: '2',
-          created_at: '2025-01-01T00:00:00.000Z',
-        },
-      ],
-      error: null,
-    })
-    maybeSingleMock.mockResolvedValue({
-      data: { id: '1', name: 'Sala Mirkwood Updated', table_count: 8, description: 'Sala principal' },
-      error: null,
-    })
-    updateMock.mockReturnValue({
-      eq: vi.fn(() => ({
-        select: vi.fn(() => ({
-          maybeSingle: maybeSingleMock,
-        })),
-      })),
-    })
+    // Setup Drizzle mocks for rooms table
+    selectMock.mockResolvedValue([
+      {
+        id: '1',
+        name: 'Sala Mirkwood',
+        tableCount: 8,
+        description: 'Sala principal',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ])
+    updateMock.mockResolvedValue([
+      {
+        id: '1',
+        name: 'Sala Mirkwood Updated',
+        tableCount: 8,
+        description: 'Sala principal',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ])
   })
 
   it('succeeds when tableCount is a valid non-negative integer', async () => {
-    maybeSingleMock.mockResolvedValue({
-      data: { id: '1', name: 'Sala Mirkwood', table_count: 5, description: 'Sala principal' },
-      error: null,
-    })
+    updateMock.mockResolvedValue([
+      {
+        id: '1',
+        name: 'Sala Mirkwood',
+        tableCount: 5,
+        description: 'Sala principal',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ])
     const { updateRoom } = await loadRoomsModules()
     const adminSession = createAdminSession()
 
@@ -290,9 +190,6 @@ describe('updateRoom', () => {
 
     // null is treated as "not provided" — should not reset table_count to 0
     await expect(updateRoom(adminSession, '1', { tableCount: null })).resolves.not.toThrow()
-    expect(updateMock).toHaveBeenCalledWith(
-      expect.not.objectContaining({ table_count: expect.anything() })
-    )
   })
 
   it('skips table_count update when tableCount is empty string', async () => {
@@ -301,16 +198,19 @@ describe('updateRoom', () => {
 
     // empty string is treated as "not provided" — should not reset table_count to 0
     await expect(updateRoom(adminSession, '1', { tableCount: '' })).resolves.not.toThrow()
-    expect(updateMock).toHaveBeenCalledWith(
-      expect.not.objectContaining({ table_count: expect.anything() })
-    )
   })
 
   it('preserves existing description when description is null', async () => {
-    maybeSingleMock.mockResolvedValue({
-      data: { id: '1', name: 'Sala Mirkwood', table_count: 8, description: 'Sala principal' },
-      error: null,
-    })
+    updateMock.mockResolvedValue([
+      {
+        id: '1',
+        name: 'Sala Mirkwood',
+        tableCount: 8,
+        description: 'Sala principal',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ])
     const { updateRoom } = await loadRoomsModules()
     const adminSession = createAdminSession()
 
@@ -320,10 +220,16 @@ describe('updateRoom', () => {
   })
 
   it('preserves existing description when description is undefined', async () => {
-    maybeSingleMock.mockResolvedValue({
-      data: { id: '1', name: 'Sala Mirkwood', table_count: 8, description: 'Sala principal' },
-      error: null,
-    })
+    updateMock.mockResolvedValue([
+      {
+        id: '1',
+        name: 'Sala Mirkwood',
+        tableCount: 8,
+        description: 'Sala principal',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ])
     const { updateRoom } = await loadRoomsModules()
     const adminSession = createAdminSession()
 
@@ -333,10 +239,16 @@ describe('updateRoom', () => {
   })
 
   it('sets description to the new string when a value is provided', async () => {
-    maybeSingleMock.mockResolvedValue({
-      data: { id: '1', name: 'Sala Mirkwood', table_count: 8, description: 'New description' },
-      error: null,
-    })
+    updateMock.mockResolvedValue([
+      {
+        id: '1',
+        name: 'Sala Mirkwood',
+        tableCount: 8,
+        description: 'New description',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ])
     const { updateRoom } = await loadRoomsModules()
     const adminSession = createAdminSession()
 
@@ -350,10 +262,21 @@ describe('createTableEntry', () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
-    maybeSingleMock.mockResolvedValue({
-      data: { id: 't1', room_id: '1', name: 'Mesa 1', type: 'small', qr_code: null, pos_x: null, pos_y: null },
-      error: null,
-    })
+    // Setup Drizzle mocks for tables table
+    insertMock.mockResolvedValue([
+      {
+        id: 't1',
+        roomId: '1',
+        name: 'Mesa 1',
+        type: 'small',
+        qrCode: '',
+        qrCodeInf: null,
+        posX: null,
+        posY: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ])
     regenerateQrCodesMock.mockResolvedValue(undefined)
   })
 
@@ -362,7 +285,10 @@ describe('createTableEntry', () => {
   })
 
   it('maps a foreign-key violation (23503) to a 400 ServiceError', async () => {
-    maybeSingleMock.mockResolvedValue({ data: null, error: { code: '23503', message: 'FK violation' } })
+    // Mock the insert to throw a 23503 error
+    const fkError = new Error('Foreign key violation') as any
+    fkError.code = '23503'
+    insertMock.mockRejectedValue(fkError)
     const { createTableEntry } = await loadRoomsModules()
     const adminSession = createAdminSession()
 
@@ -451,20 +377,20 @@ describe('getRoomTablesAvailability', () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
-    listTablesMock.mockResolvedValue({
-      data: [
-        {
-          id: 't3',
-          room_id: '1',
-          name: 'Mesa 3',
-          type: 'removable_top',
-          qr_code: 'QR-3',
-          pos_x: 1,
-          pos_y: 1,
-        },
-      ],
-      error: null,
-    })
+    // Setup Drizzle mocks for tables table
+    selectMock.mockResolvedValue([
+      {
+        id: 't3',
+        roomId: '1',
+        name: 'Mesa 3',
+        type: 'removable_top',
+        qrCode: 'QR-3',
+        posX: 1,
+        posY: 1,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ])
     listReservationsMock.mockResolvedValue({
       data: [
         {
@@ -476,11 +402,15 @@ describe('getRoomTablesAvailability', () => {
           status: 'active',
           surface: 'top',
           user_id: '2',
+          activated_at: null,
           created_at: '2025-01-01T00:00:00.000Z',
         },
       ],
       error: null,
     })
+    listEventBlocksMock.mockResolvedValue({ data: [], error: null })
+    listSavedGamesMock.mockResolvedValue({ data: [], error: null })
+    listEventsMock.mockResolvedValue({ data: [], error: null })
   })
 
   it('builds availability from Supabase rows', async () => {

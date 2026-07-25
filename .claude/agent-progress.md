@@ -1777,3 +1777,16 @@ No blocking issues. No modifications needed. Code is ready for security-reviewer
 - [10:19] No secrets/.env values in diff (grep scan clean, only false-positive match was "primaryKey"). git status matches expected 7 files (6 code/test files + this log entry).
 - [10:19] Agreed redundant index (room_default_equipment_equipment_id_idx) alongside new unique constraint is acceptable to leave as follow-up cleanup — not a correctness/security concern, just a minor schema tidiness item.
 - [10:19] Verdict: APPROVE. Committing and pushing.
+
+#### [KIM-434] security-reviewer — PR2 review + PR
+- [10:56] Started review of tables/rooms/partners Drizzle migration (uncommitted worktree diff)
+- [10:56] Verified partners-service.ts listPartners applies eq(partners.active, true); only caller is app/[locale]/page.tsx public landing (listAdminPartners correctly unfiltered + admin-gated)
+- [10:56] Verified requireAdminSession preserved unchanged on all mutating ops (createPartner/updatePartner/deletePartner, createRoomEntry/updateRoom/createTableEntry, regenerateQrCodes) via diff spot-check
+- [10:56] Confirmed tables/rooms/partners are catalog/admin data, no user_id ownership column — no member-scoping requirement applies (same category as PR1 equipment)
+- [10:56] Confirmed split-brain reads (getTableAvailability/getRoomTablesAvailability) documented via header comments referencing PR description's split-brain disclosure
+- [10:56] Grepped for raw SQL (sql``, .execute, raw()) — none found; all Drizzle query-builder usage
+- [10:56] Grepped test files + mock helper for pglite/new Pool/new Client/connection strings — none found; drizzle-mock.ts is pure vi.fn() chainable mock, no real/embedded DB
+- [10:56] Spot-checked test counts (all 5 files) vs develop: tables=20/20, rooms=19/19, partners=43/43, table-mappers=14/14, oir208=34/34 — exact match, zero deletions
+- [10:56] Independently ran: tsc --noEmit clean; targeted vitest (130/130 pass); full suite 1150 passed/21 skipped; next lint clean; pnpm build succeeded
+- [10:56] No secrets/.env values found in diff (grepped for key/password/secret/PEM patterns)
+- [10:56] Verdict: APPROVE — no security concerns

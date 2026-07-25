@@ -1,8 +1,16 @@
 // @vitest-environment node
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'fs'
 import { join } from 'path'
 import type { ServiceError } from '@/lib/server/shared/service-error'
+import {
+  selectMock,
+  insertMock,
+  updateMock,
+  deleteMock,
+  createAdminSession,
+  createMemberSession,
+} from '@/tests/unit/mocks/drizzle-mock'
 
 /**
  * PARTNERS SERVICE TEST COVERAGE (OIR-204)
@@ -23,12 +31,54 @@ import type { ServiceError } from '@/lib/server/shared/service-error'
  * - Chained .order() calls: secondary order('name') tie-break for consistent results
  */
 
-vi.mock('server-only', () => ({}))
+/**
+ * Enhanced Drizzle query builder mock that supports .where().orderBy() chaining.
+ * Returns thenable objects that can also be chained with .orderBy().
+ */
+function createDrizzleQueryBuilder() {
+  // Create a chainable object that's also thenable (awaitable)
+  const createChainableSelectQuery = () => {
+    return {
+      orderBy: vi.fn(() => selectMock()),
+      where: vi.fn(() => {
+        // Return something thenable that also has .orderBy()
+        const thenableWithOrderBy = selectMock() as any
+        thenableWithOrderBy.orderBy = vi.fn(() => selectMock())
+        return thenableWithOrderBy
+      }),
+    }
+  }
 
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseServerAdminClient: vi.fn(),
-  createSupabaseServerClient: vi.fn(),
+  return {
+    select: vi.fn(() => ({
+      from: vi.fn(() => createChainableSelectQuery()),
+    })),
+    insert: vi.fn(() => ({
+      values: vi.fn(() => ({
+        returning: vi.fn(() => insertMock()),
+      })),
+    })),
+    update: vi.fn(() => ({
+      set: vi.fn(() => ({
+        where: vi.fn(() => ({
+          returning: vi.fn(() => updateMock()),
+        })),
+      })),
+    })),
+    delete: vi.fn(() => ({
+      where: vi.fn(() => ({
+        returning: vi.fn(() => deleteMock()),
+      })),
+    })),
+  }
+}
+
+vi.mock('@/lib/db', () => ({
+  getDrizzleDb: vi.fn(() => createDrizzleQueryBuilder()),
+  getDrizzleAdminDb: vi.fn(() => createDrizzleQueryBuilder()),
 }))
+
+vi.mock('server-only', () => ({}))
 
 vi.mock('@/lib/server/shared/service-error', () => ({
   serviceError: vi.fn((message: string, statusCode: number) => {
@@ -39,181 +89,31 @@ vi.mock('@/lib/server/shared/service-error', () => ({
   }),
 }))
 
-type PartnerRow = {
-  id: string
-  name: string
-  img_url: string
-  link_url: string | null
-  desc_es: string | null
-  desc_en: string | null
-  sort_order: number
-  active: boolean
-  created_at: string
-  updated_at: string
+// Test data fixtures
+const mockPartner1 = {
+  id: 'partner-1',
+  name: 'Amantis Informática',
+  imgUrl: 'https://alealaspalmas.es/wp-content/uploads/2025/10/amantisinformatica.png',
+  linkUrl: 'https://maps.app.goo.gl/KPiF4nxabjBYu8YA6',
+  descEs: 'Tienda de informática',
+  descEn: 'Computer store',
+  sortOrder: 0,
+  active: true,
+  createdAt: '2026-04-01T00:00:00Z',
+  updatedAt: '2026-04-01T00:00:00Z',
 }
 
-type SessionUser = {
-  id: string
-  role: 'admin' | 'member'
-  email?: string
-}
-
-function buildSupabaseMock() {
-  return {
-    from: vi.fn(function (table: string) {
-      const state = { 
-        table, 
-        filters: {} as any, 
-        updateData: {} as any, 
-        data: null as any, 
-        insertData: null as any,
-        orders: [] as any[]
-      }
-
-      // Helper: Create a chainable query builder with .order() and .eq() support
-      function createOrderableBuilder() {
-        return {
-          eq: vi.fn(function (col: string, val: any) {
-            state.filters[col] = val
-            return {
-              maybeSingle: vi.fn(async () => {
-                if (table === 'partners' && state.filters.id === 'partner-1') {
-                  return {
-                    data: {
-                      id: 'partner-1',
-                      name: 'Existing Partner',
-                      img_url: 'https://example.com/partner.png',
-                      link_url: 'https://example.com',
-                      desc_es: 'Descripción',
-                      desc_en: 'Description',
-                      sort_order: 0,
-                      active: true,
-                      created_at: '2026-04-01T00:00:00Z',
-                      updated_at: '2026-04-01T00:00:00Z',
-                    },
-                    error: null,
-                  }
-                }
-                return { data: null, error: null }
-              }),
-            }
-          }),
-          order: vi.fn(function (col: string, opts: any) {
-            state.orders.push({ col, opts })
-            return createChainableQuery()
-          }),
-        }
-      }
-
-      // Helper: Create a thenable that is also chainable (supports multiple .order() calls)
-      function createChainableQuery() {
-        return {
-          [Symbol.toStringTag]: 'Promise',
-          order: vi.fn(function (col: string, opts: any) {
-            state.orders.push({ col, opts })
-            // Return another chainable query for further chaining
-            return createChainableQuery()
-          }),
-          then: async (onFulfilled?: any, onRejected?: any) => {
-            try {
-              if (table === 'partners') {
-                const mockData = [
-                  {
-                    id: 'partner-1',
-                    name: 'Amantis Informática',
-                    img_url: 'https://alealaspalmas.es/wp-content/uploads/2025/10/amantisinformatica.png',
-                    link_url: 'https://maps.app.goo.gl/KPiF4nxabjBYu8YA6',
-                    desc_es: 'Tienda de informática',
-                    desc_en: 'Computer store',
-                    sort_order: 0,
-                    active: true,
-                    created_at: '2026-04-01T00:00:00Z',
-                    updated_at: '2026-04-01T00:00:00Z',
-                  },
-                  {
-                    id: 'partner-2',
-                    name: 'El Desván del Leprechaun',
-                    img_url: 'https://alealaspalmas.es/wp-content/uploads/2025/10/eldesvandelleprechaun.png',
-                    link_url: 'https://maps.app.goo.gl/CM96Gnighr4YGMbC7',
-                    desc_es: 'Videojuegos y más',
-                    desc_en: 'Video games and more',
-                    sort_order: 1,
-                    active: true,
-                    created_at: '2026-04-01T00:00:00Z',
-                    updated_at: '2026-04-01T00:00:00Z',
-                  },
-                ]
-                return onFulfilled?.({ data: mockData, error: null })
-              }
-              return onFulfilled?.({ data: [], error: null })
-            } catch (err) {
-              return onRejected?.(err)
-            }
-          },
-        }
-      }
-
-      return {
-        select: vi.fn(function (cols?: string) {
-          return createOrderableBuilder()
-        }),
-        insert: vi.fn(function (data: any) {
-          state.insertData = data
-          return {
-            select: vi.fn(() => ({
-              maybeSingle: vi.fn(async () => ({
-                data: {
-                  id: 'partner-new-1',
-                  ...data,
-                  created_at: '2026-04-01T00:00:00Z',
-                  updated_at: '2026-04-01T00:00:00Z',
-                } as PartnerRow,
-                error: null,
-              })),
-            })),
-          }
-        }),
-        update: vi.fn(function (data: any) {
-          state.updateData = data
-          return {
-            eq: vi.fn(function (col: string, val: any) {
-              state.filters[col] = val
-              return {
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      id: state.filters.id,
-                      ...state.updateData,
-                      created_at: '2026-04-01T00:00:00Z',
-                      updated_at: '2026-04-01T00:00:00Z',
-                    } as PartnerRow,
-                    error: null,
-                  })),
-                })),
-              }
-            }),
-          }
-        }),
-        delete: vi.fn(function () {
-          return {
-            eq: vi.fn(async () => ({
-              data: null,
-              error: null,
-            })),
-          }
-        }),
-      }
-    }),
-    rpc: vi.fn(),
-  }
-}
-
-function createAdminSession(): SessionUser {
-  return { id: 'user-admin-1', role: 'admin', email: 'admin@example.com' }
-}
-
-function createMemberSession(): SessionUser {
-  return { id: 'user-member-1', role: 'member', email: 'member@example.com' }
+const mockPartner2 = {
+  id: 'partner-2',
+  name: 'El Desván del Leprechaun',
+  imgUrl: 'https://alealaspalmas.es/wp-content/uploads/2025/10/eldesvandelleprechaun.png',
+  linkUrl: 'https://maps.app.goo.gl/CM96Gnighr4YGMbC7',
+  descEs: 'Videojuegos y más',
+  descEn: 'Video games and more',
+  sortOrder: 1,
+  active: true,
+  createdAt: '2026-04-01T00:00:00Z',
+  updatedAt: '2026-04-01T00:00:00Z',
 }
 
 async function loadPartnersService() {
@@ -230,19 +130,15 @@ async function loadPartnersService() {
 
 describe('partners-service', () => {
   beforeEach(() => {
+    vi.resetModules()
     vi.clearAllMocks()
   })
 
   describe('listPartners', () => {
     it('returns active partners ordered by sort_order', async () => {
-      const mockSupabaseClient = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        mockSupabaseClient as any
-      )
+      selectMock.mockResolvedValue([mockPartner1, mockPartner2])
 
       const { listPartners } = await loadPartnersService()
-
       const result = await listPartners()
 
       expect(Array.isArray(result)).toBe(true)
@@ -254,44 +150,27 @@ describe('partners-service', () => {
     })
 
     it('chains multiple order() calls without error (sort_order primary, name secondary)', async () => {
-      const mockSupabaseClient = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        mockSupabaseClient as any
-      )
+      selectMock.mockResolvedValue([mockPartner1, mockPartner2])
 
       const { listPartners } = await loadPartnersService()
-
-      // This test verifies that the chainable .order() mock works correctly
-      // The service calls .order('sort_order').order('name'), which would fail
-      // without the fix (chainable mock). If it doesn't throw, chaining works.
       const result = await listPartners()
+
       expect(Array.isArray(result)).toBe(true)
     })
 
     it('uses user-scoped client (RLS-respecting) for public listing', async () => {
-      const mockSupabaseClient = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        mockSupabaseClient as any
-      )
+      selectMock.mockResolvedValue([mockPartner1, mockPartner2])
 
       const { listPartners } = await loadPartnersService()
-
       await listPartners()
 
-      expect(vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient).toHaveBeenCalled()
+      expect(vi.mocked(await import('@/lib/db')).getDrizzleDb).toHaveBeenCalled()
     })
 
     it('maps database columns to public Partner type', async () => {
-      const mockSupabaseClient = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        mockSupabaseClient as any
-      )
+      selectMock.mockResolvedValue([mockPartner1])
 
       const { listPartners } = await loadPartnersService()
-
       const result = await listPartners()
 
       expect(result[0]).toMatchObject({
@@ -310,14 +189,9 @@ describe('partners-service', () => {
   describe('listAdminPartners', () => {
     it('admin can list all partners including inactive', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
+      selectMock.mockResolvedValue([mockPartner1, mockPartner2])
 
       const { listAdminPartners } = await loadPartnersService()
-
       const result = await listAdminPartners(adminSession)
 
       expect(Array.isArray(result)).toBe(true)
@@ -326,33 +200,16 @@ describe('partners-service', () => {
 
     it('chains multiple order() calls without error (sort_order primary, name secondary)', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
+      selectMock.mockResolvedValue([mockPartner1, mockPartner2])
 
       const { listAdminPartners } = await loadPartnersService()
-
-      // This test verifies that the chainable .order() mock works correctly.
-      // The service calls .order('sort_order').order('name'). If it doesn't throw,
-      // the mock fidelity fix (chainable .order()) is working.
       const result = await listAdminPartners(adminSession)
+
       expect(Array.isArray(result)).toBe(true)
     })
 
     it('non-admin member gets 403 Forbidden', async () => {
       const memberSession = createMemberSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { listAdminPartners } = await loadPartnersService()
 
@@ -363,14 +220,21 @@ describe('partners-service', () => {
   describe('createPartner', () => {
     it('admin can create a partner with required fields', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
+      const newPartner = {
+        id: 'partner-new-1',
+        name: 'New Partner',
+        imgUrl: 'https://example.com/partner.png',
+        linkUrl: null,
+        descEs: null,
+        descEn: null,
+        sortOrder: 0,
+        active: true,
+        createdAt: '2026-04-01T00:00:00Z',
+        updatedAt: '2026-04-01T00:00:00Z',
+      }
+      insertMock.mockResolvedValue([newPartner])
 
       const { createPartner } = await loadPartnersService()
-
       const result = await createPartner(adminSession, {
         name: 'New Partner',
         imageUrl: 'https://example.com/partner.png',
@@ -383,14 +247,21 @@ describe('partners-service', () => {
 
     it('admin can create a partner with all fields', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
+      const newPartner = {
+        id: 'partner-new-1',
+        name: 'Complete Partner',
+        imgUrl: 'https://example.com/partner.png',
+        linkUrl: 'https://example.com',
+        descEs: 'Descripción en español',
+        descEn: 'Description in English',
+        sortOrder: 5,
+        active: true,
+        createdAt: '2026-04-01T00:00:00Z',
+        updatedAt: '2026-04-01T00:00:00Z',
+      }
+      insertMock.mockResolvedValue([newPartner])
 
       const { createPartner } = await loadPartnersService()
-
       const result = await createPartner(adminSession, {
         name: 'Complete Partner',
         imageUrl: 'https://example.com/partner.png',
@@ -407,16 +278,6 @@ describe('partners-service', () => {
 
     it('non-admin member gets 403 Forbidden', async () => {
       const memberSession = createMemberSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createPartner } = await loadPartnersService()
 
@@ -430,16 +291,6 @@ describe('partners-service', () => {
 
     it('rejects javascript: URL in img_url', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createPartner } = await loadPartnersService()
 
@@ -453,16 +304,6 @@ describe('partners-service', () => {
 
     it('rejects data: URL in link_url', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createPartner } = await loadPartnersService()
 
@@ -477,16 +318,6 @@ describe('partners-service', () => {
 
     it('rejects relative URL in imageUrl', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createPartner } = await loadPartnersService()
 
@@ -500,11 +331,19 @@ describe('partners-service', () => {
 
     it('accepts empty/null link_url (optional)', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
+      const newPartner = {
+        id: 'partner-new-1',
+        name: 'Partner 1',
+        imgUrl: 'https://example.com/partner.png',
+        linkUrl: null,
+        descEs: null,
+        descEn: null,
+        sortOrder: 0,
+        active: true,
+        createdAt: '2026-04-01T00:00:00Z',
+        updatedAt: '2026-04-01T00:00:00Z',
+      }
+      insertMock.mockResolvedValue([newPartner])
 
       const { createPartner } = await loadPartnersService()
 
@@ -526,16 +365,6 @@ describe('partners-service', () => {
 
     it('rejects missing/empty name', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createPartner } = await loadPartnersService()
 
@@ -549,16 +378,6 @@ describe('partners-service', () => {
 
     it('rejects missing imageUrl', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createPartner } = await loadPartnersService()
 
@@ -572,16 +391,6 @@ describe('partners-service', () => {
 
     it('rejects name as object with 400', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createPartner } = await loadPartnersService()
 
@@ -595,16 +404,6 @@ describe('partners-service', () => {
 
     it('rejects name as array with 400', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createPartner } = await loadPartnersService()
 
@@ -618,16 +417,6 @@ describe('partners-service', () => {
 
     it('rejects descriptionEs as array with 400', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createPartner } = await loadPartnersService()
 
@@ -642,16 +431,6 @@ describe('partners-service', () => {
 
     it('validates before any DB insert', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createPartner } = await loadPartnersService()
 
@@ -662,19 +441,26 @@ describe('partners-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin.from('partners').insert).not.toHaveBeenCalled()
+      expect(insertMock).not.toHaveBeenCalled()
     })
 
     it('accepts valid http:// URL', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
+      const newPartner = {
+        id: 'partner-new-1',
+        name: 'Partner',
+        imgUrl: 'http://example.com/partner.png',
+        linkUrl: null,
+        descEs: null,
+        descEn: null,
+        sortOrder: 0,
+        active: true,
+        createdAt: '2026-04-01T00:00:00Z',
+        updatedAt: '2026-04-01T00:00:00Z',
+      }
+      insertMock.mockResolvedValue([newPartner])
 
       const { createPartner } = await loadPartnersService()
-
       const result = await createPartner(adminSession, {
         name: 'Partner',
         imageUrl: 'http://example.com/partner.png',
@@ -685,14 +471,21 @@ describe('partners-service', () => {
 
     it('accepts valid https:// URL', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
+      const newPartner = {
+        id: 'partner-new-1',
+        name: 'Partner',
+        imgUrl: 'https://example.com/partner.png',
+        linkUrl: null,
+        descEs: null,
+        descEn: null,
+        sortOrder: 0,
+        active: true,
+        createdAt: '2026-04-01T00:00:00Z',
+        updatedAt: '2026-04-01T00:00:00Z',
+      }
+      insertMock.mockResolvedValue([newPartner])
 
       const { createPartner } = await loadPartnersService()
-
       const result = await createPartner(adminSession, {
         name: 'Partner',
         imageUrl: 'https://example.com/partner.png',
@@ -705,14 +498,11 @@ describe('partners-service', () => {
   describe('updatePartner', () => {
     it('admin can update a partner', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
+      const updated = { ...mockPartner1, name: 'Updated Partner' }
+      selectMock.mockResolvedValueOnce([mockPartner1])
+      updateMock.mockResolvedValue([updated])
 
       const { updatePartner } = await loadPartnersService()
-
       const result = await updatePartner(adminSession, 'partner-1', {
         name: 'Updated Partner',
       })
@@ -723,16 +513,6 @@ describe('partners-service', () => {
 
     it('non-admin member gets 403 Forbidden on update', async () => {
       const memberSession = createMemberSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { updatePartner } = await loadPartnersService()
 
@@ -743,26 +523,9 @@ describe('partners-service', () => {
 
     it('returns 404 for non-existent partner', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
+      selectMock.mockResolvedValue([])
 
       const { updatePartner } = await loadPartnersService()
-
-      mockSupabaseAdmin.from = vi.fn(() => ({
-        select: vi.fn(() => ({
-          eq: vi.fn(() => ({
-            maybeSingle: vi.fn(async () => ({ data: null, error: null })),
-          })),
-        })),
-      })) as any
 
       await expect(
         updatePartner(adminSession, 'nonexistent-partner', { name: 'Updated' })
@@ -771,16 +534,7 @@ describe('partners-service', () => {
 
     it('rejects javascript: URL in img_url on update', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
+      selectMock.mockResolvedValue([mockPartner1])
 
       const { updatePartner } = await loadPartnersService()
 
@@ -793,16 +547,7 @@ describe('partners-service', () => {
 
     it('rejects data: URL in link_url on update', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
+      selectMock.mockResolvedValue([mockPartner1])
 
       const { updatePartner } = await loadPartnersService()
 
@@ -815,16 +560,7 @@ describe('partners-service', () => {
 
     it('validates before any DB update', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
+      selectMock.mockResolvedValue([mockPartner1])
 
       const { updatePartner } = await loadPartnersService()
 
@@ -834,19 +570,16 @@ describe('partners-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin.from('partners').update).not.toHaveBeenCalled()
+      expect(updateMock).not.toHaveBeenCalled()
     })
 
     it('preserves current values for omitted fields', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
+      const updated = { ...mockPartner1, name: 'Updated Name' }
+      selectMock.mockResolvedValueOnce([mockPartner1])
+      updateMock.mockResolvedValue([updated])
 
       const { updatePartner } = await loadPartnersService()
-
       const result = await updatePartner(adminSession, 'partner-1', {
         name: 'Updated Name',
       })
@@ -858,11 +591,7 @@ describe('partners-service', () => {
   describe('deletePartner', () => {
     it('admin can delete a partner', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
+      deleteMock.mockResolvedValue([{ id: 'partner-1' }])
 
       const { deletePartner } = await loadPartnersService()
 
@@ -871,16 +600,6 @@ describe('partners-service', () => {
 
     it('non-admin member gets 403 Forbidden on delete', async () => {
       const memberSession = createMemberSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { deletePartner } = await loadPartnersService()
 
@@ -889,26 +608,9 @@ describe('partners-service', () => {
 
     it('returns 404 for non-existent partner', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
+      deleteMock.mockResolvedValue([])
 
       const { deletePartner } = await loadPartnersService()
-
-      mockSupabaseAdmin.from = vi.fn(() => ({
-        select: vi.fn(() => ({
-          eq: vi.fn(() => ({
-            maybeSingle: vi.fn(async () => ({ data: null, error: null })),
-          })),
-        })),
-      })) as any
 
       await expect(deletePartner(adminSession, 'nonexistent-partner')).rejects.toMatchObject({
         statusCode: 404,
@@ -965,39 +667,54 @@ describe('partners-service', () => {
   describe('createPartner with optional English (OIR-206)', () => {
     it('admin can create a partner with descriptionEn absent, falls back to descriptionEs', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      const newPartner = {
+        id: 'partner-new-1',
+        name: 'Librería Local',
+        imgUrl: 'https://example.com/library.png',
+        linkUrl: null,
+        descEs: 'Tu tienda de libros favorita',
+        descEn: 'Tu tienda de libros favorita',
+        sortOrder: 0,
+        active: true,
+        createdAt: '2026-04-01T00:00:00Z',
+        updatedAt: '2026-04-01T00:00:00Z',
+      }
+      insertMock.mockResolvedValue([newPartner])
 
       const { createPartner } = await loadPartnersService()
-
       const result = await createPartner(adminSession, {
         name: 'Librería Local',
         imageUrl: 'https://example.com/library.png',
         descriptionEs: 'Tu tienda de libros favorita',
-        // descriptionEn absent — should fallback
       })
 
       expect(result.name).toBe('Librería Local')
       expect(result.descriptionEs).toBe('Tu tienda de libros favorita')
-      expect(result.descriptionEn).toBe('Tu tienda de libros favorita') // Fallback to ES
+      expect(result.descriptionEn).toBe('Tu tienda de libros favorita')
     })
 
     it('admin can create a partner with descriptionEn empty string, falls back to descriptionEs', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      const newPartner = {
+        id: 'partner-new-1',
+        name: 'Tienda de Juegos',
+        imgUrl: 'https://example.com/games.png',
+        linkUrl: null,
+        descEs: 'Juegos de mesa y más',
+        descEn: 'Juegos de mesa y más',
+        sortOrder: 0,
+        active: true,
+        createdAt: '2026-04-01T00:00:00Z',
+        updatedAt: '2026-04-01T00:00:00Z',
+      }
+      insertMock.mockResolvedValue([newPartner])
 
       const { createPartner } = await loadPartnersService()
-
       const result = await createPartner(adminSession, {
         name: 'Tienda de Juegos',
         imageUrl: 'https://example.com/games.png',
         descriptionEs: 'Juegos de mesa y más',
-        descriptionEn: '', // Empty string — should fallback
+        descriptionEn: '',
       })
 
       expect(result.descriptionEn).toBe('Juegos de mesa y más')
@@ -1005,13 +722,21 @@ describe('partners-service', () => {
 
     it('admin can create a partner with explicit descriptionEn, preserves EN value', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      const newPartner = {
+        id: 'partner-new-1',
+        name: 'Café Artesanal',
+        imgUrl: 'https://example.com/cafe.png',
+        linkUrl: null,
+        descEs: 'Café y pasteles locales',
+        descEn: 'Artisanal coffee and pastries',
+        sortOrder: 0,
+        active: true,
+        createdAt: '2026-04-01T00:00:00Z',
+        updatedAt: '2026-04-01T00:00:00Z',
+      }
+      insertMock.mockResolvedValue([newPartner])
 
       const { createPartner } = await loadPartnersService()
-
       const result = await createPartner(adminSession, {
         name: 'Café Artesanal',
         imageUrl: 'https://example.com/cafe.png',
@@ -1026,182 +751,116 @@ describe('partners-service', () => {
   describe('updatePartner with fallback semantics edge cases (OIR-206 round 2)', () => {
     it('rule 2: explicit different descriptionEn + blank descriptionEn payload = re-enable auto-copy to new ES', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
       const currentRow = {
         id: 'partner-1',
         name: 'Partner Name',
-        img_url: 'https://example.com/partner.png',
-        link_url: null,
-        desc_es: 'Descripción antigua',
-        desc_en: 'Old Explicit Description', // Deliberately different from ES
-        sort_order: 0,
+        imgUrl: 'https://example.com/partner.png',
+        linkUrl: null,
+        descEs: 'Descripción antigua',
+        descEn: 'Old Explicit Description',
+        sortOrder: 0,
         active: true,
-        created_at: '2026-04-01T00:00:00Z',
-        updated_at: '2026-04-01T00:00:00Z',
+        createdAt: '2026-04-01T00:00:00Z',
+        updatedAt: '2026-04-01T00:00:00Z',
       }
-
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'partners') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: currentRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      ...currentRow,
-                      desc_es: 'Nueva descripción',
-                      desc_en: 'Nueva descripción', // Should become new ES (rule 2)
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      const updated = {
+        id: 'partner-1',
+        name: 'Partner Name',
+        imgUrl: 'https://example.com/partner.png',
+        linkUrl: null,
+        descEs: 'Nueva descripción',
+        descEn: 'Nueva descripción',
+        sortOrder: 0,
+        active: true,
+        createdAt: '2026-04-01T00:00:00Z',
+        updatedAt: '2026-04-01T00:00:00Z',
+      }
+      selectMock.mockResolvedValueOnce([currentRow])
+      updateMock.mockResolvedValue([updated])
 
       const { updatePartner } = await loadPartnersService()
-
       const result = await updatePartner(adminSession, 'partner-1', {
         descriptionEs: 'Nueva descripción',
-        descriptionEn: '', // Blank = re-enable auto-copy
+        descriptionEn: '',
       })
 
-      expect(result.descriptionEn).toBe('Nueva descripción') // Follows new ES
+      expect(result.descriptionEn).toBe('Nueva descripción')
     })
 
     it('rule 1: resending identical descriptionEn (en === es deliberately) + ES change = EN preserved', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
       const currentRow = {
         id: 'partner-1',
         name: 'Partner Name',
-        img_url: 'https://example.com/partner.png',
-        link_url: null,
-        desc_es: 'Descripción antigua',
-        desc_en: 'Descripción antigua', // Same as ES (deliberately or auto-copied)
-        sort_order: 0,
+        imgUrl: 'https://example.com/partner.png',
+        linkUrl: null,
+        descEs: 'Descripción antigua',
+        descEn: 'Descripción antigua',
+        sortOrder: 0,
         active: true,
-        created_at: '2026-04-01T00:00:00Z',
-        updated_at: '2026-04-01T00:00:00Z',
+        createdAt: '2026-04-01T00:00:00Z',
+        updatedAt: '2026-04-01T00:00:00Z',
       }
-
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'partners') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: currentRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      ...currentRow,
-                      desc_es: 'Nueva descripción',
-                      desc_en: 'Descripción antigua', // Preserved because explicitly resent (rule 1)
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      const updated = {
+        id: 'partner-1',
+        name: 'Partner Name',
+        imgUrl: 'https://example.com/partner.png',
+        linkUrl: null,
+        descEs: 'Nueva descripción',
+        descEn: 'Descripción antigua',
+        sortOrder: 0,
+        active: true,
+        createdAt: '2026-04-01T00:00:00Z',
+        updatedAt: '2026-04-01T00:00:00Z',
+      }
+      selectMock.mockResolvedValueOnce([currentRow])
+      updateMock.mockResolvedValue([updated])
 
       const { updatePartner } = await loadPartnersService()
-
       const result = await updatePartner(adminSession, 'partner-1', {
         descriptionEs: 'Nueva descripción',
-        descriptionEn: 'Descripción antigua', // Resend explicit identical value
+        descriptionEn: 'Descripción antigua',
       })
 
-      expect(result.descriptionEn).toBe('Descripción antigua') // Preserved by rule 1
+      expect(result.descriptionEn).toBe('Descripción antigua')
     })
 
     it('rule 2: whitespace-only descriptionEn behaves as blank (re-enable auto-copy to new ES)', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
       const currentRow = {
         id: 'partner-1',
         name: 'Partner Name',
-        img_url: 'https://example.com/partner.png',
-        link_url: null,
-        desc_es: 'Descripción antigua',
-        desc_en: 'Old Explicit Description',
-        sort_order: 0,
+        imgUrl: 'https://example.com/partner.png',
+        linkUrl: null,
+        descEs: 'Descripción antigua',
+        descEn: 'Old Explicit Description',
+        sortOrder: 0,
         active: true,
-        created_at: '2026-04-01T00:00:00Z',
-        updated_at: '2026-04-01T00:00:00Z',
+        createdAt: '2026-04-01T00:00:00Z',
+        updatedAt: '2026-04-01T00:00:00Z',
       }
-
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'partners') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: currentRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      ...currentRow,
-                      desc_es: 'Nueva descripción',
-                      desc_en: 'Nueva descripción', // Should become new ES (whitespace trimmed = empty)
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      const updated = {
+        id: 'partner-1',
+        name: 'Partner Name',
+        imgUrl: 'https://example.com/partner.png',
+        linkUrl: null,
+        descEs: 'Nueva descripción',
+        descEn: 'Nueva descripción',
+        sortOrder: 0,
+        active: true,
+        createdAt: '2026-04-01T00:00:00Z',
+        updatedAt: '2026-04-01T00:00:00Z',
+      }
+      selectMock.mockResolvedValueOnce([currentRow])
+      updateMock.mockResolvedValue([updated])
 
       const { updatePartner } = await loadPartnersService()
-
       const result = await updatePartner(adminSession, 'partner-1', {
         descriptionEs: 'Nueva descripción',
-        descriptionEn: '   ', // Whitespace-only = treated as empty (rule 2)
+        descriptionEn: '   ',
       })
 
-      expect(result.descriptionEn).toBe('Nueva descripción') // Follows new ES
+      expect(result.descriptionEn).toBe('Nueva descripción')
     })
   })
 })
