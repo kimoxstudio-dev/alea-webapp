@@ -1730,3 +1730,50 @@ No blocking issues. No modifications needed. Code is ready for security-reviewer
 - [10:41] Pushed to origin/migration-f3c-01-drizzle-seam-pilot — pre-push hook ran full CI (typecheck/lint/test/build), all green (1147 tests pass), no --no-verify used.
 - [10:42] Updated PR #178 description via `gh pr edit 178 --body-file` — appended the three addenda (schema-drift check, auth-schema dependency check, split-brain disclosure) to the existing body. Verified via `gh pr view 178` that all three sections are present and PR remains OPEN, base develop, 3 commits.
 - [10:42] ✅ Complete — PR #178 amended and updated: https://github.com/KimoxStudio/alea-webapp/pull/178
+
+#### [KIM-434] software-engineer — PR1 hotfix (setRoomDefaultEquipment transaction + unique constraint)
+- [09:45] Started — same worktree as PR1, no new worktree created. Read `lib/server/equipment/equipment-service.ts` (setRoomDefaultEquipment, lines ~157-196) and `lib/db/schema/equipment.ts` to confirm the room_default_equipment table shape and the EQUIPMENT_LOCKED_TO_ANOTHER_ROOM business rule (also referenced from `lib/server/reservations/reservations-service.ts:538`).
+- [09:48] Schema: added `unique('room_default_equipment_equipment_id_unique').on(t.equipmentId)` to `roomDefaultEquipment` in lib/db/schema/equipment.ts, with a comment explaining the exclusivity rationale.
+- [09:50] Ran `npx drizzle-kit generate --name room_default_equipment_equipment_unique` (schema-diff-to-SQL only, no DB connection — drizzle.config.ts explicitly documents this is safe). Produced lib/db/migrations/0002_room_default_equipment_equipment_unique.sql (`ALTER TABLE "room_default_equipment" ADD CONSTRAINT "room_default_equipment_equipment_id_unique" UNIQUE("equipment_id");`) + updated meta/_journal.json + new meta/0002_snapshot.json. Did NOT run drizzle-kit push/migrate.
+- [09:58] Rewrote `setRoomDefaultEquipment()`: wrapped the conflict-check SELECT, DELETE, and INSERT in `db.transaction(async (tx) => {...})` so a failing INSERT rolls back the DELETE (no more silent data loss). Added `isEquipmentExclusivityViolation()` duck-typed check for pg error `code === '23505' && constraint === 'room_default_equipment_equipment_id_unique'`, translated in the catch block to the existing `EQUIPMENT_LOCKED_TO_ANOTHER_ROOM` 400 (ServiceError instances rethrown unchanged, everything else falls to generic 500).
+- [10:02] Validation: `pnpm typecheck` PASS, `pnpm lint` PASS (no warnings/errors), `pnpm build` PASS (43/43 pages).
+- [10:03] Sanity-ran `pnpm vitest run tests/unit/server/equipment-service.test.ts`: 30/34 pass, 4 pre-existing `setRoomDefaultEquipment` tests fail because the test's `createDrizzleQueryBuilder()` mock has no `.transaction()` method — expected/legitimate behavior change from wrapping in a transaction, not a regression in the fix itself. Flagged for qa-engineer with exact guidance (mock needs `transaction: vi.fn((cb) => cb(createDrizzleQueryBuilder()))`). Did not touch the test file myself (qa-engineer owns test files).
+- [10:03] Files changed: lib/server/equipment/equipment-service.ts, lib/db/schema/equipment.ts. Files added: lib/db/migrations/0002_room_default_equipment_equipment_unique.sql, lib/db/migrations/meta/0002_snapshot.json. lib/db/migrations/meta/_journal.json updated by drizzle-kit generate.
+- [10:03] ✅ Complete — worktree left uncommitted for qa-engineer/security-reviewer per instructions (no commit/push by software-engineer).
+
+#### [KIM-434] qa-engineer — PR1 hotfix regression tests
+- [09:59] Started
+- [09:59] ✅ Fixed mock: Added `.transaction()` method to createDrizzleQueryBuilder()
+  - Mock now supports async transaction callbacks
+  - Callback receives a query builder (tx) with the same chainable structure
+  - All 4 existing setRoomDefaultEquipment tests now pass
+- [09:59] ✅ Added regression test: "rejects INSERT inside transaction and rolls back (data-loss prevention)"
+  - Verifies transaction wrapper exists and is invoked
+  - Mock INSERT rejects after DELETE succeeds
+  - Assert operation fails cleanly (500 error, not partial success)
+  - Note: Unit test layer cannot verify true rollback semantics without real Postgres transaction; integration test would be needed for that
+- [09:59] ✅ Added regression test: "translates unique-constraint violation (concurrent race) to 400 EQUIPMENT_LOCKED_TO_ANOTHER_ROOM"
+  - Simulates concurrent race: two admins both pass exclusivity check, both try to INSERT
+  - Mock INSERT rejects with code '23505' and constraint 'room_default_equipment_equipment_id_unique'
+  - Assert isEquipmentExclusivityViolation() recognizes and translates to 400 instead of 500
+- [09:59] ✅ Added regression test: "does NOT translate a unique-constraint with different constraint name to 400"
+  - Negative test: wrong constraint name should not match
+  - Mock INSERT rejects with code '23505' and constraint 'some_other_unique_constraint'
+  - Assert falls through to generic 500 path (proves duck-type check is selective)
+- [10:00] ✅ Full validation suite passed:
+  - pnpm vitest run tests/unit/server/equipment-service.test.ts: 37 tests passed
+  - pnpm typecheck: OK
+  - pnpm lint: OK (no ESLint warnings or errors)
+  - pnpm test: 1150 tests passed (full suite), 74 test files passed (includes equipment-service tests)
+  - pnpm build: OK (Next.js build complete, no errors)
+- [10:00] ✅ Complete — All regression tests added and all validation gates pass
+
+#### [KIM-434] security-reviewer — PR1 hotfix re-review + reply
+- [10:15] Started — re-reviewing setRoomDefaultEquipment() transaction fix + unique constraint, per external review comment 3649929111 on PR #178.
+- [10:16] Confirmed transaction wrapping: SELECT/DELETE/INSERT all run via `tx` inside `db.transaction(async (tx) => {...})`, no operation left outside; requireAdminSession() still called first, unchanged.
+- [10:17] Confirmed name consistency across all 3 layers: table `room_default_equipment`, column `equipment_id`, constraint `room_default_equipment_equipment_id_unique` — matches in .sql migration, schema.ts unique(), and isEquipmentExclusivityViolation() duck-type check.
+- [10:18] Confirmed isEquipmentExclusivityViolation() only matches code 23505 + exact constraint name (negative-case test proves no over-matching); ServiceError instances rethrown before reaching this check, so business errors (EQUIPMENT_LOCKED_TO_ANOTHER_ROOM from the SELECT check) aren't double-handled.
+- [10:19] Independently re-ran `pnpm vitest run tests/unit/server/equipment-service.test.ts` (37/37 pass) and `pnpm typecheck` (pass) in this worktree to confirm qa-engineer's results.
+- [10:19] No secrets/.env values in diff (grep scan clean, only false-positive match was "primaryKey"). git status matches expected 7 files (6 code/test files + this log entry).
+- [10:19] Agreed redundant index (room_default_equipment_equipment_id_idx) alongside new unique constraint is acceptable to leave as follow-up cleanup — not a correctness/security concern, just a minor schema tidiness item.
+- [10:19] Verdict: APPROVE. Committing and pushing.

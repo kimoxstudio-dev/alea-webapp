@@ -15,6 +15,13 @@
       "when": 1784203389416,
       "tag": "0001_exclusion_constraints",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1784969695002,
+      "tag": "0002_room_default_equipment_equipment_unique",
+      "breakpoints": true
     }
   ]
 }
