@@ -1794,3 +1794,4 @@ No blocking issues. No modifications needed. Code is ready for security-reviewer
 
 #### [KIM-434] software-engineer — PR3 content-batch (REDO after worktree loss)
 - [12:13] Started. Branch migration-f3c-03-content-batch already existed at PR2 tip, no lost work. Beginning file reads.
+- [12:45] library-games-service.ts migrated + committed. events-service.ts and club-events-service.ts migrated (typecheck + lint pass). Committing now.

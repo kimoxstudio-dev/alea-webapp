@@ -1,4 +1,5 @@
 import 'server-only'
+import { and, asc, eq, inArray, isNotNull } from 'drizzle-orm'
 import type {
   AdminClubEvent,
   AdminEventMaterial,
@@ -8,12 +9,13 @@ import type {
   ClubEventDateKind,
   ClubEventStatus,
 } from '@/lib/types'
-import { getDb, getAdminDb } from '@/lib/db'
-import { serviceError } from '@/lib/server/shared/service-error'
+import { getDrizzleAdminDb, getDrizzleDb } from '@/lib/db'
+import { equipment, eventEquipment, events, eventRoomBlocks, rooms, tables } from '@/lib/db/schema'
+import { ServiceError, serviceError } from '@/lib/server/shared/service-error'
 import { getCurrentClubDate } from '@/lib/club-time'
-import type { Tables } from '@/lib/supabase/types'
 import type { SessionUser } from '@/lib/server/auth/auth'
 import {
+  cancelOverlappingReservationsForBlocks,
   deleteEventCascade,
   isClubEventRow,
   validateAndNormaliseSchedule,
@@ -23,46 +25,55 @@ import { validateOptionalUrl } from '@/lib/validations/url'
 
 export type { AdminClubEvent, AdminListClubEventsResult }
 
-type EventRow = Tables<'events'>
-type EventRoomBlockRow = Tables<'event_room_blocks'>
-
-const CLUB_EVENT_COLUMNS = 'id, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url'
-
-// Same as CLUB_EVENT_COLUMNS plus the admin-only category fields and id/date
-// needed to drive the dashboard "Club events" management view (OIR-203).
-// Kept as its own string literal (not built via concatenation) so Supabase's
-// select() overload can still infer a concrete row shape.
-const ADMIN_CLUB_EVENT_COLUMNS = 'id, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url, category_es, category_en'
+type EventRow = typeof events.$inferSelect
+type EventRoomBlockRow = typeof eventRoomBlocks.$inferSelect
 
 const DEFAULT_PAST_LIMIT = 24
+
+/**
+ * KIM-434 (F3c) PR3: `events` / `event_room_blocks` / `event_equipment`
+ * reads/writes below use the Drizzle/Neon seam (`getDrizzleDb()` /
+ * `getDrizzleAdminDb()`), replacing both the legacy Supabase client and the
+ * `apply_club_event_room_blocks` SECURITY DEFINER RPC (see
+ * `applyClubEventRoomBlocksAndMaterials()` below) with an equivalent
+ * `db.transaction()`, following the pattern established in
+ * `lib/server/equipment/equipment-service.ts` (PR1).
+ *
+ * `reservations` is owned by a service NOT yet migrated (PR5), so the
+ * reservation-cancellation step `apply_club_event_room_blocks` used to
+ * perform in-transaction now runs as a separate, non-transactional
+ * follow-up call — see `cancelOverlappingReservationsForBlocks()` in
+ * `lib/server/events/events-service.ts` for the full tradeoff writeup, and
+ * the PR description's "Split-brain disclosure" section.
+ */
 
 /**
  * "Upcoming" vs "past" is derived from date/end_date at read time rather than
  * stored — a recurring event (e.g. "every Friday") is always upcoming since
  * it has no defined end.
  */
-function statusFor(row: Pick<EventRow, 'date_kind' | 'date' | 'end_date'>, today: string): ClubEventStatus {
-  if (row.date_kind === 'recurring') return 'upcoming'
-  const referenceDate = row.end_date ?? row.date
+function statusFor(row: Pick<EventRow, 'dateKind' | 'date' | 'endDate'>, today: string): ClubEventStatus {
+  if (row.dateKind === 'recurring') return 'upcoming'
+  const referenceDate = row.endDate ?? row.date
   return referenceDate < today ? 'past' : 'upcoming'
 }
 
 function toClubEvent(row: EventRow, today: string): ClubEvent {
   return {
     id: row.id,
-    titleEs: row.title_es ?? row.title,
-    titleEn: row.title_en ?? row.title,
-    blurbEs: row.blurb_es ?? '',
-    blurbEn: row.blurb_en ?? '',
-    descriptionEs: row.description_es,
-    descriptionEn: row.description_en,
-    dateKind: (row.date_kind as ClubEventDateKind) ?? 'single',
+    titleEs: row.titleEs ?? row.title,
+    titleEn: row.titleEn ?? row.title,
+    blurbEs: row.blurbEs ?? '',
+    blurbEn: row.blurbEn ?? '',
+    descriptionEs: row.descriptionEs,
+    descriptionEn: row.descriptionEn,
+    dateKind: (row.dateKind as ClubEventDateKind) ?? 'single',
     startDate: row.date,
-    endDate: row.end_date,
-    recurrenceLabelEs: row.recurrence_label_es,
-    recurrenceLabelEn: row.recurrence_label_en,
-    imageUrl: row.image_url,
-    linkUrl: row.link_url,
+    endDate: row.endDate,
+    recurrenceLabelEs: row.recurrenceLabelEs,
+    recurrenceLabelEn: row.recurrenceLabelEn,
+    imageUrl: row.imageUrl,
+    linkUrl: row.linkUrl,
     status: statusFor(row, today),
   }
 }
@@ -78,35 +89,48 @@ export interface ListClubEventsResult {
 }
 
 /**
+ * Runs a Drizzle query, translating any thrown DB/driver error into a
+ * uniform 500 ServiceError. Business-logic outcomes (e.g. "no row
+ * returned" -> 404, validation -> 400) are handled by callers, outside this
+ * wrapper, so their specific status codes aren't swallowed into a 500.
+ */
+async function runQuery<T>(query: Promise<T>): Promise<T> {
+  try {
+    return await query
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+}
+
+/**
  * Public read of club marketing events (tournaments, game nights, club
  * history) for the landing page. These live in the same "events" table used
  * for internal room-reservation blocking (lib/server/events/events-service.ts) —
  * a row is landing-eligible once it carries bilingual copy (title_es/title_en).
- * Uses the RLS-respecting client since this is unauthenticated, publicly
- * readable content; the "events_select_public" RLS policy additionally
- * restricts anon visibility to rows with bilingual copy populated.
+ *
+ * KIM-434 (F3c) PR3 note: this now reads via the Drizzle/Neon seam
+ * (`getDrizzleDb()`). The bilingual-titles-populated filter below was
+ * already enforced explicitly in application code before this PR (not
+ * solely relied on RLS), so no additional filter is needed here — unlike
+ * e.g. `listLibraryGames()`.
  */
 export async function listClubEvents(options: ListClubEventsOptions = {}): Promise<ListClubEventsResult> {
   const pastLimit = options.pastLimit ?? DEFAULT_PAST_LIMIT
   const today = getCurrentClubDate()
 
-  const supabase = await getDb()
-  const { data, error } = await supabase
-    .from('events')
-    .select(CLUB_EVENT_COLUMNS)
-    .not('title_es', 'is', null)
-    .not('title_en', 'is', null)
-    .order('date', { ascending: true })
+  const db = getDrizzleDb()
+  const rows = await runQuery(
+    db
+      .select()
+      .from(events)
+      .where(and(isNotNull(events.titleEs), isNotNull(events.titleEn)))
+      .orderBy(asc(events.date)),
+  )
 
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
+  const clubEvents = rows.map((row) => toClubEvent(row, today))
 
-  const rows = (data ?? []) as EventRow[]
-  const events = rows.map((row) => toClubEvent(row, today))
-
-  const upcoming = events.filter((event) => event.status === 'upcoming')
-  const past = events
+  const upcoming = clubEvents.filter((event) => event.status === 'upcoming')
+  const past = clubEvents
     .filter((event) => event.status === 'past')
     .sort((a, b) => b.startDate.localeCompare(a.startDate))
     .slice(0, pastLimit)
@@ -253,29 +277,29 @@ function resolveBilingualEnFallback(
 interface ClubEventFieldSet {
   // OIR-208: null when visibleOnLanding is false (internal-only event) — the
   // paired-titles CHECK constraint holds since both are nulled together.
-  title_es: string | null
-  title_en: string | null
-  blurb_es: string | null
-  blurb_en: string | null
-  description_es: string | null
-  description_en: string | null
-  category_es: string | null
-  category_en: string | null
-  date_kind: ClubEventDateKind
+  titleEs: string | null
+  titleEn: string | null
+  blurbEs: string | null
+  blurbEn: string | null
+  descriptionEs: string | null
+  descriptionEn: string | null
+  categoryEs: string | null
+  categoryEn: string | null
+  dateKind: ClubEventDateKind
   date: string
-  end_date: string | null
-  recurrence_label_es: string | null
-  recurrence_label_en: string | null
-  image_url: string | null
-  link_url: string | null
+  endDate: string | null
+  recurrenceLabelEs: string | null
+  recurrenceLabelEn: string | null
+  imageUrl: string | null
+  linkUrl: string | null
   // Legacy single-locale anchor columns kept NOT NULL by the original
   // "events" schema — mirrored from the ES copy / all-day sentinel, same
   // convention used by the OIR-202 seed migration, since club events have no
   // meaningful room-block time-of-day unless blocksRooms is also set.
   title: string
   description: string | null
-  start_time: string
-  end_time: string
+  startTime: string
+  endTime: string
 }
 
 /**
@@ -285,12 +309,12 @@ interface ClubEventFieldSet {
  * to empty/required validation instead.
  */
 function resolveClubEventFields(body: ClubEventInput, current: EventRow | null): ClubEventFieldSet {
-  // OIR-208: current.title_es is NULL for internal-only events — fall back
+  // OIR-208: current.titleEs is NULL for internal-only events — fall back
   // to the legacy `title` column (same convention as the read-side mappers)
   // so editing an internal event without resending titleEs doesn't 400.
   const titleEs = body.titleEs !== undefined
     ? requireNonEmptyString(body.titleEs, 'titleEs')
-    : requireNonEmptyString(current ? (current.title_es ?? current.title) : null, 'titleEs')
+    : requireNonEmptyString(current ? (current.titleEs ?? current.title) : null, 'titleEs')
   // OIR-206: titleEn is optional — falls back to titleEs (see
   // resolveBilingualEnFallback) rather than being required client- or
   // service-side. `?? titleEs` is a type-level safety net only; in practice
@@ -301,47 +325,47 @@ function resolveClubEventFields(body: ClubEventInput, current: EventRow | null):
     titleEs,
     body.titleEn,
     body.titleEn !== undefined,
-    current ? { es: current.title_es, en: current.title_en } : null,
+    current ? { es: current.titleEs, en: current.titleEn } : null,
   ) ?? titleEs
 
-  const blurbEs = body.blurbEs !== undefined ? optionalString(body.blurbEs, 'blurbEs') : (current?.blurb_es ?? null)
+  const blurbEs = body.blurbEs !== undefined ? optionalString(body.blurbEs, 'blurbEs') : (current?.blurbEs ?? null)
   const blurbEn = resolveBilingualEnFallback(
     'blurbEn',
     blurbEs,
     body.blurbEn,
     body.blurbEn !== undefined,
-    current ? { es: current.blurb_es, en: current.blurb_en } : null,
+    current ? { es: current.blurbEs, en: current.blurbEn } : null,
   )
-  const descriptionEs = body.descriptionEs !== undefined ? optionalString(body.descriptionEs, 'descriptionEs') : (current?.description_es ?? null)
+  const descriptionEs = body.descriptionEs !== undefined ? optionalString(body.descriptionEs, 'descriptionEs') : (current?.descriptionEs ?? null)
   const descriptionEn = resolveBilingualEnFallback(
     'descriptionEn',
     descriptionEs,
     body.descriptionEn,
     body.descriptionEn !== undefined,
-    current ? { es: current.description_es, en: current.description_en } : null,
+    current ? { es: current.descriptionEs, en: current.descriptionEn } : null,
   )
-  const categoryEs = body.categoryEs !== undefined ? optionalString(body.categoryEs, 'categoryEs') : (current?.category_es ?? null)
+  const categoryEs = body.categoryEs !== undefined ? optionalString(body.categoryEs, 'categoryEs') : (current?.categoryEs ?? null)
   const categoryEn = resolveBilingualEnFallback(
     'categoryEn',
     categoryEs,
     body.categoryEn,
     body.categoryEn !== undefined,
-    current ? { es: current.category_es, en: current.category_en } : null,
+    current ? { es: current.categoryEs, en: current.categoryEn } : null,
   )
   const recurrenceLabelEs = body.recurrenceLabelEs !== undefined
     ? optionalString(body.recurrenceLabelEs, 'recurrenceLabelEs')
-    : (current?.recurrence_label_es ?? null)
+    : (current?.recurrenceLabelEs ?? null)
   const recurrenceLabelEn = resolveBilingualEnFallback(
     'recurrenceLabelEn',
     recurrenceLabelEs,
     body.recurrenceLabelEn,
     body.recurrenceLabelEn !== undefined,
-    current ? { es: current.recurrence_label_es, en: current.recurrence_label_en } : null,
+    current ? { es: current.recurrenceLabelEs, en: current.recurrenceLabelEn } : null,
   )
 
   const dateKind = body.dateKind !== undefined
     ? normaliseDateKind(body.dateKind)
-    : ((current?.date_kind as ClubEventDateKind | undefined) ?? 'single')
+    : ((current?.dateKind as ClubEventDateKind | undefined) ?? 'single')
 
   const startDate = body.date !== undefined
     ? requireDateString(body.date, 'date')
@@ -351,13 +375,13 @@ function resolveClubEventFields(body: ClubEventInput, current: EventRow | null):
   if (dateKind === 'range') {
     endDate = body.endDate !== undefined
       ? optionalDateString(body.endDate, 'endDate')
-      : (current?.end_date ?? null)
+      : (current?.endDate ?? null)
     if (!endDate) serviceError('endDate is required when dateKind is range', 400)
     if (endDate < startDate) serviceError('endDate must be on or after date', 400)
   }
 
-  const imageUrl = body.imageUrl !== undefined ? validateOptionalUrl(body.imageUrl, 'imageUrl') : (current?.image_url ?? null)
-  const linkUrl = body.linkUrl !== undefined ? validateOptionalUrl(body.linkUrl, 'linkUrl') : (current?.link_url ?? null)
+  const imageUrl = body.imageUrl !== undefined ? validateOptionalUrl(body.imageUrl, 'imageUrl') : (current?.imageUrl ?? null)
+  const linkUrl = body.linkUrl !== undefined ? validateOptionalUrl(body.linkUrl, 'linkUrl') : (current?.linkUrl ?? null)
 
   // OIR-208: ON (default for new events) publishes the bilingual columns;
   // OFF nulls them (paired constraint holds) and keeps only the legacy
@@ -374,33 +398,33 @@ function resolveClubEventFields(body: ClubEventInput, current: EventRow | null):
   // destroy that data) — only a CREATE gets the all-day/no-description
   // defaults, since there is no prior row to preserve.
   const description = current ? current.description : null
-  const startTime = current ? current.start_time : '00:00:00'
-  const endTime = current ? current.end_time : '23:59:00'
+  const startTime = current ? current.startTime : '00:00:00'
+  const endTime = current ? current.endTime : '23:59:00'
 
   return {
-    title_es: visibleOnLanding ? titleEs : null,
-    title_en: visibleOnLanding ? titleEn : null,
+    titleEs: visibleOnLanding ? titleEs : null,
+    titleEn: visibleOnLanding ? titleEn : null,
     // Deliberate (toggle OFF stale content): blurb/description/image are kept
     // as-is when visibleOnLanding flips to false rather than being cleared.
     // This preserves the marketing copy for a later re-publish and lets the
     // admin form show it back for review when the event is re-enabled.
-    blurb_es: blurbEs,
-    blurb_en: blurbEn,
-    description_es: descriptionEs,
-    description_en: descriptionEn,
-    category_es: categoryEs,
-    category_en: categoryEn,
-    date_kind: dateKind,
+    blurbEs,
+    blurbEn,
+    descriptionEs,
+    descriptionEn,
+    categoryEs,
+    categoryEn,
+    dateKind,
     date: startDate,
-    end_date: endDate,
-    recurrence_label_es: recurrenceLabelEs,
-    recurrence_label_en: recurrenceLabelEn,
-    image_url: imageUrl,
-    link_url: linkUrl,
+    endDate,
+    recurrenceLabelEs,
+    recurrenceLabelEn,
+    imageUrl,
+    linkUrl,
     title: titleEs,
     description,
-    start_time: startTime,
-    end_time: endTime,
+    startTime,
+    endTime,
   }
 }
 
@@ -412,31 +436,31 @@ function toAdminClubEvent(
 ): AdminClubEvent {
   const roomBlocks: AdminEventRoomBlock[] = blocks.map((b) => ({
     id: b.id,
-    roomId: b.room_id,
-    tableId: b.table_id ?? null,
+    roomId: b.roomId,
+    tableId: b.tableId ?? null,
     date: b.date,
-    startTime: b.start_time.slice(0, 5),
-    endTime: b.end_time.slice(0, 5),
-    allDay: b.all_day,
+    startTime: b.startTime.slice(0, 5),
+    endTime: b.endTime.slice(0, 5),
+    allDay: b.allDay,
   }))
 
   return {
     id: row.id,
-    titleEs: row.title_es ?? row.title,
-    titleEn: row.title_en ?? row.title,
-    blurbEs: row.blurb_es ?? '',
-    blurbEn: row.blurb_en ?? '',
-    descriptionEs: row.description_es,
-    descriptionEn: row.description_en,
-    dateKind: (row.date_kind as ClubEventDateKind) ?? 'single',
+    titleEs: row.titleEs ?? row.title,
+    titleEn: row.titleEn ?? row.title,
+    blurbEs: row.blurbEs ?? '',
+    blurbEn: row.blurbEn ?? '',
+    descriptionEs: row.descriptionEs,
+    descriptionEn: row.descriptionEn,
+    dateKind: (row.dateKind as ClubEventDateKind) ?? 'single',
     startDate: row.date,
-    endDate: row.end_date,
-    recurrenceLabelEs: row.recurrence_label_es,
-    recurrenceLabelEn: row.recurrence_label_en,
-    imageUrl: row.image_url,
-    linkUrl: row.link_url,
-    categoryEs: row.category_es,
-    categoryEn: row.category_en,
+    endDate: row.endDate,
+    recurrenceLabelEs: row.recurrenceLabelEs,
+    recurrenceLabelEn: row.recurrenceLabelEn,
+    imageUrl: row.imageUrl,
+    linkUrl: row.linkUrl,
+    categoryEs: row.categoryEs,
+    categoryEn: row.categoryEn,
     status: statusFor(row, today),
     blocksRooms: roomBlocks.length > 0,
     roomBlocks,
@@ -448,71 +472,144 @@ function toAdminClubEvent(
 }
 
 /**
- * Replace room blocks and/or materials for a club event via the atomic
- * `apply_club_event_room_blocks` SECURITY DEFINER RPC (Finding 1 — replaces
- * the previous non-transactional delete-all → per-block insert → per-block
- * reservation-cancel JS loop). In one DB transaction: deletes existing
- * blocks for the event, inserts one row per schedule entry that has a room
- * attached (entries with no room are informational-only and create no block
- * — this is how "room blocking optional" is enforced even when
- * `blocksRooms` is true but a given schedule row has no room selected), and
- * cancels overlapping active/pending reservations for every newly-created
- * block using the same overlap predicate as `update_event_with_blocks` —
- * scoped to a single table when the block carries a `table_id` (OIR-208),
- * or the whole room when it doesn't (unchanged behavior). Materials
- * (event_equipment) are replaced the same way.
+ * Replace room blocks and/or materials for a club event, atomically, via a
+ * Neon `db.transaction()` — the Drizzle/Neon replacement for the former
+ * `apply_club_event_room_blocks` SECURITY DEFINER RPC (Finding 1 — this RPC
+ * itself replaced the earlier non-transactional delete-all → per-block
+ * insert → per-block reservation-cancel JS loop). In one DB transaction:
+ * deletes existing blocks for the event, inserts one row per schedule entry
+ * that has a room attached (entries with no room are informational-only and
+ * create no block — this is how "room blocking optional" is enforced even
+ * when `blocksRooms` is true but a given schedule row has no room selected),
+ * and validates that any attached `table_id` belongs to its `room_id`
+ * (mirrors the RPC's in-function check, raised as a 400 "Invalid event
+ * data" here instead of a raw 23514 check-violation). Materials
+ * (event_equipment) are replaced the same way, in the same transaction.
  *
  * `blocks`/`materials` of `null` leaves the corresponding rows untouched
- * (the RPC skips that section entirely) — used when a save only changes
- * the other axis. An array (including `[]`) fully replaces it.
+ * (matches the RPC's "skip that section entirely" behavior) and this
+ * function still returns the event's CURRENT block set (read back inside
+ * the same transaction) so callers get a consistent snapshot either way.
+ * An array (including `[]`) fully replaces it.
+ *
+ * KIM-434 PR3 note: the reservation-cancellation step the RPC used to run
+ * in-transaction for every newly-written block now runs as a SEPARATE,
+ * non-transactional follow-up call AFTER this transaction commits — see
+ * `cancelOverlappingReservationsForBlocks()` in
+ * `lib/server/events/events-service.ts` for the full tradeoff writeup. It
+ * only runs when `blocks` is non-null (i.e. this call actually replaced the
+ * block set) — reading back an untouched block set must not re-cancel
+ * reservations that were already handled by a prior write.
  */
 async function applyClubEventRoomBlocksAndMaterials(
-  admin: ReturnType<typeof getAdminDb>,
   eventId: string,
   blocks: NormalisedEventSchedule[] | null,
   materials: NormalisedMaterial[] | null,
 ): Promise<EventRoomBlockRow[]> {
-  const blocksPayload = blocks === null
-    ? null
-    : blocks
-      .filter((b) => b.room_id)
-      .map((b) => ({
-        room_id: b.room_id,
-        table_id: b.table_id,
-        date: b.date,
-        all_day: b.all_day,
-        start_time: b.start_time,
-        end_time: b.end_time,
-      }))
+  const db = getDrizzleAdminDb()
 
-  const materialsPayload = materials === null
-    ? null
-    : materials.map((m) => ({ equipment_id: m.equipment_id, quantity: m.quantity }))
+  let blocksResult: EventRoomBlockRow[]
+  try {
+    blocksResult = await db.transaction(async (tx) => {
+      const [existingEvent] = await tx.select({ id: events.id }).from(events).where(eq(events.id, eventId))
+      if (!existingEvent) serviceError('Club event not found', 404)
 
-  const { data, error } = await admin.rpc('apply_club_event_room_blocks', {
-    p_event_id: eventId,
-    p_blocks: blocksPayload,
-    p_materials: materialsPayload,
-  })
+      let currentBlocks: EventRoomBlockRow[] = []
 
-  if (error) {
+      if (blocks !== null) {
+        await tx.delete(eventRoomBlocks).where(eq(eventRoomBlocks.eventId, eventId))
+
+        const blocksWithRoom = blocks.filter(
+          (b): b is NormalisedEventSchedule & { room_id: string } => b.room_id !== null,
+        )
+
+        if (blocksWithRoom.length > 0) {
+          // Guard against a table_id/room_id mismatch: independent FKs alone
+          // would let a caller pair a table_id from one room with a room_id
+          // from another, leaving cancellation/availability logic acting on
+          // a table that does not belong to the block's room (mirrors the
+          // apply_club_event_room_blocks RPC's in-function check).
+          const tableIdsToCheck = [...new Set(
+            blocksWithRoom.map((b) => b.table_id).filter((id): id is string => id !== null),
+          )]
+
+          if (tableIdsToCheck.length > 0) {
+            const matchingTables = await tx
+              .select({ id: tables.id, roomId: tables.roomId })
+              .from(tables)
+              .where(inArray(tables.id, tableIdsToCheck))
+            const tableRoomById = new Map(matchingTables.map((t) => [t.id, t.roomId]))
+
+            for (const b of blocksWithRoom) {
+              if (b.table_id && tableRoomById.get(b.table_id) !== b.room_id) {
+                serviceError('Invalid event data', 400)
+              }
+            }
+          }
+
+          currentBlocks = await tx
+            .insert(eventRoomBlocks)
+            .values(
+              blocksWithRoom.map((b) => ({
+                eventId,
+                roomId: b.room_id,
+                tableId: b.table_id,
+                date: b.date,
+                startTime: b.start_time,
+                endTime: b.end_time,
+                allDay: b.all_day,
+              })),
+            )
+            .returning()
+        }
+      } else {
+        currentBlocks = await tx.select().from(eventRoomBlocks).where(eq(eventRoomBlocks.eventId, eventId))
+      }
+
+      if (materials !== null) {
+        await tx.delete(eventEquipment).where(eq(eventEquipment.eventId, eventId))
+
+        if (materials.length > 0) {
+          await tx.insert(eventEquipment).values(
+            materials.map((m) => ({ eventId, equipmentId: m.equipment_id, quantity: m.quantity })),
+          )
+        }
+      }
+
+      return currentBlocks
+    })
+  } catch (error) {
+    if (error instanceof ServiceError) throw error
     const pgCode = (error as { code?: string }).code
-    if (pgCode === 'P0001') {
-      serviceError('Club event not found', 404)
-    }
     if (pgCode === '23514' || pgCode === '22P02' || pgCode === '23502') {
       serviceError('Invalid event data', 400)
     }
     serviceError('Internal server error', 500)
   }
 
-  return (data ?? []) as EventRoomBlockRow[]
+  // Non-transactional follow-up — see cancelOverlappingReservationsForBlocks
+  // doc comment (lib/server/events/events-service.ts) for the
+  // reservation-cancellation split-brain tradeoff this implies. Only runs
+  // when this call actually replaced the block set.
+  if (blocks !== null) {
+    await cancelOverlappingReservationsForBlocks(
+      blocksResult.map((b) => ({
+        roomId: b.roomId,
+        tableId: b.tableId,
+        date: b.date,
+        startTime: b.startTime,
+        endTime: b.endTime,
+      })),
+    )
+  }
+
+  return blocksResult
 }
 
 /**
  * Order-insensitive comparison of the currently-stored room blocks against
  * an incoming (already-validated) schedules payload — used by Finding 4 to
- * skip the block-replace RPC entirely when a save carries no actual block
+ * skip the block-replace step entirely when a save carries no actual block
  * changes (e.g. a metadata-only edit that always resends the current
  * schedules from the edit form).
  */
@@ -520,11 +617,13 @@ function blocksMatchSchedules(current: EventRoomBlockRow[], incoming: Normalised
   const incomingWithRoom = incoming.filter((s): s is NormalisedEventSchedule & { room_id: string } => !!s.room_id)
   if (current.length !== incomingWithRoom.length) return false
 
-  const blockKey = (b: { room_id: string; table_id?: string | null; date: string; all_day: boolean; start_time: string; end_time: string }) =>
-    `${b.room_id}|${b.table_id ?? ''}|${b.date}|${b.all_day}|${b.start_time.slice(0, 5)}|${b.end_time.slice(0, 5)}`
+  const currentKey = (b: EventRoomBlockRow) =>
+    `${b.roomId}|${b.tableId ?? ''}|${b.date}|${b.allDay}|${b.startTime.slice(0, 5)}|${b.endTime.slice(0, 5)}`
+  const incomingKey = (s: NormalisedEventSchedule & { room_id: string }) =>
+    `${s.room_id}|${s.table_id ?? ''}|${s.date}|${s.all_day}|${s.start_time.slice(0, 5)}|${s.end_time.slice(0, 5)}`
 
-  const currentKeys = current.map((b) => blockKey(b)).sort()
-  const incomingKeys = incomingWithRoom.map((s) => blockKey(s)).sort()
+  const currentKeys = current.map(currentKey).sort()
+  const incomingKeys = incomingWithRoom.map(incomingKey).sort()
 
   return currentKeys.every((key, i) => key === incomingKeys[i])
 }
@@ -564,52 +663,45 @@ function validateMaterialsPayload(raw: unknown): NormalisedMaterial[] {
   })
 }
 
-type EventEquipmentJoinRow = {
-  event_id: string
-  equipment_id: string
-  quantity: number
-  equipment: { id: string; name: string } | null
+async function fetchEventMaterials(eventId: string): Promise<AdminEventMaterial[]> {
+  const db = getDrizzleAdminDb()
+  const rows = await runQuery(
+    db
+      .select({
+        equipmentId: eventEquipment.equipmentId,
+        quantity: eventEquipment.quantity,
+        name: equipment.name,
+      })
+      .from(eventEquipment)
+      .innerJoin(equipment, eq(eventEquipment.equipmentId, equipment.id))
+      .where(eq(eventEquipment.eventId, eventId)),
+  )
+
+  return rows.map((row) => ({ equipmentId: row.equipmentId, name: row.name, quantity: row.quantity }))
 }
 
-async function fetchEventMaterials(
-  admin: ReturnType<typeof getAdminDb>,
-  eventId: string,
-): Promise<AdminEventMaterial[]> {
-  const { data, error } = await admin
-    .from('event_equipment')
-    .select('event_id, equipment_id, quantity, equipment(id, name)')
-    .eq('event_id', eventId)
-
-  if (error) serviceError('Internal server error', 500)
-
-  return ((data ?? []) as unknown as EventEquipmentJoinRow[])
-    .filter((row) => row.equipment !== null)
-    .map((row) => ({
-      equipmentId: row.equipment_id,
-      name: (row.equipment as { id: string; name: string }).name,
-      quantity: row.quantity,
-    }))
-}
-
-async function fetchEventMaterialsForMany(
-  admin: ReturnType<typeof getAdminDb>,
-  eventIds: string[],
-): Promise<Map<string, AdminEventMaterial[]>> {
+async function fetchEventMaterialsForMany(eventIds: string[]): Promise<Map<string, AdminEventMaterial[]>> {
   const byEvent = new Map<string, AdminEventMaterial[]>()
   if (eventIds.length === 0) return byEvent
 
-  const { data, error } = await admin
-    .from('event_equipment')
-    .select('event_id, equipment_id, quantity, equipment(id, name)')
-    .in('event_id', eventIds)
+  const db = getDrizzleAdminDb()
+  const rows = await runQuery(
+    db
+      .select({
+        eventId: eventEquipment.eventId,
+        equipmentId: eventEquipment.equipmentId,
+        quantity: eventEquipment.quantity,
+        name: equipment.name,
+      })
+      .from(eventEquipment)
+      .innerJoin(equipment, eq(eventEquipment.equipmentId, equipment.id))
+      .where(inArray(eventEquipment.eventId, eventIds)),
+  )
 
-  if (error) serviceError('Internal server error', 500)
-
-  for (const row of (data ?? []) as unknown as EventEquipmentJoinRow[]) {
-    if (!row.equipment) continue
-    const list = byEvent.get(row.event_id) ?? []
-    list.push({ equipmentId: row.equipment_id, name: row.equipment.name, quantity: row.quantity })
-    byEvent.set(row.event_id, list)
+  for (const row of rows) {
+    const list = byEvent.get(row.eventId) ?? []
+    list.push({ equipmentId: row.equipmentId, name: row.name, quantity: row.quantity })
+    byEvent.set(row.eventId, list)
   }
   return byEvent
 }
@@ -625,25 +717,22 @@ function validateSchedulesPayload(raw: unknown): NormalisedEventSchedule[] {
 /**
  * Validate that every room referenced by an incoming schedules payload
  * actually exists, BEFORE any write to the "events" table (PR #149 review).
- * Creating the event row before calling the apply_club_event_room_blocks RPC
- * could otherwise leave an orphaned club event behind if the RPC failed
- * (bad room id, FK issue, transient DB error) — rejecting unknown room ids
- * up front removes the most common failure cause before the insert ever
- * happens. The try/catch rollback in createClubEvent still guards against
- * any other RPC failure (e.g. transient errors) so the "no orphan event row"
- * invariant holds unconditionally, not just for bad-room-id cases.
+ * Creating the event row before the block-replace step could otherwise
+ * leave an orphaned club event behind if that step failed (bad room id, FK
+ * issue, transient DB error) — rejecting unknown room ids up front removes
+ * the most common failure cause before the insert ever happens. The
+ * try/catch rollback in createClubEvent still guards against any other
+ * failure (e.g. transient errors) so the "no orphan event row" invariant
+ * holds unconditionally, not just for bad-room-id cases.
  */
-async function validateRoomsExist(
-  admin: ReturnType<typeof getAdminDb>,
-  schedules: NormalisedEventSchedule[],
-): Promise<void> {
+async function validateRoomsExist(schedules: NormalisedEventSchedule[]): Promise<void> {
   const roomIds = Array.from(new Set(schedules.map((s) => s.room_id).filter((id): id is string => !!id)))
   if (roomIds.length === 0) return
 
-  const { data, error } = await admin.from('rooms').select('id').in('id', roomIds)
-  if (error) serviceError('Internal server error', 500)
+  const db = getDrizzleAdminDb()
+  const rows = await runQuery(db.select({ id: rooms.id }).from(rooms).where(inArray(rooms.id, roomIds)))
 
-  const foundIds = new Set((data ?? []).map((r) => (r as { id: string }).id))
+  const foundIds = new Set(rows.map((r) => r.id))
   const missing = roomIds.filter((id) => !foundIds.has(id))
   if (missing.length > 0) serviceError('Invalid room id in schedules', 400)
 }
@@ -654,20 +743,17 @@ async function validateRoomsExist(
  * fix to also cover the table-scoped blocks the unified event flow allows).
  * Runs BEFORE any write to the "events" table, same rationale as
  * validateRoomsExist: rejecting an unknown table id up front avoids
- * committing the event fields UPDATE before the later block-replace RPC
+ * committing the event fields UPDATE before the later block-replace step
  * would otherwise surface the bad reference.
  */
-async function validateTablesExist(
-  admin: ReturnType<typeof getAdminDb>,
-  schedules: NormalisedEventSchedule[],
-): Promise<void> {
+async function validateTablesExist(schedules: NormalisedEventSchedule[]): Promise<void> {
   const tableIds = Array.from(new Set(schedules.map((s) => s.table_id).filter((id): id is string => !!id)))
   if (tableIds.length === 0) return
 
-  const { data, error } = await admin.from('tables').select('id').in('id', tableIds)
-  if (error) serviceError('Internal server error', 500)
+  const db = getDrizzleAdminDb()
+  const rows = await runQuery(db.select({ id: tables.id }).from(tables).where(inArray(tables.id, tableIds)))
 
-  const foundIds = new Set((data ?? []).map((r) => (r as { id: string }).id))
+  const foundIds = new Set(rows.map((r) => r.id))
   const missing = tableIds.filter((id) => !foundIds.has(id))
   if (missing.length > 0) serviceError('Invalid table id in schedules', 400)
 }
@@ -678,32 +764,23 @@ async function validateTablesExist(
  * validateRoomsExist/validateTablesExist run before any write — an unknown
  * equipment id must be rejected before the event fields UPDATE commits.
  */
-async function validateEquipmentExists(
-  admin: ReturnType<typeof getAdminDb>,
-  materials: NormalisedMaterial[],
-): Promise<void> {
+async function validateEquipmentExists(materials: NormalisedMaterial[]): Promise<void> {
   const equipmentIds = Array.from(new Set(materials.map((m) => m.equipment_id)))
   if (equipmentIds.length === 0) return
 
-  const { data, error } = await admin.from('equipment').select('id').in('id', equipmentIds)
-  if (error) serviceError('Internal server error', 500)
+  const db = getDrizzleAdminDb()
+  const rows = await runQuery(db.select({ id: equipment.id }).from(equipment).where(inArray(equipment.id, equipmentIds)))
 
-  const foundIds = new Set((data ?? []).map((r) => (r as { id: string }).id))
+  const foundIds = new Set(rows.map((r) => r.id))
   const missing = equipmentIds.filter((id) => !foundIds.has(id))
   if (missing.length > 0) serviceError('Invalid equipment id in materials', 400)
 }
 
-async function fetchEventRoomBlocks(
-  admin: ReturnType<typeof getAdminDb>,
-  eventId: string,
-): Promise<EventRoomBlockRow[]> {
-  const { data, error } = await admin
-    .from('event_room_blocks')
-    .select('id, event_id, room_id, table_id, date, start_time, end_time, all_day')
-    .eq('event_id', eventId)
-
-  if (error) serviceError('Internal server error', 500)
-  return (data ?? []) as EventRoomBlockRow[]
+async function fetchEventRoomBlocks(eventId: string): Promise<EventRoomBlockRow[]> {
+  const db = getDrizzleAdminDb()
+  return runQuery(
+    db.select().from(eventRoomBlocks).where(eq(eventRoomBlocks.eventId, eventId)),
+  )
 }
 
 /**
@@ -716,43 +793,34 @@ export async function listAdminClubEvents(session: SessionUser): Promise<AdminLi
   requireAdminSession(session)
   const today = getCurrentClubDate()
 
-  const admin = getAdminDb()
-  const { data, error } = await admin
-    .from('events')
-    .select(ADMIN_CLUB_EVENT_COLUMNS)
-    .order('date', { ascending: true })
+  const db = getDrizzleAdminDb()
+  const rows = await runQuery(db.select().from(events).orderBy(asc(events.date)))
 
-  if (error) serviceError('Internal server error', 500)
-
-  const rows = (data ?? []) as EventRow[]
   if (rows.length === 0) return { upcoming: [], past: [] }
 
   const eventIds = rows.map((r) => r.id)
 
-  const { data: blocks, error: blocksError } = await admin
-    .from('event_room_blocks')
-    .select('id, event_id, room_id, table_id, date, start_time, end_time, all_day')
-    .in('event_id', eventIds)
-
-  if (blocksError) serviceError('Internal server error', 500)
+  const blockRows = await runQuery(
+    db.select().from(eventRoomBlocks).where(inArray(eventRoomBlocks.eventId, eventIds)),
+  )
 
   const blocksByEvent = new Map<string, EventRoomBlockRow[]>()
-  for (const block of (blocks ?? []) as EventRoomBlockRow[]) {
-    const list = blocksByEvent.get(block.event_id) ?? []
+  for (const block of blockRows) {
+    const list = blocksByEvent.get(block.eventId) ?? []
     list.push(block)
-    blocksByEvent.set(block.event_id, list)
+    blocksByEvent.set(block.eventId, list)
   }
 
-  const materialsByEvent = await fetchEventMaterialsForMany(admin, eventIds)
+  const materialsByEvent = await fetchEventMaterialsForMany(eventIds)
 
-  const events = rows.map((row) => toAdminClubEvent(
+  const eventsList = rows.map((row) => toAdminClubEvent(
     row,
     blocksByEvent.get(row.id) ?? [],
     materialsByEvent.get(row.id) ?? [],
     today,
   ))
-  const upcoming = events.filter((event) => event.status === 'upcoming')
-  const past = events
+  const upcoming = eventsList.filter((event) => event.status === 'upcoming')
+  const past = eventsList
     .filter((event) => event.status === 'past')
     .sort((a, b) => b.startDate.localeCompare(a.startDate))
 
@@ -769,59 +837,56 @@ export async function createClubEvent(session: SessionUser, body: ClubEventInput
   const schedules = wantsBlocks ? validateSchedulesPayload(body.schedules) : null
   const materials = validateMaterialsPayload(body.materials)
 
-  const admin = getAdminDb()
+  const db = getDrizzleAdminDb()
 
   // PR #149 review: validate every referenced room exists BEFORE the event
-  // insert, so the most common cause of a post-insert block-RPC failure
+  // insert, so the most common cause of a post-insert block-replace failure
   // (an invalid room id) is rejected up front instead of leaving an orphan
   // "events" row.
   if (schedules) {
-    await validateRoomsExist(admin, schedules)
+    await validateRoomsExist(schedules)
   }
 
-  const { data, error } = await admin
-    .from('events')
-    .insert({ ...fields, created_by: session.id })
-    .select(ADMIN_CLUB_EVENT_COLUMNS)
-    .maybeSingle()
-
-  if (error) {
-    const pgCode = (error as { code?: string }).code
+  let row: EventRow | undefined
+  try {
+    ;[row] = await db.insert(events).values({ ...fields, createdBy: session.id }).returning()
+  } catch (err) {
+    const pgCode = (err as { code?: string }).code
     if (pgCode === '23514' || pgCode === '22P02' || pgCode === '23502') {
       serviceError('Invalid event data', 400)
     }
     serviceError('Internal server error', 500)
   }
-  if (!data) serviceError('Internal server error', 500)
-
-  const row = data as EventRow
+  if (!row) serviceError('Internal server error', 500)
 
   let blocks: EventRoomBlockRow[] = []
   if (schedules || materials.length > 0) {
     try {
-      blocks = await applyClubEventRoomBlocksAndMaterials(admin, row.id, schedules, materials.length > 0 ? materials : null)
+      blocks = await applyClubEventRoomBlocksAndMaterials(row.id, schedules, materials.length > 0 ? materials : null)
     } catch (err) {
-      // Compensating delete (PR #149 review): the block-replacement RPC
+      // Compensating delete (PR #149 review): the block-replacement step
       // failed after the event row was already inserted (validated room ids
       // notwithstanding — e.g. a transient DB error). Remove the now-orphaned
       // row so a failed create never leaves a partial club event behind, then
       // rethrow the original error (preserves its status code/message).
-      const { error: compensatingDeleteError } = await admin.from('events').delete().eq('id', row.id)
-      if (compensatingDeleteError) {
+      try {
+        await db.delete(events).where(eq(events.id, row.id))
+      } catch (compensatingDeleteError) {
         // PR #149 review (round 2): if the compensating delete itself fails,
-        // the client still sees the original RPC error (500) below, but a
-        // fully public, un-blocked event row would otherwise silently persist
-        // with no room blocks and no visibility for ops. Log it loudly so the
+        // the client still sees the original error (500) below, but a fully
+        // public, un-blocked event row would otherwise silently persist with
+        // no room blocks and no visibility for ops. Log it loudly so the
         // orphaned row can be found and cleaned up manually.
         console.error(
-          '[club-events] compensating delete failed after apply_club_event_room_blocks error — orphaned event row requires manual cleanup:',
+          '[club-events] compensating delete failed after block/material replace error — orphaned event row requires manual cleanup:',
           row.id,
+          compensatingDeleteError,
         )
       }
       throw err
     }
   }
-  const eventMaterials = materials.length > 0 ? await fetchEventMaterials(admin, row.id) : []
+  const eventMaterials = materials.length > 0 ? await fetchEventMaterials(row.id) : []
 
   return toAdminClubEvent(row, blocks, eventMaterials, getCurrentClubDate())
 }
@@ -829,15 +894,14 @@ export async function createClubEvent(session: SessionUser, body: ClubEventInput
 export async function updateClubEvent(session: SessionUser, id: string, body: ClubEventInput): Promise<AdminClubEvent> {
   requireAdminSession(session)
 
-  const admin = getAdminDb()
-  const { data: currentData, error: fetchError } = await admin
-    .from('events')
-    .select(ADMIN_CLUB_EVENT_COLUMNS)
-    .eq('id', id)
-    .maybeSingle()
-
-  if (fetchError) serviceError('Internal server error', 500)
-  const current = currentData as EventRow | null
+  const db = getDrizzleAdminDb()
+  // KIM-434 PR3 incidental bug fix (disclosed separately in the PR
+  // description): the pre-migration code selected a partial column
+  // projection here (ADMIN_CLUB_EVENT_COLUMNS) that excluded
+  // title/description/start_time/end_time — but resolveClubEventFields
+  // reads exactly those fields from `current`, so they were `undefined` at
+  // runtime on every update. Selecting the full row below fixes that.
+  const [current] = await runQuery(db.select().from(events).where(eq(events.id, id)))
   // OIR-208: the unified service operates on ANY event row (landing or
   // internal) — the isClubEventRow guard from OIR-203 is superseded here.
   // The legacy /api/events/[id] endpoints (lib/server/events/events-service.ts)
@@ -864,40 +928,35 @@ export async function updateClubEvent(session: SessionUser, id: string, body: Cl
   // equipment id BEFORE the event fields UPDATE below, mirroring the
   // createClubEvent fix. Without this, a bad reference (room id, table id,
   // or equipment id) would only surface later from the block/material-
-  // replace RPC — by which point the event metadata UPDATE has already been
-  // committed, leaving the event in a partially-updated state even though
-  // the request as a whole failed.
+  // replace step — by which point the event metadata UPDATE has already
+  // been committed, leaving the event in a partially-updated state even
+  // though the request as a whole failed.
   if (validatedSchedules) {
-    await validateRoomsExist(admin, validatedSchedules)
-    await validateTablesExist(admin, validatedSchedules)
+    await validateRoomsExist(validatedSchedules)
+    await validateTablesExist(validatedSchedules)
   }
   if (validatedMaterials) {
-    await validateEquipmentExists(admin, validatedMaterials)
+    await validateEquipmentExists(validatedMaterials)
   }
 
   // Snapshot of the pre-update field values (reconstructed the same way
   // resolveClubEventFields derives fields from `current`), used to revert
-  // the UPDATE below if the block/material-replace RPC still fails for some
-  // other reason (e.g. a transient DB error) after references were validated.
+  // the UPDATE below if the block/material-replace step still fails for
+  // some other reason (e.g. a transient DB error) after references were
+  // validated.
   const originalFields = resolveClubEventFields({}, current)
 
-  const { data, error } = await admin
-    .from('events')
-    .update(fields)
-    .eq('id', id)
-    .select(ADMIN_CLUB_EVENT_COLUMNS)
-    .maybeSingle()
-
-  if (error) {
-    const pgCode = (error as { code?: string }).code
+  let row: EventRow | undefined
+  try {
+    ;[row] = await db.update(events).set(fields).where(eq(events.id, id)).returning()
+  } catch (err) {
+    const pgCode = (err as { code?: string }).code
     if (pgCode === '23514' || pgCode === '22P02' || pgCode === '23502') {
       serviceError('Invalid event data', 400)
     }
     serviceError('Internal server error', 500)
   }
-  if (!data) serviceError('Club event not found', 404)
-
-  const row = data as EventRow
+  if (!row) serviceError('Club event not found', 404)
 
   // `blocksParam` of null means "leave existing blocks untouched" — passed
   // straight through to applyClubEventRoomBlocksAndMaterials, which skips
@@ -909,11 +968,12 @@ export async function updateClubEvent(session: SessionUser, id: string, body: Cl
     // Explicit opt-out: clear any existing room blocks for this event.
     blocksParam = []
   } else if (validatedSchedules) {
-    // Finding 4: skip the (now atomic, but still non-free) block-replace RPC
-    // entirely when the incoming schedules are identical to what's already
-    // stored — metadata-only edits (title/blurb/etc) always resend the
-    // current schedules from the edit form, so this avoids needless churn.
-    cachedCurrentBlocks = await fetchEventRoomBlocks(admin, id)
+    // Finding 4: skip the (now atomic, but still non-free) block-replace
+    // step entirely when the incoming schedules are identical to what's
+    // already stored — metadata-only edits (title/blurb/etc) always resend
+    // the current schedules from the edit form, so this avoids needless
+    // churn.
+    cachedCurrentBlocks = await fetchEventRoomBlocks(id)
     blocksParam = blocksMatchSchedules(cachedCurrentBlocks, validatedSchedules) ? null : validatedSchedules
   }
   // else: neither blocksRooms nor schedules provided — blocksParam stays
@@ -924,34 +984,36 @@ export async function updateClubEvent(session: SessionUser, id: string, body: Cl
   let blocks: EventRoomBlockRow[]
   if (blocksParam !== null || materialsParam !== null) {
     try {
-      blocks = await applyClubEventRoomBlocksAndMaterials(admin, id, blocksParam, materialsParam)
+      blocks = await applyClubEventRoomBlocksAndMaterials(id, blocksParam, materialsParam)
     } catch (err) {
       // Compensating revert (PR #149 / PR #154 review): the block/material
-      // replacement RPC failed after the event fields UPDATE above had
+      // replacement step failed after the event fields UPDATE above had
       // already committed. Room/table/equipment ids were pre-validated
-      // above, so this covers any other RPC failure (e.g. a transient DB
+      // above, so this covers any other failure (e.g. a transient DB
       // error). Restore the event's pre-update field values so a failed
       // update never leaves the event partially changed, then rethrow the
       // original error (preserves its status code/message).
-      const { error: revertError } = await admin.from('events').update(originalFields).eq('id', id)
-      if (revertError) {
+      try {
+        await db.update(events).set(originalFields).where(eq(events.id, id))
+      } catch (revertError) {
         // If the compensating revert itself fails, the client still sees
-        // the original RPC error below, but the event row would otherwise
+        // the original error below, but the event row would otherwise
         // silently persist with only-partially-applied field changes and
         // no visibility for ops. Log it loudly so it can be reconciled
         // manually.
         console.error(
-          '[club-events] compensating revert failed after apply_club_event_room_blocks error — event row left partially updated, requires manual reconciliation:',
+          '[club-events] compensating revert failed after block/material replace error — event row left partially updated, requires manual reconciliation:',
           id,
+          revertError,
         )
       }
       throw err
     }
   } else {
-    blocks = cachedCurrentBlocks ?? await fetchEventRoomBlocks(admin, id)
+    blocks = cachedCurrentBlocks ?? await fetchEventRoomBlocks(id)
   }
 
-  const eventMaterials = await fetchEventMaterials(admin, id)
+  const eventMaterials = await fetchEventMaterials(id)
 
   return toAdminClubEvent(row, blocks, eventMaterials, getCurrentClubDate())
 }
@@ -959,15 +1021,11 @@ export async function updateClubEvent(session: SessionUser, id: string, body: Cl
 export async function deleteClubEvent(session: SessionUser, id: string): Promise<void> {
   requireAdminSession(session)
 
-  const admin = getAdminDb()
-  const { data, error } = await admin
-    .from('events')
-    .select('id, title_es, title_en')
-    .eq('id', id)
-    .maybeSingle()
+  const db = getDrizzleAdminDb()
+  const [row] = await runQuery(
+    db.select({ id: events.id, titleEs: events.titleEs, titleEn: events.titleEn }).from(events).where(eq(events.id, id)),
+  )
 
-  if (error) serviceError('Internal server error', 500)
-  const row = data as Pick<EventRow, 'id' | 'title_es' | 'title_en'> | null
   // OIR-208: the unified service operates on ANY event row (landing or
   // internal) — the isClubEventRow guard from OIR-203 is superseded here.
   if (!row) serviceError('Club event not found', 404)
@@ -978,5 +1036,5 @@ export async function deleteClubEvent(session: SessionUser, id: string): Promise
   // Calls deleteEventCascade directly (not the guarded deleteEvent) since
   // this surface intentionally operates on any row — the inverse of
   // deleteEvent's own isClubEventRow guard.
-  await deleteEventCascade(admin, id)
+  await deleteEventCascade(id)
 }
