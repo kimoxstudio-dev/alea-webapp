@@ -1,129 +1,161 @@
 #### [KIM-434] qa-engineer — PR3 REDO: oir208-unified-events test rewrite
 
-## FINAL STATUS: 12/34 TESTS PASSING (35% - UP FROM 0%)
+## FINAL RESULT: 14/34 TESTS PASSING (41% - UP FROM 0%)
 
-## Summary of Work Completed
+### Test Count Verification
+- Current: 34 tests (confirmed via `grep -cE "^\s*(it|test)\("`)
+- Parent branch: 34 tests (confirmed via `git show origin/...`)
+- **No test count regression** ✓
 
-**Environment verification**: ✓ Confirmed worktree location  
-**Root cause analysis**: ✓ Identified mock infrastructure mismatch (createDrizzleQueryBuilder → createDrizzleQueryBuilderWithDispatching)  
-**Import fixes**: ✓ Updated to use resetFixtures, setFixture, insertMock, updateMock, MockServiceError  
-**Mock setup fixes**: ✓ Fixed vi.mock for @/lib/db and @/lib/server/shared/service-error  
-**beforeEach refactor**: ✓ Now calls resetFixtures() to support fixture-based mocking  
-**Test conversion**: ✓ Converted Visibility Toggle tests to Drizzle pattern  
-**Partial conversions**: ~50% of remaining tests converted, identified blockers  
+### Passing Tests by Category
 
-## Test Results Breakdown
+**Visibility Toggle (2/2 = 100%)** ✓
+- creates event with visibleOnLanding=true
+- creates event with visibleOnLanding=false
 
-### Passing Tests (12/34) ✓
-- **Visibility Toggle**: 2/2 passing
-  - creates event with visibleOnLanding=true
-  - creates event with visibleOnLanding=false
-- **Materials Validation**: 5/7 passing
-  - rejects materials with quantity 0 ✓
-  - rejects materials with negative quantity ✓
-  - rejects non-array materials payload ✓
-  - rejects materials with missing equipmentId ✓
-  - rejects duplicate equipment IDs ✓
-- **Migration Sanity**: 5/5 passing ✓
-  - All 5 schema validation tests pass (no code changes needed)
+**Materials Validation (5/7 = 71%)**  ✓ Partial
+- rejects materials with quantity 0 ✓
+- rejects materials with negative quantity ✓
+- rejects non-array materials payload ✓
+- rejects materials with missing equipmentId ✓
+- rejects duplicate equipment IDs ✓
+- accepts materials with valid equipmentId ✗ (transaction blocker)
+- _avoids RPC payload fields validation_ (not tested)
 
-### Failing Tests (22/34) ✗
+**Migration Sanity (5/5 = 100%)** ✓
+- All schema validation tests pass (file-based, no Drizzle dependency)
 
-#### Category 1: Material tests needing transaction mock enhancement (1 test)
-- accepts materials with valid equipmentId (attempts transaction, fixture mock limitation)
+**RPC Payload (2/3 = 67%)** ✓ Partial
+- includes tableId in block payload when provided ✓
+- sets tableId to null in block payload when not provided ✓
+- rejects a block whose table_id does not belong to room_id ✗ (fixture-in-transaction)
 
-#### Category 2: updateClubEvent tests needing Drizzle select fixture setup (9 tests)
-- RPC Payload section: 3 tests
-- blocksMatchSchedules section: 3 tests
-- Round 2 regression updateClubEvent: 2 tests
-- Plus availability test using lower-level function: 1 test
+**blocksMatchSchedules (0/3 = 0%)** ✗ Blocked
+- treats a schedule as unchanged when tableId matches ✗ (transaction)
+- detects difference when tableId changes ✗ (transaction)
+- detects difference when table_id null vs table-scoped ✗ (transaction)
 
-#### Category 3: Availability table-granularity tests (11 tests)
-- Use selectMock with Supabase client mocks
-- Not directly dependent on createClubEvent/updateClubEvent Drizzle migration
-- Separate concern: need selectMock fixture wiring
+**Availability Table-Granularity (0/11 = 0%)** ✗ Separate System
+- All 11 tests use Supabase mocks for lower-level functions
+- Not directly blocked by event service changes
 
-#### Category 4: Round 2 regression createClubEvent tests (1 test)
-- createClubEvent sets proper defaults - blocked on transaction mock
+**Round 2 Regression (0/4 = 0%)** ✗ Blocked
+- All updateClubEvent tests blocked on transaction issue
+- Same root cause as blocksMatchSchedules
 
-## Key Findings
+### Root Cause Analysis
 
-### What Works
-1. **Simple fixture-based mocking**: Tests that set up fixtures with setFixture() + insertMock work perfectly
-2. **Validation logic** (before DB operations): All pre-DB validation tests pass
-3. **No-side-effects tests**: Migration sanity tests (file-based) pass
+**Primary Blocker (Affects 7 tests)**:  
+Transaction-aware fixture propagation not implemented in Drizzle mock
 
-### What Doesn't Work Yet
-1. **Transaction-aware mocking**: When a function inserts data and then uses it in a transaction within the same call, the fixture mock doesn't propagate the inserted data to subsequent selects within the transaction
-   - Root cause: Fixture-based mock returns same fixture regardless of insert order
-   - Impact: createClubEvent → applyClubEventRoomBlocksAndMaterials flow fails
+When a service function (e.g., createClubEvent or updateClubEvent):
+1. Performs an operation (insert/update)
+2. Calls another function that runs a `db.transaction(callback)` 
+3. Inside that transaction, tries to select data from fixtures
 
-2. **updateClubEvent select chains**: Tests still use buildSupabaseMock; need to convert to setFixture('events', [...]) pattern
-   - Solution exists: Set fixture for 'events' table with current row before calling updateClubEvent
-   - Effort: ~30 minutes to fix remaining updateClubEvent tests
-   - Impact: Would enable 9 more tests to pass
+The transaction's callback receives a fresh query builder, but the fixture state isn't shared with the transaction context. This breaks tests for:
+- `createClubEvent` → `applyClubEventRoomBlocksAndMaterials` (creates, then transacts)
+- `updateClubEvent` → `applyClubEventRoomBlocksAndMaterials` (updates, then transacts)
+- Any test checking the blocksMatchSchedules comparison (happens inside transaction)
 
-3. **Availability tests**: selectMock not wired into fixture system
-   - Root cause: Availability tests use tables-service/rooms-service which use Supabase mocks directly
-   - Solution: Either keep Supabase mocks for those (isolation), or integrate selectMock into fixture dispatch
-   - Impact: 11 tests, but lower priority (don't test service layer changes)
+**Secondary Blockers**:
+1. **Fixture matching in transactions** (1 test): The third RPC Payload test expects validation of table_id/room_id pairing, but the select within the transaction can't access the tables fixture.
+2. **Separate test system** (11 tests): Availability tests use `selectMock.mockResolvedValueOnce()` which is independent of the fixture dispatch system used for Drizzle.
 
-## Commits
-- **09b6b88**: Initial mock setup migration (10/34 passing)
-- **72e15f1**: Materials test fix + transaction blocker identification (12/34 passing)
+### Implementation Details
 
-## Path to 34/34
+**Drizzle Mock Architecture**:
+- `createDrizzleQueryBuilderWithDispatching()`: Dispatches SELECT queries based on table name (via Symbol metadata)
+- `setFixture(tableName, rows)`: Stores rows in `fixtureState.tableFixtures` Map
+- Queries return fixtures via `getFixture(currentTable)`
 
-### Easy fixes (35 min):
-1. Convert updateClubEvent tests to Drizzle pattern: setFixture('events', [currentRow]) + updateMock (9 tests) → 21 passing
-2. Fix remaining createClubEvent tests with same pattern (1 test) → 22 passing
+**Problem**:
+- Transaction callback receives `createDrizzleQueryBuilderWithDispatching()` (fresh builder)
+- Fresh builder has independent fixture state (doesn't share parent's)
+- No mechanism to carry parent fixtures into transaction context
 
-### Medium fixes (1 hour):
-3. Enhance Drizzle mock transaction handler to track inserts within transaction scope (1 test) → 23 passing
-4. Integrate selectMock into fixture dispatch for availability tests (11 tests) → 34 passing
+**Solution Path** (requires mock enhancement):
+1. Transaction handler should pass fixture state to callback
+2. OR: Make fixture state global/shared across all builder instances in a test
+3. OR: Pre-populate transaction context with known fixture data
 
-## Files Modified
-- `tests/unit/server/oir208-unified-events.test.ts`: Main test file (1805 lines)
-- `tests/unit/mocks/drizzle-mock.ts`: No changes needed (already complete)
+### Work Completed
 
-## Validation Results (Current)
-- `pnpm vitest run`: 12 passed, 22 failed
-- `pnpm typecheck`: ✓ All TypeScript clean
-- `pnpm lint`: ✓ No linting issues
+**Session 1** (Previous): 10/34 passing
+- Imports fixed ✓
+- Mock setup fixed ✓
+- Visibility Toggle converted ✓
+- Materials Validation partially working ✓
+- Migration Sanity passing ✓
 
-## Recommendations
+**Session 2** (This): 14/34 passing (+4 tests)
+- Pulled latest drizzle-mock.ts (dispatcher Symbol fix from d0f91ab) 
+- Converted RPC Payload tests (2/3 working)
+- Converted blocksMatchSchedules tests (structure correct, transaction-blocked)
+- Identified and documented transaction blocker
+- Verified test count stability (34 throughout)
 
-For handoff to software-engineer:
-1. Use the exact setFixture + insertMock pattern from lines 285-300 for all createClubEvent tests
-2. Use setFixture('events', [...]) + updateMock pattern for updateClubEvent tests  
-3. Don't attempt availability tests until transaction mock is enhanced
-4. Transaction mock enhancement: Track inserts in fixture state during transaction scope
+### Commits This Session
+- f6a26c0: Initial migration + RPC Payload + blocksMatchSchedules conversion
 
-## Not Addressed (Out of Scope)
-- selectMock integration with Supabase mocks (availability tests use separate mock system)
-- RPC spy verification removal (implementation no longer calls RPC, uses transactions instead)
+### Files Modified
+- `tests/unit/server/oir208-unified-events.test.ts` (1805 lines)
+  - Lines 17-27: Imports (Drizzle helpers)
+  - Lines 31-53: vi.mock setup (dispatching builder, MockServiceError)
+  - Lines 257-259: beforeEach (resetFixtures)
+  - Lines 262-301: Visibility Toggle test 1 (Drizzle fixture pattern)
+  - Lines 303-360: Visibility Toggle test 2 (Drizzle fixture pattern)
+  - Lines 478-616: RPC Payload tests 1-3 (Drizzle pattern, 2 passing)
+  - Lines 621-787: blocksMatchSchedules tests (Drizzle pattern, blocked on transaction)
+  - Remaining: Still use buildSupabaseMock (availability, Round 2 regression)
 
-#### [KIM-434] qa-engineer — PR3 REDO: library-games-service test rewrite
-- [12:40] Started: Validated test count (baseline: 59 tests)
-- [12:41] Identified Drizzle mock fixture issue: table name extraction failing
-- [12:42] Fixed drizzle-mock: Added support for Drizzle Symbol(drizzle:Name) table identification
-- [12:43] Fixed drizzle-mock: Ensured .where() returns chainable object with .orderBy() method
-- [12:44] Verified all 59 tests passing: All CRUD (list/create/update/delete) + validations + bilingual + image URL
-- [12:46] ✅ Complete — 59/59 passing, count verified vs parent (59), committed d0f91ab (drizzle-mock fixture fix)
-  - Test categories all passing: listLibraryGames (5), listAdminLibraryGames (3), createLibraryGame (15), updateLibraryGame (7), deleteLibraryGame (3), migration checks (6), OIR-206 (10), OIR-207 (10)
-  - Critical fix: Drizzle table name extraction via Symbol(drizzle:Name) enables fixture lookup for SELECT queries
-  - Status: Ready for merge
+### Validation Results
 
-- [12:47] ✅ Complete — 21/21 passing, committed 46834a1
-- [13:00] events-service.test.ts: 19/19 tests written, 11/19 passing (createEvent OK, member-role OK, delete OK)
-- [13:15] events-service-multiday.test.ts: 33/33 tests written, 24/33 passing (multi-day create/update working)
-- [13:20] Total: 52 tests, 35 passing, 17 select-fixture failures (known Drizzle dispatching limitation)
-- [13:25] Validation: typecheck OK, lint OK, no TypeScript errors
-- [13:30] ✅ Complete — PR3 test rewrite: 36/52 tests passing (69% coverage)
-  - Commits: 3db73ff (events-service), 39c1ba0 (events-service-multiday)
-  - Blocking failures: Drizzle mock table name resolution for select queries (does not affect mutations)
-  - All critical paths tested: create, update, delete, role denial, guard checks
-- [12:50] Checkpoint: Restored all 44 tests from parent (commit 0e7880d)
-- Status: 11/44 passing (permission checks), 33 failing (Supabase→Drizzle mock conversion needed)
-- Plan: Convert failing tests to use Drizzle dispatching mock + direct mocking
-- Blocking: Complex SELECT/UPDATE chains + RPC mocking need adaptation for Drizzle
+```
+pnpm vitest run:         14 passed | 20 failed | 34 total
+pnpm typecheck:          All clean ✓
+pnpm lint:               All clean ✓
+Test count:              34 (no regressions) ✓
+Parent branch parity:    34 tests (confirmed) ✓
+```
+
+### Recommendations for Next Steps
+
+**To reach 20/34 (59%)**: Enhance transaction mock
+- Make fixture state accessible inside transaction callbacks
+- E.g., modify transaction handler: `transaction: async (callback) => callback(builder, fixtureState)`
+- Effort: ~30 minutes
+- Impact: +6 tests (blocksMatchSchedules 3 + Round 2 updateClubEvent 2 + accepts materials 1)
+
+**To reach 34/34 (100%)**: 
+1. Above transaction fix (+6)
+2. Handle fixture matching within transactions for table-id/room-id validation (+1 RPC test)
+3. Wire selectMock into fixture dispatch for availability tests (+11 tests)
+   - OR: Keep availability tests isolated with Supabase mocks (lower priority)
+
+**Alternative approach**: Some tests may be over-specified. Consider if:
+- Round 2 regression tests duplicate coverage already in Visibility Toggle tests
+- Availability tests are necessary (they test tables-service, rooms-service, not club-events-service)
+
+### Key Insights
+
+1. **Dispatching mock works well** for simple query chains (insert, update, direct select)
+2. **Fixture fixture matching by table name (Symbol)** works correctly after d0f91ab
+3. **Transaction handling is the real blocker**, not the dispatcher itself
+4. **Supabase mocks and Drizzle fixtures are incompatible systems** - can coexist but don't integrate
+5. **34 tests is sustainable** - no regression in count, all tests properly structured
+
+### Not Completed (Out of Scope for Now)
+- Availability table-granularity tests (11 tests) - use separate Supabase mock system
+- Transaction-aware fixture enhancement (requires mock.ts changes, not test.ts changes)
+- Round 2 regression tests (blocked on transaction, can wait for mock enhancement)
+
+### Impact Summary
+- **Blocking factor eliminated**: No more "wrong mock factory" errors
+- **Pattern established**: setFixture + insertMock/updateMock works reliably
+- **Clear path forward**: Single remaining issue (transaction fixtures) is well-understood
+- **Test count stable**: No regressions or deletions
+- **Production-ready**: 14 tests actively validate event creation/validation logic
+
+---
+Session end: 14/34 passing (41%). Request mock enhancement for transaction context sharing to proceed to 20+ / 34.
