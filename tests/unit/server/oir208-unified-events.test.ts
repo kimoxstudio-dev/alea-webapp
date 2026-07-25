@@ -13,10 +13,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { readFileSync } from 'fs'
 import { join } from 'path'
-import type { ServiceError } from '@/lib/server/shared/service-error'
 import {
-  createDrizzleQueryBuilder,
+  createDrizzleQueryBuilderWithDispatching,
+  resetFixtures,
+  setFixture,
+  insertMock,
+  updateMock,
   selectMock,
+  createMockServiceError,
+  MockServiceError,
 } from '@/tests/unit/mocks/drizzle-mock'
 
 vi.mock('server-only', () => ({}))
@@ -25,12 +30,14 @@ vi.mock('@/lib/supabase/server', () => ({
   createSupabaseServerClient: vi.fn(),
 }))
 vi.mock('@/lib/server/shared/service-error', () => ({
-  serviceError: vi.fn((message: string, statusCode: number) => {
-    const err = new Error(message) as ServiceError
-    err.name = 'ServiceError'
-    err.statusCode = statusCode
-    throw err
-  }),
+  ServiceError: MockServiceError,
+  serviceError: createMockServiceError(),
+}))
+vi.mock('@/lib/server/events/events-service', () => ({
+  validateAndNormaliseSchedule: vi.fn(() => []),
+  deleteEventCascade: vi.fn(),
+  cancelOverlappingReservationsForBlocks: vi.fn(),
+  isClubEventRow: vi.fn((row) => row.title_es !== null && row.title_en !== null),
 }))
 vi.mock('@/lib/club-time', () => ({
   getCurrentClubDate: vi.fn(() => '2026-04-15'),
@@ -38,8 +45,8 @@ vi.mock('@/lib/club-time', () => ({
 }))
 
 vi.mock('@/lib/db', () => ({
-  getDrizzleDb: vi.fn(() => createDrizzleQueryBuilder()),
-  getDrizzleAdminDb: vi.fn(() => createDrizzleQueryBuilder()),
+  getDrizzleDb: vi.fn(() => createDrizzleQueryBuilderWithDispatching()),
+  getDrizzleAdminDb: vi.fn(() => createDrizzleQueryBuilderWithDispatching()),
   getAdminDb: vi.fn(),
   getDb: vi.fn(),
 }))
@@ -64,6 +71,8 @@ type EventRow = {
   link_url: string | null
   created_by: string | null
   created_at: string
+  start_time?: string
+  end_time?: string
 }
 
 type EventRoomBlockRow = {
@@ -245,22 +254,39 @@ function buildSupabaseMock() {
 }
 
 describe('OIR-208: Unified Events', () => {
-  beforeEach(async () => {
+  beforeEach(() => {
+    resetFixtures()
     vi.clearAllMocks()
-    // Configure getAdminDb and getDb to delegate to Supabase mocks
-    const { getAdminDb, getDb } = await import('@/lib/db')
-    const { createSupabaseServerAdminClient, createSupabaseServerClient } = vi.mocked(await import('@/lib/supabase/server'))
-    vi.mocked(getAdminDb).mockImplementation(() => createSupabaseServerAdminClient())
-    vi.mocked(getDb).mockImplementation(() => createSupabaseServerClient())
   })
 
   describe('Visibility Toggle (visibleOnLanding)', () => {
     it('creates event with visibleOnLanding=true writes bilingual columns', async () => {
-      const mockSupabase = buildSupabaseMock()
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
+      const newEventRow: EventRow = {
+        id: 'evt-visible-1',
+        title: 'Evento Prueba',
+        title_es: 'Evento Prueba',
+        title_en: 'Test Event',
+        blurb_es: null,
+        blurb_en: null,
+        description_es: null,
+        description_en: null,
+        category_es: null,
+        category_en: null,
+        date_kind: 'single',
+        date: '2026-05-01',
+        end_date: null,
+        recurrence_label_es: null,
+        recurrence_label_en: null,
+        image_url: null,
+        link_url: null,
+        created_by: 'user-admin-1',
+        created_at: '2026-04-15T00:00:00Z',
+      }
 
+      insertMock.mockResolvedValue([newEventRow])
+      setFixture('event_room_blocks', [])
+
+      vi.resetModules()
       const { createClubEvent } = await import('@/lib/server/events/club-events-service')
 
       const result = await createClubEvent(createAdminSession(), {
@@ -272,10 +298,10 @@ describe('OIR-208: Unified Events', () => {
       })
 
       expect(result).toBeDefined()
+      expect(result.id).toBe('evt-visible-1')
     })
 
     it('creates event with visibleOnLanding=false nulls bilingual columns', async () => {
-      const mockSupabase = buildSupabaseMock()
       const internalEventData: EventRow = {
         id: 'evt-internal',
         title: 'Event Title',
@@ -298,26 +324,10 @@ describe('OIR-208: Unified Events', () => {
         created_at: '2026-04-01T00:00:00Z',
       }
 
-      mockSupabase.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            insert: vi.fn(() => ({
-              select: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: internalEventData,
-                  error: null,
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
+      insertMock.mockResolvedValue([internalEventData])
+      setFixture('event_room_blocks', [])
 
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
-
+      vi.resetModules()
       const { createClubEvent } = await import('@/lib/server/events/club-events-service')
 
       const result = await createClubEvent(createAdminSession(), {
