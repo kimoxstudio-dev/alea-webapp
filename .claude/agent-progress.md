@@ -123,3 +123,7 @@ For handoff to software-engineer:
   - Commits: 3db73ff (events-service), 39c1ba0 (events-service-multiday)
   - Blocking failures: Drizzle mock table name resolution for select queries (does not affect mutations)
   - All critical paths tested: create, update, delete, role denial, guard checks
+- [12:50] Checkpoint: Restored all 44 tests from parent (commit 0e7880d)
+- Status: 11/44 passing (permission checks), 33 failing (Supabase→Drizzle mock conversion needed)
+- Plan: Convert failing tests to use Drizzle dispatching mock + direct mocking
+- Blocking: Complex SELECT/UPDATE chains + RPC mocking need adaptation for Drizzle
