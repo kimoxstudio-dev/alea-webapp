@@ -165,6 +165,8 @@ Agent prepares + validates. User applies.
 ### Shared Working Directory
 
 - The shared checkout is read-only to every agent, with exactly one exception: appending to `.claude/agent-progress.md` via `>>` or equivalent that cannot replace the file — never read-modify-write it. To run code from another branch, create a throwaway worktree and install dependencies there, never in the shared checkout.
+- Worktree cleanup removes only the agent's own worktree, by absolute path: `git worktree remove /absolute/path/to/own-worktree` then `git worktree prune`. Never `rm -rf` the parent worktrees directory — in a multi-pipeline session that destroys other agents' active work.
+- Commit early and often on the worktree's branch. Uncommitted work exists in exactly one place and survives nothing — committing after each meaningful step is cheap insurance against losing hours of work.
 
 ### Stopping and Escalating
 
