@@ -1670,3 +1670,12 @@ No blocking issues. No modifications needed. Code is ready for security-reviewer
 - Added tsx ^4.23.1 devDependency + "db:seed": "tsx scripts/seed.ts" script. Documented DEV_SEED_CONFIRM in .env.example (name only) and added README.md "Dev seed on Neon" section with dev-only seeded credentials.
 - Validation: pnpm typecheck ✅, pnpm lint ✅. Did not run drizzle-kit push/migrate or pnpm db:seed for real, per hard constraint.
 - ✅ Complete — branch migration-f2b-dev-seed-admin-bootstrap, committed locally (not pushed, no PR opened per instructions).
+
+#### [KIM-432] security-reviewer — Dev seed + admin bootstrap security review
+- [08:08] Started. Read-only inspection via git show/git diff, no checkout of shared repo.
+- [08:08] scripts/seed.ts: confirmed assertDevSeedAllowed() runs first in main(), before createSeedDbClient() — no bypass path. No POSTGRES_URL*/password values logged anywhere. bcryptjs salt rounds=10 (reasonable default). Drizzle query builder used throughout (eq/and), no raw SQL/string concat — no injection surface.
+- [08:08] pnpm-lock.yaml diff verified minimal and expected: tsx@4.23.1 was already a transitive dep (via vite/vitest) in develop's lockfile; this PR only promotes it to an explicit devDependency — no new/unexpected packages pulled in.
+- [08:08] .env.example / README.md changes document DEV_SEED_CONFIRM by name only; README's seeded credentials table is clearly dev-only/placeholder (admin@devseed.local etc, password dev-only-Seed123!), not a real secret.
+- [08:08] Confirmed lib/db/index.ts, lib/authjs/db.ts, lib/db/schema/*, supabase/migrations/, supabase/seed.sql are untouched (empty diff).
+- [08:08] tests/unit/seed-guard.test.ts: reimplements guard logic inline rather than importing scripts/seed.ts; does not touch a DB or leak anything. LOW note: could drift from the real implementation over time (QA follow-up, non-blocking).
+- [08:08] ✅ Complete — APPROVE. No CRITICAL/HIGH findings. Pushing branch and opening PR.
