@@ -168,6 +168,13 @@ describe('uploads-service', () => {
       expect(result.url).toContain('https://example.public.blob.vercel-storage.com')
       expect(result.url).toContain('landing-media')
       expect(result.url).toMatch(/events\/[0-9a-f-]+\.png$/)
+
+      // Verify @vercel/blob put() was called with correct arguments
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).toHaveBeenCalled()
+      const [pathname, body, options] = blobPut.mock.calls[0]
+      expect(pathname).toMatch(/^landing-media\/events\/[0-9a-f-]+\.png$/)
+      expect(options?.contentType).toBe('image/png')
     })
 
     it('admin uploads valid JPEG file → extension .jpg derived from MIME', async () => {
@@ -188,6 +195,13 @@ describe('uploads-service', () => {
 
       expect(result).toHaveProperty('url')
       expect(result.url).toMatch(/partners\/[0-9a-f-]+\.jpg$/)
+
+      // Verify @vercel/blob put() was called with correct arguments
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).toHaveBeenCalled()
+      const [pathname, body, options] = blobPut.mock.calls[0]
+      expect(pathname).toMatch(/^landing-media\/partners\/[0-9a-f-]+\.jpg$/)
+      expect(options?.contentType).toBe('image/jpeg')
     })
 
     it('admin uploads valid WebP file → extension .webp derived from MIME', async () => {
@@ -208,6 +222,13 @@ describe('uploads-service', () => {
 
       expect(result).toHaveProperty('url')
       expect(result.url).toMatch(/library-games\/[0-9a-f-]+\.webp$/)
+
+      // Verify @vercel/blob put() was called with correct arguments
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).toHaveBeenCalled()
+      const [pathname, body, options] = blobPut.mock.calls[0]
+      expect(pathname).toMatch(/^landing-media\/library-games\/[0-9a-f-]+\.webp$/)
+      expect(options?.contentType).toBe('image/webp')
     })
 
     it('admin uploads valid GIF file → extension .gif derived from MIME', async () => {
@@ -228,6 +249,13 @@ describe('uploads-service', () => {
 
       expect(result).toHaveProperty('url')
       expect(result.url).toMatch(/events\/[0-9a-f-]+\.gif$/)
+
+      // Verify @vercel/blob put() was called with correct arguments
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).toHaveBeenCalled()
+      const [pathname, body, options] = blobPut.mock.calls[0]
+      expect(pathname).toMatch(/^landing-media\/events\/[0-9a-f-]+\.gif$/)
+      expect(options?.contentType).toBe('image/gif')
     })
   })
 
@@ -255,7 +283,9 @@ describe('uploads-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 403 })
 
-      expect(mockSupabaseAdmin._uploadSpy).not.toHaveBeenCalled()
+      // Verify @vercel/blob put() was NOT called
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).not.toHaveBeenCalled()
     })
   })
 
@@ -282,7 +312,9 @@ describe('uploads-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin._uploadSpy).not.toHaveBeenCalled()
+      // Verify @vercel/blob put() was NOT called
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).not.toHaveBeenCalled()
     })
   })
 
@@ -310,7 +342,9 @@ describe('uploads-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin._uploadSpy).not.toHaveBeenCalled()
+      // Verify @vercel/blob put() was NOT called
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).not.toHaveBeenCalled()
     })
 
     it('folder: "avatars" (not in allowlist) → 400 before storage call', async () => {
@@ -336,7 +370,9 @@ describe('uploads-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin._uploadSpy).not.toHaveBeenCalled()
+      // Verify @vercel/blob put() was NOT called
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).not.toHaveBeenCalled()
     })
 
     it('folder: empty string → 400 before storage call', async () => {
@@ -362,7 +398,9 @@ describe('uploads-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin._uploadSpy).not.toHaveBeenCalled()
+      // Verify @vercel/blob put() was NOT called
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).not.toHaveBeenCalled()
     })
   })
 
@@ -390,7 +428,9 @@ describe('uploads-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin._uploadSpy).not.toHaveBeenCalled()
+      // Verify @vercel/blob put() was NOT called
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).not.toHaveBeenCalled()
     })
 
     it('MIME: application/pdf → 400 before storage call', async () => {
@@ -416,7 +456,9 @@ describe('uploads-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin._uploadSpy).not.toHaveBeenCalled()
+      // Verify @vercel/blob put() was NOT called
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).not.toHaveBeenCalled()
     })
 
     it('MIME: text/html → 400 before storage call', async () => {
@@ -442,7 +484,9 @@ describe('uploads-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin._uploadSpy).not.toHaveBeenCalled()
+      // Verify @vercel/blob put() was NOT called
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).not.toHaveBeenCalled()
     })
   })
 
@@ -471,7 +515,9 @@ describe('uploads-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin._uploadSpy).not.toHaveBeenCalled()
+      // Verify @vercel/blob put() was NOT called
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).not.toHaveBeenCalled()
     })
 
     it('file size 0 bytes (empty) → 400 before storage call', async () => {
@@ -497,7 +543,9 @@ describe('uploads-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin._uploadSpy).not.toHaveBeenCalled()
+      // Verify @vercel/blob put() was NOT called
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).not.toHaveBeenCalled()
     })
 
     it('file size exactly 5 MB (boundary) → allowed', async () => {
@@ -518,6 +566,10 @@ describe('uploads-service', () => {
       })
 
       expect(result.url).toBeDefined()
+
+      // Verify @vercel/blob put() was called
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).toHaveBeenCalled()
     })
   })
 
@@ -541,6 +593,12 @@ describe('uploads-service', () => {
       // Verify upload succeeded with .png extension (derived from MIME, not filename)
       expect(result.url).toBeDefined()
       expect(result.url).toMatch(/\.png$/)
+
+      // Verify @vercel/blob put() was called with correct extension
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).toHaveBeenCalled()
+      const [pathname] = blobPut.mock.calls[0]
+      expect(pathname).toMatch(/\.png$/)
     })
   })
 
@@ -569,7 +627,9 @@ describe('uploads-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin._uploadSpy).not.toHaveBeenCalled()
+      // Verify @vercel/blob put() was NOT called
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).not.toHaveBeenCalled()
     })
 
     it('file.type is "image/jpeg" but body is not JPEG (plain text bytes) → 400, storage never called', async () => {
@@ -596,7 +656,9 @@ describe('uploads-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin._uploadSpy).not.toHaveBeenCalled()
+      // Verify @vercel/blob put() was NOT called
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).not.toHaveBeenCalled()
     })
 
     it('file.type is "image/png" but body bytes are a real JPEG signature (cross-format mismatch) → 400', async () => {
@@ -622,7 +684,9 @@ describe('uploads-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin._uploadSpy).not.toHaveBeenCalled()
+      // Verify @vercel/blob put() was NOT called
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).not.toHaveBeenCalled()
     })
 
     it('file.type is "image/webp" but body bytes are a real GIF signature (cross-format mismatch) → 400', async () => {
@@ -648,7 +712,9 @@ describe('uploads-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin._uploadSpy).not.toHaveBeenCalled()
+      // Verify @vercel/blob put() was NOT called
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).not.toHaveBeenCalled()
     })
 
     it('real matching PNG signature with file.type "image/png" → passes and uploads', async () => {
@@ -668,6 +734,10 @@ describe('uploads-service', () => {
       })
 
       expect(result.url).toBeDefined()
+
+      // Verify @vercel/blob put() was called
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).toHaveBeenCalled()
     })
 
     it('real matching JPEG signature with file.type "image/jpeg" → passes and uploads', async () => {
@@ -687,6 +757,10 @@ describe('uploads-service', () => {
       })
 
       expect(result.url).toBeDefined()
+
+      // Verify @vercel/blob put() was called
+      const blobPut = vi.mocked(await import('@vercel/blob')).put
+      expect(blobPut).toHaveBeenCalled()
     })
   })
 
