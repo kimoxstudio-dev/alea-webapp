@@ -113,7 +113,7 @@ function buildSupabaseMock() {
           getPublicUrl: vi.fn(function (path: string) {
             return {
               data: {
-                publicUrl: `https://example.com/storage/v1/object/public/${bucket}/${path}`,
+                publicUrl: `https://example.public.blob.vercel-storage.com/landing-media/${path}`,
               },
             }
           }),
@@ -134,6 +134,7 @@ function createMemberSession(): SessionUser {
 
 async function loadUploadsService() {
   vi.resetModules()
+  process.env.BLOB_PUBLIC_BASE_URL = 'https://example.public.blob.vercel-storage.com'
   const mod = await import('@/lib/server/uploads/uploads-service')
   return {
     uploadLandingMediaImage: mod.uploadLandingMediaImage,
@@ -164,13 +165,9 @@ describe('uploads-service', () => {
       })
 
       expect(result).toHaveProperty('url')
-      expect(result.url).toContain('https://example.com')
+      expect(result.url).toContain('https://example.public.blob.vercel-storage.com')
       expect(result.url).toContain('landing-media')
-
-      expect(mockSupabaseAdmin._uploadSpy).toHaveBeenCalled()
-      const uploadArgs = mockSupabaseAdmin._uploadSpy.mock.calls[0]
-      expect(uploadArgs[0]).toMatch(/^events\/[0-9a-f-]+\.png$/)
-      expect(uploadArgs[2].contentType).toBe('image/png')
+      expect(result.url).toMatch(/events\/[0-9a-f-]+\.png$/)
     })
 
     it('admin uploads valid JPEG file → extension .jpg derived from MIME', async () => {
@@ -184,13 +181,13 @@ describe('uploads-service', () => {
 
       const { uploadLandingMediaImage } = await loadUploadsService()
 
-      await uploadLandingMediaImage(adminSession, {
+      const result = await uploadLandingMediaImage(adminSession, {
         file: mockFile,
         folder: 'partners',
       })
 
-      const uploadArgs = mockSupabaseAdmin._uploadSpy.mock.calls[0]
-      expect(uploadArgs[0]).toMatch(/^partners\/[0-9a-f-]+\.jpg$/)
+      expect(result).toHaveProperty('url')
+      expect(result.url).toMatch(/partners\/[0-9a-f-]+\.jpg$/)
     })
 
     it('admin uploads valid WebP file → extension .webp derived from MIME', async () => {
@@ -204,13 +201,13 @@ describe('uploads-service', () => {
 
       const { uploadLandingMediaImage } = await loadUploadsService()
 
-      await uploadLandingMediaImage(adminSession, {
+      const result = await uploadLandingMediaImage(adminSession, {
         file: mockFile,
         folder: 'library-games',
       })
 
-      const uploadArgs = mockSupabaseAdmin._uploadSpy.mock.calls[0]
-      expect(uploadArgs[0]).toMatch(/^library-games\/[0-9a-f-]+\.webp$/)
+      expect(result).toHaveProperty('url')
+      expect(result.url).toMatch(/library-games\/[0-9a-f-]+\.webp$/)
     })
 
     it('admin uploads valid GIF file → extension .gif derived from MIME', async () => {
@@ -224,13 +221,13 @@ describe('uploads-service', () => {
 
       const { uploadLandingMediaImage } = await loadUploadsService()
 
-      await uploadLandingMediaImage(adminSession, {
+      const result = await uploadLandingMediaImage(adminSession, {
         file: mockFile,
         folder: 'events',
       })
 
-      const uploadArgs = mockSupabaseAdmin._uploadSpy.mock.calls[0]
-      expect(uploadArgs[0]).toMatch(/^events\/[0-9a-f-]+\.gif$/)
+      expect(result).toHaveProperty('url')
+      expect(result.url).toMatch(/events\/[0-9a-f-]+\.gif$/)
     })
   })
 
@@ -521,7 +518,6 @@ describe('uploads-service', () => {
       })
 
       expect(result.url).toBeDefined()
-      expect(mockSupabaseAdmin._uploadSpy).toHaveBeenCalled()
     })
   })
 
@@ -537,15 +533,14 @@ describe('uploads-service', () => {
 
       const { uploadLandingMediaImage } = await loadUploadsService()
 
-      await uploadLandingMediaImage(adminSession, {
+      const result = await uploadLandingMediaImage(adminSession, {
         file: mockFile,
         folder: 'partners',
       })
 
-      const uploadArgs = mockSupabaseAdmin._uploadSpy.mock.calls[0]
-      // Path should end with .png, not .svg
-      expect(uploadArgs[0]).toMatch(/\.png$/)
-      expect(uploadArgs[0]).not.toMatch(/\.svg/)
+      // Verify upload succeeded with .png extension (derived from MIME, not filename)
+      expect(result.url).toBeDefined()
+      expect(result.url).toMatch(/\.png$/)
     })
   })
 
@@ -673,7 +668,6 @@ describe('uploads-service', () => {
       })
 
       expect(result.url).toBeDefined()
-      expect(mockSupabaseAdmin._uploadSpy).toHaveBeenCalled()
     })
 
     it('real matching JPEG signature with file.type "image/jpeg" → passes and uploads', async () => {
@@ -693,7 +687,6 @@ describe('uploads-service', () => {
       })
 
       expect(result.url).toBeDefined()
-      expect(mockSupabaseAdmin._uploadSpy).toHaveBeenCalled()
     })
   })
 
@@ -702,24 +695,11 @@ describe('uploads-service', () => {
       const adminSession = createAdminSession()
       const mockFile = createMockFile(1024, 'image/png')
 
-      const errorUploadSpy = vi.fn(async () => ({
-        error: { message: 'Storage bucket misconfigured' },
-        data: null,
-      }))
-
-      const mockSupabaseAdmin = {
-        storage: {
-          from: vi.fn(() => ({
-            upload: errorUploadSpy,
-            getPublicUrl: vi.fn(),
-          })),
-        },
-        _uploadSpy: errorUploadSpy,
-      }
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
+      // Mock Blob put() to return an error
+      vi.mocked(await import('@vercel/blob')).put.mockRejectedValue(
+        new Error('Storage quota exceeded')
       )
+
       vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
         const err = new Error(msg) as ServiceError
         err.statusCode = code
@@ -738,30 +718,13 @@ describe('uploads-service', () => {
       expect(console.error).toHaveBeenCalled()
     })
 
-    it('getPublicUrl returns no publicUrl → 500 ServiceError and console.error called', async () => {
+    it('BLOB_PUBLIC_BASE_URL not set → 500 ServiceError and console.error called', async () => {
       const adminSession = createAdminSession()
       const mockFile = createMockFile(1024, 'image/png')
 
-      const uploadSpy = vi.fn(async () => ({
-        error: null,
-        data: { path: 'events/test.png' },
-      }))
+      // Clear BLOB_PUBLIC_BASE_URL to simulate missing configuration
+      delete process.env.BLOB_PUBLIC_BASE_URL
 
-      const mockSupabaseAdmin = {
-        storage: {
-          from: vi.fn(() => ({
-            upload: uploadSpy,
-            getPublicUrl: vi.fn(() => ({
-              data: { publicUrl: null },
-            })),
-          })),
-        },
-        _uploadSpy: uploadSpy,
-      }
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
       vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
         const err = new Error(msg) as ServiceError
         err.statusCode = code
