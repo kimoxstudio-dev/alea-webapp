@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import {
-  createDrizzleQueryBuilderWithDispatching,
+  createTransactionAwareMockBuilder,
   resetFixtures,
   setFixture,
   createMockServiceError,
@@ -31,8 +31,8 @@ import {
 vi.mock('server-only', () => ({}))
 
 vi.mock('@/lib/db', () => ({
-  getDrizzleDb: vi.fn(() => createDrizzleQueryBuilderWithDispatching()),
-  getDrizzleAdminDb: vi.fn(() => createDrizzleQueryBuilderWithDispatching()),
+  getDrizzleDb: vi.fn(() => createTransactionAwareMockBuilder()),
+  getDrizzleAdminDb: vi.fn(() => createTransactionAwareMockBuilder()),
   getAdminDb: vi.fn(() => ({
     from: vi.fn(() => ({
       update: vi.fn(() => ({
