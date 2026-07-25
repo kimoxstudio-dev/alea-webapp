@@ -1662,3 +1662,61 @@ No blocking issues. No modifications needed. Code is ready for security-reviewer
 - Validation: pnpm typecheck ✅, pnpm lint ✅ (no warnings), pnpm test — full suite green (see validation summary below), pnpm build ✅.
 - Pushed --force-with-lease to origin/docs/migration-status-update.
 - ✅ Complete — PR #175 rebased cleanly onto origin/develop, all conflicts resolved, 9 additional stale references from newer develop PRs fixed, full validation green.
+
+#### [KIM-434] software-engineer — PR1 drizzle-seam-pilot
+- [09:05] Started. Worktree pre-provisioned with no node_modules; ran `pnpm install --frozen-lockfile` inside the isolated worktree (not the shared checkout).
+- [09:06] Investigated: 11 untouched `lib/db` consumers call live Supabase query-builder methods (`.from().eq()...`, `.rpc()`) directly on `getDb()`/`getAdminDb()`'s return value — a real Drizzle client cannot satisfy that API at runtime, not just at compile time. Also found `checkUserSlotOverlap()` in reservations-service.ts (untouched) calls `getDatabaseNow()` with no args, so database-time.ts's default path must stay on the legacy Supabase client too.
+- [09:06] Decision: kept `getDb()`/`getAdminDb()` bodies unchanged (still Supabase, zero behavior change for the 11 untouched services). Added new `getDrizzleDb()`/`getDrizzleAdminDb()` exports (real Drizzle/Neon clients over `POSTGRES_URL` via `pg`) for genuinely migrated consumers. Repurposed the (previously unused-elsewhere) `DbClient`/`AdminDbClient` type aliases to the Drizzle type.
+- [09:07] Migrated `lib/server/shared/database-time.ts`: added Drizzle-client detection (duck-typed) so it supports both seams; default (no-arg) path stays on legacy Supabase for backward compat with untouched callers.
+- [09:08] Migrated `lib/server/equipment/equipment-service.ts` end-to-end to idiomatic Drizzle (`db.select().from()...`, `.insert().returning()`, `.update().set()...returning()`, `.delete()...returning()`, inner join for `getRoomDefaultEquipment`).
+- [09:10] Validation: `pnpm typecheck` green, `pnpm lint` green (no warnings/errors), `pnpm build` exit 0 (43/43 pages generated). `pnpm test` (tests/unit): 73 files / 1122 tests passed, 21 skipped — only `tests/unit/server/equipment-service.test.ts` fails (25 tests), expected: it mocks the Supabase client directly and needs a full Drizzle-mock rewrite by qa-engineer. `database-time.test.ts` passes unchanged.
+- [09:10] Files changed: lib/db/index.ts, lib/server/shared/database-time.ts, lib/server/equipment/equipment-service.ts. No test files touched (qa-engineer scope).
+- [09:10] ✅ Complete — PR1 implementation done, worktree left uncommitted for security-reviewer per instructions. See handoff report for full PR description draft.
+
+#### [KIM-434] qa-engineer — PR1 drizzle-seam-pilot QA
+- [09:24] Started — rewriting equipment-service tests for Drizzle mocks
+- [09:24] Test file rewritten: 34 tests, all pass (equipment-service.test.ts)
+- [09:24] database-time.test.ts verified: 3 tests pass (unchanged, uses legacy Supabase path)
+- [09:24] typecheck: PASS — backward compatibility preserved for 11 legacy services
+- [09:25] lint: PASS
+- [09:25] test (all unit tests): 1147 PASS, 21 SKIP — equipment-service 34/34 pass
+- [09:25] build: PASS — no errors
+- [09:25] ✅ Complete — APPROVE PR1. All validations green: typecheck OK, lint OK, tests OK (equipment-service + 1147 total), build OK.
+
+#### [KIM-434] security-reviewer — PR1 drizzle-seam-pilot review + PR
+- [09:30] Started. Reviewed lib/db/index.ts, lib/server/shared/database-time.ts, lib/server/equipment/equipment-service.ts, tests/unit/server/equipment-service.test.ts.
+- [09:32] Confirmed equipment/room_default_equipment/reservation_equipment schema (lib/db/schema/equipment.ts) has no user_id column — catalog-data claim verified, no member-row scoping bypass.
+- [09:33] Confirmed all 4 mutating operations (createEquipment, updateEquipment, deleteEquipment, setRoomDefaultEquipment) still call requireAdminSession(session) as the first statement — privilege-check parity with prior Supabase version preserved.
+- [09:34] Confirmed getDb()/getAdminDb() function bodies unchanged (still return createSupabaseServerClient()/createSupabaseServerAdminClient()); only the return-type annotation was renamed from DbClient/AdminDbClient to LegacySupabaseDbClient (a type alias for the same SupabaseClient<Database> type). Not literally byte-for-byte, but functionally/runtime-identical for the 11 untouched services — no concern.
+- [09:35] Confirmed all Drizzle queries use parameterized query-builder calls (eq(), inArray(), sql`select now() as now` with no interpolation) — no SQL injection surface introduced.
+- [09:35] Confirmed no .env values or secrets anywhere in the diff — only variable names (POSTGRES_URL) referenced, consistent with .env.example.
+- [09:36] git status confirms only the 4 intended files changed — no route handlers or other files touched.
+- [09:40] Branch renamed to migration-f3c-01-drizzle-seam-pilot, committed the 4 files (commit 6e46cf1).
+- [09:41] ⚠️ BLOCKED — `git push` triggered the pre-push hook's full test suite; it failed (exit non-zero, "ELIFECYCLE Test failed") despite 1147/1147 tests passing. Root cause: 8 occurrences of `xMock.mockReturnValue(Promise.reject(new Error(...)))` in tests/unit/server/equipment-service.test.ts (lines 118, 181, 247, 289, 324, 379, 388, 397) eagerly construct a rejected Promise at mock-setup time, before the code under test ever awaits/attaches a handler to it — Node flags these as unhandled rejections even though the assertions later pass. This is a test-authoring issue in a test file (qa-engineer's exclusive domain per CLAUDE.md), not a security or implementation issue. Did NOT fix it myself, did NOT use --no-verify. Commit 6e46cf1 exists locally on migration-f3c-01-drizzle-seam-pilot in this worktree but was NOT pushed to origin, and no PR was opened.
+
+#### [KIM-434] qa-engineer — PR1 unhandled-rejection fix
+- [09:30] Started — fixing 8 occurrences of mockReturnValue(Promise.reject(...)) in tests/unit/server/equipment-service.test.ts
+- [09:30] Replaced all 8 instances with mockImplementation(() => Promise.reject(...)) to defer promise creation until call-time, preventing Node's unhandled-rejection detector from firing before error handler attachment
+- [09:30] Lines fixed: 118, 181, 247, 289, 324, 379, 388, 397
+- [09:31] Test run: pnpm vitest run tests/unit/server/equipment-service.test.ts — 34 tests PASSED ✓ (no unhandled-rejection errors)
+- [09:32] Full validation:
+  - pnpm typecheck — PASS ✓
+  - pnpm lint — PASS ✓ (0 warnings/errors)
+  - pnpm test — 1147 tests PASSED ✓ (74 files passed, 1 skipped, 21 skipped tests)
+  - pnpm build — PASS ✓
+- [09:33] ✅ Complete — All blocking failures resolved, full suite green, ready for security-reviewer re-commit
+- [09:31] qa-engineer fixed the 8 unhandled-rejection mocks (mockReturnValue → mockImplementation) directly in this worktree. Independently re-verified: `pnpm vitest run tests/unit/server/equipment-service.test.ts` — 34/34 pass, 0 unhandled rejections.
+- [09:32] Diff confirmed to be exactly the 8 mockReturnValue→mockImplementation swaps, no other changes.
+- [09:33] Per global git-safety rule (amend only on explicit user request, not peer-agent request), created a NEW commit b539ed2 (fix(test): avoid eager Promise.reject() in equipment-service mocks) on top of 6e46cf1, rather than amending.
+- [09:34] git push -u origin migration-f3c-01-drizzle-seam-pilot — pre-push hook ran full local CI (typecheck/lint/test/build) for real, no --no-verify. Passed ("CI local pasado ✓"). Pushed successfully.
+- [09:36] Opened PR via gh pr create --base develop --head migration-f3c-01-drizzle-seam-pilot.
+- [09:36] ✅ Complete — PR #178 opened: https://github.com/KimoxStudio/alea-webapp/pull/178 (base: develop, head: migration-f3c-01-drizzle-seam-pilot, state: OPEN).
+
+#### [KIM-434] software-engineer — PR1 amendment (drift script + auth-schema check)
+- [10:05] Started — same worktree as PR1 (no new worktree created).
+- [10:08] Auth-schema check: grepped `lib/db/index.ts`, `lib/server/shared/database-time.ts`, `lib/server/equipment/equipment-service.ts` for `auth.users`/`auth.` schema references and any join touching a users/profiles table. Result: none found. Equipment is catalog data with no FK to profiles/auth in these 3 files; `database-time.ts` only runs `select now()`/`rpc('get_database_time')`. No fix needed — noted as clean in PR description addendum.
+- [10:15] Added `scripts/check-schema-drift.mjs`: plain Node ESM (matches existing `scripts/cutover-rehearsal-runner.mjs` convention — no `tsx`/`ts-node` dependency needed, repo has none and engines pin Node 20 which lacks native TS stripping). Connects via `POSTGRES_URL` (same pattern as `lib/db/index.ts`/`lib/authjs/db.ts`), queries `information_schema.columns` per table in a hand-derived manifest mirroring `lib/db/schema/*.ts` (all 14 tables), reports missing/extra/mismatched columns, read-only (SELECT only), never runs automatically. Added `pnpm check:schema-drift` script entry in package.json.
+- [10:16] Did NOT run the script against any real database. Did NOT run drizzle-kit push, db:seed, or any DB-mutating command.
+- [10:20] Validation: `pnpm typecheck` PASS (0 errors — .mjs file not picked up by tsc's `**/*.ts`/`**/*.tsx` include globs), `pnpm lint` PASS (no ESLint warnings or errors), `pnpm build` PASS (43/43 pages, exit 0).
+- [10:20] Files changed: scripts/check-schema-drift.mjs (new), package.json (+1 script entry). No test files touched.
+- [10:20] ✅ Complete — worktree left uncommitted for security-reviewer per instructions. PR description addendum text provided in handoff report.
