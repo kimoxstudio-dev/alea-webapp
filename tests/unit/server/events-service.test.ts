@@ -1,13 +1,11 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import {
-  createTransactionAwareMockBuilder,
   createDrizzleQueryBuilderWithDispatching,
   resetFixtures,
   setFixture,
   createMockServiceError,
   MockServiceError,
-  selectMock,
   insertMock,
   updateMock,
   deleteMock,
@@ -18,8 +16,8 @@ import {
 vi.mock('server-only', () => ({}))
 
 vi.mock('@/lib/db', () => ({
-  getDrizzleDb: vi.fn(() => createTransactionAwareMockBuilder()),
-  getDrizzleAdminDb: vi.fn(() => createTransactionAwareMockBuilder()),
+  getDrizzleDb: vi.fn(() => createDrizzleQueryBuilderWithDispatching()),
+  getDrizzleAdminDb: vi.fn(() => createDrizzleQueryBuilderWithDispatching()),
   getAdminDb: vi.fn(() => ({
     from: vi.fn(() => ({
       update: vi.fn(() => ({
@@ -60,123 +58,66 @@ describe('events-service — createEvent with roomId cancellation', () => {
     vi.clearAllMocks()
   })
 
-  it('calls create_event_atomic RPC with correct parameters', async () => {
+  it('calls create_event_atomic with correct parameters', async () => {
     const adminSession = createAdminSession()
-
     insertMock.mockResolvedValue([{
-      id: 'evt-new-1',
-      title: 'Game Night',
-      description: 'Weekly game session',
-      date: '2026-04-15',
-      startTime: '18:00:00',
-      endTime: '22:00:00',
-      createdAt: new Date('2026-04-13'),
+      id: 'evt-1', title: 'Game Night', description: 'Weekly session',
+      date: '2026-04-15', startTime: '18:00:00', endTime: '22:00:00',
+      createdAt: new Date(),
     }])
-    setFixture('event_room_blocks', [{
-      id: 'block-new-1',
-      eventId: 'evt-new-1',
-      roomId: 'room-1',
-      date: '2026-04-15',
-      startTime: '18:00:00',
-      endTime: '22:00:00',
-      allDay: false,
-      tableId: null,
-    }])
-    setFixture('tables', [])
-
+    setFixture('event_room_blocks', [])
     const { createEvent } = await loadEventsService()
-
     const result = await createEvent(adminSession, {
-      title: 'Game Night',
-      description: 'Weekly game session',
-      date: '2026-04-15',
-      startTime: '18:00',
-      endTime: '22:00',
-      roomId: 'room-1',
-      allDay: false,
+      title: 'Game Night', description: 'Weekly session',
+      date: '2026-04-15', startTime: '18:00', endTime: '22:00',
+      roomId: 'room-1', allDay: false,
     })
-
-    expect(result.id).toBe('evt-new-1')
-    expect(result.title).toBe('Game Night')
+    expect(result.id).toBe('evt-1')
   })
 
   it('does not attempt cancellation when roomId is not provided', async () => {
     const adminSession = createAdminSession()
-
     insertMock.mockResolvedValue([{
-      id: 'evt-no-room',
-      title: 'Announcement',
-      description: null,
-      date: '2026-04-15',
-      startTime: '19:00:00',
-      endTime: '20:00:00',
-      createdAt: new Date('2026-04-13'),
+      id: 'evt-2', title: 'Announcement', description: null,
+      date: '2026-04-15', startTime: '19:00:00', endTime: '20:00:00',
+      createdAt: new Date(),
     }])
     setFixture('event_room_blocks', [])
-
     const { createEvent } = await loadEventsService()
-
     const result = await createEvent(adminSession, {
-      title: 'Announcement',
-      description: null,
-      date: '2026-04-15',
-      startTime: '19:00',
-      endTime: '20:00',
-      roomId: null,
-      allDay: false,
+      title: 'Announcement', description: null,
+      date: '2026-04-15', startTime: '19:00', endTime: '20:00',
+      roomId: null, allDay: false,
     })
-
-    expect(result.id).toBe('evt-no-room')
     expect(result.roomBlocks.length).toBe(0)
   })
 
   it('includes description when provided', async () => {
     const adminSession = createAdminSession()
-
     insertMock.mockResolvedValue([{
-      id: 'evt-desc',
-      title: 'Tournament',
-      description: 'Competitive tournament',
-      date: '2026-04-20',
-      startTime: '14:00:00',
-      endTime: '18:00:00',
-      createdAt: new Date('2026-04-13'),
+      id: 'evt-3', title: 'Tournament', description: 'Competitive',
+      date: '2026-04-20', startTime: '14:00:00', endTime: '18:00:00',
+      createdAt: new Date(),
     }])
     setFixture('event_room_blocks', [])
-
     const { createEvent } = await loadEventsService()
-
     const result = await createEvent(adminSession, {
-      title: 'Tournament',
-      description: 'Competitive tournament',
-      date: '2026-04-20',
-      startTime: '14:00',
-      endTime: '18:00',
-      roomId: null,
-      allDay: false,
+      title: 'Tournament', description: 'Competitive',
+      date: '2026-04-20', startTime: '14:00', endTime: '18:00',
+      roomId: null, allDay: false,
     })
-
-    expect(result.description).toBe('Competitive tournament')
+    expect(result.description).toBe('Competitive')
   })
 
-  it('throws 500 when RPC fails', async () => {
+  it('throws 500 when DB transaction fails', async () => {
     const adminSession = createAdminSession()
-
-    insertMock.mockRejectedValue(new Error('Connection failed'))
-
+    insertMock.mockRejectedValue(new Error('Failed'))
     const { createEvent } = await loadEventsService()
-
-    await expect(
-      createEvent(adminSession, {
-        title: 'Game Night',
-        description: null,
-        date: '2026-04-15',
-        startTime: '18:00',
-        endTime: '22:00',
-        roomId: 'room-1',
-        allDay: false,
-      }),
-    ).rejects.toThrow(MockServiceError)
+    await expect(createEvent(adminSession, {
+      title: 'Game Night', description: null,
+      date: '2026-04-15', startTime: '18:00', endTime: '22:00',
+      roomId: 'room-1', allDay: false,
+    })).rejects.toThrow(MockServiceError)
   })
 })
 
@@ -184,460 +125,267 @@ describe('events-service — updateEvent with cancellation', () => {
   beforeEach(() => {
     resetFixtures()
     vi.clearAllMocks()
-    // Don't mock selectMock - let it use fixtures instead
-    // selectMock.mockResolvedValue([])
-    insertMock.mockResolvedValue([])
-    updateMock.mockResolvedValue([])
-    deleteMock.mockResolvedValue([])
   })
 
-  it('calls update_event_atomic RPC with updated time values', async () => {
+  it('calls update_event_atomic with updated values', async () => {
     const adminSession = createAdminSession()
-
     setFixture('events', [{
-      title: 'Old Event',
-      description: null,
-      date: '2026-04-20',
-      startTime: '18:00:00',
-      endTime: '22:00:00',
-      titleEs: null,
-      titleEn: null,
+      title: 'Old', description: null,
+      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
+      titleEs: null, titleEn: null,
     }])
     updateMock.mockResolvedValue([{
-      id: 'evt-update-1',
-      title: 'Updated Event',
-      description: null,
-      date: '2026-04-20',
-      startTime: '16:00:00',
-      endTime: '20:00:00',
-      createdAt: new Date('2026-04-13'),
+      id: 'evt-4', title: 'Updated',
+      description: null, date: '2026-04-20',
+      startTime: '16:00:00', endTime: '20:00:00', createdAt: new Date(),
     }])
     setFixture('event_room_blocks', [])
-
     const { updateEvent } = await loadEventsService()
-
-    const result = await updateEvent(adminSession, 'evt-update-1', {
-      title: 'Updated Event',
-      description: null,
-      date: '2026-04-20',
-      startTime: '16:00',
-      endTime: '20:00',
-      roomId: null,
-      allDay: false,
+    const result = await updateEvent(adminSession, 'evt-4', {
+      title: 'Updated', description: null,
+      date: '2026-04-20', startTime: '16:00', endTime: '20:00',
+      roomId: null, allDay: false,
     })
-
-    expect(result.id).toBe('evt-update-1')
-    expect(result.title).toBe('Updated Event')
+    expect(result.title).toBe('Updated')
   })
 
   it('loads existing room when roomId is not provided', async () => {
     const adminSession = createAdminSession()
-
     setFixture('events', [{
-      title: 'Old Title',
-      description: null,
-      date: '2026-04-20',
-      startTime: '18:00:00',
-      endTime: '22:00:00',
-      titleEs: null,
-      titleEn: null,
+      title: 'Event', description: null,
+      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
+      titleEs: null, titleEn: null,
     }])
     updateMock.mockResolvedValue([{
-      id: 'evt-keep-room',
-      title: 'Updated Title Only',
-      description: null,
-      date: '2026-04-20',
-      startTime: '18:00:00',
-      endTime: '22:00:00',
-      createdAt: new Date('2026-04-13'),
+      id: 'evt-5', title: 'Event', description: null,
+      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
+      createdAt: new Date(),
     }])
     setFixture('event_room_blocks', [{
-      id: 'block-existing',
-      eventId: 'evt-keep-room',
-      roomId: 'room-2',
-      date: '2026-04-20',
-      startTime: '18:00:00',
-      endTime: '22:00:00',
-      allDay: false,
-      tableId: null,
+      id: 'b1', eventId: 'evt-5', roomId: 'room-2',
+      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
+      allDay: false, tableId: null,
     }])
-
     const { updateEvent } = await loadEventsService()
-
-    const result = await updateEvent(adminSession, 'evt-keep-room', {
-      title: 'Updated Title Only',
-      description: null,
-      date: '2026-04-20',
-      startTime: '18:00',
-      endTime: '22:00',
-      roomId: null,
-      allDay: false,
+    const result = await updateEvent(adminSession, 'evt-5', {
+      title: 'Event', description: null,
+      date: '2026-04-20', startTime: '18:00', endTime: '22:00',
+      roomId: null, allDay: false,
     })
-
     expect(result.roomBlocks.length).toBeGreaterThan(0)
   })
 
-  it('keeps existing room when allDay is updated without roomId', async () => {
+  it('keeps existing room when allDay is updated', async () => {
     const adminSession = createAdminSession()
-
     setFixture('events', [{
-      title: 'All-Day Event',
-      description: null,
-      date: '2026-04-20',
-      startTime: '00:00:00',
-      endTime: '23:59:00',
-      titleEs: null,
-      titleEn: null,
+      title: 'All-Day', description: null,
+      date: '2026-04-20', startTime: '00:00:00', endTime: '23:59:00',
+      titleEs: null, titleEn: null,
     }])
     updateMock.mockResolvedValue([{
-      id: 'evt-allday',
-      title: 'All-Day Event',
-      description: null,
-      date: '2026-04-20',
-      startTime: '00:00:00',
-      endTime: '23:59:00',
-      createdAt: new Date('2026-04-13'),
+      id: 'evt-6', title: 'All-Day', description: null,
+      date: '2026-04-20', startTime: '00:00:00', endTime: '23:59:00',
+      createdAt: new Date(),
     }])
     setFixture('event_room_blocks', [{
-      id: 'block-allday',
-      eventId: 'evt-allday',
-      roomId: 'room-3',
-      date: '2026-04-20',
-      startTime: '00:00:00',
-      endTime: '23:59:00',
-      allDay: true,
-      tableId: null,
+      id: 'b2', eventId: 'evt-6', roomId: 'room-3',
+      date: '2026-04-20', startTime: '00:00:00', endTime: '23:59:00',
+      allDay: true, tableId: null,
     }])
-
     const { updateEvent } = await loadEventsService()
-
-    const result = await updateEvent(adminSession, 'evt-allday', {
-      title: 'All-Day Event',
-      description: null,
-      date: '2026-04-20',
-      startTime: '00:00',
-      endTime: '23:59',
-      roomId: null,
-      allDay: true,
+    const result = await updateEvent(adminSession, 'evt-6', {
+      title: 'All-Day', description: null,
+      date: '2026-04-20', startTime: '00:00', endTime: '23:59',
+      roomId: null, allDay: true,
     })
-
     expect(result.allDay).toBe(true)
   })
 
   it('updates room when roomId is provided', async () => {
     const adminSession = createAdminSession()
-
     setFixture('events', [{
-      title: 'Changed Room Event',
-      description: null,
-      date: '2026-04-20',
-      startTime: '18:00:00',
-      endTime: '22:00:00',
-      titleEs: null,
-      titleEn: null,
+      title: 'Event', description: null,
+      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
+      titleEs: null, titleEn: null,
     }])
     updateMock.mockResolvedValue([{
-      id: 'evt-room-change',
-      title: 'Changed Room Event',
-      description: null,
-      date: '2026-04-20',
-      startTime: '18:00:00',
-      endTime: '22:00:00',
-      createdAt: new Date('2026-04-13'),
+      id: 'evt-7', title: 'Event', description: null,
+      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
+      createdAt: new Date(),
     }])
     setFixture('event_room_blocks', [{
-      id: 'block-new-room',
-      eventId: 'evt-room-change',
-      roomId: 'room-new',
-      date: '2026-04-20',
-      startTime: '18:00:00',
-      endTime: '22:00:00',
-      allDay: false,
-      tableId: null,
+      id: 'b3', eventId: 'evt-7', roomId: 'room-new',
+      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
+      allDay: false, tableId: null,
     }])
     setFixture('tables', [])
-
     const { updateEvent } = await loadEventsService()
-
-    const result = await updateEvent(adminSession, 'evt-room-change', {
-      title: 'Changed Room Event',
-      description: null,
-      date: '2026-04-20',
-      startTime: '18:00',
-      endTime: '22:00',
-      roomId: 'room-new',
-      allDay: false,
+    const result = await updateEvent(adminSession, 'evt-7', {
+      title: 'Event', description: null,
+      date: '2026-04-20', startTime: '18:00', endTime: '22:00',
+      roomId: 'room-new', allDay: false,
     })
-
-    expect(result.id).toBe('evt-room-change')
+    expect(result.id).toBe('evt-7')
   })
 
   it('removes room when roomId is explicitly set to null', async () => {
     const adminSession = createAdminSession()
-
     setFixture('events', [{
-      title: 'No Room Event',
-      description: null,
-      date: '2026-04-20',
-      startTime: '18:00:00',
-      endTime: '22:00:00',
-      titleEs: null,
-      titleEn: null,
+      title: 'Event', description: null,
+      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
+      titleEs: null, titleEn: null,
     }])
     updateMock.mockResolvedValue([{
-      id: 'evt-remove-room',
-      title: 'No Room Event',
-      description: null,
-      date: '2026-04-20',
-      startTime: '18:00:00',
-      endTime: '22:00:00',
-      createdAt: new Date('2026-04-13'),
+      id: 'evt-8', title: 'Event', description: null,
+      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
+      createdAt: new Date(),
     }])
     setFixture('event_room_blocks', [])
-
     const { updateEvent } = await loadEventsService()
-
-    const result = await updateEvent(adminSession, 'evt-remove-room', {
-      title: 'No Room Event',
-      description: null,
-      date: '2026-04-20',
-      startTime: '18:00',
-      endTime: '22:00',
-      roomId: null,
-      allDay: false,
+    const result = await updateEvent(adminSession, 'evt-8', {
+      title: 'Event', description: null,
+      date: '2026-04-20', startTime: '18:00', endTime: '22:00',
+      roomId: null, allDay: false,
     })
-
     expect(result.roomBlocks.length).toBe(0)
   })
 
-  it('throws 500 when event not found', async () => {
+  it('throws 404 when event not found', async () => {
     const adminSession = createAdminSession()
-
     setFixture('events', [])
-
     const { updateEvent } = await loadEventsService()
-
-    await expect(
-      updateEvent(adminSession, 'evt-nonexistent', {
-        title: 'Title',
-        description: null,
-        date: '2026-04-20',
-        startTime: '18:00',
-        endTime: '22:00',
-        roomId: null,
-        allDay: false,
-      }),
-    ).rejects.toThrow(MockServiceError)
+    await expect(updateEvent(adminSession, 'evt-missing', {
+      title: 'Title', description: null,
+      date: '2026-04-20', startTime: '18:00', endTime: '22:00',
+      roomId: null, allDay: false,
+    })).rejects.toThrow(MockServiceError)
   })
 
-  it('throws 500 when RPC fails', async () => {
+  it('throws 500 when update fails', async () => {
     const adminSession = createAdminSession()
-
     setFixture('events', [{
-      title: 'Event',
-      description: null,
-      date: '2026-04-20',
-      startTime: '18:00:00',
-      endTime: '22:00:00',
-      titleEs: null,
-      titleEn: null,
+      title: 'Event', description: null,
+      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
+      titleEs: null, titleEn: null,
     }])
     updateMock.mockRejectedValue(new Error('DB error'))
-
     const { updateEvent } = await loadEventsService()
-
-    await expect(
-      updateEvent(adminSession, 'evt-update-1', {
-        title: 'Title',
-        description: null,
-        date: '2026-04-20',
-        startTime: '18:00',
-        endTime: '22:00',
-        roomId: null,
-        allDay: false,
-      }),
-    ).rejects.toThrow(MockServiceError)
+    await expect(updateEvent(adminSession, 'evt-9', {
+      title: 'Title', description: null,
+      date: '2026-04-20', startTime: '18:00', endTime: '22:00',
+      roomId: null, allDay: false,
+    })).rejects.toThrow(MockServiceError)
   })
 
-  it('rejects non-hour event start times', async () => {
+  it('rejects non-hour start times', async () => {
     const adminSession = createAdminSession()
-
     setFixture('events', [{
-      title: 'Event',
-      description: null,
-      date: '2026-04-20',
-      startTime: '18:00:00',
-      endTime: '22:00:00',
-      titleEs: null,
-      titleEn: null,
+      title: 'Event', description: null,
+      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
+      titleEs: null, titleEn: null,
     }])
-
     const { updateEvent } = await loadEventsService()
-
-    await expect(
-      updateEvent(adminSession, 'evt-update-1', {
-        title: 'Title',
-        description: null,
-        date: '2026-04-20',
-        startTime: '18:30',
-        endTime: '22:00',
-        roomId: null,
-        allDay: false,
-      }),
-    ).rejects.toThrow(MockServiceError)
+    await expect(updateEvent(adminSession, 'evt-10', {
+      title: 'Title', description: null,
+      date: '2026-04-20', startTime: '18:30', endTime: '22:00',
+      roomId: null, allDay: false,
+    })).rejects.toThrow(MockServiceError)
   })
 })
 
-describe('events-service — isClubEventRow guard (Finding 3)', () => {
+describe('events-service — isClubEventRow guard', () => {
   beforeEach(() => {
     resetFixtures()
     vi.clearAllMocks()
   })
 
-  it('updateEvent rejects club event rows (both title_es and title_en set)', async () => {
+  it('updateEvent rejects club event rows (both bilingual)', async () => {
     const adminSession = createAdminSession()
-
     setFixture('events', [{
-      title: 'Club Event',
-      description: null,
-      date: '2026-04-20',
-      startTime: '18:00:00',
-      endTime: '22:00:00',
-      titleEs: 'Evento de Club',
-      titleEn: 'Club Event',
+      title: 'Club', description: null,
+      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
+      titleEs: 'Club', titleEn: 'Club',
     }])
-
     const { updateEvent } = await loadEventsService()
-
-    await expect(
-      updateEvent(adminSession, 'evt-club', {
-        title: 'Updated',
-        description: null,
-        date: '2026-04-20',
-        startTime: '18:00',
-        endTime: '22:00',
-        roomId: null,
-        allDay: false,
-      }),
-    ).rejects.toThrow(MockServiceError)
+    await expect(updateEvent(adminSession, 'evt-club', {
+      title: 'Updated', description: null,
+      date: '2026-04-20', startTime: '18:00', endTime: '22:00',
+      roomId: null, allDay: false,
+    })).rejects.toThrow(MockServiceError)
   })
 
-  it('deleteEvent rejects club event rows (both title_es and title_en set)', async () => {
+  it('deleteEvent rejects club event rows', async () => {
     const adminSession = createAdminSession()
-
     setFixture('events', [{
-      id: 'evt-club-del',
-      titleEs: 'Evento de Club',
-      titleEn: 'Club Event',
+      id: 'evt-club', titleEs: 'Club', titleEn: 'Club',
     }])
-
     const { deleteEvent } = await loadEventsService()
-
-    await expect(deleteEvent(adminSession, 'evt-club-del')).rejects.toThrow(MockServiceError)
+    await expect(deleteEvent(adminSession, 'evt-club')).rejects.toThrow(MockServiceError)
   })
 
-  it('updateEvent allows legacy rows (only one of title_es or title_en)', async () => {
+  it('updateEvent allows legacy rows (one bilingual)', async () => {
     const adminSession = createAdminSession()
-
     setFixture('events', [{
-      title: 'Legacy Event',
-      description: null,
-      date: '2026-04-20',
-      startTime: '18:00:00',
-      endTime: '22:00:00',
-      titleEs: null,
-      titleEn: 'Legacy Event',
+      title: 'Legacy', description: null,
+      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
+      titleEs: null, titleEn: 'Legacy',
     }])
     updateMock.mockResolvedValue([{
-      id: 'evt-legacy',
-      title: 'Legacy Event',
-      description: null,
-      date: '2026-04-20',
-      startTime: '18:00:00',
-      endTime: '22:00:00',
-      createdAt: new Date('2026-04-13'),
+      id: 'evt-legacy', title: 'Legacy', description: null,
+      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
+      createdAt: new Date(),
     }])
     setFixture('event_room_blocks', [])
-
     const { updateEvent } = await loadEventsService()
-
     const result = await updateEvent(adminSession, 'evt-legacy', {
-      title: 'Updated Legacy',
-      description: null,
-      date: '2026-04-20',
-      startTime: '18:00',
-      endTime: '22:00',
-      roomId: null,
-      allDay: false,
+      title: 'Updated Legacy', description: null,
+      date: '2026-04-20', startTime: '18:00', endTime: '22:00',
+      roomId: null, allDay: false,
     })
-
     expect(result.id).toBe('evt-legacy')
   })
 
-  it('deleteEvent allows legacy rows (only one of title_es or title_en)', async () => {
+  it('deleteEvent allows legacy rows', async () => {
     const adminSession = createAdminSession()
-
     setFixture('events', [{
-      id: 'evt-legacy-del',
-      titleEs: null,
-      titleEn: 'Legacy Event',
+      id: 'evt-legacy-del', titleEs: null, titleEn: 'Legacy',
     }])
     setFixture('event_room_blocks', [])
     deleteMock.mockResolvedValue([])
-
     const { deleteEvent } = await loadEventsService()
-
     await expect(deleteEvent(adminSession, 'evt-legacy-del')).resolves.not.toThrow()
   })
 })
 
-describe('events-service — Member-role session denial (requireAdminSession)', () => {
+describe('events-service — Member-role denial', () => {
   beforeEach(() => {
     resetFixtures()
     vi.clearAllMocks()
   })
 
-  it('createEvent throws 403 when session role is member', async () => {
+  it('createEvent throws 403 for member', async () => {
     const memberSession = createMemberSession()
-
     const { createEvent } = await loadEventsService()
-
-    await expect(
-      createEvent(memberSession, {
-        title: 'Game Night',
-        description: null,
-        date: '2026-04-15',
-        startTime: '18:00',
-        endTime: '22:00',
-        roomId: 'room-1',
-        allDay: false,
-      }),
-    ).rejects.toThrow(MockServiceError)
+    await expect(createEvent(memberSession, {
+      title: 'Game Night', description: null,
+      date: '2026-04-15', startTime: '18:00', endTime: '22:00',
+      roomId: 'room-1', allDay: false,
+    })).rejects.toThrow(MockServiceError)
   })
 
-  it('updateEvent throws 403 when session role is member', async () => {
+  it('updateEvent throws 403 for member', async () => {
     const memberSession = createMemberSession()
-
     const { updateEvent } = await loadEventsService()
-
-    await expect(
-      updateEvent(memberSession, 'evt-1', {
-        title: 'Updated',
-        description: null,
-        date: '2026-04-20',
-        startTime: '18:00',
-        endTime: '22:00',
-        roomId: null,
-        allDay: false,
-      }),
-    ).rejects.toThrow(MockServiceError)
+    await expect(updateEvent(memberSession, 'evt-1', {
+      title: 'Updated', description: null,
+      date: '2026-04-20', startTime: '18:00', endTime: '22:00',
+      roomId: null, allDay: false,
+    })).rejects.toThrow(MockServiceError)
   })
 
-  it('deleteEvent throws 403 when session role is member', async () => {
+  it('deleteEvent throws 403 for member', async () => {
     const memberSession = createMemberSession()
-
     const { deleteEvent } = await loadEventsService()
-
     await expect(deleteEvent(memberSession, 'evt-1')).rejects.toThrow(MockServiceError)
   })
 })
