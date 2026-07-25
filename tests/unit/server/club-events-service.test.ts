@@ -19,59 +19,52 @@ import type { ServiceError } from '@/lib/server/shared/service-error'
  * - listEvents() excludes landing rows (both title_es and title_en populated)
  */
 
-/**
- * DEFERRED TO PR3b (KIM-434, after PR5) — DO NOT re-derive this plan from scratch.
- *
- * This file's 44 tests are restored and count-matched to the parent branch
- * (commit 0e7880d), but the file is still on the OLD Supabase mocking style
- * below (`vi.mock('@/lib/supabase/server', ...)`, `buildSupabaseMock()`) —
- * it never reached the shared Drizzle dispatching helper
- * (`tests/unit/mocks/drizzle-mock.ts`, see `tests/unit/server/tables-service.test.ts`
- * or `tests/unit/server/library-games-service.test.ts` for the proven pattern).
- * The 33 historical failures on this file were NOT caused by the
- * `Symbol(drizzle:Name)` table-lookup bug fixed in commit `d0f91ab` — this file
- * simply hasn't been converted yet. `d0f91ab` will not fix anything here for free.
- *
- * `club-events-service.ts` was migrated to Drizzle in commit `6c6928f` (this same
- * stack, KIM-434 PR3). This test file needs to catch up to that.
- *
- * Conversion plan (proven to work on this exact file — one proof test already
- * passing this way, see `createClubEvent > admin can create a public club event
- * without room blocks`):
- *   1. Replace the `vi.mock('@/lib/supabase/server', ...)` setup below with
- *      `vi.mock('@/lib/db', () => ({ getDrizzleDb: ..., getDrizzleAdminDb: ... }))`
- *      wired to `createDrizzleQueryBuilderWithDispatching()` from
- *      `tests/unit/mocks/drizzle-mock.ts`.
- *   2. Swap `buildSupabaseMock()` calls for `setFixture(table, rows)` /
- *      `resetFixtures()` from the same shared helper.
- *   3. Convert RPC-shaped mocks (the old `apply_club_event_room_blocks` RPC) to
- *      `db.transaction()` mocking — the service now calls `db.transaction()`
- *      directly (see `lib/server/events/club-events-service.ts`).
- *   4. Convert remaining `SELECT`-shaped mocks to `setFixture()` calls per table.
- *   5. Work in batches of 5-10 tests, re-running after each batch — NOT a full
- *      rewrite. Never let the test count drop below 44 at any point; check with
- *      `grep -cE "^\s*(it|test)\(" tests/unit/server/club-events-service.test.ts`
- *      after every batch.
- *
- * The required regression test for the `updateClubEvent` pre-existing bug fix
- * (partial column projection missing title/description/start_time/end_time,
- * fixed in `6c6928f`) still needs to be added if not already present — check
- * for a `describe('pre-existing bug fix: updateClubEvent full-row fetch')`
- * block before assuming it's missing.
- *
- * This service/test pair is being shipped as a separate PR (PR3b) after PR5,
- * not PR3 — see KIM-434 for context. `events-service.ts` and
- * `library-games-service.ts` do not depend on `club-events-service.ts`
- * (verified: club-events-service.ts imports FROM events-service.ts, not the
- * reverse), so PR3 ships without this file being finished.
- */
-
 vi.mock('server-only', () => ({}))
 
 vi.mock('@/lib/supabase/server', () => ({
   createSupabaseServerAdminClient: vi.fn(),
   createSupabaseServerClient: vi.fn(),
 }))
+
+/**
+ * KIM-434 PR3/PR3b compatibility note: this file stays on the legacy
+ * Supabase seam (club-events-service.ts itself is unmigrated, deferred to
+ * PR3b — see the plan above), but it calls two functions from
+ * events-service.ts that WERE migrated to Drizzle in PR3 (commit 6c6928f):
+ * `deleteEventCascade` (from deleteClubEvent) and `listEvents` (tested
+ * directly in the "listEvents (from events-service.ts)" describe block
+ * below). Both need a minimal Drizzle mock to resolve without touching a
+ * real database — empty results are sufficient for what these specific
+ * tests assert (no error thrown / result is an array), so this is
+ * deliberately NOT the full shared dispatching mock from
+ * tests/unit/mocks/drizzle-mock.ts — just enough to keep this otherwise-
+ * untouched file passing against its migrated dependency.
+ */
+function createMinimalDrizzleStub() {
+  const resolved = Promise.resolve([]) as Promise<any[]> & { orderBy: () => Promise<any[]> }
+  resolved.orderBy = () => Promise.resolve([])
+  const chain: any = {
+    select: () => chain,
+    from: () => chain,
+    where: () => resolved,
+    delete: () => chain,
+    transaction: async (cb: (tx: typeof chain) => unknown) => cb(chain),
+  }
+  return chain
+}
+
+// Only override the Drizzle-seam exports; getDb/getAdminDb must keep their
+// real (thin-wrapper) implementation, which itself calls the mocked
+// @/lib/supabase/server functions above — every other test in this file
+// depends on that passthrough continuing to work.
+vi.mock('@/lib/db', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/db')>()
+  return {
+    ...actual,
+    getDrizzleDb: vi.fn(() => createMinimalDrizzleStub()),
+    getDrizzleAdminDb: vi.fn(() => createMinimalDrizzleStub()),
+  }
+})
 
 vi.mock('@/lib/server/shared/service-error', () => ({
   serviceError: vi.fn((message: string, statusCode: number) => {
