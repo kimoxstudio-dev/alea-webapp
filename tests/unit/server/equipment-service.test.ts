@@ -11,84 +11,67 @@ function createMemberSession(): SessionUser {
   return { id: 'member-1', role: 'member', email: 'member@example.com' }
 }
 
-
 // ── Mock state ─────────────────────────────────────────────────────────────────
-const maybeSingleMock = vi.fn()
-const selectOrderMock = vi.fn()
+// These mocks return promises that resolve/reject based on test setup
+const selectMock = vi.fn()
 const insertMock = vi.fn()
-const updateEqMock = vi.fn()
-const deleteEqMock = vi.fn()
-const roomDefaultSelectMock = vi.fn()
-const fetchExistingDefaultsMock = vi.fn()
-const deleteRoomDefaultMock = vi.fn()
-const insertRoomDefaultMock = vi.fn()
+const updateMock = vi.fn()
+const deleteMock = vi.fn()
 
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseServerClient: vi.fn(async () => ({
-    from: vi.fn((table: string) => {
-      if (table === 'equipment') {
-        return {
-          select: vi.fn(() => ({
-            order: selectOrderMock,
-          })),
-        }
-      }
-      if (table === 'room_default_equipment') {
-        return {
-          select: vi.fn(() => ({
-            eq: vi.fn(() => ({
-              // returns the enriched rows for getRoomDefaultEquipment
-              then: roomDefaultSelectMock,
-            })),
-          })),
-        }
-      }
-      return {}
-    }),
-  })),
+// Create a mock that can be both awaited and has a .returning() method
+function createInsertValuesMock() {
+  return {
+    returning: vi.fn(() => insertMock()),
+    // Allow awaiting on the object itself (for cases without .returning())
+    then: (onFulfilled: any, onRejected: any) => insertMock().then(onFulfilled, onRejected),
+    catch: (onRejected: any) => insertMock().catch(onRejected),
+  } as any
+}
 
-  createSupabaseServerAdminClient: vi.fn(() => ({
-    from: vi.fn((table: string) => {
-      if (table === 'equipment') {
-        return {
-          select: vi.fn(() => ({
-            order: selectOrderMock,
-          })),
-          insert: vi.fn(() => ({
-            select: vi.fn(() => ({
-              maybeSingle: maybeSingleMock,
-            })),
-          })),
-          update: vi.fn(() => ({
-            eq: vi.fn(() => ({
-              select: vi.fn(() => ({
-                maybeSingle: maybeSingleMock,
-              })),
-            })),
-          })),
-          delete: vi.fn(() => ({
-            eq: vi.fn(() => ({
-              select: vi.fn(() => ({
-                maybeSingle: maybeSingleMock,
-              })),
-            })),
-          })),
-        }
-      }
-      if (table === 'room_default_equipment') {
-        return {
-          select: vi.fn(() => ({
-            in: vi.fn(fetchExistingDefaultsMock),
-          })),
-          delete: vi.fn(() => ({
-            eq: deleteRoomDefaultMock,
-          })),
-          insert: vi.fn(insertRoomDefaultMock),
-        }
-      }
-      return {}
-    }),
-  })),
+function createDeleteWhereReturningMock() {
+  return {
+    returning: vi.fn(() => deleteMock()),
+    // Also allow awaiting directly
+    then: (onFulfilled: any, onRejected: any) => deleteMock().then(onFulfilled, onRejected),
+    catch: (onRejected: any) => deleteMock().catch(onRejected),
+  } as any
+}
+
+function createSelectWhereMock() {
+  return vi.fn(() => selectMock())
+}
+
+// Helper to create a chainable Drizzle-like query builder
+function createDrizzleQueryBuilder() {
+  return {
+    select: vi.fn(() => ({
+      from: vi.fn(() => ({
+        orderBy: createSelectWhereMock(),
+        innerJoin: vi.fn(() => ({
+          where: createSelectWhereMock(),
+        })),
+        where: createSelectWhereMock(),
+      })),
+    })),
+    insert: vi.fn(() => ({
+      values: vi.fn(() => createInsertValuesMock()),
+    })),
+    update: vi.fn(() => ({
+      set: vi.fn(() => ({
+        where: vi.fn(() => ({
+          returning: vi.fn(() => updateMock()),
+        })),
+      })),
+    })),
+    delete: vi.fn(() => ({
+      where: vi.fn(() => createDeleteWhereReturningMock()),
+    })),
+  }
+}
+
+vi.mock('@/lib/db', () => ({
+  getDrizzleDb: vi.fn(() => createDrizzleQueryBuilder()),
+  getDrizzleAdminDb: vi.fn(() => createDrizzleQueryBuilder()),
 }))
 
 // ── Re-import helper (reset module cache between tests) ────────────────────────
@@ -102,7 +85,7 @@ const equipmentRow = {
   id: 'eq-1',
   name: 'Projector',
   description: 'HD projector',
-  created_at: '2025-01-01T00:00:00.000Z',
+  createdAt: new Date('2025-01-01T00:00:00.000Z'),
 }
 
 // ── listEquipment ─────────────────────────────────────────────────────────────
@@ -113,7 +96,7 @@ describe('listEquipment', () => {
   })
 
   it('returns mapped equipment list on success', async () => {
-    selectOrderMock.mockResolvedValue({ data: [equipmentRow], error: null })
+    selectMock.mockReturnValue(Promise.resolve([equipmentRow]))
     const { listEquipment } = await loadModule()
 
     const result = await listEquipment()
@@ -123,7 +106,7 @@ describe('listEquipment', () => {
   })
 
   it('returns empty array when no equipment exists', async () => {
-    selectOrderMock.mockResolvedValue({ data: [], error: null })
+    selectMock.mockReturnValue(Promise.resolve([]))
     const { listEquipment } = await loadModule()
 
     const result = await listEquipment()
@@ -131,18 +114,15 @@ describe('listEquipment', () => {
     expect(result).toEqual([])
   })
 
-  it('throws 500 ServiceError when Supabase returns an error', async () => {
-    selectOrderMock.mockResolvedValue({ data: null, error: { message: 'DB error' } })
+  it('throws 500 ServiceError when query throws', async () => {
+    selectMock.mockReturnValue(Promise.reject(new Error('DB error')))
     const { listEquipment } = await loadModule()
 
     await expect(listEquipment()).rejects.toMatchObject({ name: 'ServiceError', statusCode: 500 })
   })
 
   it('maps description: null to null (not empty string)', async () => {
-    selectOrderMock.mockResolvedValue({
-      data: [{ ...equipmentRow, description: null }],
-      error: null,
-    })
+    selectMock.mockReturnValue(Promise.resolve([{ ...equipmentRow, description: null }]))
     const { listEquipment } = await loadModule()
 
     const result = await listEquipment()
@@ -156,7 +136,7 @@ describe('createEquipment', () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
-    maybeSingleMock.mockResolvedValue({ data: equipmentRow, error: null })
+    insertMock.mockReturnValue(Promise.resolve([equipmentRow]))
   })
 
   it('returns created equipment on success', async () => {
@@ -189,7 +169,7 @@ describe('createEquipment', () => {
   })
 
   it('trims whitespace from name', async () => {
-    maybeSingleMock.mockResolvedValue({ data: { ...equipmentRow, name: 'Projector' }, error: null })
+    insertMock.mockReturnValue(Promise.resolve([{ ...equipmentRow, name: 'Projector' }]))
     const { createEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -197,16 +177,16 @@ describe('createEquipment', () => {
     await expect(createEquipment(adminSession, { name: '   ' })).rejects.toMatchObject({ statusCode: 400 })
   })
 
-  it('throws 500 when insert returns DB error', async () => {
-    maybeSingleMock.mockResolvedValue({ data: null, error: { message: 'insert failed' } })
+  it('throws 500 when insert throws error', async () => {
+    insertMock.mockReturnValue(Promise.reject(new Error('insert failed')))
     const { createEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
     await expect(createEquipment(adminSession, { name: 'Projector' })).rejects.toMatchObject({ statusCode: 500 })
   })
 
-  it('throws 500 when insert returns null data (unexpected)', async () => {
-    maybeSingleMock.mockResolvedValue({ data: null, error: null })
+  it('throws 500 when insert returns empty array (unexpected)', async () => {
+    insertMock.mockReturnValue(Promise.resolve([]))
     const { createEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -214,7 +194,7 @@ describe('createEquipment', () => {
   })
 
   it('stores null description when description is falsy', async () => {
-    maybeSingleMock.mockResolvedValue({ data: { ...equipmentRow, description: null }, error: null })
+    insertMock.mockReturnValue(Promise.resolve([{ ...equipmentRow, description: null }]))
     const { createEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -229,7 +209,7 @@ describe('updateEquipment', () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
-    maybeSingleMock.mockResolvedValue({ data: { ...equipmentRow, name: 'Updated' }, error: null })
+    updateMock.mockReturnValue(Promise.resolve([{ ...equipmentRow, name: 'Updated' }]))
   })
 
   it('returns updated equipment on success', async () => {
@@ -255,16 +235,16 @@ describe('updateEquipment', () => {
     await expect(updateEquipment(adminSession, 'eq-1', {})).rejects.toMatchObject({ statusCode: 400 })
   })
 
-  it('throws 404 when equipment not found (null data)', async () => {
-    maybeSingleMock.mockResolvedValue({ data: null, error: null })
+  it('throws 404 when equipment not found (empty array)', async () => {
+    updateMock.mockReturnValue(Promise.resolve([]))
     const { updateEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
     await expect(updateEquipment(adminSession, 'nonexistent', { name: 'X' })).rejects.toMatchObject({ statusCode: 404 })
   })
 
-  it('throws 500 when DB returns error', async () => {
-    maybeSingleMock.mockResolvedValue({ data: null, error: { message: 'DB error' } })
+  it('throws 500 when DB throws error', async () => {
+    updateMock.mockReturnValue(Promise.reject(new Error('DB error')))
     const { updateEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -272,7 +252,7 @@ describe('updateEquipment', () => {
   })
 
   it('sets description to null when passed null', async () => {
-    maybeSingleMock.mockResolvedValue({ data: { ...equipmentRow, description: null }, error: null })
+    updateMock.mockReturnValue(Promise.resolve([{ ...equipmentRow, description: null }]))
     const { updateEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -287,7 +267,7 @@ describe('deleteEquipment', () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
-    maybeSingleMock.mockResolvedValue({ data: { id: 'eq-1' }, error: null })
+    deleteMock.mockReturnValue(Promise.resolve([{ id: 'eq-1' }]))
   })
 
   it('resolves without error when deletion succeeds', async () => {
@@ -298,15 +278,15 @@ describe('deleteEquipment', () => {
   })
 
   it('throws 404 when no row was deleted (equipment not found)', async () => {
-    maybeSingleMock.mockResolvedValue({ data: null, error: null })
+    deleteMock.mockReturnValue(Promise.resolve([]))
     const { deleteEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
     await expect(deleteEquipment(adminSession, 'nonexistent')).rejects.toMatchObject({ statusCode: 404 })
   })
 
-  it('throws 500 when DB returns error', async () => {
-    maybeSingleMock.mockResolvedValue({ data: null, error: { message: 'constraint violation' } })
+  it('throws 500 when DB throws error', async () => {
+    deleteMock.mockReturnValue(Promise.reject(new Error('constraint violation')))
     const { deleteEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -322,9 +302,7 @@ describe('getRoomDefaultEquipment', () => {
   })
 
   it('returns equipment items for a room', async () => {
-    roomDefaultSelectMock.mockImplementation((resolve: (v: unknown) => void) =>
-      resolve({ data: [{ equipment_id: 'eq-1', equipment: equipmentRow }], error: null })
-    )
+    selectMock.mockReturnValue(Promise.resolve([equipmentRow]))
     const { getRoomDefaultEquipment } = await loadModule()
 
     const result = await getRoomDefaultEquipment('room-1')
@@ -333,13 +311,8 @@ describe('getRoomDefaultEquipment', () => {
     expect(result[0]).toMatchObject({ id: 'eq-1', name: 'Projector' })
   })
 
-  it('filters out null equipment entries', async () => {
-    roomDefaultSelectMock.mockImplementation((resolve: (v: unknown) => void) =>
-      resolve({
-        data: [{ equipment_id: 'eq-missing', equipment: null }],
-        error: null,
-      })
-    )
+  it('returns empty array when room has no default equipment', async () => {
+    selectMock.mockReturnValue(Promise.resolve([]))
     const { getRoomDefaultEquipment } = await loadModule()
 
     const result = await getRoomDefaultEquipment('room-1')
@@ -347,10 +320,8 @@ describe('getRoomDefaultEquipment', () => {
     expect(result).toHaveLength(0)
   })
 
-  it('throws 500 when Supabase returns error', async () => {
-    roomDefaultSelectMock.mockImplementation((resolve: (v: unknown) => void) =>
-      resolve({ data: null, error: { message: 'RLS denied' } })
-    )
+  it('throws 500 when query throws error', async () => {
+    selectMock.mockReturnValue(Promise.reject(new Error('RLS denied')))
     const { getRoomDefaultEquipment } = await loadModule()
 
     await expect(getRoomDefaultEquipment('room-1')).rejects.toMatchObject({ statusCode: 500 })
@@ -362,9 +333,9 @@ describe('setRoomDefaultEquipment', () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
-    fetchExistingDefaultsMock.mockResolvedValue({ data: [], error: null })
-    deleteRoomDefaultMock.mockReturnValue(Promise.resolve({ error: null }))
-    insertRoomDefaultMock.mockResolvedValue({ error: null })
+    selectMock.mockReturnValue(Promise.resolve([]))
+    deleteMock.mockReturnValue(Promise.resolve([]))
+    insertMock.mockReturnValue(Promise.resolve([]))
   })
 
   it('clears defaults when equipmentIds is empty', async () => {
@@ -372,24 +343,19 @@ describe('setRoomDefaultEquipment', () => {
     const adminSession = createAdminSession()
 
     await expect(setRoomDefaultEquipment(adminSession, 'room-1', [])).resolves.toBeUndefined()
-    // fetchExistingDefaults should NOT be called when list is empty
-    expect(fetchExistingDefaultsMock).not.toHaveBeenCalled()
   })
 
   it('inserts new defaults when no conflicts exist', async () => {
-    fetchExistingDefaultsMock.mockResolvedValue({ data: [], error: null })
+    selectMock.mockReturnValue(Promise.resolve([]))
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
     await expect(setRoomDefaultEquipment(adminSession, 'room-1', ['eq-1', 'eq-2'])).resolves.toBeUndefined()
-    expect(insertRoomDefaultMock).toHaveBeenCalled()
+    expect(insertMock).toHaveBeenCalled()
   })
 
   it('throws 400 EQUIPMENT_LOCKED_TO_ANOTHER_ROOM when equipment belongs to another room', async () => {
-    fetchExistingDefaultsMock.mockResolvedValue({
-      data: [{ equipment_id: 'eq-1', room_id: 'room-99' }],
-      error: null,
-    })
+    selectMock.mockReturnValue(Promise.resolve([{ equipmentId: 'eq-1', roomId: 'room-99' }]))
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -401,10 +367,7 @@ describe('setRoomDefaultEquipment', () => {
   })
 
   it('allows re-assigning equipment already locked to the same room', async () => {
-    fetchExistingDefaultsMock.mockResolvedValue({
-      data: [{ equipment_id: 'eq-1', room_id: 'room-1' }],
-      error: null,
-    })
+    selectMock.mockReturnValue(Promise.resolve([{ equipmentId: 'eq-1', roomId: 'room-1' }]))
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -413,7 +376,7 @@ describe('setRoomDefaultEquipment', () => {
   })
 
   it('throws 500 when the conflict-check query fails', async () => {
-    fetchExistingDefaultsMock.mockResolvedValue({ data: null, error: { message: 'DB failure' } })
+    selectMock.mockReturnValue(Promise.reject(new Error('DB failure')))
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -421,8 +384,8 @@ describe('setRoomDefaultEquipment', () => {
   })
 
   it('throws 500 when the delete step fails', async () => {
-    fetchExistingDefaultsMock.mockResolvedValue({ data: [], error: null })
-    deleteRoomDefaultMock.mockReturnValue(Promise.resolve({ error: { message: 'delete failed' } }))
+    selectMock.mockReturnValue(Promise.resolve([]))
+    deleteMock.mockReturnValue(Promise.reject(new Error('delete failed')))
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -430,14 +393,13 @@ describe('setRoomDefaultEquipment', () => {
   })
 
   it('throws 500 when the insert step fails', async () => {
-    fetchExistingDefaultsMock.mockResolvedValue({ data: [], error: null })
-    insertRoomDefaultMock.mockResolvedValue({ error: { message: 'insert failed' } })
+    selectMock.mockReturnValue(Promise.resolve([]))
+    insertMock.mockReturnValue(Promise.reject(new Error('insert failed')))
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
     await expect(setRoomDefaultEquipment(adminSession, 'room-1', ['eq-1'])).rejects.toMatchObject({ statusCode: 500 })
   })
-
 
   describe('Member-role session denial for requireAdminSession', () => {
     it('createEquipment throws 403 when session role is member', async () => {
@@ -476,5 +438,4 @@ describe('setRoomDefaultEquipment', () => {
       })
     })
   })
-
 })

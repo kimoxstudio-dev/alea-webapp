@@ -1,23 +1,49 @@
-import { getAdminDb, getDb } from '@/lib/db'
+import { asc, eq, inArray } from 'drizzle-orm'
+import { getDrizzleAdminDb, getDrizzleDb } from '@/lib/db'
+import { equipment, roomDefaultEquipment } from '@/lib/db/schema'
 import { serviceError } from '@/lib/server/shared/service-error'
 import { ERROR_CODES } from '@/lib/types/error-codes'
-import type { Tables, TablesInsert, TablesUpdate } from '@/lib/supabase/types'
 import type { Equipment } from '@/lib/types'
 import type { SessionUser } from '@/lib/server/auth/auth'
 
 export type { Equipment }
 
-type EquipmentRow = Tables<'equipment'>
-type RoomDefaultEquipmentRow = Tables<'room_default_equipment'>
+/**
+ * KIM-434 (F3c) pilot service: this is the first service migrated to the
+ * Drizzle/Neon seam (see `lib/db/index.ts` header for the full stack
+ * rationale). Equipment is public-read/admin-write catalog data — it is
+ * NOT member-row-scoped, so `assertMemberRowsScoped()` does not apply here.
+ */
+
+type EquipmentRow = {
+  id: string
+  name: string
+  description: string | null
+  createdAt: Date
+}
 
 // Privilege checks (role === 'admin') live here in the service layer, not in
-// route handlers (repo convention). These mutations use the admin client
-// (bypasses RLS entirely), so this in-function check is the only
-// authorization guard once RLS is removed as part of the Vercel/Postgres
-// migration — mirrors equipment_admin_insert/update/delete and
-// room_default_equipment_admin_insert/delete RLS policies (is_admin()).
+// route handlers (repo convention). Neon/Drizzle has no RLS, so this
+// in-function check is the only authorization guard for these mutations —
+// mirrors the equipment_admin_insert/update/delete and
+// room_default_equipment_admin_insert/delete Supabase RLS policies
+// (is_admin()) this service used to rely on.
 function requireAdminSession(session: SessionUser): void {
   if (session.role !== 'admin') serviceError('Forbidden', 403)
+}
+
+/**
+ * Runs a Drizzle query, translating any thrown DB/driver error into a
+ * uniform 500 ServiceError. Business-logic outcomes (e.g. "no row
+ * returned" -> 404, validation -> 400) are handled by callers, outside this
+ * wrapper, so their specific status codes aren't swallowed into a 500.
+ */
+async function runQuery<T>(query: Promise<T>): Promise<T> {
+  try {
+    return await query
+  } catch {
+    serviceError('Internal server error', 500)
+  }
 }
 
 function toEquipment(row: EquipmentRow): Equipment {
@@ -25,22 +51,15 @@ function toEquipment(row: EquipmentRow): Equipment {
     id: row.id,
     name: row.name,
     description: row.description ?? null,
-    createdAt: row.created_at,
+    createdAt: row.createdAt.toISOString(),
   }
 }
 
 export async function listEquipment(): Promise<Equipment[]> {
-  const supabase = await getDb()
-  const { data, error } = await supabase
-    .from('equipment')
-    .select('id, name, description, created_at')
-    .order('name', { ascending: true })
+  const db = getDrizzleDb()
+  const rows = await runQuery(db.select().from(equipment).orderBy(asc(equipment.name)))
 
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-
-  return ((data ?? []) as EquipmentRow[]).map(toEquipment)
+  return rows.map(toEquipment)
 }
 
 export async function createEquipment(
@@ -53,26 +72,22 @@ export async function createEquipment(
     serviceError('Equipment name is required', 400)
   }
 
-  const supabase = getAdminDb()
-  const insert: TablesInsert<'equipment'> = {
-    name,
-    description: body.description ? String(body.description) : null,
-  }
+  const db = getDrizzleAdminDb()
+  const [row] = await runQuery(
+    db
+      .insert(equipment)
+      .values({
+        name,
+        description: body.description ? String(body.description) : null,
+      })
+      .returning(),
+  )
 
-  const { data, error } = await supabase
-    .from('equipment')
-    .insert(insert)
-    .select('id, name, description, created_at')
-    .maybeSingle()
-
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-  if (!data) {
+  if (!row) {
     serviceError('Internal server error', 500)
   }
 
-  return toEquipment(data as EquipmentRow)
+  return toEquipment(row)
 }
 
 export async function updateEquipment(
@@ -81,7 +96,7 @@ export async function updateEquipment(
   body: { name?: unknown; description?: unknown },
 ): Promise<Equipment> {
   requireAdminSession(session)
-  const updates: TablesUpdate<'equipment'> = {}
+  const updates: Partial<{ name: string; description: string | null }> = {}
   if (body.name !== undefined) {
     const name = String(body.name).trim()
     if (!name) {
@@ -97,57 +112,46 @@ export async function updateEquipment(
     serviceError('No updatable fields provided', 400)
   }
 
-  const supabase = getAdminDb()
-  const { data, error } = await supabase
-    .from('equipment')
-    .update(updates)
-    .eq('id', id)
-    .select('id, name, description, created_at')
-    .maybeSingle()
+  const db = getDrizzleAdminDb()
+  const [row] = await runQuery(
+    db.update(equipment).set(updates).where(eq(equipment.id, id)).returning(),
+  )
 
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-  if (!data) {
+  if (!row) {
     serviceError('Equipment not found', 404)
   }
 
-  return toEquipment(data as EquipmentRow)
+  return toEquipment(row)
 }
 
 export async function deleteEquipment(session: SessionUser, id: string): Promise<void> {
   requireAdminSession(session)
-  const supabase = getAdminDb()
-  const { data, error } = await supabase
-    .from('equipment')
-    .delete()
-    .eq('id', id)
-    .select('id')
-    .maybeSingle()
+  const db = getDrizzleAdminDb()
+  const [row] = await runQuery(
+    db.delete(equipment).where(eq(equipment.id, id)).returning({ id: equipment.id }),
+  )
 
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-  if (!data) {
+  if (!row) {
     serviceError('Equipment not found', 404)
   }
 }
 
 export async function getRoomDefaultEquipment(roomId: string): Promise<Equipment[]> {
-  const supabase = await getDb()
-  const { data, error } = await supabase
-    .from('room_default_equipment')
-    .select('equipment_id, equipment(id, name, description, created_at)')
-    .eq('room_id', roomId)
+  const db = getDrizzleDb()
+  const rows = await runQuery(
+    db
+      .select({
+        id: equipment.id,
+        name: equipment.name,
+        description: equipment.description,
+        createdAt: equipment.createdAt,
+      })
+      .from(roomDefaultEquipment)
+      .innerJoin(equipment, eq(roomDefaultEquipment.equipmentId, equipment.id))
+      .where(eq(roomDefaultEquipment.roomId, roomId)),
+  )
 
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-
-  return ((data ?? []) as Array<RoomDefaultEquipmentRow & { equipment: EquipmentRow | null }>)
-    .map((row) => row.equipment)
-    .filter((e): e is EquipmentRow => e !== null)
-    .map(toEquipment)
+  return rows.map(toEquipment)
 }
 
 export async function setRoomDefaultEquipment(
@@ -156,21 +160,21 @@ export async function setRoomDefaultEquipment(
   equipmentIds: string[],
 ): Promise<void> {
   requireAdminSession(session)
-  const supabase = getAdminDb()
+  const db = getDrizzleAdminDb()
 
   if (equipmentIds.length > 0) {
     // Enforce exclusivity: reject any equipment already locked to a different room
-    const { data: existingDefaults, error: fetchError } = await supabase
-      .from('room_default_equipment')
-      .select('equipment_id, room_id')
-      .in('equipment_id', equipmentIds)
+    const existingDefaults = await runQuery(
+      db
+        .select({
+          equipmentId: roomDefaultEquipment.equipmentId,
+          roomId: roomDefaultEquipment.roomId,
+        })
+        .from(roomDefaultEquipment)
+        .where(inArray(roomDefaultEquipment.equipmentId, equipmentIds)),
+    )
 
-    if (fetchError) {
-      serviceError('Internal server error', 500)
-    }
-
-    const conflicts = ((existingDefaults ?? []) as Array<{ equipment_id: string; room_id: string }>)
-      .filter((row) => row.room_id !== roomId)
+    const conflicts = existingDefaults.filter((row) => row.roomId !== roomId)
 
     if (conflicts.length > 0) {
       serviceError(ERROR_CODES.EQUIPMENT_LOCKED_TO_ANOTHER_ROOM, 400)
@@ -178,29 +182,15 @@ export async function setRoomDefaultEquipment(
   }
 
   // Delete existing defaults for this room
-  const { error: deleteError } = await supabase
-    .from('room_default_equipment')
-    .delete()
-    .eq('room_id', roomId)
-
-  if (deleteError) {
-    serviceError('Internal server error', 500)
-  }
+  await runQuery(db.delete(roomDefaultEquipment).where(eq(roomDefaultEquipment.roomId, roomId)))
 
   if (equipmentIds.length === 0) {
     return
   }
 
-  const inserts: TablesInsert<'room_default_equipment'>[] = equipmentIds.map((equipment_id) => ({
-    room_id: roomId,
-    equipment_id,
-  }))
-
-  const { error: insertError } = await supabase
-    .from('room_default_equipment')
-    .insert(inserts)
-
-  if (insertError) {
-    serviceError('Internal server error', 500)
-  }
+  await runQuery(
+    db.insert(roomDefaultEquipment).values(
+      equipmentIds.map((equipmentId) => ({ roomId, equipmentId })),
+    ),
+  )
 }
