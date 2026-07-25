@@ -14,7 +14,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { readFileSync } from 'fs'
 import { join } from 'path'
 import {
-  createDrizzleQueryBuilderWithDispatching,
+  createTransactionAwareMockBuilder,
   resetFixtures,
   setFixture,
   insertMock,
@@ -45,8 +45,8 @@ vi.mock('@/lib/club-time', () => ({
 }))
 
 vi.mock('@/lib/db', () => ({
-  getDrizzleDb: vi.fn(() => createDrizzleQueryBuilderWithDispatching()),
-  getDrizzleAdminDb: vi.fn(() => createDrizzleQueryBuilderWithDispatching()),
+  getDrizzleDb: vi.fn(() => createTransactionAwareMockBuilder()),
+  getDrizzleAdminDb: vi.fn(() => createTransactionAwareMockBuilder()),
   getAdminDb: vi.fn(),
   getDb: vi.fn(),
 }))
