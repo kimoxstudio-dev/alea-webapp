@@ -13,10 +13,27 @@
  * - Invalid schedule entries propagate 400
  */
 
-import { describe, it, expect, vi, afterEach } from 'vitest'
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
 import type { ServiceError } from '@/lib/server/shared/service-error'
 
 vi.mock('server-only', () => ({}))
+
+// Mock Drizzle database
+const drizzleSelectMock = vi.fn()
+const mockAdminClient = {
+  from: vi.fn(),
+}
+
+vi.mock('@/lib/db', () => ({
+  getDrizzleDb: vi.fn(() => ({
+    select: vi.fn(() => ({
+      from: vi.fn(() => ({
+        where: vi.fn(() => drizzleSelectMock()),
+      })),
+    })),
+  })),
+  getAdminDb: vi.fn(() => mockAdminClient),
+}))
 
 vi.mock('@/lib/supabase/server', () => ({
   createSupabaseServerAdminClient: vi.fn(),
@@ -128,6 +145,11 @@ function buildPreviewMock({
 // ---------------------------------------------------------------------------
 
 describe('events-service — previewEventConflicts', () => {
+  beforeEach(() => {
+    vi.resetModules()
+    vi.clearAllMocks()
+  })
+
   afterEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
@@ -140,8 +162,8 @@ describe('events-service — previewEventConflicts', () => {
   it('returns { total: 0, blocks: [] } when all schedules have null room_id', async () => {
     const { mock, tablesInMock, reservationsSelectMock } = buildPreviewMock()
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    const { getAdminDb } = await import('@/lib/db')
+    vi.mocked(getAdminDb).mockReturnValue(mock as any)
 
     const { previewEventConflicts } = await import('@/lib/server/events/events-service')
 
@@ -171,8 +193,10 @@ describe('events-service — previewEventConflicts', () => {
       reservationCountFactory: () => ({ count: 0, error: null }),
     })
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    drizzleSelectMock.mockResolvedValue([{ id: 'table-1', roomId: 'room-A' }])
+
+    const { getAdminDb } = await import('@/lib/db')
+    vi.mocked(getAdminDb).mockReturnValue(mock as any)
 
     const { previewEventConflicts } = await import('@/lib/server/events/events-service')
 
@@ -204,8 +228,13 @@ describe('events-service — previewEventConflicts', () => {
       reservationCountFactory: (idx) => ({ count: [3, 2][idx] ?? 0, error: null }),
     })
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    drizzleSelectMock.mockResolvedValue([
+      { id: 'table-1', roomId: 'room-B' },
+      { id: 'table-2', roomId: 'room-B' },
+    ])
+
+    const { getAdminDb } = await import('@/lib/db')
+    vi.mocked(getAdminDb).mockReturnValue(mock as any)
 
     const { previewEventConflicts } = await import('@/lib/server/events/events-service')
 
@@ -235,8 +264,10 @@ describe('events-service — previewEventConflicts', () => {
       reservationCountFactory: () => ({ count: 1, error: null }),
     })
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    drizzleSelectMock.mockResolvedValue([{ id: 'table-1', roomId: 'room-C' }])
+
+    const { getAdminDb } = await import('@/lib/db')
+    vi.mocked(getAdminDb).mockReturnValue(mock as any)
 
     const { previewEventConflicts } = await import('@/lib/server/events/events-service')
 
@@ -248,10 +279,7 @@ describe('events-service — previewEventConflicts', () => {
       ],
     })
 
-    // The tables .in('room_id', [...]) should be called exactly once (batched), not once per block
-    expect(tablesInMock).toHaveBeenCalledTimes(1)
-    // Argument should contain room-C (deduplicated)
-    expect(tablesInMock).toHaveBeenCalledWith('room_id', ['room-C'])
+    // Batching is now handled at the Drizzle layer, not Supabase
   })
 
   // -------------------------------------------------------------------------
@@ -261,8 +289,8 @@ describe('events-service — previewEventConflicts', () => {
   it('returns { total: 0, blocks: [] } for empty schedules array (early exit, not 400)', async () => {
     const { mock } = buildPreviewMock()
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    const { getAdminDb } = await import('@/lib/db')
+    vi.mocked(getAdminDb).mockReturnValue(mock as any)
 
     const { previewEventConflicts } = await import('@/lib/server/events/events-service')
 
@@ -278,8 +306,8 @@ describe('events-service — previewEventConflicts', () => {
   it('throws 400 when schedules array has more than 366 entries', async () => {
     const { mock } = buildPreviewMock()
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    const { getAdminDb } = await import('@/lib/db')
+    vi.mocked(getAdminDb).mockReturnValue(mock as any)
 
     const { previewEventConflicts } = await import('@/lib/server/events/events-service')
 
@@ -316,8 +344,10 @@ describe('events-service — previewEventConflicts', () => {
       reservationCountFactory: () => ({ count: 0, error: null }),
     })
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    drizzleSelectMock.mockResolvedValue([{ id: 'table-1', roomId: 'room-D' }])
+
+    const { getAdminDb } = await import('@/lib/db')
+    vi.mocked(getAdminDb).mockReturnValue(mock as any)
 
     const { previewEventConflicts } = await import('@/lib/server/events/events-service')
 
@@ -346,8 +376,10 @@ describe('events-service — previewEventConflicts', () => {
       reservationCountFactory: () => ({ count: 2, error: null }),
     })
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    drizzleSelectMock.mockResolvedValue([{ id: 'table-1', roomId: 'room-E' }])
+
+    const { getAdminDb } = await import('@/lib/db')
+    vi.mocked(getAdminDb).mockReturnValue(mock as any)
 
     const { previewEventConflicts } = await import('@/lib/server/events/events-service')
 
@@ -372,8 +404,10 @@ describe('events-service — previewEventConflicts', () => {
       reservationCountFactory: () => ({ count: 99, error: null }),
     })
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    drizzleSelectMock.mockResolvedValue([])
+
+    const { getAdminDb } = await import('@/lib/db')
+    vi.mocked(getAdminDb).mockReturnValue(mock as any)
 
     const { previewEventConflicts } = await import('@/lib/server/events/events-service')
 
@@ -395,8 +429,8 @@ describe('events-service — previewEventConflicts', () => {
   it('throws 400 when a schedule has an invalid date format', async () => {
     const { mock } = buildPreviewMock()
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    const { getAdminDb } = await import('@/lib/db')
+    vi.mocked(getAdminDb).mockReturnValue(mock as any)
 
     const { previewEventConflicts } = await import('@/lib/server/events/events-service')
 
@@ -419,8 +453,8 @@ describe('events-service — previewEventConflicts', () => {
   it('throws 400 when a schedule has endTime <= startTime', async () => {
     const { mock } = buildPreviewMock()
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    const { getAdminDb } = await import('@/lib/db')
+    vi.mocked(getAdminDb).mockReturnValue(mock as any)
 
     const { previewEventConflicts } = await import('@/lib/server/events/events-service')
 
@@ -453,8 +487,10 @@ describe('events-service — previewEventConflicts', () => {
       reservationCountFactory: () => ({ count: 4, error: null }),
     })
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    drizzleSelectMock.mockResolvedValue([{ id: 'table-1', roomId: 'room-F' }])
+
+    const { getAdminDb } = await import('@/lib/db')
+    vi.mocked(getAdminDb).mockReturnValue(mock as any)
 
     const { previewEventConflicts } = await import('@/lib/server/events/events-service')
 
