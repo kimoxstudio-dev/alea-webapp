@@ -1662,3 +1662,11 @@ No blocking issues. No modifications needed. Code is ready for security-reviewer
 - Validation: pnpm typecheck ✅, pnpm lint ✅ (no warnings), pnpm test — full suite green (see validation summary below), pnpm build ✅.
 - Pushed --force-with-lease to origin/docs/migration-status-update.
 - ✅ Complete — PR #175 rebased cleanly onto origin/develop, all conflicts resolved, 9 additional stale references from newer develop PRs fixed, full validation green.
+
+#### [KIM-432] software-engineer — Dev seed + admin bootstrap on Neon
+- Started. Branch migration-f2b-dev-seed-admin-bootstrap created off origin/develop.
+- Added scripts/seed.ts: Drizzle/Neon-native TS seed (own local pg.Pool + drizzle-orm/node-postgres client, does not touch lib/db/index.ts or lib/authjs/db.ts). Seeds 1 admin + 3 member profiles (email == authEmail for Auth.js credentials-user.ts compat, isActive=true, bcryptjs passwordHash), 2 rooms, 5 tables (varied type). Profiles upserted via onConflictDoUpdate on authEmail; rooms/tables via check-then-insert by name (documented in-file).
+- Guard: aborts unless NODE_ENV!=='production' AND DEV_SEED_CONFIRM===YES_SEED_NEON_DEV_DB. Verified all 3 abort paths (missing confirm, NODE_ENV=production, missing POSTGRES_URL) exit 1 before any Pool/connection is created — never ran against a real DB.
+- Added tsx ^4.23.1 devDependency + "db:seed": "tsx scripts/seed.ts" script. Documented DEV_SEED_CONFIRM in .env.example (name only) and added README.md "Dev seed on Neon" section with dev-only seeded credentials.
+- Validation: pnpm typecheck ✅, pnpm lint ✅. Did not run drizzle-kit push/migrate or pnpm db:seed for real, per hard constraint.
+- ✅ Complete — branch migration-f2b-dev-seed-admin-bootstrap, committed locally (not pushed, no PR opened per instructions).
