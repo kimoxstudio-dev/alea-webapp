@@ -1662,3 +1662,11 @@ No blocking issues. No modifications needed. Code is ready for security-reviewer
 - Validation: pnpm typecheck ✅, pnpm lint ✅ (no warnings), pnpm test — full suite green (see validation summary below), pnpm build ✅.
 - Pushed --force-with-lease to origin/docs/migration-status-update.
 - ✅ Complete — PR #175 rebased cleanly onto origin/develop, all conflicts resolved, 9 additional stale references from newer develop PRs fixed, full validation green.
+
+#### [KIM-431] software-engineer — Wire lib/storage/qr seam to Vercel Blob adapter
+- Started implementation on branch migration-f3-wire-vercel-blob-seam
+- Rewired lib/storage/qr/index.ts to delegate uploadToStorage/getPublicStorageUrl/removeFromStorage to lib/storage/qr/vercel-blob.ts (removed @supabase/* import); added application-level 5MB cap in the seam
+- Fixed lib/server/tables/tables-service.ts::uploadQrCodeToStorage() to resolve URLs via getPublicStorageUrl() instead of manually building a Supabase URL (pre-documented required follow-up in vercel-blob.ts from KIM-421)
+- Added BLOB_READ_WRITE_TOKEN and BLOB_PUBLIC_BASE_URL to .env.example
+- pnpm typecheck: pass. pnpm lint: pass
+- ✅ Complete — index.ts wired to Vercel Blob adapter; uploads-service.ts untouched (no edits needed); pre-existing tests (tests/unit/lib/storage/qr.test.ts, tests/unit/server/tables-service.test.ts, tests/unit/server/uploads-service.test.ts) now fail as expected because they still mock @/lib/supabase/server instead of @vercel/blob — flagged for qa-engineer

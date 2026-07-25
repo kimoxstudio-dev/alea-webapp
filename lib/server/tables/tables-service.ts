@@ -1,6 +1,6 @@
 import qrcode from 'qrcode'
 import type { GameTable } from '@/lib/types'
-import { uploadToStorage } from '@/lib/storage/qr'
+import { uploadToStorage, getPublicStorageUrl } from '@/lib/storage/qr'
 import { getAdminDb, getDb } from '@/lib/db'
 import { serviceError } from '@/lib/server/shared/service-error'
 import { resolveDate, buildAvailability } from '@/lib/server/reservations/availability'
@@ -28,9 +28,6 @@ function requireAdminSession(session: SessionUser): void {
 }
 
 async function uploadQrCodeToStorage(url: string, storagePath: string): Promise<string> {
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
-  if (!supabaseUrl) serviceError('NEXT_PUBLIC_SUPABASE_URL is not set — cannot build QR code storage URL', 500)
-
   const buffer = await qrcode.toBuffer(url, { errorCorrectionLevel: 'M', width: 400, type: 'png' })
 
   const { error: uploadError } = await uploadToStorage('table-qr-codes', storagePath, buffer, {
@@ -42,7 +39,18 @@ async function uploadQrCodeToStorage(url: string, storagePath: string): Promise<
     serviceError('Failed to upload QR code to storage', 500)
   }
 
-  return `${supabaseUrl}/storage/v1/object/public/table-qr-codes/${storagePath}`
+  // Resolve the public URL via the storage seam (lib/storage/qr) rather than
+  // manually constructing a backend-specific path — this call site used to
+  // hardcode a Supabase Storage URL, which would have silently pointed at a
+  // nonexistent object once uploadToStorage() above started routing to
+  // Vercel Blob instead (KIM-431 F3 cutover; documented follow-up from
+  // KIM-421/lib/storage/qr/vercel-blob.ts's original doc comment).
+  const { publicUrl } = getPublicStorageUrl('table-qr-codes', storagePath)
+  if (!publicUrl) {
+    serviceError('Failed to resolve QR code public URL', 500)
+  }
+
+  return publicUrl
 }
 
 export async function generateTableQrCode(session: SessionUser, tableId: string): Promise<string> {
