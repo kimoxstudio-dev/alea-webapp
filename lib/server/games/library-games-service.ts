@@ -1,27 +1,39 @@
 import 'server-only'
+import { asc, eq } from 'drizzle-orm'
 import type { AdminLibraryGame, LibraryGame } from '@/lib/types'
-import { getDb, getAdminDb } from '@/lib/db'
+import { getDrizzleAdminDb, getDrizzleDb } from '@/lib/db'
+import { libraryGames } from '@/lib/db/schema'
 import { serviceError } from '@/lib/server/shared/service-error'
-import type { Tables } from '@/lib/supabase/types'
 import type { SessionUser } from '@/lib/server/auth/auth'
 import { validateOptionalUrl } from '@/lib/validations/url'
 
-type LibraryGameRow = Tables<'library_games'>
+type LibraryGameRow = typeof libraryGames.$inferSelect
 
-const PUBLIC_LIBRARY_GAME_COLUMNS = 'id, title, category_es, category_en, players, play_time, weight, sort_order, img_url'
-const ADMIN_LIBRARY_GAME_COLUMNS = 'id, title, category_es, category_en, players, play_time, weight, sort_order, active, img_url'
+/**
+ * Runs a Drizzle query, translating any thrown DB/driver error into a
+ * uniform 500 ServiceError. Business-logic outcomes (e.g. "no row
+ * returned" -> 404, validation -> 400) are handled by callers, outside this
+ * wrapper, so their specific status codes aren't swallowed into a 500.
+ */
+async function runQuery<T>(query: Promise<T>): Promise<T> {
+  try {
+    return await query
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+}
 
-function toLibraryGame(row: Pick<LibraryGameRow, 'id' | 'title' | 'category_es' | 'category_en' | 'players' | 'play_time' | 'weight' | 'sort_order' | 'img_url'>): LibraryGame {
+function toLibraryGame(row: Pick<LibraryGameRow, 'id' | 'title' | 'categoryEs' | 'categoryEn' | 'players' | 'playTime' | 'weight' | 'sortOrder' | 'imgUrl'>): LibraryGame {
   return {
     id: row.id,
     title: row.title,
-    categoryEs: row.category_es,
-    categoryEn: row.category_en,
+    categoryEs: row.categoryEs,
+    categoryEn: row.categoryEn,
     players: row.players,
-    playTime: row.play_time,
+    playTime: row.playTime,
     weight: Number(row.weight),
-    sortOrder: row.sort_order,
-    imgUrl: row.img_url,
+    sortOrder: row.sortOrder,
+    imgUrl: row.imgUrl,
   }
 }
 
@@ -31,22 +43,26 @@ function toAdminLibraryGame(row: LibraryGameRow): AdminLibraryGame {
 
 /**
  * Public read of active library games (ludoteca highlights) for the landing
- * page, ordered the same way the board arranges them in the dashboard. Uses
- * the RLS-respecting client since this is unauthenticated, publicly readable
- * content — the "library_games_select_active" RLS policy additionally
- * restricts anon/authenticated visibility to active rows.
+ * page, ordered the same way the board arranges them in the dashboard.
+ *
+ * KIM-434 (F3c) PR3 note: this now reads via the Drizzle/Neon seam
+ * (`getDrizzleDb()`). Neon has no RLS, so unlike the legacy Supabase path
+ * this used to take, the "public read" scoping (RLS's
+ * "library_games_select_active" policy previously restricted anon/
+ * authenticated visibility to active rows) is now enforced here, in the
+ * service layer, via the explicit `eq(libraryGames.active, true)` filter
+ * below.
  */
 export async function listLibraryGames(): Promise<LibraryGame[]> {
-  const supabase = await getDb()
-  const { data, error } = await supabase
-    .from('library_games')
-    .select(PUBLIC_LIBRARY_GAME_COLUMNS)
-    .order('sort_order', { ascending: true })
-    .order('title', { ascending: true })
+  const db = getDrizzleDb()
+  const rows = await runQuery(
+    db
+      .select()
+      .from(libraryGames)
+      .where(eq(libraryGames.active, true))
+      .orderBy(asc(libraryGames.sortOrder), asc(libraryGames.title)),
+  )
 
-  if (error) serviceError('Internal server error', 500)
-
-  const rows = (data ?? []) as LibraryGameRow[]
   return rows.map((row) => toLibraryGame(row))
 }
 
@@ -138,23 +154,25 @@ function resolveBilingualEnFallback(
 }
 
 /** weight is a numeric(2,1) column: required, must be a number in [0, 5]. */
-function requireWeight(value: unknown): number {
+function requireWeight(value: unknown): string {
   const num = typeof value === 'number' ? value : Number(value)
   if (typeof value !== 'number' && typeof value !== 'string') serviceError('weight must be a number', 400)
   if (!Number.isFinite(num) || num < 0 || num > 5) serviceError('weight must be a number between 0 and 5', 400)
-  return num
+  // Drizzle's `numeric` column type maps to a string in JS (avoids float
+  // precision loss); the DB still enforces numeric(2,1) on write.
+  return String(num)
 }
 
 interface LibraryGameFieldSet {
   title: string
-  category_es: string
-  category_en: string
+  categoryEs: string
+  categoryEn: string
   players: string
-  play_time: string
-  weight: number
-  sort_order: number
+  playTime: string
+  weight: string
+  sortOrder: number
   active: boolean
-  img_url: string | null
+  imgUrl: string | null
 }
 
 /**
@@ -171,14 +189,14 @@ function resolveLibraryGameFields(body: LibraryGameInput, current: LibraryGameRo
 
   const categoryEs = body.categoryEs !== undefined
     ? requireNonEmptyString(body.categoryEs, 'categoryEs')
-    : requireNonEmptyString(current?.category_es, 'categoryEs')
+    : requireNonEmptyString(current?.categoryEs, 'categoryEs')
 
   const categoryEn = resolveBilingualEnFallback(
     'categoryEn',
     categoryEs,
     body.categoryEn,
     body.categoryEn !== undefined,
-    current ? { es: current.category_es, en: current.category_en } : null,
+    current ? { es: current.categoryEs, en: current.categoryEn } : null,
   )
 
   const players = body.players !== undefined
@@ -187,7 +205,7 @@ function resolveLibraryGameFields(body: LibraryGameInput, current: LibraryGameRo
 
   const playTime = body.playTime !== undefined
     ? requireNonEmptyString(body.playTime, 'playTime')
-    : requireNonEmptyString(current?.play_time, 'playTime')
+    : requireNonEmptyString(current?.playTime, 'playTime')
 
   const weight = body.weight !== undefined
     ? requireWeight(body.weight)
@@ -195,24 +213,24 @@ function resolveLibraryGameFields(body: LibraryGameInput, current: LibraryGameRo
 
   const sortOrder = body.sortOrder !== undefined
     ? (optionalInteger(body.sortOrder, 'sortOrder') ?? 0)
-    : (current?.sort_order ?? 0)
+    : (current?.sortOrder ?? 0)
 
   const active = body.active !== undefined ? parseBooleanFlag(body.active) : (current?.active ?? true)
 
   const imgUrl = body.imageUrl !== undefined
     ? validateOptionalUrl(body.imageUrl, 'imageUrl')
-    : (current?.img_url ?? null)
+    : (current?.imgUrl ?? null)
 
   return {
     title,
-    category_es: categoryEs,
-    category_en: categoryEn,
+    categoryEs,
+    categoryEn,
     players,
-    play_time: playTime,
+    playTime,
     weight,
-    sort_order: sortOrder,
+    sortOrder,
     active,
-    img_url: imgUrl,
+    imgUrl,
   }
 }
 
@@ -220,16 +238,11 @@ function resolveLibraryGameFields(body: LibraryGameInput, current: LibraryGameRo
 export async function listAdminLibraryGames(session: SessionUser): Promise<AdminLibraryGame[]> {
   requireAdminSession(session)
 
-  const admin = getAdminDb()
-  const { data, error } = await admin
-    .from('library_games')
-    .select(ADMIN_LIBRARY_GAME_COLUMNS)
-    .order('sort_order', { ascending: true })
-    .order('title', { ascending: true })
+  const db = getDrizzleAdminDb()
+  const rows = await runQuery(
+    db.select().from(libraryGames).orderBy(asc(libraryGames.sortOrder), asc(libraryGames.title)),
+  )
 
-  if (error) serviceError('Internal server error', 500)
-
-  const rows = (data ?? []) as LibraryGameRow[]
   return rows.map((row) => toAdminLibraryGame(row))
 }
 
@@ -239,74 +252,55 @@ export async function createLibraryGame(session: SessionUser, body: LibraryGameI
   // Validate EVERYTHING before any DB write.
   const fields = resolveLibraryGameFields(body, null)
 
-  const admin = getAdminDb()
-  const { data, error } = await admin
-    .from('library_games')
-    .insert(fields)
-    .select(ADMIN_LIBRARY_GAME_COLUMNS)
-    .maybeSingle()
-
-  if (error) {
-    const pgCode = (error as { code?: string }).code
+  const db = getDrizzleAdminDb()
+  let row: LibraryGameRow | undefined
+  try {
+    ;[row] = await db.insert(libraryGames).values(fields).returning()
+  } catch (err) {
+    const pgCode = (err as { code?: string }).code
     if (pgCode === '23514' || pgCode === '22P02' || pgCode === '23502') {
       serviceError('Invalid library game data', 400)
     }
     serviceError('Internal server error', 500)
   }
-  if (!data) serviceError('Internal server error', 500)
+  if (!row) serviceError('Internal server error', 500)
 
-  return toAdminLibraryGame(data as LibraryGameRow)
+  return toAdminLibraryGame(row)
 }
 
 export async function updateLibraryGame(session: SessionUser, id: string, body: LibraryGameInput): Promise<AdminLibraryGame> {
   requireAdminSession(session)
 
-  const admin = getAdminDb()
-  const { data: currentData, error: fetchError } = await admin
-    .from('library_games')
-    .select(ADMIN_LIBRARY_GAME_COLUMNS)
-    .eq('id', id)
-    .maybeSingle()
+  const db = getDrizzleAdminDb()
+  const [current] = await runQuery(db.select().from(libraryGames).where(eq(libraryGames.id, id)))
 
-  if (fetchError) serviceError('Internal server error', 500)
-  const current = currentData as LibraryGameRow | null
   if (!current) serviceError('Library game not found', 404)
 
   // Validate EVERYTHING before the UPDATE below.
   const fields = resolveLibraryGameFields(body, current)
 
-  const { data, error } = await admin
-    .from('library_games')
-    .update(fields)
-    .eq('id', id)
-    .select(ADMIN_LIBRARY_GAME_COLUMNS)
-    .maybeSingle()
-
-  if (error) {
-    const pgCode = (error as { code?: string }).code
+  let row: LibraryGameRow | undefined
+  try {
+    ;[row] = await db.update(libraryGames).set(fields).where(eq(libraryGames.id, id)).returning()
+  } catch (err) {
+    const pgCode = (err as { code?: string }).code
     if (pgCode === '23514' || pgCode === '22P02' || pgCode === '23502') {
       serviceError('Invalid library game data', 400)
     }
     serviceError('Internal server error', 500)
   }
-  if (!data) serviceError('Library game not found', 404)
+  if (!row) serviceError('Library game not found', 404)
 
-  return toAdminLibraryGame(data as LibraryGameRow)
+  return toAdminLibraryGame(row)
 }
 
 export async function deleteLibraryGame(session: SessionUser, id: string): Promise<void> {
   requireAdminSession(session)
 
-  const admin = getAdminDb()
-  const { data, error } = await admin
-    .from('library_games')
-    .select('id')
-    .eq('id', id)
-    .maybeSingle()
+  const db = getDrizzleAdminDb()
+  const [row] = await runQuery(
+    db.delete(libraryGames).where(eq(libraryGames.id, id)).returning({ id: libraryGames.id }),
+  )
 
-  if (error) serviceError('Internal server error', 500)
-  if (!data) serviceError('Library game not found', 404)
-
-  const { error: deleteError } = await admin.from('library_games').delete().eq('id', id)
-  if (deleteError) serviceError('Internal server error', 500)
+  if (!row) serviceError('Library game not found', 404)
 }
