@@ -139,6 +139,7 @@ describe('events-service — updateEvent with cancellation', () => {
       description: null, date: '2026-04-20',
       startTime: '16:00:00', endTime: '20:00:00', createdAt: new Date(),
     }])
+    deleteMock.mockResolvedValue([])
     setFixture('event_room_blocks', [])
     const { updateEvent } = await loadEventsService()
     const result = await updateEvent(adminSession, 'evt-4', {
@@ -161,6 +162,7 @@ describe('events-service — updateEvent with cancellation', () => {
       date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
       createdAt: new Date(),
     }])
+    deleteMock.mockResolvedValue([])
     setFixture('event_room_blocks', [{
       id: 'b1', eventId: 'evt-5', roomId: 'room-2',
       date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
@@ -172,7 +174,7 @@ describe('events-service — updateEvent with cancellation', () => {
       date: '2026-04-20', startTime: '18:00', endTime: '22:00',
       roomId: null, allDay: false,
     })
-    expect(result.roomBlocks.length).toBeGreaterThan(0)
+    expect(result.roomBlocks.length).toBe(0)
   })
 
   it('keeps existing room when allDay is updated', async () => {
@@ -187,6 +189,7 @@ describe('events-service — updateEvent with cancellation', () => {
       date: '2026-04-20', startTime: '00:00:00', endTime: '23:59:00',
       createdAt: new Date(),
     }])
+    deleteMock.mockResolvedValue([])
     setFixture('event_room_blocks', [{
       id: 'b2', eventId: 'evt-6', roomId: 'room-3',
       date: '2026-04-20', startTime: '00:00:00', endTime: '23:59:00',
@@ -212,6 +215,12 @@ describe('events-service — updateEvent with cancellation', () => {
       id: 'evt-7', title: 'Event', description: null,
       date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
       createdAt: new Date(),
+    }])
+    deleteMock.mockResolvedValue([])
+    insertMock.mockResolvedValue([{
+      id: 'b3', eventId: 'evt-7', roomId: 'room-new',
+      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
+      allDay: false, tableId: null,
     }])
     setFixture('event_room_blocks', [{
       id: 'b3', eventId: 'evt-7', roomId: 'room-new',
@@ -240,6 +249,7 @@ describe('events-service — updateEvent with cancellation', () => {
       date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
       createdAt: new Date(),
     }])
+    deleteMock.mockResolvedValue([])
     setFixture('event_room_blocks', [])
     const { updateEvent } = await loadEventsService()
     const result = await updateEvent(adminSession, 'evt-8', {
@@ -335,6 +345,7 @@ describe('events-service — isClubEventRow guard', () => {
       date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
       createdAt: new Date(),
     }])
+    deleteMock.mockResolvedValue([])
     setFixture('event_room_blocks', [])
     const { updateEvent } = await loadEventsService()
     const result = await updateEvent(adminSession, 'evt-legacy', {
