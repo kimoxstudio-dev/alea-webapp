@@ -415,40 +415,32 @@ describe('OIR-208: Unified Events', () => {
     })
 
     it('accepts materials with valid equipmentId and quantity >= 1', async () => {
-      const mockSupabase = buildSupabaseMock()
-      mockSupabase.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            insert: vi.fn(() => ({
-              select: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: {
-                    id: 'evt-with-materials',
-                    title: 'Event',
-                    title_es: 'Evento',
-                    title_en: 'Event',
-                    date: '2026-05-01',
-                    date_kind: 'single',
-                    created_at: '2026-04-01T00:00:00Z',
-                  } as EventRow,
-                  error: null,
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
+      const newEventRow: EventRow = {
+        id: 'evt-with-materials',
+        title: 'Event',
+        title_es: 'Evento',
+        title_en: 'Event',
+        blurb_es: null,
+        blurb_en: null,
+        description_es: null,
+        description_en: null,
+        category_es: null,
+        category_en: null,
+        date_kind: 'single',
+        date: '2026-05-01',
+        end_date: null,
+        recurrence_label_es: null,
+        recurrence_label_en: null,
+        image_url: null,
+        link_url: null,
+        created_by: 'user-admin-1',
+        created_at: '2026-04-01T00:00:00Z',
+      }
 
-      mockSupabase.rpc = vi.fn(async () => ({
-        data: [],
-        error: null,
-      }))
+      insertMock.mockResolvedValue([newEventRow])
+      setFixture('event_room_blocks', [])
 
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
-
+      vi.resetModules()
       const { createClubEvent } = await import('@/lib/server/events/club-events-service')
 
       const result = await createClubEvent(createAdminSession(), {

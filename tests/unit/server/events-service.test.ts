@@ -35,9 +35,6 @@ vi.mock('server-only', () => ({}))
 vi.mock('@/lib/db', () => ({
   getDrizzleDb: vi.fn(() => createDrizzleQueryBuilderWithDispatching()),
   getDrizzleAdminDb: vi.fn(() => createDrizzleQueryBuilderWithDispatching()),
-}))
-
-vi.mock('@/lib/supabase/server', () => ({
   getAdminDb: vi.fn(() => ({
     from: vi.fn((table: string) => ({
       update: vi.fn(() => ({
@@ -123,6 +120,7 @@ describe('events-service — createEvent with roomId cancellation', () => {
 
     insertMock.mockResolvedValue([newEventRow])
     setFixture('event_room_blocks', [blockRow])
+    setFixture('tables', [])
 
     const { createEvent } = await loadEventsService()
 
@@ -309,6 +307,7 @@ describe('events-service — updateEvent with cancellation', () => {
     setFixture('events', [currentEventRow])
     updateMock.mockResolvedValue([updatedEventRow])
     setFixture('event_room_blocks', [blockRow])
+    setFixture('tables', [])
 
     const { updateEvent } = await loadEventsService()
 
@@ -379,6 +378,7 @@ describe('events-service — updateEvent with cancellation', () => {
     setFixture('events', [currentEventRow])
     updateMock.mockResolvedValue([existingEventRow])
     setFixture('event_room_blocks', [existingBlock])
+    setFixture('tables', [])
 
     const { updateEvent } = await loadEventsService()
 
@@ -446,6 +446,7 @@ describe('events-service — updateEvent with cancellation', () => {
     setFixture('events', [currentEventRow])
     updateMock.mockResolvedValue([eventRow])
     setFixture('event_room_blocks', [blockRow])
+    setFixture('tables', [])
 
     const { updateEvent } = await loadEventsService()
 
@@ -513,6 +514,7 @@ describe('events-service — updateEvent with cancellation', () => {
     setFixture('events', [currentEventRow])
     updateMock.mockResolvedValue([eventRow])
     setFixture('event_room_blocks', [newBlockRow])
+    setFixture('tables', [])
 
     const { updateEvent } = await loadEventsService()
 
