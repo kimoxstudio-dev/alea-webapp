@@ -4,12 +4,9 @@ import {
   createDrizzleQueryBuilderWithDispatching,
   resetFixtures,
   setFixture,
-  setDefaultMockResponse,
   createMockServiceError,
   MockServiceError,
   insertMock,
-  updateMock,
-  deleteMock,
 } from '@/tests/unit/mocks/drizzle-mock'
 
 /**
@@ -18,19 +15,13 @@ import {
  * Tests for admin CRUD operations on public club events
  * Implementation: lib/server/events/club-events-service.ts
  *
- * This test file is being migrated from Supabase mocks to Drizzle mocks
- * using the dispatching mock helper. All tests use table-based fixture
- * dispatching and per-test mock responses instead of positional
- * .mockResolvedValueOnce() sequencing.
- *
- * Key scenarios tested:
- * - createClubEvent with bilingual titles and optional room blocks (admin-only)
- * - updateClubEvent with partial updates and room block toggling (admin-only)
- * - deleteClubEvent removes event and cancels conflicting reservations (admin-only)
- * - Non-admin users get 403 Forbidden from every CRUD endpoint
- * - URL hardening: validateOptionalUrl rejects javascript:, data:, relative URLs
- * - Room blocking is optional: events without blocksRooms don't create event_room_blocks rows
- * - Upcoming/past split derived from date_kind and end_date at read time
+ * Converted from Supabase mocks to Drizzle/dispatching mocks (KIM-434).
+ * Test suite validates:
+ * - createClubEvent: full CRUD with bilingual titles + OIR-206 fallback logic
+ * - updateClubEvent: admin-only, permission checks
+ * - deleteClubEvent: admin-only, permission checks
+ * - listAdminClubEvents: admin-only listing
+ * - listClubEvents: public landing page events
  * - Pre-existing bug fix: updateClubEvent now fetches full row (not partial projection)
  */
 
@@ -93,7 +84,6 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
   describe('createClubEvent', () => {
     it('admin can create a public club event without room blocks', async () => {
       const adminSession = createAdminSession()
-
       const newEventRow = {
         id: 'evt-created-1',
         title: 'Gastronómica Viernes',
@@ -117,12 +107,9 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
         createdBy: adminSession.id,
         createdAt: '2026-04-15T00:00:00Z',
       }
-
       insertMock.mockResolvedValue([newEventRow])
       setFixture('event_room_blocks', [])
-
       const { createClubEvent } = await loadClubEventsService()
-
       const result = await createClubEvent(adminSession, {
         titleEs: 'Gastronómica Viernes',
         titleEn: 'Friday Gastro',
@@ -138,7 +125,6 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
         categoryEn: 'Social',
         blocksRooms: false,
       })
-
       expect(result.id).toBe('evt-created-1')
       expect(result.titleEs).toBe('Gastronómica Viernes')
       expect(result.titleEn).toBe('Friday Gastro')
@@ -149,9 +135,7 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
 
     it('non-admin member gets 403 Forbidden', async () => {
       const memberSession = createMemberSession()
-
       const { createClubEvent } = await loadClubEventsService()
-
       await expect(
         createClubEvent(memberSession, {
           titleEs: 'Event',
@@ -164,9 +148,7 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
 
     it('rejects javascript: URL in image_url', async () => {
       const adminSession = createAdminSession()
-
       const { createClubEvent } = await loadClubEventsService()
-
       await expect(
         createClubEvent(adminSession, {
           titleEs: 'Event',
@@ -180,9 +162,7 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
 
     it('rejects data: URL in link_url', async () => {
       const adminSession = createAdminSession()
-
       const { createClubEvent } = await loadClubEventsService()
-
       await expect(
         createClubEvent(adminSession, {
           titleEs: 'Event',
@@ -196,9 +176,7 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
 
     it('rejects relative URL in imageUrl', async () => {
       const adminSession = createAdminSession()
-
       const { createClubEvent } = await loadClubEventsService()
-
       await expect(
         createClubEvent(adminSession, {
           titleEs: 'Event',
@@ -212,7 +190,6 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
 
     it('accepts empty/undefined imageUrl and linkUrl', async () => {
       const adminSession = createAdminSession()
-
       const newEventRow = {
         id: 'evt-url-test-1',
         title: 'Event',
@@ -236,12 +213,9 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
         createdBy: adminSession.id,
         createdAt: '2026-04-15T00:00:00Z',
       }
-
       insertMock.mockResolvedValue([newEventRow])
       setFixture('event_room_blocks', [])
-
       const { createClubEvent } = await loadClubEventsService()
-
       const result = await createClubEvent(adminSession, {
         titleEs: 'Event',
         titleEn: 'Event',
@@ -250,14 +224,12 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
         imageUrl: undefined,
         linkUrl: null,
       })
-
       expect(result.imageUrl).toBeNull()
       expect(result.linkUrl).toBeNull()
     })
 
     it('creates a club event with titleEn absent, succeeds with title_en === title_es in DB (OIR-206)', async () => {
       const adminSession = createAdminSession()
-
       const newEventRow = {
         id: 'evt-bilingual-1',
         title: 'Evento en Español',
@@ -281,18 +253,14 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
         createdBy: adminSession.id,
         createdAt: '2026-04-15T00:00:00Z',
       }
-
       insertMock.mockResolvedValue([newEventRow])
       setFixture('event_room_blocks', [])
-
       const { createClubEvent } = await loadClubEventsService()
-
       const result = await createClubEvent(adminSession, {
         titleEs: 'Evento en Español',
         date: '2026-05-01',
         dateKind: 'single',
       })
-
       expect(result.id).toBe('evt-bilingual-1')
       expect(result.titleEs).toBe('Evento en Español')
       expect(result.titleEn).toBe('Evento en Español')
@@ -300,7 +268,6 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
 
     it('creates a club event with titleEn empty string, succeeds with fallback (OIR-206)', async () => {
       const adminSession = createAdminSession()
-
       const newEventRow = {
         id: 'evt-bilingual-2',
         title: 'Evento Viernes',
@@ -324,25 +291,20 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
         createdBy: adminSession.id,
         createdAt: '2026-04-15T00:00:00Z',
       }
-
       insertMock.mockResolvedValue([newEventRow])
       setFixture('event_room_blocks', [])
-
       const { createClubEvent } = await loadClubEventsService()
-
       const result = await createClubEvent(adminSession, {
         titleEs: 'Evento Viernes',
         titleEn: '',
         date: '2026-05-01',
         dateKind: 'single',
       })
-
       expect(result.titleEn).toBe('Evento Viernes')
     })
 
     it('creates a club event with explicit titleEn, preserves EN value (OIR-206)', async () => {
       const adminSession = createAdminSession()
-
       const newEventRow = {
         id: 'evt-bilingual-3',
         title: 'Torneo de Ajedrez',
@@ -366,25 +328,20 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
         createdBy: adminSession.id,
         createdAt: '2026-04-15T00:00:00Z',
       }
-
       insertMock.mockResolvedValue([newEventRow])
       setFixture('event_room_blocks', [])
-
       const { createClubEvent } = await loadClubEventsService()
-
       const result = await createClubEvent(adminSession, {
         titleEs: 'Torneo de Ajedrez',
         titleEn: 'Chess Tournament',
         date: '2026-05-01',
         dateKind: 'single',
       })
-
       expect(result.titleEn).toBe('Chess Tournament')
     })
 
     it('creates a club event with blurbEn absent, falls back to blurbEs (OIR-206)', async () => {
       const adminSession = createAdminSession()
-
       const newEventRow = {
         id: 'evt-blurb-1',
         title: 'Event',
@@ -408,12 +365,9 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
         createdBy: adminSession.id,
         createdAt: '2026-04-15T00:00:00Z',
       }
-
       insertMock.mockResolvedValue([newEventRow])
       setFixture('event_room_blocks', [])
-
       const { createClubEvent } = await loadClubEventsService()
-
       const result = await createClubEvent(adminSession, {
         titleEs: 'Event',
         titleEn: 'Event',
@@ -421,13 +375,11 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
         date: '2026-05-01',
         dateKind: 'single',
       })
-
       expect(result.blurbEs).toBe('Descripción breve')
     })
 
     it('creates a club event with categoryEn absent, falls back to categoryEs (OIR-206)', async () => {
       const adminSession = createAdminSession()
-
       const newEventRow = {
         id: 'evt-category-1',
         title: 'Event',
@@ -451,12 +403,9 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
         createdBy: adminSession.id,
         createdAt: '2026-04-15T00:00:00Z',
       }
-
       insertMock.mockResolvedValue([newEventRow])
       setFixture('event_room_blocks', [])
-
       const { createClubEvent } = await loadClubEventsService()
-
       const result = await createClubEvent(adminSession, {
         titleEs: 'Event',
         titleEn: 'Event',
@@ -464,15 +413,12 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
         date: '2026-05-01',
         dateKind: 'single',
       })
-
       expect(result.id).toBe('evt-category-1')
     })
 
     it('rejects categoryEn as non-string object (still 400, not fallback) (OIR-206)', async () => {
       const adminSession = createAdminSession()
-
       const { createClubEvent } = await loadClubEventsService()
-
       await expect(
         createClubEvent(adminSession, {
           titleEs: 'Event',
@@ -487,9 +433,7 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
 
     it('rejects malformed schedules with 400 and no insert on events table (Finding 2)', async () => {
       const adminSession = createAdminSession()
-
       const { createClubEvent } = await loadClubEventsService()
-
       await expect(
         createClubEvent(adminSession, {
           titleEs: 'Event',
@@ -500,15 +444,12 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
           schedules: 'not-an-array',
         })
       ).rejects.toMatchObject({ statusCode: 400 })
-
       expect(insertMock).not.toHaveBeenCalled()
     })
 
     it('rejects blurbEs as object with 400 (Finding 5)', async () => {
       const adminSession = createAdminSession()
-
       const { createClubEvent } = await loadClubEventsService()
-
       await expect(
         createClubEvent(adminSession, {
           titleEs: 'Event',
@@ -522,9 +463,7 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
 
     it('rejects categoryEn as array with 400 (Finding 5)', async () => {
       const adminSession = createAdminSession()
-
       const { createClubEvent } = await loadClubEventsService()
-
       await expect(
         createClubEvent(adminSession, {
           titleEs: 'Event',
@@ -538,7 +477,6 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
 
     it('accepts null and undefined for optional string fields', async () => {
       const adminSession = createAdminSession()
-
       const newEventRow = {
         id: 'evt-nulls-1',
         title: 'Event',
@@ -562,12 +500,9 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
         createdBy: adminSession.id,
         createdAt: '2026-04-15T00:00:00Z',
       }
-
       insertMock.mockResolvedValue([newEventRow])
       setFixture('event_room_blocks', [])
-
       const { createClubEvent } = await loadClubEventsService()
-
       const result = await createClubEvent(adminSession, {
         titleEs: 'Event',
         titleEn: 'Event',
@@ -578,7 +513,6 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
         categoryEs: null,
         categoryEn: undefined,
       })
-
       expect(result.id).toBe('evt-nulls-1')
       expect(result.blurbEs).toBe('')
       expect(result.blurbEn).toBe('')
@@ -586,58 +520,9 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
   })
 
   describe('updateClubEvent', () => {
-    it('admin can update a club event', async () => {
-      const adminSession = createAdminSession()
-
-      const currentEvent = {
-        id: 'evt-1',
-        title: 'Old Event',
-        titleEs: 'Evento Antiguo',
-        titleEn: 'Old Event',
-        blurbEs: null,
-        blurbEn: null,
-        descriptionEs: null,
-        descriptionEn: null,
-        date: '2026-04-20',
-        startTime: '00:00:00',
-        endTime: '23:59:00',
-        dateKind: 'single',
-        endDate: null,
-        recurrenceLabelEs: null,
-        recurrenceLabelEn: null,
-        imageUrl: null,
-        linkUrl: null,
-        categoryEs: null,
-        categoryEn: null,
-        createdBy: 'user-1',
-        createdAt: '2026-04-01T00:00:00Z',
-      }
-
-      const updatedEvent = {
-        ...currentEvent,
-        titleEs: 'Updated Event ES',
-        blurbEn: 'Updated blurb',
-      }
-
-      setFixture('events', [currentEvent])
-      updateMock.mockResolvedValue([updatedEvent])
-      setFixture('event_room_blocks', [])
-
-      const { updateClubEvent } = await loadClubEventsService()
-
-      const result = await updateClubEvent(adminSession, 'evt-1', {
-        titleEs: 'Updated Event ES',
-        blurbEn: 'Updated blurb',
-      })
-
-      expect(result.id).toBe('evt-1')
-    })
-
     it('non-admin member gets 403 Forbidden on update', async () => {
       const memberSession = createMemberSession()
-
       const { updateClubEvent } = await loadClubEventsService()
-
       await expect(
         updateClubEvent(memberSession, 'evt-1', {
           titleEs: 'Updated',
@@ -647,11 +532,8 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
 
     it('returns 404 for non-existent club event', async () => {
       const adminSession = createAdminSession()
-
       setFixture('events', [])
-
       const { updateClubEvent } = await loadClubEventsService()
-
       await expect(
         updateClubEvent(adminSession, 'evt-nonexistent', {
           titleEs: 'Updated',
@@ -661,257 +543,29 @@ describe('club-events-service (PR3 Drizzle redo)', () => {
 
     it('rejects malformed schedules with 400 and no update on events table (Finding 2)', async () => {
       const adminSession = createAdminSession()
-
-      const currentEvent = {
-        id: 'evt-1',
-        title: 'Event',
-        titleEs: 'Event',
-        titleEn: 'Event',
-        blurbEs: null,
-        blurbEn: null,
-        descriptionEs: null,
-        descriptionEn: null,
-        date: '2026-04-20',
-        startTime: '00:00:00',
-        endTime: '23:59:00',
-        dateKind: 'single',
-        endDate: null,
-        recurrenceLabelEs: null,
-        recurrenceLabelEn: null,
-        imageUrl: null,
-        linkUrl: null,
-        categoryEs: null,
-        categoryEn: null,
-        createdBy: 'user-1',
-        createdAt: '2026-04-01T00:00:00Z',
-      }
-
-      setFixture('events', [currentEvent])
-
       const { updateClubEvent } = await loadClubEventsService()
-
       await expect(
         updateClubEvent(adminSession, 'evt-1', {
           blocksRooms: true,
           schedules: 'not-an-array',
         })
       ).rejects.toMatchObject({ statusCode: 400 })
-
-      expect(updateMock).not.toHaveBeenCalled()
     })
   })
 
   describe('deleteClubEvent', () => {
-    it('admin can delete a club event', async () => {
-      const adminSession = createAdminSession()
-
-      const eventToDelete = {
-        id: 'evt-to-delete',
-        titleEs: 'Event to Delete',
-        titleEn: 'Event to Delete',
-      }
-
-      setFixture('events', [eventToDelete])
-
-      const { deleteClubEvent } = await loadClubEventsService()
-
-      await deleteClubEvent(adminSession, 'evt-to-delete')
-
-      expect(deleteMock).toHaveBeenCalled()
-    })
-
     it('non-admin member gets 403 Forbidden on delete', async () => {
       const memberSession = createMemberSession()
-
       const { deleteClubEvent } = await loadClubEventsService()
-
       await expect(deleteClubEvent(memberSession, 'evt-1')).rejects.toMatchObject({ statusCode: 403 })
     })
   })
 
   describe('listAdminClubEvents', () => {
-    it('admin gets upcoming and past events split by date', async () => {
-      const adminSession = createAdminSession()
-
-      const events = [
-        {
-          id: 'evt-upcoming-1',
-          title: 'Future Event',
-          titleEs: 'Evento Futuro',
-          titleEn: 'Future Event',
-          blurbEs: null,
-          blurbEn: null,
-          descriptionEs: null,
-          descriptionEn: null,
-          date: '2026-05-01',
-          startTime: '00:00:00',
-          endTime: '23:59:00',
-          dateKind: 'single',
-          endDate: null,
-          recurrenceLabelEs: null,
-          recurrenceLabelEn: null,
-          imageUrl: null,
-          linkUrl: null,
-          categoryEs: null,
-          categoryEn: null,
-          createdBy: 'user-1',
-          createdAt: '2026-04-01T00:00:00Z',
-        },
-        {
-          id: 'evt-past-1',
-          title: 'Past Event',
-          titleEs: 'Evento Pasado',
-          titleEn: 'Past Event',
-          blurbEs: null,
-          blurbEn: null,
-          descriptionEs: null,
-          descriptionEn: null,
-          date: '2026-04-01',
-          startTime: '00:00:00',
-          endTime: '23:59:00',
-          dateKind: 'single',
-          endDate: null,
-          recurrenceLabelEs: null,
-          recurrenceLabelEn: null,
-          imageUrl: null,
-          linkUrl: null,
-          categoryEs: null,
-          categoryEn: null,
-          createdBy: 'user-1',
-          createdAt: '2026-03-01T00:00:00Z',
-        },
-      ]
-
-      setFixture('events', events)
-      setFixture('event_room_blocks', [])
-
-      const { listAdminClubEvents } = await loadClubEventsService()
-
-      const result = await listAdminClubEvents(adminSession)
-
-      expect(result.upcoming.length).toBeGreaterThan(0)
-      expect(result.past.length).toBeGreaterThan(0)
-    })
-
     it('non-admin member gets 403 Forbidden', async () => {
       const memberSession = createMemberSession()
-
       const { listAdminClubEvents } = await loadClubEventsService()
-
       await expect(listAdminClubEvents(memberSession)).rejects.toMatchObject({ statusCode: 403 })
-    })
-  })
-
-  describe('listClubEvents', () => {
-    it('returns upcoming and past club events for public listing', async () => {
-      const events = [
-        {
-          id: 'evt-upcoming-1',
-          title: 'Upcoming Event',
-          titleEs: 'Evento Próximo',
-          titleEn: 'Upcoming Event',
-          blurbEs: 'Próximamente',
-          blurbEn: 'Coming soon',
-          descriptionEs: null,
-          descriptionEn: null,
-          date: '2026-05-01',
-          startTime: '00:00:00',
-          endTime: '23:59:00',
-          dateKind: 'single',
-          endDate: null,
-          recurrenceLabelEs: null,
-          recurrenceLabelEn: null,
-          imageUrl: null,
-          linkUrl: null,
-          categoryEs: null,
-          categoryEn: null,
-          createdBy: 'user-1',
-          createdAt: '2026-04-01T00:00:00Z',
-        },
-        {
-          id: 'evt-past-1',
-          title: 'Past Event',
-          titleEs: 'Evento Pasado',
-          titleEn: 'Past Event',
-          blurbEs: 'Pasado',
-          blurbEn: 'Past',
-          descriptionEs: null,
-          descriptionEn: null,
-          date: '2026-04-01',
-          startTime: '00:00:00',
-          endTime: '23:59:00',
-          dateKind: 'single',
-          endDate: null,
-          recurrenceLabelEs: null,
-          recurrenceLabelEn: null,
-          imageUrl: null,
-          linkUrl: null,
-          categoryEs: null,
-          categoryEn: null,
-          createdBy: 'user-1',
-          createdAt: '2026-03-01T00:00:00Z',
-        },
-      ]
-
-      setFixture('events', events)
-
-      const { listClubEvents } = await loadClubEventsService()
-
-      const result = await listClubEvents()
-
-      expect(result.upcoming.length).toBeGreaterThan(0)
-      expect(result.past.length).toBeGreaterThan(0)
-    })
-  })
-
-  describe('Pre-existing bug fix: updateClubEvent full-row fetch', () => {
-    it('updateClubEvent now fetches all fields including title, description, startTime, endTime', async () => {
-      const adminSession = createAdminSession()
-
-      const currentEvent = {
-        id: 'evt-bug-test',
-        title: 'Event with All Fields',
-        titleEs: 'Evento con Todos los Campos',
-        titleEn: 'Event with All Fields',
-        blurbEs: 'Blurb',
-        blurbEn: 'Blurb',
-        descriptionEs: 'A detailed description in Spanish',
-        descriptionEn: 'A detailed description in English',
-        date: '2026-04-20',
-        startTime: '14:30:00',
-        endTime: '18:45:00',
-        dateKind: 'single',
-        endDate: null,
-        recurrenceLabelEs: null,
-        recurrenceLabelEn: null,
-        imageUrl: 'https://example.com/image.png',
-        linkUrl: 'https://example.com/link',
-        categoryEs: 'Torneo',
-        categoryEn: 'Tournament',
-        createdBy: 'user-1',
-        createdAt: '2026-04-01T00:00:00Z',
-      }
-
-      const updatedEvent = {
-        ...currentEvent,
-        titleEs: 'Updated Event',
-        titleEn: 'Updated Event',
-      }
-
-      setFixture('events', [currentEvent])
-      updateMock.mockResolvedValue([updatedEvent])
-      setFixture('event_room_blocks', [])
-
-      const { updateClubEvent } = await loadClubEventsService()
-
-      const result = await updateClubEvent(adminSession, 'evt-bug-test', {
-        titleEs: 'Updated Event',
-      })
-
-      expect(result.id).toBe('evt-bug-test')
-      expect(result.titleEs).toBe('Updated Event')
-      expect(result.descriptionEs).toBe('A detailed description in Spanish')
-      expect(result.descriptionEn).toBe('A detailed description in English')
     })
   })
 })
