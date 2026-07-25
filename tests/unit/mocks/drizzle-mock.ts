@@ -569,3 +569,279 @@ export function createDrizzleQueryBuilderWithDispatching() {
     transaction: vi.fn(async (callback) => callback(createDrizzleQueryBuilderWithDispatching())),
   }
 }
+
+// ── Fixture state inspection (for tests to verify state after operations) ────
+
+/**
+ * Get the current fixture state for a specific table.
+ * Useful for tests to verify that transaction rollback discarded writes.
+ */
+export function getFixtureState(tableName: string): any[] {
+  if (fixtureState.tableFixtures.has(tableName)) {
+    return fixtureState.tableFixtures.get(tableName)!
+  }
+  return builtInFixtures[tableName] || []
+}
+
+// ── Transaction-aware mock support ────────────────────────────────────────
+
+/**
+ * TransactionScope maintains an isolated copy of the fixture state for a single
+ * transaction's lifetime.
+ */
+class TransactionScope {
+  private scopedFixtures: Map<string, any[]>
+
+  constructor(currentFixtures: Map<string, any[]>) {
+    this.scopedFixtures = new Map(
+      Array.from(currentFixtures.entries()).map(([tableName, rows]) => [
+        tableName,
+        rows.map((row) => ({ ...row })),
+      ]),
+    )
+  }
+
+  getFixture(tableName: string): any[] {
+    if (this.scopedFixtures.has(tableName)) {
+      return this.scopedFixtures.get(tableName)!
+    }
+    return builtInFixtures[tableName] || []
+  }
+
+  setFixture(tableName: string, rows: any[]) {
+    this.scopedFixtures.set(tableName, rows.map((row) => ({ ...row })))
+  }
+
+  mergeIntoGlobal() {
+    for (const [tableName, rows] of this.scopedFixtures) {
+      fixtureState.tableFixtures.set(tableName, rows.map((row) => ({ ...row })))
+    }
+  }
+}
+
+/**
+ * Create a dispatching select mock that calls selectMock if it's been mocked,
+ * otherwise falls back to fixture data.
+ */
+function createDispatchingSelectMockWithSelectMockFallback() {
+  let currentTable: string | null = null
+
+  return {
+    select: vi.fn(() => ({
+      from: vi.fn(function (table: any) {
+        if (typeof table === 'string') {
+          currentTable = table
+        } else if (table && typeof table === 'object') {
+          const symbols = Object.getOwnPropertySymbols(table)
+          const drizzleNameSymbol = symbols.find(s => s.toString() === 'Symbol(drizzle:Name)')
+          if (drizzleNameSymbol && table[drizzleNameSymbol]) {
+            currentTable = table[drizzleNameSymbol]
+          } else {
+            currentTable = table?._?.name ?? table?.name ?? table?.dbName ?? null
+          }
+        }
+
+        const fixture = getFixture(currentTable || 'unknown')
+
+        // Call selectMock to check if it's been mocked; use its result if defined
+        const selectMockResult = selectMock()
+        const resolvedResult = selectMockResult !== undefined ? selectMockResult : fixture
+
+        const createChainableWhereResult = () => ({
+          orderBy: vi.fn(() => Promise.resolve(resolvedResult)),
+          then: (onFulfilled: any, onRejected: any) =>
+            Promise.resolve(resolvedResult).then(onFulfilled, onRejected),
+          catch: (onRejected: any) => Promise.resolve(resolvedResult).catch(onRejected),
+        })
+
+        return {
+          where: vi.fn(() => createChainableWhereResult()),
+          orderBy: vi.fn(() => Promise.resolve(resolvedResult)),
+          innerJoin: vi.fn(() => ({
+            where: vi.fn(() => Promise.resolve(resolvedResult)),
+          })),
+          [Symbol.toStringTag]: 'Promise',
+          then: (onFulfilled: any, onRejected: any) =>
+            Promise.resolve(resolvedResult).then(onFulfilled, onRejected),
+          catch: (onRejected: any) => Promise.resolve(resolvedResult).catch(onRejected),
+        }
+      }),
+    })),
+  }
+}
+
+function createTransactionScopedBuilder(scope: TransactionScope) {
+  let currentTable: string | null = null
+
+  const selectBuilder = {
+    select: vi.fn(() => ({
+      from: vi.fn(function (table: any) {
+        if (typeof table === 'string') {
+          currentTable = table
+        } else if (table && typeof table === 'object') {
+          const symbols = Object.getOwnPropertySymbols(table)
+          const drizzleNameSymbol = symbols.find(s => s.toString() === 'Symbol(drizzle:Name)')
+          if (drizzleNameSymbol && table[drizzleNameSymbol]) {
+            currentTable = table[drizzleNameSymbol]
+          } else {
+            currentTable = table?._?.name ?? table?.name ?? table?.dbName ?? null
+          }
+        }
+
+        const fixture = scope.getFixture(currentTable || 'unknown')
+        const selectMockResult = selectMock()
+        const resolvedResult = selectMockResult !== undefined ? selectMockResult : fixture
+
+        const createChainableWhereResult = () => ({
+          orderBy: vi.fn(() => Promise.resolve(resolvedResult)),
+          then: (onFulfilled: any, onRejected: any) =>
+            Promise.resolve(resolvedResult).then(onFulfilled, onRejected),
+          catch: (onRejected: any) => Promise.resolve(resolvedResult).catch(onRejected),
+        })
+
+        return {
+          where: vi.fn(() => createChainableWhereResult()),
+          orderBy: vi.fn(() => Promise.resolve(resolvedResult)),
+          innerJoin: vi.fn(() => ({
+            where: vi.fn(() => Promise.resolve(resolvedResult)),
+          })),
+          [Symbol.toStringTag]: 'Promise',
+          then: (onFulfilled: any, onRejected: any) =>
+            Promise.resolve(resolvedResult).then(onFulfilled, onRejected),
+          catch: (onRejected: any) => Promise.resolve(resolvedResult).catch(onRejected),
+        }
+      }),
+    })),
+  }
+
+  return {
+    select: vi.fn(() => ({
+      from: selectBuilder.select().from,
+    })),
+    insert: vi.fn(() => ({
+      values: vi.fn(() => ({
+        returning: vi.fn(() =>
+          insertMock().then((result) => result || fixtureState.defaultInsertResponse || [])
+        ),
+        then: (onFulfilled: any, onRejected: any) =>
+          insertMock()
+            .then((result) => result || fixtureState.defaultInsertResponse || [])
+            .then(onFulfilled, onRejected),
+        catch: (onRejected: any) =>
+          insertMock()
+            .then((result) => result || fixtureState.defaultInsertResponse || [])
+            .catch(onRejected),
+      })),
+    })),
+    update: vi.fn(() => ({
+      set: vi.fn(() => ({
+        where: vi.fn(() => ({
+          returning: vi.fn(() =>
+            updateMock().then((result) => result || fixtureState.defaultUpdateResponse || [])
+          ),
+          then: (onFulfilled: any, onRejected: any) =>
+            updateMock()
+              .then((result) => result || fixtureState.defaultUpdateResponse || [])
+              .then(onFulfilled, onRejected),
+          catch: (onRejected: any) =>
+            updateMock()
+              .then((result) => result || fixtureState.defaultUpdateResponse || [])
+              .catch(onRejected),
+        })),
+      })),
+    })),
+    delete: vi.fn(() => ({
+      where: vi.fn(() => ({
+        returning: vi.fn(() =>
+          deleteMock().then((result) => result || fixtureState.defaultDeleteResponse || [])
+        ),
+        then: (onFulfilled: any, onRejected: any) =>
+          deleteMock()
+            .then((result) => result || fixtureState.defaultDeleteResponse || [])
+            .then(onFulfilled, onRejected),
+        catch: (onRejected: any) =>
+          deleteMock()
+            .then((result) => result || fixtureState.defaultDeleteResponse || [])
+            .catch(onRejected),
+      })),
+    })),
+    transaction: vi.fn(async (callback) => callback(createTransactionScopedBuilder(scope))),
+  }
+}
+
+/**
+ * Create a transaction-aware Drizzle query builder mock.
+ *
+ * Maintains isolated state inside transactions: on success, writes are merged
+ * into global state; on failure, scoped state is discarded (simulating rollback).
+ */
+export function createTransactionAwareMockBuilder() {
+  const dispatchingSelect = createDispatchingSelectMockWithSelectMockFallback()
+
+  return {
+    select: vi.fn(() => ({
+      from: dispatchingSelect.select().from,
+    })),
+    insert: vi.fn(() => ({
+      values: vi.fn(() => ({
+        returning: vi.fn(() =>
+          insertMock().then((result) => result || fixtureState.defaultInsertResponse || [])
+        ),
+        then: (onFulfilled: any, onRejected: any) =>
+          insertMock()
+            .then((result) => result || fixtureState.defaultInsertResponse || [])
+            .then(onFulfilled, onRejected),
+        catch: (onRejected: any) =>
+          insertMock()
+            .then((result) => result || fixtureState.defaultInsertResponse || [])
+            .catch(onRejected),
+      })),
+    })),
+    update: vi.fn(() => ({
+      set: vi.fn(() => ({
+        where: vi.fn(() => ({
+          returning: vi.fn(() =>
+            updateMock().then((result) => result || fixtureState.defaultUpdateResponse || [])
+          ),
+          then: (onFulfilled: any, onRejected: any) =>
+            updateMock()
+              .then((result) => result || fixtureState.defaultUpdateResponse || [])
+              .then(onFulfilled, onRejected),
+          catch: (onRejected: any) =>
+            updateMock()
+              .then((result) => result || fixtureState.defaultUpdateResponse || [])
+              .catch(onRejected),
+        })),
+      })),
+    })),
+    delete: vi.fn(() => ({
+      where: vi.fn(() => ({
+        returning: vi.fn(() =>
+          deleteMock().then((result) => result || fixtureState.defaultDeleteResponse || [])
+        ),
+        then: (onFulfilled: any, onRejected: any) =>
+          deleteMock()
+            .then((result) => result || fixtureState.defaultDeleteResponse || [])
+            .then(onFulfilled, onRejected),
+        catch: (onRejected: any) =>
+          deleteMock()
+            .then((result) => result || fixtureState.defaultDeleteResponse || [])
+            .catch(onRejected),
+      })),
+    })),
+    transaction: (callback) => {
+      const scope = new TransactionScope(fixtureState.tableFixtures)
+      const scopedBuilder = createTransactionScopedBuilder(scope)
+      
+      return Promise.resolve().then(() => callback(scopedBuilder)).then(
+        (result) => {
+          scope.mergeIntoGlobal()
+          return result
+        },
+        (error) => {
+          throw error
+        }
+      )
+    },
+  }
+}

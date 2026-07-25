@@ -1,11 +1,13 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import {
+  createTransactionAwareMockBuilder,
   createDrizzleQueryBuilderWithDispatching,
   resetFixtures,
   setFixture,
   createMockServiceError,
   MockServiceError,
+  selectMock,
   insertMock,
   updateMock,
   deleteMock,
@@ -16,8 +18,8 @@ import {
 vi.mock('server-only', () => ({}))
 
 vi.mock('@/lib/db', () => ({
-  getDrizzleDb: vi.fn(() => createDrizzleQueryBuilderWithDispatching()),
-  getDrizzleAdminDb: vi.fn(() => createDrizzleQueryBuilderWithDispatching()),
+  getDrizzleDb: vi.fn(() => createTransactionAwareMockBuilder()),
+  getDrizzleAdminDb: vi.fn(() => createTransactionAwareMockBuilder()),
   getAdminDb: vi.fn(() => ({
     from: vi.fn(() => ({
       update: vi.fn(() => ({
@@ -182,6 +184,11 @@ describe('events-service — updateEvent with cancellation', () => {
   beforeEach(() => {
     resetFixtures()
     vi.clearAllMocks()
+    // Don't mock selectMock - let it use fixtures instead
+    // selectMock.mockResolvedValue([])
+    insertMock.mockResolvedValue([])
+    updateMock.mockResolvedValue([])
+    deleteMock.mockResolvedValue([])
   })
 
   it('calls update_event_atomic RPC with updated time values', async () => {
