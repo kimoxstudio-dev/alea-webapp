@@ -1662,3 +1662,8 @@ No blocking issues. No modifications needed. Code is ready for security-reviewer
 - Validation: pnpm typecheck ✅, pnpm lint ✅ (no warnings), pnpm test — full suite green (see validation summary below), pnpm build ✅.
 - Pushed --force-with-lease to origin/docs/migration-status-update.
 - ✅ Complete — PR #175 rebased cleanly onto origin/develop, all conflicts resolved, 9 additional stale references from newer develop PRs fixed, full validation green.
+
+#### [KIM-437] software-engineer — Add agent working agreements to CLAUDE.md
+- [12:06] Started
+- [12:07] Strengthened test-file-ownership rule; added product-manager single-instance reinforcement; added new "Agent Working Agreements" section (Reporting Standards, Test Integrity, Shared Working Directory, Stopping and Escalating, Tooling)
+- [12:07] ✅ Complete — 34 lines added / 1 removed in CLAUDE.md, all 11 rules covered
