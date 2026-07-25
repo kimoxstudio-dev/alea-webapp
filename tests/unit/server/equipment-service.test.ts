@@ -115,7 +115,7 @@ describe('listEquipment', () => {
   })
 
   it('throws 500 ServiceError when query throws', async () => {
-    selectMock.mockReturnValue(Promise.reject(new Error('DB error')))
+    selectMock.mockImplementation(() => Promise.reject(new Error('DB error')))
     const { listEquipment } = await loadModule()
 
     await expect(listEquipment()).rejects.toMatchObject({ name: 'ServiceError', statusCode: 500 })
@@ -178,7 +178,7 @@ describe('createEquipment', () => {
   })
 
   it('throws 500 when insert throws error', async () => {
-    insertMock.mockReturnValue(Promise.reject(new Error('insert failed')))
+    insertMock.mockImplementation(() => Promise.reject(new Error('insert failed')))
     const { createEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -244,7 +244,7 @@ describe('updateEquipment', () => {
   })
 
   it('throws 500 when DB throws error', async () => {
-    updateMock.mockReturnValue(Promise.reject(new Error('DB error')))
+    updateMock.mockImplementation(() => Promise.reject(new Error('DB error')))
     const { updateEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -286,7 +286,7 @@ describe('deleteEquipment', () => {
   })
 
   it('throws 500 when DB throws error', async () => {
-    deleteMock.mockReturnValue(Promise.reject(new Error('constraint violation')))
+    deleteMock.mockImplementation(() => Promise.reject(new Error('constraint violation')))
     const { deleteEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -321,7 +321,7 @@ describe('getRoomDefaultEquipment', () => {
   })
 
   it('throws 500 when query throws error', async () => {
-    selectMock.mockReturnValue(Promise.reject(new Error('RLS denied')))
+    selectMock.mockImplementation(() => Promise.reject(new Error('RLS denied')))
     const { getRoomDefaultEquipment } = await loadModule()
 
     await expect(getRoomDefaultEquipment('room-1')).rejects.toMatchObject({ statusCode: 500 })
@@ -376,7 +376,7 @@ describe('setRoomDefaultEquipment', () => {
   })
 
   it('throws 500 when the conflict-check query fails', async () => {
-    selectMock.mockReturnValue(Promise.reject(new Error('DB failure')))
+    selectMock.mockImplementation(() => Promise.reject(new Error('DB failure')))
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -385,7 +385,7 @@ describe('setRoomDefaultEquipment', () => {
 
   it('throws 500 when the delete step fails', async () => {
     selectMock.mockReturnValue(Promise.resolve([]))
-    deleteMock.mockReturnValue(Promise.reject(new Error('delete failed')))
+    deleteMock.mockImplementation(() => Promise.reject(new Error('delete failed')))
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -394,7 +394,7 @@ describe('setRoomDefaultEquipment', () => {
 
   it('throws 500 when the insert step fails', async () => {
     selectMock.mockReturnValue(Promise.resolve([]))
-    insertMock.mockReturnValue(Promise.reject(new Error('insert failed')))
+    insertMock.mockImplementation(() => Promise.reject(new Error('insert failed')))
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
