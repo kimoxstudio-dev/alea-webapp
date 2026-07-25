@@ -20,7 +20,7 @@
     "test:e2e:cancellation": "node tests/e2e/runners/qa-reservation-cancellation.mjs",
     "test:e2e:no-show": "node tests/e2e/runners/qa-no-show-expiry.mjs",
     "test:e2e:equipment": "node tests/e2e/runners/qa-reservation-equipment.mjs",
-    "lint": "next lint --no-cache",
+    "lint": "eslint .",
     "typecheck": "next typegen && node -e \"require('node:fs').rmSync('.next/cache/.tsbuildinfo', { force: true })\" && tsc --noEmit",
     "security:deps": "pnpm audit --prod --audit-level high",
     "cutover:rehearsal": "bash ./scripts/cutover-rehearsal.sh",
@@ -78,6 +78,7 @@
     }
   },
   "devDependencies": {
+    "@eslint/eslintrc": "^3.3.5",
     "@tanstack/react-query-devtools": "^5.96.2",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
