@@ -1773,23 +1773,23 @@ function createDispatchingSelectMock() {
         if (typeof table === 'string') {
           currentTable = table
         } else if (table && typeof table === 'object') {
-          // Drizzle table object: try multiple patterns
-          // First try ._.name (Drizzle metadata), then .name, then .dbName
-          let extracted = table?._?.name ?? table?.name ?? table?.dbName
+          // Drizzle table objects use Symbol keys for metadata
+          // The table name is stored in Symbol(drizzle:Name)
+          let extracted = undefined
           
-          // If extraction failed, the table might be using symbol-based keys or other patterns
-          // In this case, we'll log what we got and let getFixture handle unknown table gracefully
-          currentTable = extracted ?? null
-          // DEBUG: Log table name extraction
-          if (typeof table === 'object' && table !== null) {
-            console.log('[DRIZZLE-MOCK] Table extraction:', { 
-              extracted,
-              hasUnderscore: !!table._,
-              hasName: !!table.name,
-              tableKeys: Object.keys(table).slice(0, 5),
-              currentTable
-            })
+          // Try to find the Drizzle Name symbol
+          const symbols = Object.getOwnPropertySymbols(table)
+          const drizzleNameSymbol = symbols.find(s => s.toString() === 'Symbol(drizzle:Name)')
+          if (drizzleNameSymbol && table[drizzleNameSymbol]) {
+            extracted = table[drizzleNameSymbol]
           }
+          
+          // Fallback to other patterns if symbol-based extraction didn't work
+          if (!extracted) {
+            extracted = table?._?.name ?? table?.name ?? table?.dbName
+          }
+          
+          currentTable = extracted ?? null
         }
 
         const fixture = getFixture(currentTable || 'unknown')
