@@ -38,6 +38,11 @@ vi.mock('@/lib/server/shared/service-error', () => ({
   }),
 }))
 
+vi.mock('@vercel/blob', () => ({
+  put: vi.fn().mockResolvedValue({}),
+  del: vi.fn().mockResolvedValue({}),
+}))
+
 type SessionUser = {
   id: string
   role: 'admin' | 'member'
