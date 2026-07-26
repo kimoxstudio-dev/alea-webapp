@@ -854,3 +854,150 @@ describe('error injection and store isolation', () => {
     expect(getRows('profiles')).toEqual([])
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Error injection on raw db.execute()
+//
+// `QueryOp` advertises `'execute'` and `failNextQuery({ op: 'execute' })` is a
+// documented spec, so the execute path must actually consume the injected
+// failure. It once did not: the spec was accepted, queued, and then never
+// matched, so `db.execute(sql\`...\`)` resolved through `executeMock` while the
+// test believed it was exercising a raw-SQL error path — a silently passing
+// error-path test. `reservations-service.ts` replaced the
+// `mark_no_show_reservations` RPC with a raw `db.execute(sql\`...\`)`, which is
+// exactly the call these tests protect.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('error injection on raw db.execute()', () => {
+  it('fails exactly one execute with failNextQuery({ op: execute }) and lets the next one through', async () => {
+    executeMock.mockReturnValue({ rows: [], rowCount: 3 })
+    failNextQuery({ op: 'execute' })
+
+    await expect(db().execute(sql`update reservations set status = 'no_show'`)).rejects.toThrow(
+      '[drizzle-mock] injected query failure',
+    )
+    // The failure is consumed, not sticky — the call after it behaves normally.
+    await expect(db().execute(sql`update reservations set status = 'no_show'`)).resolves.toEqual({
+      rows: [],
+      rowCount: 3,
+    })
+  })
+
+  it('rejects with the custom error supplied to failNextQuery', async () => {
+    failNextQuery({ op: 'execute', error: new Error('no_show sweep exploded') })
+
+    await expect(db().execute(sql`select 1`)).rejects.toThrow('no_show sweep exploded')
+  })
+
+  it('fails an execute more than once via times', async () => {
+    failNextQuery({ op: 'execute', times: 2 })
+
+    await expect(db().execute(sql`select 1`)).rejects.toThrow(/injected query failure/)
+    await expect(db().execute(sql`select 1`)).rejects.toThrow(/injected query failure/)
+    await expect(db().execute(sql`select 1`)).resolves.toEqual({ rows: [], rowCount: 0 })
+  })
+
+  it('lets an unfiltered failNextQuery() fail the next execute', async () => {
+    failNextQuery()
+
+    await expect(db().execute(sql`select 1`)).rejects.toThrow('[drizzle-mock] injected query failure')
+    await expect(db().execute(sql`select 1`)).resolves.toEqual({ rows: [], rowCount: 0 })
+  })
+
+  it('does not leak between execute and the table-backed operations in either direction', async () => {
+    seed({ profiles: [{ id: 'p1', memberNumber: 'M1' }] })
+
+    // An execute-scoped failure must not be swallowed by any other operation…
+    failNextQuery({ op: 'execute' })
+    await expect(db().select().from(profiles)).resolves.toHaveLength(1)
+    await expect(db().insert(profiles).values({ id: 'p2', memberNumber: 'M2' })).resolves.toEqual([])
+    await expect(db().update(profiles).set({ fullName: 'X' }).where(eq(profiles.id, 'p1'))).resolves.toEqual([])
+    // …it is still queued, and fires on the execute.
+    await expect(db().execute(sql`select 1`)).rejects.toThrow(/injected query failure/)
+
+    // And the reverse: a select-scoped failure must not be consumed by execute.
+    failNextQuery({ op: 'select', table: profiles })
+    await expect(db().execute(sql`select 1`)).resolves.toEqual({ rows: [], rowCount: 0 })
+    await expect(db().select().from(profiles)).rejects.toThrow(/injected query failure/)
+  })
+
+  it('does not fire a table-scoped failure on execute, since raw SQL names no parsable table', async () => {
+    seed({ profiles: [{ id: 'p1', memberNumber: 'M1' }] })
+    failNextQuery({ table: profiles })
+
+    // `execute` is matched on the empty table key, so a table-scoped spec with
+    // no `op` deliberately passes it by and waits for the real profiles query.
+    await expect(db().execute(sql`select 1`)).resolves.toEqual({ rows: [], rowCount: 0 })
+    await expect(db().select().from(profiles)).rejects.toThrow(/injected query failure/)
+  })
+
+  it('rejects the never-matchable { op: execute, table } combination at call time, queueing nothing', async () => {
+    expect(() => failNextQuery({ op: 'execute', table: profiles })).toThrow(/cannot be scoped by table/)
+
+    // Nothing was queued by the rejected spec, so a later execute still resolves.
+    await expect(db().execute(sql`select 1`)).resolves.toEqual({ rows: [], rowCount: 0 })
+  })
+
+  it('leaves a failed execute out of the query log and records a successful one', async () => {
+    failNextQuery({ op: 'execute' })
+    await expect(db().execute(sql`select 1`)).rejects.toThrow(/injected query failure/)
+
+    // Consistent with select/insert/update/delete: the failure is thrown before
+    // the log push, so a query that never ran is not reported as having run.
+    expect(getQueryLog()).toEqual([])
+
+    await db().execute(sql`select 1`)
+    expect(getQueryLog()).toEqual([{ op: 'execute', table: '', rowCount: 0 }])
+  })
+
+  it('never reaches executeMock when the failure is consumed', async () => {
+    executeMock.mockReturnValue({ rows: [{ swept: 1 }], rowCount: 1 })
+    failNextQuery({ op: 'execute' })
+
+    await expect(db().execute(sql`select 1`)).rejects.toThrow(/injected query failure/)
+    expect(executeMock).not.toHaveBeenCalled()
+
+    await expect(db().execute(sql`select 1`)).resolves.toEqual({ rows: [{ swept: 1 }], rowCount: 1 })
+    expect(executeMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('surfaces the failure as a rejected promise rather than a synchronous throw', async () => {
+    failNextQuery({ op: 'execute' })
+
+    // Every other operation rejects rather than throwing at call time; execute
+    // must match, or `await expect(...).rejects` reads as a false negative.
+    let pending: Promise<unknown> | undefined
+    expect(() => {
+      pending = db().execute(sql`select 1`)
+    }).not.toThrow()
+    await expect(pending).rejects.toThrow('[drizzle-mock] injected query failure')
+  })
+
+  it('returns the executeMock value when nothing is queued, and the documented default when it is unset', async () => {
+    executeMock.mockReturnValue({ rows: [{ total: 7 }], rowCount: 1 })
+    await expect(db().execute(sql`select count(*) from profiles`)).resolves.toEqual({
+      rows: [{ total: 7 }],
+      rowCount: 1,
+    })
+
+    executeMock.mockReset()
+    await expect(db().execute(sql`select 1`)).resolves.toEqual({ rows: [], rowCount: 0 })
+    expect(executeMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('rolls a transaction back when the failing call is an execute inside it', async () => {
+    seed({ profiles: [{ id: 'p1', memberNumber: 'M1', fullName: 'Keep' }] })
+    failNextQuery({ op: 'execute' })
+
+    await expect(
+      db().transaction(async (tx) => {
+        await tx.update(profiles).set({ fullName: 'Dirty' }).where(eq(profiles.id, 'p1'))
+        await tx.execute(sql`update reservations set status = 'no_show'`)
+        return 'unreachable'
+      }),
+    ).rejects.toThrow('[drizzle-mock] injected query failure')
+
+    // The write made before the failing execute was rolled back with it.
+    expect(getRows('profiles')[0].fullName).toBe('Keep')
+  })
+})
