@@ -1697,3 +1697,13 @@ No blocking issues. No modifications needed. Code is ready for security-reviewer
 - Added BLOB_READ_WRITE_TOKEN and BLOB_PUBLIC_BASE_URL to .env.example
 - pnpm typecheck: pass. pnpm lint: pass
 - ✅ Complete — index.ts wired to Vercel Blob adapter; uploads-service.ts untouched (no edits needed); pre-existing tests (tests/unit/lib/storage/qr.test.ts, tests/unit/server/tables-service.test.ts, tests/unit/server/uploads-service.test.ts) now fail as expected because they still mock @/lib/supabase/server instead of @vercel/blob — flagged for qa-engineer
+#### [PR180-FIX] software-engineer — harden static SQL verification
+- [15:30] Started: hardening tests/unit/server/drizzle-migration-apply.test.ts (PR #180, KIM-435)
+- [15:31] Added dynamic enum discovery from migration SQL (regex over CREATE TYPE ... AS ENUM), replacing hardcoded 4-enum list
+- [15:31] Added dynamic EXCLUDE constraint discovery, replacing hardcoded 2-name list; discovered a real gap (reservations_no_pending_active_overlap_bottom existed but was never checked by the old test)
+- [15:32] Added explicit table-extraction-count > 0 assertion cross-checked against independently-derived CREATE TABLE count (15 == 15)
+- [15:32] Changed password_hash assertion from substring match to actual declared-type check (must equal "text")
+- [15:32] Validated: pnpm typecheck clean, pnpm lint clean (no ESLint warnings/errors), vitest 20/20 passed
+- [15:33] Deliberate corruption test: changed password_hash to integer -> test correctly FAILED ("expected 'integer' to be 'text'"); reverted, test passes again
+- [15:33] Deliberate corruption test: malformed EXCLUDE constraint name (missing quotes) -> test correctly FAILED (extracted count 2 != raw clause count 3); reverted, test passes again
+- [15:34] ✅ Complete — committed and pushed to test/KIM-435-drizzle-migration-static-sql-verification
