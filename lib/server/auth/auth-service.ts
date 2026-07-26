@@ -42,6 +42,18 @@ const PASSWORD_HASH_COST = 10
  * activation/recovery would fail against a null or stale hash (KIM-433
  * Codex-review fix).
  *
+ * Resolves `true` only when the hash is durably visible to
+ * `verifyCredentials()` afterward — not merely when no exception was
+ * thrown. Drizzle's `.update()` over node-postgres does NOT throw when the
+ * `WHERE` clause matches zero rows (e.g. no Neon row exists yet for this
+ * `profileId` — the common case pre-F2-cutover, not an edge case); it just
+ * resolves with nothing updated. `.returning({ id: profiles.id })` lets us
+ * distinguish "updated one row" from "matched nothing", following the same
+ * pattern other Drizzle-backed services in `lib/server/` already use
+ * (e.g. `rooms-service.ts`'s `updateRoom()`). Treating a zero-row match as
+ * success would silently leave the account "activated" with no usable
+ * credential — exactly the class of bug this fix exists to close.
+ *
  * Must be called, and succeed, BEFORE the Supabase-side `profiles` row is
  * marked `is_active: true` (activation) — so that if this write fails, the
  * account is never left "marked active, token already consumed, but
@@ -56,7 +68,7 @@ async function persistDrizzlePasswordHash(
 ): Promise<boolean> {
   try {
     const drizzleAdmin = getDrizzleAdminDb()
-    await drizzleAdmin
+    const [row] = await drizzleAdmin
       .update(profiles)
       .set({
         passwordHash,
@@ -65,7 +77,10 @@ async function persistDrizzlePasswordHash(
         pswChanged: fields.pswChanged,
       })
       .where(eq(profiles.id, profileId))
-    return true
+      .returning({ id: profiles.id })
+    // No matching Neon row → nothing was actually persisted, even though
+    // no error was thrown. Treat exactly like a failed write.
+    return row !== undefined
   } catch {
     // Connection error, missing POSTGRES_URL, unexpected shape, etc. — never
     // leak internals; caller treats this the same as any other failed write.
