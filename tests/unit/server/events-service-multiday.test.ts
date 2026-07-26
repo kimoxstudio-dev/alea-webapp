@@ -1210,4 +1210,193 @@ describe('events-service — deleteEvent multi-day cancellation', () => {
       await expect(deleteEvent(memberSession, 'evt-1')).rejects.toThrow(MockServiceError)
     })
   })
+
+  // ---------------------------------------------------------------------------
+  // KIM-434 PR #182 review fix: room_id/table_id consistency guard
+  // (assertBlocksTableRoomConsistency in lib/server/events/events-service.ts).
+  //
+  // Independent FKs on room_id/table_id alone don't catch a table_id from an
+  // unrelated room — the removed create_event_with_blocks/update_event_with_blocks
+  // RPCs used to guard against this in Postgres; this guard reimplements it in
+  // the Drizzle transaction.
+  // ---------------------------------------------------------------------------
+  describe('room_id/table_id consistency guard (PR #182 review fix)', () => {
+    it('rejects createEvent when a block\'s table_id belongs to a different room than declared', async () => {
+      const adminSession = createAdminSession()
+
+      // table-mismatch actually belongs to room-real, but the schedule below
+      // declares it under room-other.
+      setFixture('tables', [{ id: 'table-mismatch', roomId: 'room-real' }])
+      insertMock.mockResolvedValue([
+        {
+          id: 'evt-guard-reject',
+          title: 'Guard Reject',
+          description: null,
+          date: '2026-08-01',
+          startTime: '10:00:00',
+          endTime: '12:00:00',
+          titleEs: null,
+          titleEn: null,
+          createdBy: null,
+          createdAt: new Date('2026-08-01'),
+          dateKind: 'single',
+          endDate: null,
+          imageUrl: null,
+          linkUrl: null,
+          blurbEs: null,
+          blurbEn: null,
+          recurrenceLabelEs: null,
+          recurrenceLabelEn: null,
+          categoryEs: null,
+          categoryEn: null,
+        },
+      ])
+
+      const { createEvent } = await loadEventsService()
+
+      await expect(
+        createEvent(adminSession, {
+          title: 'Guard Reject',
+          description: null,
+          schedules: [
+            {
+              roomId: 'room-other',
+              tableId: 'table-mismatch',
+              date: '2026-08-01',
+              startTime: '10:00',
+              endTime: '12:00',
+              allDay: false,
+            },
+          ],
+        }),
+      ).rejects.toMatchObject({ statusCode: 400 })
+
+      // The guard must fire BEFORE the event_room_blocks insert: insertMock is
+      // the shared fallback resolver used when no per-table fixture is set —
+      // it should only have been consumed once (for the `events` insert), not
+      // a second time for `event_room_blocks`, proving nothing was written
+      // for the rejected block.
+      expect(insertMock).toHaveBeenCalledTimes(1)
+    })
+
+    it('rejects updateEvent when a block\'s table_id belongs to a different room than declared', async () => {
+      const adminSession = createAdminSession()
+
+      setFixture('events', [
+        {
+          id: 'evt-guard-update',
+          title: 'Guard Update',
+          description: null,
+          date: '2026-08-02',
+          startTime: '10:00:00',
+          endTime: '12:00:00',
+          titleEs: null,
+          titleEn: null,
+        },
+      ])
+      setFixture('tables', [{ id: 'table-mismatch', roomId: 'room-real' }])
+      updateMock.mockResolvedValue([
+        {
+          id: 'evt-guard-update',
+          title: 'Guard Update',
+          description: null,
+          date: '2026-08-02',
+          startTime: '10:00:00',
+          endTime: '12:00:00',
+          titleEs: null,
+          titleEn: null,
+        },
+      ])
+      deleteMock.mockResolvedValue([])
+
+      const { updateEvent } = await loadEventsService()
+
+      await expect(
+        updateEvent(adminSession, 'evt-guard-update', {
+          title: 'Guard Update',
+          description: null,
+          schedules: [
+            {
+              roomId: 'room-other',
+              tableId: 'table-mismatch',
+              date: '2026-08-02',
+              startTime: '10:00',
+              endTime: '12:00',
+              allDay: false,
+            },
+          ],
+        }),
+      ).rejects.toMatchObject({ statusCode: 400 })
+
+      // insertMock (event_room_blocks insert) must never be reached once the
+      // guard rejects inside the same transaction.
+      expect(insertMock).not.toHaveBeenCalled()
+    })
+
+    it('allows createEvent when a block\'s table_id correctly belongs to its declared room_id', async () => {
+      const adminSession = createAdminSession()
+
+      const newEventRow = {
+        id: 'evt-guard-ok',
+        title: 'Guard OK',
+        description: null,
+        date: '2026-08-03',
+        startTime: '10:00:00',
+        endTime: '12:00:00',
+        titleEs: null,
+        titleEn: null,
+        createdBy: null,
+        createdAt: new Date('2026-08-01'),
+        dateKind: 'single',
+        endDate: null,
+        imageUrl: null,
+        linkUrl: null,
+        blurbEs: null,
+        blurbEn: null,
+        recurrenceLabelEs: null,
+        recurrenceLabelEn: null,
+        categoryEs: null,
+        categoryEn: null,
+      }
+
+      const blocks = [
+        {
+          id: 'block-guard-ok',
+          eventId: 'evt-guard-ok',
+          roomId: 'room-1',
+          tableId: 'table-1',
+          date: '2026-08-03',
+          startTime: '10:00:00',
+          endTime: '12:00:00',
+          allDay: false,
+        },
+      ]
+
+      // table-1 correctly belongs to room-1 — the guard must allow this through.
+      setFixture('tables', [{ id: 'table-1', roomId: 'room-1' }])
+      insertMock.mockResolvedValue([newEventRow])
+      setInsertFixture('event_room_blocks', blocks)
+
+      const { createEvent } = await loadEventsService()
+
+      const result = await createEvent(adminSession, {
+        title: 'Guard OK',
+        description: null,
+        schedules: [
+          {
+            roomId: 'room-1',
+            tableId: 'table-1',
+            date: '2026-08-03',
+            startTime: '10:00',
+            endTime: '12:00',
+            allDay: false,
+          },
+        ],
+      })
+
+      expect(result.id).toBe('evt-guard-ok')
+      expect(result.roomBlocks).toHaveLength(1)
+      expect(result.schedules[0].tableId).toBe('table-1')
+    })
+  })
 })

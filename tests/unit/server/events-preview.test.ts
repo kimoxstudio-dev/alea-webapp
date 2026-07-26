@@ -507,4 +507,89 @@ describe('events-service — previewEventConflicts', () => {
     expect(result.blocks).toHaveLength(1)
     expect(result.blocks[0]).toEqual({ date: '2026-08-11', roomId: 'room-F', count: 4 })
   })
+
+  // -------------------------------------------------------------------------
+  // 10. KIM-434 PR #182 review fix: a table-level block (table_id set) must
+  //     only count conflicts against that ONE table, not every table in the
+  //     room — matching cancelOverlappingReservationsForBlocks()'s scoping.
+  //     Before the fix, `tableIds = roomTableMap.get(block.room_id)` counted
+  //     against every table in the room regardless of the block's table_id.
+  // -------------------------------------------------------------------------
+
+  it('scopes conflict count to the block\'s specific table_id, not every table in the room', async () => {
+    // room-Y has two tables; the schedule below is a table-level block that
+    // only targets table-Y1. We capture the actual filter args passed to the
+    // reservations count query's first `.in('table_id', tableIds)` call so
+    // this test fails if the implementation regresses to counting the whole
+    // room's tables for a table-scoped block.
+    let capturedTableIds: string[] | undefined
+
+    const tablesInMock = vi.fn().mockResolvedValue({
+      data: [
+        { id: 'table-Y1', room_id: 'room-Y' },
+        { id: 'table-Y2', room_id: 'room-Y' },
+      ],
+      error: null,
+    })
+    const tablesSelectMock = vi.fn().mockReturnValue({ in: tablesInMock })
+
+    let inCallCount = 0
+    const reservationsChain: Record<string, unknown> = {}
+    reservationsChain['in'] = vi.fn((...args: unknown[]) => {
+      inCallCount++
+      if (inCallCount === 1) {
+        // First .in() call is the table_id filter — capture it.
+        capturedTableIds = args[1] as string[]
+        return reservationsChain
+      }
+      // Second .in() call is the status filter — terminal, resolves.
+      return Promise.resolve({ count: 5, error: null, data: null })
+    })
+    reservationsChain['eq'] = vi.fn(() => reservationsChain)
+    reservationsChain['lt'] = vi.fn(() => reservationsChain)
+    reservationsChain['gt'] = vi.fn(() => reservationsChain)
+
+    const reservationsSelectMock = vi.fn(() => reservationsChain)
+
+    const mock = {
+      from: vi.fn((table: string) => {
+        if (table === 'tables') return { select: tablesSelectMock }
+        if (table === 'reservations') return { select: reservationsSelectMock }
+        return {
+          select: vi.fn().mockReturnThis(),
+          eq: vi.fn().mockReturnThis(),
+          in: vi.fn().mockResolvedValue({ data: [], error: null }),
+        }
+      }),
+    }
+
+    drizzleSelectMock.mockResolvedValue([
+      { id: 'table-Y1', roomId: 'room-Y' },
+      { id: 'table-Y2', roomId: 'room-Y' },
+    ])
+
+    const { getAdminDb } = await import('@/lib/db')
+    vi.mocked(getAdminDb).mockReturnValue(mock as any)
+
+    const { previewEventConflicts } = await import('@/lib/server/events/events-service')
+
+    const result = await previewEventConflicts({
+      schedules: [
+        {
+          date: '2027-01-01',
+          startTime: '10:00',
+          endTime: '12:00',
+          roomId: 'room-Y',
+          tableId: 'table-Y1',
+          allDay: false,
+        },
+      ],
+    })
+
+    // The bug would pass ['table-Y1', 'table-Y2'] here (whole room).
+    expect(capturedTableIds).toEqual(['table-Y1'])
+    expect(result.total).toBe(5)
+    expect(result.blocks).toHaveLength(1)
+    expect(result.blocks[0]).toEqual({ date: '2027-01-01', roomId: 'room-Y', count: 5 })
+  })
 })
