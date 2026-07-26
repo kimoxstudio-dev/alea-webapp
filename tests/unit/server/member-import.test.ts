@@ -17,6 +17,26 @@ function createMemberSession(): SessionUser {
   return { id: 'member-1', role: 'member', email: 'member@example.com' }
 }
 
+// Tag every `eq(column, value)` call with the raw `value` it was compared
+// against, without altering its real drizzle-orm behavior (the mocked
+// `db.update(...).where(...)` chain in drizzle-mock.ts doesn't interpret the
+// SQL object itself — it only forwards it to `updateMock`). This lets
+// `configureImportUpdateMock` below look up "does a row with this id really
+// exist?" the same way a real `UPDATE ... WHERE id = :id` would, instead of
+// inferring row existence from what's in the `.set(...)` payload (KIM-440
+// Finding B).
+vi.mock('drizzle-orm', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('drizzle-orm')>()
+  return {
+    ...actual,
+    eq: (column: unknown, value: unknown) => Object.assign(actual.eq(column as never, value as never), { __mockEqValue: value }),
+  }
+})
+
+function extractEqValue(sqlLike: unknown): unknown {
+  return (sqlLike as { __mockEqValue?: unknown } | undefined)?.__mockEqValue
+}
+
 
 const createUserMock = vi.fn(async (opts?: any) => ({
   data: { user: { id: 'new-user-' + Math.random().toString(36).substr(2, 9) } },
@@ -97,46 +117,33 @@ function toSelectRow(row: ProfileStateRow) {
 /**
  * Gives `updateMock` real persistence behavior against `profileState` for
  * the `importMembersFromCsv` / `importMembersFromSource` describes below.
- * The real service (`users-service.ts`) always sets camelCase fields via
- * `db.update(profiles).set(updates)`:
- *  - "create new member" payloads always include `memberNumber` (see
- *    `importMembersFromNormalizedRows`'s create-path `.set({ memberNumber, ... })`)
- *    -> build a fresh row keyed by that member number.
- *  - "update existing member" payloads never include `memberNumber` (only
- *    `fullName`/`email`/`phone`) -> merge into the single pre-seeded fixture.
- * No test in these describes mixes both scenarios in one call, so keying
- * off `updates.memberNumber` presence is sufficient without needing to
- * thread the real row id through the mock's `.where()` clause.
+ *
+ * Models a real `UPDATE profiles SET ... WHERE id = :id` statement: it only
+ * ever affects a row that already exists with that id — it can never bring
+ * a new row into existence, no matter what's in the `.set(...)` payload.
+ * This is the opposite of the previous version of this mock, which created
+ * a fresh row whenever `updates.memberNumber` was present in the SET
+ * payload — that reproduced `users-service.ts`'s (incorrect, Supabase-era)
+ * assumption that a DB trigger already inserted a matching `profiles` row
+ * for a brand-new auth user, instead of modelling what Neon/Postgres (no
+ * such trigger) actually does: zero rows matched, zero rows created
+ * (KIM-440 Finding A/B).
+ *
+ * The "update existing member" import path (no `memberNumber` in the SET
+ * payload) legitimately targets a row that a prior `db.select(...)` already
+ * found (see `existing.id` in `importMembersFromNormalizedRows`), so it
+ * continues to match here as before.
  */
 function configureImportUpdateMock() {
-  updateMock.mockImplementation(async (updates: Record<string, unknown>) => {
+  updateMock.mockImplementation(async (updates: Record<string, unknown>, ...whereArgs: unknown[]) => {
     const now = '2026-04-14T00:00:00.000Z'
+    const targetId = extractEqValue(whereArgs[0])
+    const target = typeof targetId === 'string'
+      ? Array.from(profileState.values()).find((row) => row.id === targetId)
+      : undefined
 
-    if (typeof updates.memberNumber === 'string') {
-      const memberNumber = updates.memberNumber
-      const row = {
-        id: `user-${memberNumber}`,
-        member_number: memberNumber,
-        full_name: (updates.fullName as string | null | undefined) ?? null,
-        auth_email: updates.authEmail as string,
-        email: (updates.email as string | null | undefined) ?? null,
-        phone: (updates.phone as string | null | undefined) ?? null,
-        role: (updates.role as 'member' | 'admin' | undefined) ?? 'member',
-        is_active: (updates.isActive as boolean | undefined) ?? false,
-        active_from: (updates.activeFrom as string | null | undefined) ?? null,
-        psw_changed: (updates.pswChanged as string | null | undefined) ?? null,
-        no_show_count: 0,
-        blocked_until: null,
-        created_at: now,
-        updated_at: now,
-      }
-      profileState.set(memberNumber, row)
-      return [{ id: row.id }]
-    }
+    if (!target) return []
 
-    const [existingKey] = profileState.keys()
-    if (!existingKey) return []
-    const target = profileState.get(existingKey)!
     const next = {
       ...target,
       ...(updates.fullName !== undefined ? { full_name: updates.fullName as string | null } : {}),
@@ -144,7 +151,7 @@ function configureImportUpdateMock() {
       ...(updates.phone !== undefined ? { phone: updates.phone as string | null } : {}),
       updated_at: now,
     }
-    profileState.set(existingKey, next)
+    profileState.set(target.member_number, next)
     return [next]
   })
 }
@@ -498,6 +505,36 @@ describe('importMembersFromCsv', () => {
         phone: '699000111',
       },
     ])
+  })
+
+  // KIM-440 Finding A evidence: isolates *why* new-member creation fails,
+  // independently of the assertions above. `createAuthUser` succeeds (a real
+  // Supabase Auth user is provisioned), but the follow-up
+  // `db.update(profiles).set({...}).where(eq(profiles.id, authData.user.id))`
+  // matches zero rows on Neon/Postgres (no DB trigger populates `profiles`
+  // for a new auth user the way the legacy Supabase trigger did), so the
+  // service must take its `persist_import_failed` branch and roll back the
+  // just-created auth user. If this ever fails with a *different* issue code
+  // (e.g. `create_auth_failed`) or without `deleteUserMock` being called,
+  // that points to a mock-wiring regression rather than Finding A.
+  it('demonstrates Finding A: new-member persist fails because UPDATE-by-new-id matches zero rows', async () => {
+    const { importMembersFromCsv } = await loadService()
+
+    selectMock.mockResolvedValue([])
+
+    const adminSession = createAdminSession()
+    const result = await importMembersFromCsv(adminSession, 'USUARIOS,ID,email,phone\nNew Member,100020,new@alea.club,699000111\n'
+    )
+
+    expect(createUserMock).toHaveBeenCalled()
+    expect(result.issues).toContainEqual({
+      rowNumber: 2,
+      memberNumber: '100020',
+      code: 'persist_import_failed',
+    })
+    expect(deleteUserMock).toHaveBeenCalledWith('user-100020')
+    expect(profileState.get('100020')).toBeUndefined()
+    expect(result.createdCount).toBe(0)
   })
 
   it('fills missing source email with internal generated email and keeps phone null', async () => {

@@ -1807,3 +1807,13 @@ No blocking issues. No modifications needed. Code is ready for security-reviewer
 - [17:42] npx vitest run on users-service.test.ts/profile-mappers.test.ts/auth-service.test.ts: auth-service.test.ts 43/43 passed (confirms decoupling fix preserved behavior); users-service.test.ts + profile-mappers.test.ts fail (31 tests) because their mocks still target the legacy Supabase seam - expected, same pattern as prior migrations, left for qa-engineer.
 - [17:45] Committed on migration-f3c-05-users.
 - [17:45] Complete - users-service.ts + profile-mappers.ts migrated to Drizzle; auth-service.ts decoupled (local mapper); typecheck/lint/build clean; tests pending qa-engineer mock updates.
+
+#### [KIM-440] qa-engineer — test correction + failure evidence (step 1/3)
+- [19:00] Started. Fresh worktree at origin/migration-f3c-05-users (9d83322), pnpm install.
+- [19:15] tests/unit/mocks/drizzle-mock.ts: additive threading only -- select() forwards columns arg to selectMock(columns); update().where() forwards where-args to updateMock(updates, ...whereArgs). Verified backward-compatible against partners/rooms/tables/oir208 suites (117 tests pass).
+- [19:20] member-import.test.ts (Finding B): rewrote configureImportUpdateMock so UPDATE only affects a row that truly exists by id (via local vi.mock(drizzle-orm) tagging eq() calls). No longer conjures a row from the SET payload. Added 1 diagnostic test for Finding A. Count 24->25 vs develop.
+- [19:25] users-service.test.ts (Finding C): added configureListMocks/isCountQueryColumns so row-select and count-select get distinct responses instead of sharing one value (which forced total===0 always). Added total assertions + 1 new test. Count 37->38 vs develop.
+- [19:26] Ran corrected tests against CURRENT unmodified service: 4 failures, all in member-import.test.ts (createdCount/normalizedRows expected N got 0) -- confirms Finding A. users-service.test.ts passes 38/38 (no live bug there, Finding C was test-precision only).
+- [19:27] Full suite: 76 files, 75 passed/1 failed, 1172 tests, 1168 passed/4 failed -- no regressions elsewhere.
+- [19:28] Zero production files touched. .claude/settings.json not present on this branch/worktree.
+- [19:29] Complete -- corrected tests committed+pushed to migration-f3c-05-users, left intentionally RED as evidence for step 2 service fix.

@@ -71,6 +71,35 @@ function resetMocks() {
   deleteMock.mockReset()
 }
 
+/**
+ * `listPaginatedUsers` issues two concurrent `db.select(...)` queries — one
+ * for the page of rows (`.select(PROFILE_COLUMNS)`), one for the total count
+ * (`.select({ value: count() })`) — and both route through the same shared
+ * `selectMock` singleton (see tests/unit/mocks/drizzle-mock.ts). The columns
+ * object each call was made with is threaded through to `selectMock` as its
+ * first argument, so it can be used to tell the two queries apart: the count
+ * query's columns object is always the single-key `{ value: <count SQL> }`
+ * shape; the row-select's `PROFILE_COLUMNS` never has a key named `value`.
+ *
+ * Before this helper existed, both queries shared one `mockResolvedValue`,
+ * so `countRows[0]?.value` was always `undefined` -> `total` was always
+ * silently coerced to 0 by `?? 0`, regardless of how many rows were
+ * returned. `data.length > 0 && total === 0` could happen in every test
+ * below without a single assertion catching it (KIM-440 Finding C). This
+ * helper gives each query a distinct, realistic response instead.
+ */
+function isCountQueryColumns(columns: unknown): boolean {
+  return !!columns && typeof columns === 'object' && !Array.isArray(columns)
+    && Object.keys(columns as object).length === 1 && 'value' in (columns as object)
+}
+
+function configureListMocks(rows: typeof profileRows, total: number = rows.length) {
+  selectMock.mockImplementation(async (columns?: unknown) => {
+    if (isCountQueryColumns(columns)) return [{ value: total }]
+    return rows
+  })
+}
+
 async function loadUsersModules() {
   vi.resetModules()
   const service = await import("@/lib/server/users/users-service")
@@ -86,7 +115,7 @@ describe("listPaginatedUsers", () => {
 
   it("clamps page=0 to 1", async () => {
     const adminSession = createAdminSession()
-    selectMock.mockResolvedValue(profileRows.slice(0, 2))
+    configureListMocks(profileRows.slice(0, 2))
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: 0, limit: 10 })
@@ -96,7 +125,7 @@ describe("listPaginatedUsers", () => {
 
   it("clamps page=-5 to 1", async () => {
     const adminSession = createAdminSession()
-    selectMock.mockResolvedValue(profileRows.slice(0, 2))
+    configureListMocks(profileRows.slice(0, 2))
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: -5, limit: 10 })
@@ -106,7 +135,7 @@ describe("listPaginatedUsers", () => {
 
   it("clamps limit=0 to default and totalPages is not Infinity", async () => {
     const adminSession = createAdminSession()
-    selectMock.mockResolvedValue(profileRows.slice(0, 2))
+    configureListMocks(profileRows.slice(0, 2))
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: 1, limit: 0 })
@@ -117,7 +146,7 @@ describe("listPaginatedUsers", () => {
 
   it("clamps limit=-10 to 1", async () => {
     const adminSession = createAdminSession()
-    selectMock.mockResolvedValue(profileRows.slice(0, 2))
+    configureListMocks(profileRows.slice(0, 2))
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: 1, limit: -10 })
@@ -127,7 +156,7 @@ describe("listPaginatedUsers", () => {
 
   it("clamps limit=200 to 100", async () => {
     const adminSession = createAdminSession()
-    selectMock.mockResolvedValue(profileRows.slice(0, 2))
+    configureListMocks(profileRows.slice(0, 2))
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: 1, limit: 200 })
@@ -137,7 +166,7 @@ describe("listPaginatedUsers", () => {
 
   it("returns limit=50 as-is when within bounds", async () => {
     const adminSession = createAdminSession()
-    selectMock.mockResolvedValue(profileRows.slice(0, 2))
+    configureListMocks(profileRows.slice(0, 2))
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: 1, limit: 50 })
@@ -147,7 +176,7 @@ describe("listPaginatedUsers", () => {
 
   it("filters by memberNumber substring case-insensitively", async () => {
     const adminSession = createAdminSession()
-    selectMock.mockResolvedValue(profileRows)
+    configureListMocks(profileRows)
     const { listPaginatedUsers } = await loadUsersModules()
 
     await listPaginatedUsers(adminSession, { page: 1, limit: 10, search: "ADMIN" })
@@ -157,55 +186,86 @@ describe("listPaginatedUsers", () => {
 
   it("filters by memberNumber substring", async () => {
     const adminSession = createAdminSession()
-    selectMock.mockResolvedValue(profileRows.filter(r => r.memberNumber.includes("100002")))
+    const filtered = profileRows.filter(r => r.memberNumber.includes("100002"))
+    configureListMocks(filtered)
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: 1, limit: 10, search: "100002" })
 
     expect(result.data.length).toBeGreaterThan(0)
+    // KIM-440 Finding C: `total` must reflect the count query, not just
+    // "however many rows the (indistinguishable) mock happened to return" --
+    // a service bug returning `data.length > 0` alongside `total === 0` must
+    // fail this assertion.
+    expect(result.total).toBe(filtered.length)
   })
 
   it("filters by full name substring", async () => {
     const adminSession = createAdminSession()
-    selectMock.mockResolvedValue(profileRows.filter(r => r.fullName.includes("Member")))
+    const filtered = profileRows.filter(r => r.fullName.includes("Member"))
+    configureListMocks(filtered)
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: 1, limit: 10, search: "member user" })
 
     expect(result.data).toHaveLength(1)
     expect(result.data[0]?.id).toBe("2")
+    expect(result.total).toBe(1)
   })
 
   it("filters by email substring", async () => {
     const adminSession = createAdminSession()
-    selectMock.mockResolvedValue(profileRows.filter(r => r.email.includes("admin@alea.club")))
+    const filtered = profileRows.filter(r => r.email.includes("admin@alea.club"))
+    configureListMocks(filtered)
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: 1, limit: 10, search: "admin@alea.club" })
 
     expect(result.data).toHaveLength(1)
     expect(result.data[0]?.id).toBe("1")
+    expect(result.total).toBe(1)
   })
 
   it("returns all users when search is empty", async () => {
     const adminSession = createAdminSession()
-    selectMock.mockResolvedValue(profileRows)
+    configureListMocks(profileRows)
     const { listPaginatedUsers } = await loadUsersModules()
 
     const all = await listPaginatedUsers(adminSession, { page: 1, limit: 100 })
     const withEmpty = await listPaginatedUsers(adminSession, { page: 1, limit: 100, search: "" })
 
     expect(withEmpty.total).toBe(all.total)
+    expect(all.total).toBe(profileRows.length)
   })
 
   it("does not filter out suspended users from the admin listing", async () => {
     const adminSession = createAdminSession()
-    selectMock.mockResolvedValue(profileRows)
+    configureListMocks(profileRows)
     const { listPaginatedUsers } = await loadUsersModules()
 
     await listPaginatedUsers(adminSession, { page: 1, limit: 10 })
 
     expect(selectMock).toHaveBeenCalled()
+  })
+
+  // KIM-440 Finding C: with the shared `selectMock` singleton previously
+  // resolving to the same value for both the row query and the count query,
+  // `countRows[0]?.value` was always `undefined` (a row object has no
+  // `value` key) and silently coerced to 0 by `?? 0` -- so `data.length > 0`
+  // and `total === 0` could coexist in every test above without any
+  // assertion ever catching it. This test pins that exact combination down
+  // directly: a page of real rows alongside a distinctly-configured,
+  // realistic total.
+  it("reports a total independent of and consistent with the returned page of data", async () => {
+    const adminSession = createAdminSession()
+    configureListMocks(profileRows.slice(0, 1), 2)
+    const { listPaginatedUsers } = await loadUsersModules()
+
+    const result = await listPaginatedUsers(adminSession, { page: 1, limit: 1 })
+
+    expect(result.data).toHaveLength(1)
+    expect(result.total).toBe(2)
+    expect(result.totalPages).toBe(2)
   })
 
   it("throws Forbidden when called by non-admin", async () => {
