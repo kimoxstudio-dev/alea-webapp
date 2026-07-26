@@ -1,146 +1,78 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SessionUser } from '@/lib/server/auth/auth'
+import {
+  createStatefulDrizzleDb,
+  resetDb,
+  seed,
+  getRows,
+  failNextQuery,
+  createMockServiceError,
+} from '@/tests/unit/mocks/drizzle-mock'
 import { createQueryBuilder } from '@/tests/unit/mocks/supabase-mock'
+import { rooms, tables, savedGames, savedGameAttendances } from '@/lib/db/schema'
 
-type SavedGameRow = {
-  id: string
-  table_id: string
-  user_id: string
-  start_date: string
-  end_date: string
-  status: string
-  attendance_count: number
-  renewed_from_id: string | null
-  created_at: string
-  updated_at: string
-  tables?: { name: string; rooms: { name: string } }
-}
-
-const state = vi.hoisted(() => ({
-  tables: new Map<string, { id: string; room_id: string; type: string; name: string }>(),
-  blocks: [] as Array<{ id: string; room_id: string; date: string }>,
-  savedGames: [] as SavedGameRow[],
-  attendances: [] as Array<{ saved_game_id: string; play_reservation_id: string; attended_on: string }>,
-}))
+// In-memory store for event_room_blocks (still using legacy Supabase)
+const eventRoomBlocksStore: Array<{ id: string; room_id: string; table_id: string | null; date: string }> = []
 
 vi.mock('@/lib/club-time', async () => {
   const actual = await vi.importActual<typeof import('@/lib/club-time')>('@/lib/club-time')
   return { ...actual, getCurrentClubDate: () => '2026-06-19' }
 })
 
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseServerAdminClient: () => ({
+vi.mock('@/lib/server/shared/service-error', () => ({
+  serviceError: createMockServiceError(),
+}))
+
+vi.mock('@/lib/db', () => ({
+  getDrizzleDb: vi.fn(() => createStatefulDrizzleDb()),
+  getDrizzleAdminDb: vi.fn(() => createStatefulDrizzleDb()),
+  getAdminDb: vi.fn(() => ({
     from: (table: string) => {
-      if (table === 'tables') {
-        return {
-          select: () => ({
-            eq: (_column: string, id: string) => ({
-              maybeSingle: async () => ({
-                data: state.tables.get(id) ?? null,
-                error: null,
-              }),
-            }),
-          }),
-        }
-      }
       if (table === 'event_room_blocks') {
-        return { select: () => createQueryBuilder(state.blocks) }
+        return { select: () => createQueryBuilder(eventRoomBlocksStore) }
       }
-      if (table === 'saved_game_attendances') {
-        return {
-          insert: async (row: {
-            saved_game_id: string
-            play_reservation_id: string
-            attended_on: string
-          }) => {
-            if (
-              state.attendances.some((item) => item.play_reservation_id === row.play_reservation_id)
-            ) {
-              return { error: { code: '23505' } }
-            }
-            state.attendances.push(row)
-            return { error: null }
-          },
-        }
-      }
-      if (table !== 'saved_games') throw new Error(`Unexpected table ${table}`)
-      return {
-        select: () => createQueryBuilder(state.savedGames),
-        update: (values: Partial<SavedGameRow>) => {
-          const filters: Array<[string, string, 'eq' | 'lt']> = []
-          const updateChain = {
-            eq: (column: string, value: string) => {
-              filters.push([column, value, 'eq'])
-              return updateChain
-            },
-            lt: (column: string, value: string) => {
-              filters.push([column, value, 'lt'])
-              state.savedGames
-                .filter((row) =>
-                  filters.every(
-                    ([key, expected, op]) =>
-                      op === 'eq'
-                        ? String(row[key as keyof SavedGameRow]) === expected
-                        : String(row[key as keyof SavedGameRow]) < expected,
-                  ),
-                )
-                .forEach((row) => Object.assign(row, values))
-              return Promise.resolve({ error: null })
-            },
-          }
-          return updateChain
-        },
-        insert: (values: Partial<SavedGameRow>) => ({
-          select: () => ({
-            single: async () => {
-              const overlap = state.savedGames.some(
-                (row) =>
-                  row.table_id === values.table_id &&
-                  row.status === 'active' &&
-                  row.start_date <= String(values.end_date) &&
-                  row.end_date >= String(values.start_date),
-              )
-              if (overlap) return { data: null, error: { code: '23P01' } }
-              const tableRow = state.tables.get(String(values.table_id))!
-              const row: SavedGameRow = {
-                id: `sg-${state.savedGames.length + 1}`,
-                table_id: String(values.table_id),
-                user_id: String(values.user_id),
-                start_date: String(values.start_date),
-                end_date: String(values.end_date),
-                status: 'active',
-                attendance_count: 0,
-                renewed_from_id: values.renewed_from_id ? String(values.renewed_from_id) : null,
-                created_at: '2026-06-19T10:00:00Z',
-                updated_at: '2026-06-19T10:00:00Z',
-                tables: { name: tableRow.name, rooms: { name: 'Sala' } },
-              }
-              state.savedGames.push(row)
-              return { data: row, error: null }
-            },
-          }),
-        }),
-      }
+      throw new Error(`Unexpected table ${table}`)
     },
-  }),
+  })),
 }))
 
 const member: SessionUser = { id: 'user-1', role: 'member' }
 
 describe('saved games service', () => {
   beforeEach(() => {
-    state.tables.clear()
-    state.tables.set('double', {
-      id: 'double',
-      room_id: 'room-1',
-      type: 'removable_top',
-      name: 'Mesa doble',
+    resetDb()
+    eventRoomBlocksStore.length = 0
+    vi.clearAllMocks()
+
+    // Seed common test data: room, two tables (one removable_top, one regular)
+    seed({
+      rooms: [{ id: 'room-1', name: 'Sala Principal', tableCount: 2, createdAt: new Date(), description: '' }],
+      tables: [
+        {
+          id: 'double',
+          roomId: 'room-1',
+          name: 'Mesa doble',
+          type: 'removable_top',
+          qrCode: null,
+          posX: null,
+          posY: null,
+          createdAt: new Date(),
+          qrCodeInf: null,
+        },
+        {
+          id: 'regular',
+          roomId: 'room-1',
+          name: 'Mesa normal',
+          type: 'large',
+          qrCode: null,
+          posX: null,
+          posY: null,
+          createdAt: new Date(),
+          qrCodeInf: null,
+        },
+      ],
     })
-    state.tables.set('regular', { id: 'regular', room_id: 'room-1', type: 'large', name: 'Mesa normal' })
-    state.blocks.length = 0
-    state.savedGames.length = 0
-    state.attendances.length = 0
   })
 
   it('creates a day-based Saved Game on a removable-top table', async () => {
@@ -177,7 +109,7 @@ describe('saved games service', () => {
   })
 
   it('rejects date ranges blocked by an event', async () => {
-    state.blocks.push({ id: 'event-1', room_id: 'room-1', date: '2026-07-01' })
+    eventRoomBlocksStore.push({ id: 'event-1', room_id: 'room-1', table_id: null, date: '2026-07-01' })
     const { createSavedGameForSession } = await import('@/lib/server/games/saved-games-service')
     await expect(
       createSavedGameForSession(member, {
@@ -189,17 +121,21 @@ describe('saved games service', () => {
   })
 
   it('allows renewal only during the final fifteen days and creates the next period', async () => {
-    state.savedGames.push({
-      id: 'sg-1',
-      table_id: 'double',
-      user_id: 'user-1',
-      start_date: '2026-04-01',
-      end_date: '2026-06-30',
-      status: 'active',
-      attendance_count: 2,
-      renewed_from_id: null,
-      created_at: '',
-      updated_at: '',
+    seed({
+      saved_games: [
+        {
+          id: 'sg-1',
+          tableId: 'double',
+          userId: 'user-1',
+          startDate: '2026-04-01',
+          endDate: '2026-06-30',
+          status: 'active',
+          attendanceCount: 2,
+          renewedFromId: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ],
     })
     const { renewSavedGameForSession } = await import('@/lib/server/games/saved-games-service')
     const renewed = await renewSavedGameForSession(member, 'sg-1')
@@ -211,17 +147,21 @@ describe('saved games service', () => {
   })
 
   it('rejects renewal before the final fifteen days', async () => {
-    state.savedGames.push({
-      id: 'sg-1',
-      table_id: 'double',
-      user_id: 'user-1',
-      start_date: '2026-06-01',
-      end_date: '2026-08-31',
-      status: 'active',
-      attendance_count: 0,
-      renewed_from_id: null,
-      created_at: '',
-      updated_at: '',
+    seed({
+      saved_games: [
+        {
+          id: 'sg-1',
+          tableId: 'double',
+          userId: 'user-1',
+          startDate: '2026-06-01',
+          endDate: '2026-08-31',
+          status: 'active',
+          attendanceCount: 0,
+          renewedFromId: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ],
     })
     const { renewSavedGameForSession } = await import('@/lib/server/games/saved-games-service')
     await expect(renewSavedGameForSession(member, 'sg-1')).rejects.toMatchObject({
@@ -230,38 +170,51 @@ describe('saved games service', () => {
   })
 
   it('derives completed status for expired games without mutating during a list read', async () => {
-    state.savedGames.push({
-      id: 'sg-1',
-      table_id: 'double',
-      user_id: 'user-1',
-      start_date: '2026-03-01',
-      end_date: '2026-06-18',
-      status: 'active',
-      attendance_count: 3,
-      renewed_from_id: null,
-      created_at: '',
-      updated_at: '',
+    seed({
+      saved_games: [
+        {
+          id: 'sg-1',
+          tableId: 'double',
+          userId: 'user-1',
+          startDate: '2026-03-01',
+          endDate: '2026-06-18',
+          status: 'active',
+          attendanceCount: 3,
+          renewedFromId: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ],
     })
     const { listSavedGamesForSession } = await import('@/lib/server/games/saved-games-service')
+
+    const resultBefore = getRows(savedGames)
+    expect(resultBefore[0]!.status).toBe('active')
 
     await expect(listSavedGamesForSession(member)).resolves.toEqual([
       expect.objectContaining({ id: 'sg-1', status: 'completed', canRenew: false }),
     ])
-    expect(state.savedGames[0].status).toBe('active')
+
+    const resultAfter = getRows(savedGames)
+    expect(resultAfter[0]!.status).toBe('active')
   })
 
   it('records QR attendance only for the user top reservation and remains idempotent', async () => {
-    state.savedGames.push({
-      id: 'sg-1',
-      table_id: 'double',
-      user_id: 'user-1',
-      start_date: '2026-06-01',
-      end_date: '2026-08-31',
-      status: 'active',
-      attendance_count: 0,
-      renewed_from_id: null,
-      created_at: '',
-      updated_at: '',
+    seed({
+      saved_games: [
+        {
+          id: 'sg-1',
+          tableId: 'double',
+          userId: 'user-1',
+          startDate: '2026-06-01',
+          endDate: '2026-08-31',
+          status: 'active',
+          attendanceCount: 0,
+          renewedFromId: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ],
     })
     const { recordSavedGameAttendance } = await import('@/lib/server/games/saved-games-service')
     const reservation = {
@@ -273,26 +226,61 @@ describe('saved games service', () => {
       end_time: '20:00',
       surface: 'top' as const,
       status: 'active' as const,
-      activated_at: '',
-      created_at: '',
+      activated_at: '2026-06-19T18:00:00Z',
+      created_at: '2026-06-19T10:00:00Z',
     }
     await recordSavedGameAttendance(reservation)
+
+    // Second call should fail with 23505 (unique constraint on playReservationId)
+    // Create an Error-like object with a code property that passes the duck-type check
+    const pgError = new Error('unique_violation') as unknown as { code: string }
+    ;(pgError as any).code = '23505'
+    failNextQuery({ op: 'insert', table: savedGameAttendances, error: pgError })
     await recordSavedGameAttendance(reservation)
-    expect(state.attendances).toEqual([
-      { saved_game_id: 'sg-1', play_reservation_id: 'r-1', attended_on: '2026-06-19' },
-    ])
+
+    const attendances = getRows(savedGameAttendances)
+    expect(attendances).toHaveLength(1)
+    expect(attendances[0]).toMatchObject({
+      savedGameId: 'sg-1',
+      playReservationId: 'r-1',
+      attendedOn: '2026-06-19',
+    })
   })
 
   it('member session cannot access foreign saved games (isolation via assertMemberRowsScoped)', async () => {
     const { listSavedGamesForSession } = await import('@/lib/server/games/saved-games-service')
-    const memberSession = { id: 'user-1', role: 'member' } as const
-    const adminSession = { id: 'admin-1', role: 'admin' } as const
+    const memberSession: SessionUser = { id: 'user-1', role: 'member' }
+    const adminSession: SessionUser = { id: 'admin-1', role: 'admin' }
 
-    // Create saved games: one for user-1, one for user-2
-    state.savedGames.push(
-      { id: 'sg-1', table_id: 'double', user_id: 'user-1', start_date: '2026-06-01', end_date: '2026-08-31', status: 'active', attendance_count: 1, renewed_from_id: null, created_at: '', updated_at: '' },
-      { id: 'sg-2', table_id: 'regular', user_id: 'user-2', start_date: '2026-07-01', end_date: '2026-09-30', status: 'active', attendance_count: 0, renewed_from_id: null, created_at: '', updated_at: '' }
-    )
+    // Seed saved games: one for user-1, one for user-2
+    seed({
+      saved_games: [
+        {
+          id: 'sg-1',
+          tableId: 'double',
+          userId: 'user-1',
+          startDate: '2026-06-01',
+          endDate: '2026-08-31',
+          status: 'active',
+          attendanceCount: 1,
+          renewedFromId: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+        {
+          id: 'sg-2',
+          tableId: 'regular',
+          userId: 'user-2',
+          startDate: '2026-07-01',
+          endDate: '2026-09-30',
+          status: 'active',
+          attendanceCount: 0,
+          renewedFromId: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ],
+    })
 
     // Member can only see their own saved games
     const memberResult = await listSavedGamesForSession(memberSession)
