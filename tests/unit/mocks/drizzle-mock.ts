@@ -1619,6 +1619,8 @@ const fixtureState = {
   // `insertMock` remains the fallback for tables with no fixture set, so
   // existing single-table tests keep working unmodified.
   insertFixtures: new Map<string, any[]>(),
+  updateFixtures: new Map<string, any[]>(),
+  deleteFixtures: new Map<string, any[]>(),
   defaultInsertResponse: null as any,
   defaultUpdateResponse: null as any,
   defaultDeleteResponse: null as any,
@@ -1631,6 +1633,8 @@ const fixtureState = {
 export function resetFixtures() {
   fixtureState.tableFixtures.clear()
   fixtureState.insertFixtures.clear()
+  fixtureState.updateFixtures.clear()
+  fixtureState.deleteFixtures.clear()
   fixtureState.defaultInsertResponse = null
   fixtureState.defaultUpdateResponse = null
   fixtureState.defaultDeleteResponse = null
@@ -1658,6 +1662,22 @@ export function setFixture(tableName: string, rows: any[]) {
  */
 export function setInsertFixture(tableName: string, rows: any[]) {
   fixtureState.insertFixtures.set(tableName, rows)
+}
+
+/**
+ * Set the rows returned by `db.update(<table>).set(...).where(...).returning()` for
+ * a SPECIFIC table, dispatching the same way `setInsertFixture` does.
+ */
+export function setUpdateFixture(tableName: string, rows: any[]) {
+  fixtureState.updateFixtures.set(tableName, rows)
+}
+
+/**
+ * Set the rows returned by `db.delete(<table>).where(...).returning()` for
+ * a SPECIFIC table, dispatching the same way `setInsertFixture` does.
+ */
+export function setDeleteFixture(tableName: string, rows: any[]) {
+  fixtureState.deleteFixtures.set(tableName, rows)
 }
 
 /**
@@ -1700,6 +1720,54 @@ function createDispatchingInsertMock() {
 
     return {
       values: vi.fn(() => ({
+        returning: vi.fn(() => resolve()),
+        then: (onFulfilled: any, onRejected: any) => resolve().then(onFulfilled, onRejected),
+        catch: (onRejected: any) => resolve().catch(onRejected),
+      })),
+    }
+  })
+}
+
+/**
+ * Create a dispatching mock for UPDATE...RETURNING operations
+ */
+function createDispatchingUpdateMock() {
+  return vi.fn((table: any) => {
+    const tableName = extractTableName(table)
+    const resolve = () => {
+      if (tableName && fixtureState.updateFixtures.has(tableName)) {
+        return Promise.resolve(fixtureState.updateFixtures.get(tableName))
+      }
+      return updateMock().then((result: any) => result || fixtureState.defaultUpdateResponse || [])
+    }
+
+    return {
+      set: vi.fn(() => ({
+        where: vi.fn(() => ({
+          returning: vi.fn(() => resolve()),
+          then: (onFulfilled: any, onRejected: any) => resolve().then(onFulfilled, onRejected),
+          catch: (onRejected: any) => resolve().catch(onRejected),
+        })),
+      })),
+    }
+  })
+}
+
+/**
+ * Create a dispatching mock for DELETE...RETURNING operations
+ */
+function createDispatchingDeleteMock() {
+  return vi.fn((table: any) => {
+    const tableName = extractTableName(table)
+    const resolve = () => {
+      if (tableName && fixtureState.deleteFixtures.has(tableName)) {
+        return Promise.resolve(fixtureState.deleteFixtures.get(tableName))
+      }
+      return deleteMock().then((result: any) => result || fixtureState.defaultDeleteResponse || [])
+    }
+
+    return {
+      where: vi.fn(() => ({
         returning: vi.fn(() => resolve()),
         then: (onFulfilled: any, onRejected: any) => resolve().then(onFulfilled, onRejected),
         catch: (onRejected: any) => resolve().catch(onRejected),
@@ -1964,38 +2032,8 @@ export function createDrizzleQueryBuilderWithDispatching() {
       from: dispatchingSelect.select().from,
     })),
     insert: createDispatchingInsertMock(),
-    update: vi.fn(() => ({
-      set: vi.fn(() => ({
-        where: vi.fn(() => ({
-          returning: vi.fn(() =>
-            updateMock().then((result) => result || fixtureState.defaultUpdateResponse || [])
-          ),
-          then: (onFulfilled: any, onRejected: any) =>
-            updateMock()
-              .then((result) => result || fixtureState.defaultUpdateResponse || [])
-              .then(onFulfilled, onRejected),
-          catch: (onRejected: any) =>
-            updateMock()
-              .then((result) => result || fixtureState.defaultUpdateResponse || [])
-              .catch(onRejected),
-        })),
-      })),
-    })),
-    delete: vi.fn(() => ({
-      where: vi.fn(() => ({
-        returning: vi.fn(() =>
-          deleteMock().then((result) => result || fixtureState.defaultDeleteResponse || [])
-        ),
-        then: (onFulfilled: any, onRejected: any) =>
-          deleteMock()
-            .then((result) => result || fixtureState.defaultDeleteResponse || [])
-            .then(onFulfilled, onRejected),
-        catch: (onRejected: any) =>
-          deleteMock()
-            .then((result) => result || fixtureState.defaultDeleteResponse || [])
-            .catch(onRejected),
-      })),
-    })),
+    update: createDispatchingUpdateMock(),
+    delete: createDispatchingDeleteMock(),
     transaction: vi.fn(async (callback) => callback(createDrizzleQueryBuilderWithDispatching())),
   }
 }
@@ -2149,38 +2187,8 @@ function createTransactionScopedBuilder(scope: TransactionScope) {
       from: selectBuilder.select().from,
     })),
     insert: createDispatchingInsertMock(),
-    update: vi.fn(() => ({
-      set: vi.fn(() => ({
-        where: vi.fn(() => ({
-          returning: vi.fn(() =>
-            updateMock().then((result) => result || fixtureState.defaultUpdateResponse || [])
-          ),
-          then: (onFulfilled: any, onRejected: any) =>
-            updateMock()
-              .then((result) => result || fixtureState.defaultUpdateResponse || [])
-              .then(onFulfilled, onRejected),
-          catch: (onRejected: any) =>
-            updateMock()
-              .then((result) => result || fixtureState.defaultUpdateResponse || [])
-              .catch(onRejected),
-        })),
-      })),
-    })),
-    delete: vi.fn(() => ({
-      where: vi.fn(() => ({
-        returning: vi.fn(() =>
-          deleteMock().then((result) => result || fixtureState.defaultDeleteResponse || [])
-        ),
-        then: (onFulfilled: any, onRejected: any) =>
-          deleteMock()
-            .then((result) => result || fixtureState.defaultDeleteResponse || [])
-            .then(onFulfilled, onRejected),
-        catch: (onRejected: any) =>
-          deleteMock()
-            .then((result) => result || fixtureState.defaultDeleteResponse || [])
-            .catch(onRejected),
-      })),
-    })),
+    update: createDispatchingUpdateMock(),
+    delete: createDispatchingDeleteMock(),
     transaction: vi.fn(async (callback) => callback(createTransactionScopedBuilder(scope))),
   }
 }
@@ -2199,38 +2207,8 @@ export function createTransactionAwareMockBuilder() {
       from: dispatchingSelect.select().from,
     })),
     insert: createDispatchingInsertMock(),
-    update: vi.fn(() => ({
-      set: vi.fn(() => ({
-        where: vi.fn(() => ({
-          returning: vi.fn(() =>
-            updateMock().then((result) => result || fixtureState.defaultUpdateResponse || [])
-          ),
-          then: (onFulfilled: any, onRejected: any) =>
-            updateMock()
-              .then((result) => result || fixtureState.defaultUpdateResponse || [])
-              .then(onFulfilled, onRejected),
-          catch: (onRejected: any) =>
-            updateMock()
-              .then((result) => result || fixtureState.defaultUpdateResponse || [])
-              .catch(onRejected),
-        })),
-      })),
-    })),
-    delete: vi.fn(() => ({
-      where: vi.fn(() => ({
-        returning: vi.fn(() =>
-          deleteMock().then((result) => result || fixtureState.defaultDeleteResponse || [])
-        ),
-        then: (onFulfilled: any, onRejected: any) =>
-          deleteMock()
-            .then((result) => result || fixtureState.defaultDeleteResponse || [])
-            .then(onFulfilled, onRejected),
-        catch: (onRejected: any) =>
-          deleteMock()
-            .then((result) => result || fixtureState.defaultDeleteResponse || [])
-            .catch(onRejected),
-      })),
-    })),
+    update: createDispatchingUpdateMock(),
+    delete: createDispatchingDeleteMock(),
     transaction: (callback) => {
       const scope = new TransactionScope(fixtureState.tableFixtures)
       const scopedBuilder = createTransactionScopedBuilder(scope)
