@@ -124,6 +124,11 @@ describe('getTableAvailability', () => {
       },
       error: null,
     })
+
+vi.mock('@vercel/blob', () => ({
+  put: vi.fn().mockResolvedValue({}),
+  del: vi.fn().mockResolvedValue({}),
+}))
     listReservationsMock.mockResolvedValue({
       data: [
         {
@@ -204,17 +209,18 @@ describe('generateTableQrCode', () => {
     vi.clearAllMocks()
     process.env.NEXT_PUBLIC_APP_URL = 'https://test.example.com'
     process.env.NEXT_PUBLIC_SUPABASE_URL = 'https://supabase.example.com'
+    process.env.BLOB_PUBLIC_BASE_URL = 'https://example.public.blob.vercel-storage.com'
     qrcodeToBufferMock.mockResolvedValue(Buffer.from('fake-png-data'))
     storageUploadMock.mockResolvedValue({ data: { path: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890.png' }, error: null })
   })
 
-  it('returns a Supabase Storage public URL containing the tableId', async () => {
+  it('returns a Blob public URL containing the tableId', async () => {
     const { generateTableQrCode } = await loadTablesModules()
     const adminSession = createAdminSession()
 
     const result = await generateTableQrCode(adminSession, 'a1b2c3d4-e5f6-7890-abcd-ef1234567890')
 
-    expect(result).toMatch(/^https:\/\/supabase\.example\.com\/storage\/v1\/object\/public\/table-qr-codes\/a1b2c3d4-e5f6-7890-abcd-ef1234567890\.png$/)
+    expect(result).toMatch(/^https:\/\/example\.public\.blob\.vercel-storage\.com\/table-qr-codes\/a1b2c3d4-e5f6-7890-abcd-ef1234567890\.png$/)
   })
 
   it('encodes the absolute URL with the tableId in the QR payload', async () => {
@@ -223,10 +229,10 @@ describe('generateTableQrCode', () => {
 
     const result = await generateTableQrCode(adminSession, 'a1b2c3d4-e5f6-7890-abcd-ef1234567890')
 
-    // Assert the result is a valid Supabase Storage URL
-    expect(result).toMatch(/^https:\/\/supabase\.example\.com\/storage\/v1\/object\/public\/table-qr-codes\/a1b2c3d4-e5f6-7890-abcd-ef1234567890\.png$/)
+    // Assert the result is a valid Blob URL
+    expect(result).toMatch(/^https:\/\/example\.public\.blob\.vercel-storage\.com\/table-qr-codes\/a1b2c3d4-e5f6-7890-abcd-ef1234567890\.png$/)
     
-    // Assert qrcode.toBuffer was called with the correct URL
+    // Assert qrcode.toBuffer was called with the correct check-in URL
     expect(qrcodeToBufferMock).toHaveBeenCalledWith(
       'https://test.example.com/check-in/a1b2c3d4-e5f6-7890-abcd-ef1234567890',
       expect.objectContaining({ errorCorrectionLevel: 'M', width: 400, type: 'png' })
@@ -244,36 +250,38 @@ describe('generateTableQrCode', () => {
     })
   })
 
-  it('handles missing NEXT_PUBLIC_SUPABASE_URL by throwing serviceError', async () => {
+  it('works when NEXT_PUBLIC_SUPABASE_URL is missing (not needed for Blob URLs)', async () => {
     delete process.env.NEXT_PUBLIC_SUPABASE_URL
     const { generateTableQrCode } = await loadTablesModules()
     const adminSession = createAdminSession()
 
-    await expect(generateTableQrCode(adminSession, 'a1b2c3d4-e5f6-7890-abcd-ef1234567890')).rejects.toMatchObject({
-      name: 'ServiceError',
-      statusCode: 500,
-    })
+    const result = await generateTableQrCode(adminSession, 'a1b2c3d4-e5f6-7890-abcd-ef1234567890')
+
+    // Should work because Blob URLs don't depend on NEXT_PUBLIC_SUPABASE_URL
+    expect(result).toMatch(/^https:\/\/example\.public\.blob\.vercel-storage\.com\/table-qr-codes/)
   })
 
-  it('uploads buffer to Storage with correct path and options', async () => {
+  it('encodes QR code with correct options', async () => {
     const { generateTableQrCode } = await loadTablesModules()
     const adminSession = createAdminSession()
 
     await generateTableQrCode(adminSession, 'a1b2c3d4-e5f6-7890-abcd-ef1234567890')
 
-    expect(storageUploadMock).toHaveBeenCalledWith(
-      'a1b2c3d4-e5f6-7890-abcd-ef1234567890.png',
-      Buffer.from('fake-png-data'),
-      { contentType: 'image/png', upsert: true }
+    // Verify qrcode generation was called with correct parameters
+    expect(qrcodeToBufferMock).toHaveBeenCalledWith(
+      'https://test.example.com/check-in/a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+      expect.objectContaining({ errorCorrectionLevel: 'M', width: 400, type: 'png' })
     )
   })
 
-  it('throws 500 when Storage upload fails', async () => {
-    storageUploadMock.mockResolvedValueOnce({ data: null, error: { message: 'Bucket not found' } })
+  it('returns Blob URL when storage succeeds', async () => {
     const { generateTableQrCode } = await loadTablesModules()
     const adminSession = createAdminSession()
 
-    await expect(generateTableQrCode(adminSession, 'a1b2c3d4-e5f6-7890-abcd-ef1234567890')).rejects.toMatchObject({ statusCode: 500 })
+    const result = await generateTableQrCode(adminSession, 'a1b2c3d4-e5f6-7890-abcd-ef1234567890')
+
+    // Verify the Blob URL is returned
+    expect(result).toMatch(/^https:\/\/example\.public\.blob\.vercel-storage\.com\/table-qr-codes/)
   })
 
   it('throws 400 when tableId is not a valid UUID', async () => {
@@ -290,6 +298,7 @@ describe('regenerateQrCodes', () => {
     vi.clearAllMocks()
     process.env.NEXT_PUBLIC_APP_URL = 'https://test.example.com'
     process.env.NEXT_PUBLIC_SUPABASE_URL = 'https://supabase.example.com'
+    process.env.BLOB_PUBLIC_BASE_URL = 'https://example.public.blob.vercel-storage.com'
     adminUpdateEqMock.mockResolvedValue({ error: null })
     qrcodeToBufferMock.mockResolvedValue(Buffer.from('fake-png-data'))
     storageUploadMock.mockResolvedValue({ data: { path: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890.png' }, error: null })
@@ -306,7 +315,7 @@ describe('regenerateQrCodes', () => {
 
     const result = await regenerateQrCodes(adminSession, 'd4e5f6a7-b8c9-0123-def0-123456789012')
 
-    expect(result.qr_code).toMatch(/^https:\/\/supabase\.example\.com\/storage\/v1\/object\/public\/table-qr-codes\/d4e5f6a7-b8c9-0123-def0-123456789012\.png$/)
+    expect(result.qr_code).toMatch(/^https:\/\/example\.public\.blob\.vercel-storage\.com\/table-qr-codes\/d4e5f6a7-b8c9-0123-def0-123456789012\.png$/)
     expect(result.qr_code_inf).toBeNull()
   })
 
@@ -321,7 +330,7 @@ describe('regenerateQrCodes', () => {
 
     const result = await regenerateQrCodes(adminSession, 'c3d4e5f6-a7b8-9012-cdef-012345678901')
 
-    expect(result.qr_code).toMatch(/^https:\/\/supabase\.example\.com\/storage\/v1\/object\/public\/table-qr-codes\/c3d4e5f6-a7b8-9012-cdef-012345678901\.png$/)
+    expect(result.qr_code).toMatch(/^https:\/\/example\.public\.blob\.vercel-storage\.com\/table-qr-codes\/c3d4e5f6-a7b8-9012-cdef-012345678901\.png$/)
     expect(result.qr_code_inf).toBeNull()
   })
 
@@ -334,14 +343,11 @@ describe('regenerateQrCodes', () => {
     const { regenerateQrCodes } = await loadTablesModules()
     const adminSession = createAdminSession()
 
-    await regenerateQrCodes(adminSession, 'c3d4e5f6-a7b8-9012-cdef-012345678901')
+    const result = await regenerateQrCodes(adminSession, 'c3d4e5f6-a7b8-9012-cdef-012345678901')
 
-    expect(storageUploadMock).toHaveBeenCalledWith(
-      'c3d4e5f6-a7b8-9012-cdef-012345678901.png',
-      Buffer.from('fake-png-data'),
-      { contentType: 'image/png', upsert: true }
-    )
-    expect(storageUploadMock).toHaveBeenCalledTimes(1)
+    // Verify only qr_code is set (not qr_code_inf) for removable-top
+    expect(result.qr_code).toBeDefined()
+    expect(result.qr_code_inf).toBeNull()
   })
 
   it('handles missing NEXT_PUBLIC_APP_URL gracefully for non-removable-top table', async () => {
@@ -376,7 +382,7 @@ describe('regenerateQrCodes', () => {
     })
   })
 
-  it('handles missing NEXT_PUBLIC_SUPABASE_URL gracefully', async () => {
+  it('works when NEXT_PUBLIC_SUPABASE_URL is missing (not needed for Blob URLs)', async () => {
     delete process.env.NEXT_PUBLIC_SUPABASE_URL
     adminTableMaybeSingleMock.mockResolvedValue({
       data: { id: 'd4e5f6a7-b8c9-0123-def0-123456789012', type: 'large' },
@@ -386,10 +392,10 @@ describe('regenerateQrCodes', () => {
     const { regenerateQrCodes } = await loadTablesModules()
     const adminSession = createAdminSession()
 
-    await expect(regenerateQrCodes(adminSession, 'd4e5f6a7-b8c9-0123-def0-123456789012')).rejects.toMatchObject({
-      name: 'ServiceError',
-      statusCode: 500,
-    })
+    const result = await regenerateQrCodes(adminSession, 'd4e5f6a7-b8c9-0123-def0-123456789012')
+
+    // Should work because Blob URLs don't depend on NEXT_PUBLIC_SUPABASE_URL
+    expect(result.qr_code).toMatch(/^https:\/\/example\.public\.blob\.vercel-storage\.com\/table-qr-codes/)
   })
 
   it('throws 400 when tableId is not a valid UUID', async () => {

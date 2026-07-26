@@ -11,37 +11,24 @@ import type {
  * lib/storage/qr/vercel-blob — Vercel Blob-backed implementation of the same
  * seam interface exposed by lib/storage/qr/index.ts.
  *
- * This is an F3 parallel-buildable scaffold (see Linear KIM-393..422, Supabase→Neon migration):
- * it implements the storage seam's exact function signatures
- * (`uploadToStorage`, `getPublicStorageUrl`, `removeFromStorage`) against
- * Vercel Blob so a later, explicit cutover step can swap the active backend
- * without touching call sites. This module is intentionally NOT imported or
- * wired in anywhere yet — lib/storage/qr/index.ts (Supabase Storage) remains
- * the sole active implementation. Activation is out of scope here; it
- * belongs to the real F3 cutover, which is a separate, user/infra-gated
- * change (requires a live Vercel Blob store + `BLOB_READ_WRITE_TOKEN`).
+ * As of the F3 cutover (KIM-431, see Linear KIM-393..422, Supabase→Vercel
+ * migration), lib/storage/qr/index.ts imports and delegates to the functions
+ * below for every call — this is now the sole active storage backend for
+ * both admin QR code generation and admin landing-media uploads. Requires a
+ * live Vercel Blob store with `BLOB_READ_WRITE_TOKEN` (write) and
+ * `BLOB_PUBLIC_BASE_URL` (public URL construction) configured in the
+ * deployment environment; see .env.example.
  *
  * Vercel Blob has no "bucket" concept — a read-write token is scoped to a
  * single store with a flat pathname namespace. To preserve call-site parity
- * with the Supabase-backed implementation (which takes a `bucket` and a
- * `path`), this adapter joins the two into a single blob pathname
- * (`${bucket}/${path}`), so callers can be swapped over unchanged.
+ * with the previous Supabase-backed implementation (which took a `bucket`
+ * and a `path`), this adapter joins the two into a single blob pathname
+ * (`${bucket}/${path}`).
  *
  * `put()`/`del()` below use the default `BLOB_READ_WRITE_TOKEN` env var
  * (Vercel's standard SDK convention) rather than accepting a client instance,
  * since `@vercel/blob` exposes module-level functions instead of a
  * client/from() builder like `@supabase/storage-js`.
- *
- * REQUIRED F3 CUTOVER FOLLOW-UP (KIM-421):
- * - lib/server/tables/tables-service.ts::uploadQrCodeToStorage() (line 33)
- *   currently builds Supabase Storage URLs manually from NEXT_PUBLIC_SUPABASE_URL
- *   instead of delegating to getPublicStorageUrl().
- * - When activating this Vercel Blob implementation, that call site MUST be
- *   refactored to use getPublicStorageUrl('table-qr-codes', storagePath) so
- *   the URL construction is backend-agnostic and respects the active seam.
- * - This scaffold intentionally does NOT refactor it now to preserve inert-only
- *   semantics (zero runtime behavior change until real cutover activation).
- * - See tests/unit/lib/storage/qr.test.ts for a documenting test of this gap.
  */
 
 function toPathname(bucket: string, path: string): string {
