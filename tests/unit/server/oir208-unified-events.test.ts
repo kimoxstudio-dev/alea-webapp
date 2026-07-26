@@ -14,12 +14,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { readFileSync } from 'fs'
 import { join } from 'path'
 import {
-  createTransactionAwareMockBuilder,
-  resetFixtures,
-  setFixture,
-  insertMock,
-  updateMock,
-  selectMock,
+  createStatefulDrizzleDb,
+  resetDb,
+  seedTable,
   createMockServiceError,
   MockServiceError,
 } from '@/tests/unit/mocks/drizzle-mock'
@@ -50,8 +47,8 @@ vi.mock('@/lib/club-time', () => ({
 }))
 
 vi.mock('@/lib/db', () => ({
-  getDrizzleDb: vi.fn(() => createTransactionAwareMockBuilder()),
-  getDrizzleAdminDb: vi.fn(() => createTransactionAwareMockBuilder()),
+  getDrizzleDb: vi.fn(() => createStatefulDrizzleDb()),
+  getDrizzleAdminDb: vi.fn(() => createStatefulDrizzleDb()),
   getAdminDb: vi.fn(),
   getDb: vi.fn(),
 }))
@@ -263,7 +260,7 @@ function buildSupabaseMock() {
 
 describe('OIR-208: Unified Events', () => {
   beforeEach(async () => {
-    resetFixtures()
+    resetDb()
     vi.clearAllMocks()
     // Dual-mock coexistence: Drizzle for migrated paths (club-events-service),
     // Supabase for unmigrated paths (availability tests reading event_room_blocks)
@@ -457,32 +454,11 @@ describe('OIR-208: Unified Events', () => {
 
   describe('RPC Payload: tableId in blocks', () => {
     it('includes tableId in block payload when provided', async () => {
-      const currentEventRow: EventRow = {
-        id: 'evt-1',
-        title: 'Event',
-        title_es: 'Evento',
-        title_en: 'Event',
-        blurb_es: null,
-        blurb_en: null,
-        description_es: null,
-        description_en: null,
-        category_es: null,
-        category_en: null,
-        date_kind: 'single',
-        date: '2026-04-20',
-        end_date: null,
-        recurrence_label_es: null,
-        recurrence_label_en: null,
-        image_url: null,
-        link_url: null,
-        created_by: 'user-1',
-        created_at: '2026-04-01T00:00:00Z',
-      }
-
-      setFixture('events', [currentEventRow])
-      setFixture('event_room_blocks', [])
-      updateMock.mockResolvedValue([currentEventRow])
-
+      // updateClubEvent runs entirely on the Supabase client (getAdminDb),
+      // not the Drizzle seam — the drizzle-mock fixtures this test used to
+      // set here were never actually consulted by the code path under test
+      // (confirmed by reading club-events-service.ts: it has no
+      // getDrizzleDb/getDrizzleAdminDb call at all). Removed as vestigial.
       vi.resetModules()
       const { updateClubEvent } = await import('@/lib/server/events/club-events-service')
 
@@ -503,32 +479,8 @@ describe('OIR-208: Unified Events', () => {
     })
 
     it('sets tableId to null in block payload when not provided', async () => {
-      const currentEventRow: EventRow = {
-        id: 'evt-1',
-        title: 'Event',
-        title_es: 'Evento',
-        title_en: 'Event',
-        blurb_es: null,
-        blurb_en: null,
-        description_es: null,
-        description_en: null,
-        category_es: null,
-        category_en: null,
-        date_kind: 'single',
-        date: '2026-04-20',
-        end_date: null,
-        recurrence_label_es: null,
-        recurrence_label_en: null,
-        image_url: null,
-        link_url: null,
-        created_by: 'user-1',
-        created_at: '2026-04-01T00:00:00Z',
-      }
-
-      setFixture('events', [currentEventRow])
-      setFixture('event_room_blocks', [])
-      updateMock.mockResolvedValue([currentEventRow])
-
+      // See note above: updateClubEvent never touches the Drizzle seam, so
+      // no drizzle-mock fixture is needed here.
       vi.resetModules()
       const { updateClubEvent } = await import('@/lib/server/events/club-events-service')
 
@@ -548,33 +500,10 @@ describe('OIR-208: Unified Events', () => {
     })
 
     it('rejects a block whose table_id does not belong to room_id (mismatched room/table payload)', async () => {
-      const currentEventRow: EventRow = {
-        id: 'evt-1',
-        title: 'Event',
-        title_es: 'Evento',
-        title_en: 'Event',
-        blurb_es: null,
-        blurb_en: null,
-        description_es: null,
-        description_en: null,
-        category_es: null,
-        category_en: null,
-        date_kind: 'single',
-        date: '2026-04-20',
-        end_date: null,
-        recurrence_label_es: null,
-        recurrence_label_en: null,
-        image_url: null,
-        link_url: null,
-        created_by: 'user-1',
-        created_at: '2026-04-01T00:00:00Z',
-      }
-
-      // table-1 belongs to room-1, so pairing with room-2 should fail
-      setFixture('events', [currentEventRow])
-      setFixture('event_room_blocks', [])
-      setFixture('tables', [{ id: 'table-1', roomId: 'room-1' }])
-      updateMock.mockResolvedValue([currentEventRow])
+      // table-1 belongs to room-1, so pairing with room-2 should fail. The
+      // TABLE_ROOM_MAP inside the RPC mock (buildSupabaseMock, top of file)
+      // is what actually enforces this — updateClubEvent never touches the
+      // Drizzle seam, so no drizzle-mock fixture is needed here.
 
       // This test must explicitly wire its own admin-client mock rather than
       // relying on whatever a PRECEDING test's `.mockReturnValue()` left in
@@ -628,45 +557,10 @@ describe('OIR-208: Unified Events', () => {
 
   describe('blocksMatchSchedules includes tableId comparison', () => {
     it('treats a schedule as unchanged when its tableId matches the stored block (RPC skipped)', async () => {
-      const currentEventRow: EventRow = {
-        id: 'evt-1',
-        title: 'Event',
-        title_es: 'Evento',
-        title_en: 'Event',
-        blurb_es: null,
-        blurb_en: null,
-        description_es: null,
-        description_en: null,
-        category_es: null,
-        category_en: null,
-        date_kind: 'single',
-        date: '2026-04-20',
-        end_date: null,
-        recurrence_label_es: null,
-        recurrence_label_en: null,
-        image_url: null,
-        link_url: null,
-        created_by: 'user-1',
-        created_at: '2026-04-01T00:00:00Z',
-      }
-
-      const currentBlocks: EventRoomBlockRow[] = [
-        {
-          id: 'blk-1',
-          event_id: 'evt-1',
-          room_id: 'room-1',
-          table_id: 'table-1',
-          date: '2026-04-20',
-          start_time: '14:00:00',
-          end_time: '16:00:00',
-          all_day: false,
-        },
-      ]
-
-      setFixture('events', [currentEventRow])
-      setFixture('event_room_blocks', currentBlocks)
-      updateMock.mockResolvedValue([currentEventRow])
-
+      // updateClubEvent reads current blocks via the Supabase admin client
+      // (fetchEventRoomBlocks -> admin.from('event_room_blocks')...), not the
+      // Drizzle seam, so the drizzle-mock fixture this test used to set here
+      // was never consulted — removed as vestigial.
       vi.resetModules()
       const { updateClubEvent } = await import('@/lib/server/events/club-events-service')
 
@@ -687,45 +581,7 @@ describe('OIR-208: Unified Events', () => {
     })
 
     it('detects difference when tableId changes between the stored block and incoming schedule', async () => {
-      const currentEventRow: EventRow = {
-        id: 'evt-1',
-        title: 'Event',
-        title_es: 'Evento',
-        title_en: 'Event',
-        blurb_es: null,
-        blurb_en: null,
-        description_es: null,
-        description_en: null,
-        category_es: null,
-        category_en: null,
-        date_kind: 'single',
-        date: '2026-04-20',
-        end_date: null,
-        recurrence_label_es: null,
-        recurrence_label_en: null,
-        image_url: null,
-        link_url: null,
-        created_by: 'user-1',
-        created_at: '2026-04-01T00:00:00Z',
-      }
-
-      const currentBlocks: EventRoomBlockRow[] = [
-        {
-          id: 'blk-1',
-          event_id: 'evt-1',
-          room_id: 'room-1',
-          table_id: 'table-1',
-          date: '2026-04-20',
-          start_time: '14:00:00',
-          end_time: '16:00:00',
-          all_day: false,
-        },
-      ]
-
-      setFixture('events', [currentEventRow])
-      setFixture('event_room_blocks', currentBlocks)
-      updateMock.mockResolvedValue([currentEventRow])
-
+      // See note above: no drizzle-mock fixture needed.
       vi.resetModules()
       const { updateClubEvent } = await import('@/lib/server/events/club-events-service')
 
@@ -746,45 +602,7 @@ describe('OIR-208: Unified Events', () => {
     })
 
     it('detects difference when table_id differs (room-level block vs. table-scoped schedule)', async () => {
-      const currentEventRow: EventRow = {
-        id: 'evt-1',
-        title: 'Event',
-        title_es: 'Evento',
-        title_en: 'Event',
-        blurb_es: null,
-        blurb_en: null,
-        description_es: null,
-        description_en: null,
-        category_es: null,
-        category_en: null,
-        date_kind: 'single',
-        date: '2026-04-20',
-        end_date: null,
-        recurrence_label_es: null,
-        recurrence_label_en: null,
-        image_url: null,
-        link_url: null,
-        created_by: 'user-1',
-        created_at: '2026-04-01T00:00:00Z',
-      }
-
-      const currentBlocks: EventRoomBlockRow[] = [
-        {
-          id: 'blk-1',
-          event_id: 'evt-1',
-          room_id: 'room-1',
-          table_id: null,
-          date: '2026-04-20',
-          start_time: '14:00:00',
-          end_time: '16:00:00',
-          all_day: false,
-        },
-      ]
-
-      setFixture('events', [currentEventRow])
-      setFixture('event_room_blocks', currentBlocks)
-      updateMock.mockResolvedValue([currentEventRow])
-
+      // See note above: no drizzle-mock fixture needed.
       vi.resetModules()
       const { updateClubEvent } = await import('@/lib/server/events/club-events-service')
 
@@ -959,8 +777,9 @@ describe('OIR-208: Unified Events', () => {
       vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
         buildAvailabilityAdminClient(eventBlocks) as any,
       )
-      selectMock.mockResolvedValueOnce([mockTableRow('table-A', ROOM)])
-      selectMock.mockResolvedValueOnce([mockTableRow('table-B', ROOM)])
+      // Real where(eq(tables.id, ...)) matching now, so both tables are
+      // seeded once — each call finds its own row regardless of order.
+      seedTable('tables', [mockTableRow('table-A', ROOM), mockTableRow('table-B', ROOM)])
 
       const { getTableAvailability } = await import('@/lib/server/tables/tables-service')
 
@@ -985,8 +804,7 @@ describe('OIR-208: Unified Events', () => {
       vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
         buildAvailabilityAdminClient(eventBlocks) as any,
       )
-      selectMock.mockResolvedValueOnce([mockTableRow('table-A', ROOM)])
-      selectMock.mockResolvedValueOnce([mockTableRow('table-B', ROOM)])
+      seedTable('tables', [mockTableRow('table-A', ROOM), mockTableRow('table-B', ROOM)])
 
       const { getTableAvailability } = await import('@/lib/server/tables/tables-service')
 
@@ -1007,7 +825,7 @@ describe('OIR-208: Unified Events', () => {
       vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
         buildAvailabilityAdminClient(eventBlocks) as any,
       )
-      selectMock.mockResolvedValueOnce([mockTableRow('table-A', ROOM), mockTableRow('table-B', ROOM)])
+      seedTable('tables', [mockTableRow('table-A', ROOM), mockTableRow('table-B', ROOM)])
 
       const { getRoomTablesAvailability } = await import('@/lib/server/rooms/rooms-service')
 
@@ -1027,7 +845,7 @@ describe('OIR-208: Unified Events', () => {
       vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
         buildAvailabilityAdminClient(eventBlocks) as any,
       )
-      selectMock.mockResolvedValueOnce([mockTableRow('table-A', ROOM), mockTableRow('table-B', ROOM)])
+      seedTable('tables', [mockTableRow('table-A', ROOM), mockTableRow('table-B', ROOM)])
 
       const { getRoomTablesAvailability } = await import('@/lib/server/rooms/rooms-service')
 
