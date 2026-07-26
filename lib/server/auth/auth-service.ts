@@ -1,12 +1,15 @@
 import type { User } from '@/lib/types'
 import type { SessionUser } from '@/lib/server/auth/auth'
 import { createHash, randomBytes } from 'node:crypto'
+import bcrypt from 'bcryptjs'
+import { eq } from 'drizzle-orm'
 import { AuthError } from 'next-auth'
 import { signIn as authJsSignIn, signOut as authJsSignOut } from '@/lib/authjs/auth'
 import { verifyCredentials } from '@/lib/authjs/credentials-user'
 import { getDatabaseNow } from '@/lib/server/shared/database-time'
 import { serviceError } from '@/lib/server/shared/service-error'
-import { getAdminDb, getDb } from '@/lib/db'
+import { getAdminDb, getDb, getDrizzleAdminDb } from '@/lib/db'
+import { profiles } from '@/lib/db/schema'
 import {
   createAuthUser,
   deleteAuthUser,
@@ -16,6 +19,59 @@ import {
 import type { Tables, TablesInsert } from '@/lib/supabase/types'
 import { activationServerSchema, recoveryServerSchema, registerServerSchema } from '@/lib/validations/auth'
 import { type PublicProfileRow, toPublicUser } from '@/lib/server/users/profile-mappers'
+
+/**
+ * bcryptjs cost factor — matches `scripts/seed.ts`'s `bcrypt.hash(password, 10)`
+ * so seeded and activated/recovered accounts hash with the same cost.
+ */
+const PASSWORD_HASH_COST = 10
+
+/**
+ * Writes the new password's bcrypt hash (and, for activation, the
+ * active-status fields) to `profiles.password_hash` on the Drizzle/Neon
+ * seam (`getDrizzleAdminDb()` — see `lib/db/index.ts`).
+ *
+ * This is NOT redundant with `updateAuthUserById()` above/below: that call
+ * only changes the password on the legacy Supabase Auth (GoTrue) seam
+ * (`getAdminDb()` / `NEXT_PUBLIC_SUPABASE_URL`), a physically different
+ * database from the one `POSTGRES_URL` points at (see `lib/db/index.ts`
+ * file header — Neon/Vercel Postgres is a separate target until the F2
+ * cutover, KIM-419/420). `verifyCredentials()`
+ * (`lib/authjs/credentials-user.ts`) authenticates exclusively against the
+ * Drizzle/Neon row, so without this write every Auth.js login attempt after
+ * activation/recovery would fail against a null or stale hash (KIM-433
+ * Codex-review fix).
+ *
+ * Must be called, and succeed, BEFORE the Supabase-side `profiles` row is
+ * marked `is_active: true` (activation) — so that if this write fails, the
+ * account is never left "marked active, token already consumed, but
+ * unusable" (no valid credential on the seam `verifyCredentials()` reads).
+ * Callers roll back the single-use activation/recovery token on failure,
+ * the same way they already do for `updateAuthUserById()` failures.
+ */
+async function persistDrizzlePasswordHash(
+  profileId: string,
+  passwordHash: string,
+  fields: { isActive?: boolean; activeFrom?: Date; pswChanged: Date },
+): Promise<boolean> {
+  try {
+    const drizzleAdmin = getDrizzleAdminDb()
+    await drizzleAdmin
+      .update(profiles)
+      .set({
+        passwordHash,
+        ...(fields.isActive !== undefined ? { isActive: fields.isActive } : {}),
+        ...(fields.activeFrom !== undefined ? { activeFrom: fields.activeFrom } : {}),
+        pswChanged: fields.pswChanged,
+      })
+      .where(eq(profiles.id, profileId))
+    return true
+  } catch {
+    // Connection error, missing POSTGRES_URL, unexpected shape, etc. — never
+    // leak internals; caller treats this the same as any other failed write.
+    return false
+  }
+}
 
 type ActivationTokenRow = Tables<'activation_tokens'>
 type AuthCredentialRow = Pick<Tables<'profiles'>, 'id' | 'member_number' | 'auth_email' | 'email' | 'full_name' | 'phone' | 'role' | 'is_active' | 'active_from' | 'no_show_count' | 'blocked_until' | 'created_at' | 'updated_at'>
@@ -473,11 +529,27 @@ export async function activateAccount(input: { token: unknown; password: unknown
     serviceError('Activation link is invalid or has expired', 400)
   }
 
+  const passwordHash = await bcrypt.hash(parsed.data.password, PASSWORD_HASH_COST)
+
   const { error: updateAuthError } = await updateAuthUserById(admin, profile.id, {
     password: parsed.data.password,
     email_confirm: true,
   })
   if (updateAuthError) {
+    await activationTokens.update({ used_at: null }).eq('id', claimedToken.id)
+    serviceError('Failed to activate account', 500)
+  }
+
+  // KIM-433 Codex-review fix — see `persistDrizzlePasswordHash()` doc comment.
+  // Must succeed, and must land, before the Supabase `is_active: true` flip
+  // below so a failure here never leaves the account marked active with the
+  // token already consumed but no usable credential.
+  const drizzleWriteOk = await persistDrizzlePasswordHash(profile.id, passwordHash, {
+    isActive: true,
+    activeFrom: new Date(activatedAt),
+    pswChanged: new Date(activatedAt),
+  })
+  if (!drizzleWriteOk) {
     await activationTokens.update({ used_at: null }).eq('id', claimedToken.id)
     serviceError('Failed to activate account', 500)
   }
@@ -593,11 +665,26 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
     serviceError('Recovery link is invalid or has expired', 400)
   }
 
+  const passwordHash = await bcrypt.hash(parsed.data.password, PASSWORD_HASH_COST)
+
   const { error: updateAuthError } = await updateAuthUserById(admin, profile.id, {
     password: parsed.data.password,
     email_confirm: true,
   })
   if (updateAuthError) {
+    await activationTokens.update({ used_at: null }).eq('id', claimedToken.id)
+    serviceError('Failed to recover account', 500)
+  }
+
+  // KIM-433 Codex-review fix — see `persistDrizzlePasswordHash()` doc comment.
+  // `isActive: true` is reasserted (not flipped — `profile.is_active` was
+  // already required to be true above) as defense-in-depth self-healing in
+  // case the Drizzle/Neon row ever lagged the Supabase one.
+  const drizzleWriteOk = await persistDrizzlePasswordHash(profile.id, passwordHash, {
+    isActive: true,
+    pswChanged: new Date(recoveredAt),
+  })
+  if (!drizzleWriteOk) {
     await activationTokens.update({ used_at: null }).eq('id', claimedToken.id)
     serviceError('Failed to recover account', 500)
   }

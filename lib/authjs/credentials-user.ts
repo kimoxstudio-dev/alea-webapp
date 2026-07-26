@@ -41,9 +41,16 @@ export interface AuthJsUser {
  *
  * This is defensive scaffolding: the schema column exists, but the data
  * behind it does not yet. Any failure — connection error, no matching row,
- * a `null` password_hash, or a wrong password — resolves to `null`
- * uniformly so callers can never infer whether a given email exists. This
- * route is also gated 404-by-default behind `AUTH_JS_ENABLED` (see
+ * a `null` password_hash, an inactive (`is_active: false`) profile, or a
+ * wrong password — resolves to `null` uniformly so callers can never infer
+ * whether a given email exists (or whether it exists but is suspended).
+ * Failing authentication here, at the point of credential verification —
+ * rather than relying solely on `getSessionUser()`'s downstream
+ * `is_active` re-check (`lib/server/auth/auth.ts`) — means the Credentials
+ * provider never issues a session token for a suspended profile in the
+ * first place.
+ *
+ * This route is also gated 404-by-default behind `AUTH_JS_ENABLED` (see
  * app/api/authjs/[...nextauth]/route.ts) so this code path cannot be
  * reached in any deployed environment before the F2 cutover intentionally
  * enables it, even though KIM-433 wires it into the live session path
@@ -68,7 +75,7 @@ export async function verifyCredentials(
       .where(eq(profiles.authEmail, authEmail))
       .limit(1)
 
-    if (!row || !row.passwordHash) {
+    if (!row || !row.isActive || !row.passwordHash) {
       return null
     }
 
