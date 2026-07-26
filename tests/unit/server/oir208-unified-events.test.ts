@@ -37,7 +37,12 @@ vi.mock('@/lib/server/events/events-service', () => ({
   validateAndNormaliseSchedule: vi.fn(() => []),
   deleteEventCascade: vi.fn(),
   cancelOverlappingReservationsForBlocks: vi.fn(),
-  isClubEventRow: vi.fn((row) => row.title_es !== null && row.title_en !== null),
+  // KIM-434 PR3/PR3b: the real isClubEventRow (lib/server/events/events-service.ts)
+  // takes the camelCase Drizzle shape { titleEs, titleEn } — see
+  // club-events-service.ts:373/452 which call it with { titleEs: row.title_es,
+  // titleEn: row.title_en }. This stub must read the same camelCase keys the
+  // real call site passes, not the snake_case keys of this file's own EventRow.
+  isClubEventRow: vi.fn((row) => row.titleEs !== null && row.titleEn !== null),
 }))
 vi.mock('@/lib/club-time', () => ({
   getCurrentClubDate: vi.fn(() => '2026-04-15'),
@@ -136,10 +141,13 @@ function buildSupabaseMock() {
               })),
             })),
           })),
-          insert: vi.fn(() => ({
+          insert: vi.fn((payload: any) => ({
             select: vi.fn(() => ({
+              // Echo back the inserted fields (title_es/title_en/etc) instead
+              // of a hardcoded id-only row, so callers reading e.g. row.title_es
+              // off the "inserted" row see what was actually inserted (KIM-434 3/5).
               maybeSingle: vi.fn(async () => ({
-                data: { id: 'evt-new-1' } as EventRow,
+                data: { id: 'evt-new-1', ...payload } as EventRow,
                 error: null,
               })),
             })),
@@ -568,8 +576,36 @@ describe('OIR-208: Unified Events', () => {
       setFixture('tables', [{ id: 'table-1', roomId: 'room-1' }])
       updateMock.mockResolvedValue([currentEventRow])
 
+      // This test must explicitly wire its own admin-client mock rather than
+      // relying on whatever a PRECEDING test's `.mockReturnValue()` left in
+      // place (vi.clearAllMocks() does not reset mock implementations) —
+      // otherwise it may hit an admin mock whose `rpc` doesn't simulate the
+      // mismatched room/table 23514 error this test targets (KIM-434 3/5).
+      const mockSupabase = buildSupabaseMock()
+      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
+        mockSupabase as any,
+      )
+
       vi.resetModules()
       const { updateClubEvent } = await import('@/lib/server/events/club-events-service')
+
+      // The module-level stub for validateAndNormaliseSchedule (top of file)
+      // always returns `[]`, which is fine for the other tests in this
+      // describe block (they don't inspect the built RPC payload) but loses
+      // roomId/tableId entirely — the block would get filtered out before
+      // ever reaching the RPC's mismatch check. This test specifically
+      // exercises that RPC-error path, so it needs a real per-schedule
+      // normalisation matching validateAndNormaliseSchedule's actual shape.
+      vi.mocked(await import('@/lib/server/events/events-service')).validateAndNormaliseSchedule.mockImplementation(
+        (raw: any) => ({
+          room_id: raw.roomId ?? null,
+          table_id: raw.tableId ?? null,
+          date: raw.date,
+          start_time: raw.startTime,
+          end_time: raw.endTime,
+          all_day: raw.allDay === true,
+        }),
+      )
 
       await expect(
         updateClubEvent(createAdminSession(), 'evt-1', {

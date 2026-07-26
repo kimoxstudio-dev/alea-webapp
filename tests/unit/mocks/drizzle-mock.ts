@@ -1609,6 +1609,16 @@ export function createStatefulDrizzleDb() {
  */
 const fixtureState = {
   tableFixtures: new Map<string, any[]>(),
+  // Per-table INSERT...RETURNING overrides (KIM-434 3/5). Unlike select,
+  // which always dispatches by table, insert historically resolved via a
+  // single shared `insertMock()` regardless of which table was targeted —
+  // fine for single-table scenarios, but wrong once a test needs two
+  // different tables inserted into within the same transaction (e.g.
+  // `events` returning one row, `event_room_blocks` returning N rows).
+  // `setInsertFixture(table, rows)` lets a test configure that per table;
+  // `insertMock` remains the fallback for tables with no fixture set, so
+  // existing single-table tests keep working unmodified.
+  insertFixtures: new Map<string, any[]>(),
   defaultInsertResponse: null as any,
   defaultUpdateResponse: null as any,
   defaultDeleteResponse: null as any,
@@ -1620,6 +1630,7 @@ const fixtureState = {
  */
 export function resetFixtures() {
   fixtureState.tableFixtures.clear()
+  fixtureState.insertFixtures.clear()
   fixtureState.defaultInsertResponse = null
   fixtureState.defaultUpdateResponse = null
   fixtureState.defaultDeleteResponse = null
@@ -1631,6 +1642,70 @@ export function resetFixtures() {
  */
 export function setFixture(tableName: string, rows: any[]) {
   fixtureState.tableFixtures.set(tableName, rows)
+}
+
+/**
+ * Set the rows returned by `db.insert(<table>).values(...).returning()` for
+ * a SPECIFIC table, dispatching the same way `setFixture`/select does.
+ *
+ * Use this when a test needs different insert results for different tables
+ * within the same transaction (e.g. inserting into `events` returns one row,
+ * inserting into `event_room_blocks` returns N rows). Takes precedence over
+ * `insertMock` / `setDefaultMockResponse('insert', ...)` for the table it's
+ * set on; other tables continue to resolve via `insertMock` as before.
+ *
+ * Example: setInsertFixture('event_room_blocks', [blockRow1, blockRow2])
+ */
+export function setInsertFixture(tableName: string, rows: any[]) {
+  fixtureState.insertFixtures.set(tableName, rows)
+}
+
+/**
+ * Extract a Drizzle table's name from either a plain string or a Drizzle
+ * table object (which stores its name under a `Symbol(drizzle:Name)` key).
+ * Shared by every dispatching mock (select/insert) below so table-name
+ * resolution stays consistent in one place.
+ */
+function extractTableName(table: any): string | null {
+  if (typeof table === 'string') return table
+  if (table && typeof table === 'object') {
+    const symbols = Object.getOwnPropertySymbols(table)
+    const drizzleNameSymbol = symbols.find((s) => s.toString() === 'Symbol(drizzle:Name)')
+    if (drizzleNameSymbol && table[drizzleNameSymbol]) {
+      return table[drizzleNameSymbol]
+    }
+    return table?._?.name ?? table?.name ?? table?.dbName ?? null
+  }
+  return null
+}
+
+/**
+ * Create a dispatching mock for `db.insert(<table>).values(...).returning()`
+ * (and direct-await without `.returning()`).
+ *
+ * Dispatch order per table:
+ * 1. A per-table fixture set via `setInsertFixture(table, rows)` — used as-is.
+ * 2. Otherwise, falls back to the shared `insertMock()` (+ default insert
+ *    response), preserving existing single-table test behavior.
+ */
+function createDispatchingInsertMock() {
+  return vi.fn((table: any) => {
+    const tableName = extractTableName(table)
+    const resolve = () => {
+      if (tableName && fixtureState.insertFixtures.has(tableName)) {
+        return Promise.resolve(fixtureState.insertFixtures.get(tableName))
+      }
+      return insertMock().then((result: any) => result || fixtureState.defaultInsertResponse || [])
+    }
+
+    return {
+      values: vi.fn(() => ({
+        returning: vi.fn(() => resolve()),
+        then: (onFulfilled: any, onRejected: any) => resolve().then(onFulfilled, onRejected),
+        catch: (onRejected: any) => resolve().catch(onRejected),
+      })),
+    }
+  })
 }
 
 /**
@@ -1888,21 +1963,7 @@ export function createDrizzleQueryBuilderWithDispatching() {
     select: vi.fn(() => ({
       from: dispatchingSelect.select().from,
     })),
-    insert: vi.fn(() => ({
-      values: vi.fn(() => ({
-        returning: vi.fn(() =>
-          insertMock().then((result) => result || fixtureState.defaultInsertResponse || [])
-        ),
-        then: (onFulfilled: any, onRejected: any) =>
-          insertMock()
-            .then((result) => result || fixtureState.defaultInsertResponse || [])
-            .then(onFulfilled, onRejected),
-        catch: (onRejected: any) =>
-          insertMock()
-            .then((result) => result || fixtureState.defaultInsertResponse || [])
-            .catch(onRejected),
-      })),
-    })),
+    insert: createDispatchingInsertMock(),
     update: vi.fn(() => ({
       set: vi.fn(() => ({
         where: vi.fn(() => ({
@@ -2087,21 +2148,7 @@ function createTransactionScopedBuilder(scope: TransactionScope) {
     select: vi.fn(() => ({
       from: selectBuilder.select().from,
     })),
-    insert: vi.fn(() => ({
-      values: vi.fn(() => ({
-        returning: vi.fn(() =>
-          insertMock().then((result) => result || fixtureState.defaultInsertResponse || [])
-        ),
-        then: (onFulfilled: any, onRejected: any) =>
-          insertMock()
-            .then((result) => result || fixtureState.defaultInsertResponse || [])
-            .then(onFulfilled, onRejected),
-        catch: (onRejected: any) =>
-          insertMock()
-            .then((result) => result || fixtureState.defaultInsertResponse || [])
-            .catch(onRejected),
-      })),
-    })),
+    insert: createDispatchingInsertMock(),
     update: vi.fn(() => ({
       set: vi.fn(() => ({
         where: vi.fn(() => ({
@@ -2151,21 +2198,7 @@ export function createTransactionAwareMockBuilder() {
     select: vi.fn(() => ({
       from: dispatchingSelect.select().from,
     })),
-    insert: vi.fn(() => ({
-      values: vi.fn(() => ({
-        returning: vi.fn(() =>
-          insertMock().then((result) => result || fixtureState.defaultInsertResponse || [])
-        ),
-        then: (onFulfilled: any, onRejected: any) =>
-          insertMock()
-            .then((result) => result || fixtureState.defaultInsertResponse || [])
-            .then(onFulfilled, onRejected),
-        catch: (onRejected: any) =>
-          insertMock()
-            .then((result) => result || fixtureState.defaultInsertResponse || [])
-            .catch(onRejected),
-      })),
-    })),
+    insert: createDispatchingInsertMock(),
     update: vi.fn(() => ({
       set: vi.fn(() => ({
         where: vi.fn(() => ({
