@@ -1,3 +1,4 @@
+import { and, asc, eq, gt, gte, inArray, isNull, lt, lte, ne, sql } from 'drizzle-orm'
 import type { AvailableEquipment, Equipment, Reservation, TableSurface } from '@/lib/types'
 import { ERROR_CODES } from '@/lib/types/error-codes'
 import type { SessionUser } from '@/lib/server/auth/auth'
@@ -5,8 +6,18 @@ import { CLUB_TIMEZONE, getCurrentClubDate, isValidDateOnlyString, zonedDateTime
 import { getDatabaseNow } from '@/lib/server/shared/database-time'
 import { serviceError } from '@/lib/server/shared/service-error'
 import { assertMemberRowsScoped } from '@/lib/server/shared/data-scoping'
-import { getAdminDb, getDb } from '@/lib/db'
-import type { Tables, TablesInsert, TablesUpdate } from '@/lib/supabase/types'
+import { getDrizzleAdminDb, getDrizzleDb, type DbClient } from '@/lib/db'
+import {
+  equipment,
+  eventRoomBlocks,
+  profiles,
+  reservationEquipment,
+  reservations,
+  roomDefaultEquipment,
+  rooms,
+  savedGames,
+  tables,
+} from '@/lib/db/schema'
 import { normalizeTime } from '@/lib/server/reservations/availability'
 import {
   CHECK_IN_LATE_MINUTES,
@@ -14,78 +25,27 @@ import {
   isPendingReservationExpired,
 } from '@/lib/server/reservations/pending-reservation-expiry'
 
-type ReservationRow = Tables<'reservations'>
-type TableRow = Tables<'tables'>
-type EquipmentRow = Tables<'equipment'>
-type ReservationEquipmentRow = Tables<'reservation_equipment'>
-type PostgrestErrorLike = { code?: string }
-type TablesLookupClient = {
-  select: (columns?: string) => {
-    eq: (column: 'id', value: string) => {
-      maybeSingle: () => Promise<{ data: TableRow | null; error: unknown }>
-    }
-  }
-}
-type AdminReservationsQuery = {
-  eq: (column: 'id' | 'table_id' | 'date' | 'status', value: string) => AdminReservationsQuery
-  neq: (column: 'id', value: string) => AdminReservationsQuery
-  in: (column: 'status', values: string[]) => AdminReservationsQuery
-  lt: (column: 'start_time', value: string) => AdminReservationsQuery
-  gt: (column: 'end_time', value: string) => AdminReservationsQuery
-  order: (column: string, options?: { ascending: boolean }) => AdminReservationsQuery
-  range: (from: number, to: number) => Promise<{ data: Array<{ id: string }> | null; error: unknown }>
-  limit: (count: number) => Promise<{ data: Array<{ id: string }> | null; error: unknown }>
-  maybeSingle: () => Promise<{ data: ReservationRow | null; error: unknown }>
-  then: Promise<{ data: ReservationRow[] | null; error: unknown }>['then']
-}
-type AdminReservationsTableClient = {
-  select: (columns: string) => AdminReservationsQuery
-}
-type SessionReservationsQuery = {
-  eq: (column: 'user_id' | 'table_id' | 'date', value: string) => SessionReservationsQuery
-  order: (column: string, options: { ascending: boolean }) => SessionReservationsQuery
-  then: Promise<{ data: ReservationRow[] | null; error: unknown }>['then']
-}
-type UserSlotOverlapQuery = {
-  eq: (column: 'user_id' | 'date', value: string) => UserSlotOverlapQuery
-  neq: (column: 'id', value: string) => UserSlotOverlapQuery
-  in: (column: 'status', values: string[]) => UserSlotOverlapQuery
-  lt: (column: 'start_time' | 'end_time', value: string) => UserSlotOverlapQuery
-  gt: (column: 'start_time' | 'end_time', value: string) => UserSlotOverlapQuery
-  then: Promise<{ data: ReservationRow[] | null; error: unknown }>['then']
-}
-type UserSlotOverlapTableClient = {
-  select: (columns: string) => UserSlotOverlapQuery
-}
-type SessionReservationsTableClient = {
-  select: (columns: string) => SessionReservationsQuery
-  insert: (values: TablesInsert<'reservations'>) => {
-    select: (columns: string) => {
-      single: () => Promise<{ data: ReservationRow | null; error: PostgrestErrorLike | null }>
-    }
-  }
-  update: (values: TablesUpdate<'reservations'>) => {
-    eq: (column: 'id', value: string) => {
-      select: (columns: string) => {
-        single: () => Promise<{ data: ReservationRow | null; error: PostgrestErrorLike | null }>
-      }
-    }
-  }
+/**
+ * KIM-434 (F3c) PR4: this service now reads/writes via the Drizzle/Neon seam
+ * (see `lib/db/index.ts` header for the full stack rationale), following the
+ * pattern established in `lib/server/equipment/equipment-service.ts` and
+ * `lib/server/partners/partners-service.ts`.
+ */
+
+type ReservationRow = typeof reservations.$inferSelect
+type TableRow = typeof tables.$inferSelect
+type EquipmentRow = typeof equipment.$inferSelect
+
+/** Shape expected by `isPendingReservationExpired()` / `getPendingCheckInDeadline()` (lib/server/reservations/pending-reservation-expiry.ts), which is also shared by not-yet-migrated services and therefore still keyed by the legacy snake_case column names. */
+function toPendingSlot(row: Pick<ReservationRow, 'date' | 'startTime' | 'endTime'>) {
+  return { date: row.date, start_time: row.startTime, end_time: row.endTime }
 }
 
 type EnrichedReservationRow = ReservationRow & {
-  profiles?: { member_number: string } | null
-  tables?: { name: string; rooms?: { name: string } | null } | null
-  reservation_equipment?: Array<ReservationEquipmentRow & { equipment: EquipmentRow | null }> | null
-}
-
-type EnrichedReservationsQuery = {
-  eq: (column: 'user_id' | 'table_id' | 'date', value: string) => EnrichedReservationsQuery
-  order: (column: string, options: { ascending: boolean }) => EnrichedReservationsQuery
-  then: Promise<{ data: EnrichedReservationRow[] | null; error: unknown }>['then']
-}
-type EnrichedReservationsTableClient = {
-  select: (columns: string) => EnrichedReservationsQuery
+  memberNumber: string | null
+  tableName: string | null
+  roomName: string | null
+  equipment: Equipment[]
 }
 
 /** @deprecated Pending expiry is slot-relative; retained for compatibility. */
@@ -97,8 +57,19 @@ export { CHECK_IN_LATE_MINUTES }
 export const BOOKING_WINDOW_DAYS = 7
 const CANCELLATION_CUTOFF_MS = 60 * 60 * 1000 // 60 minutes
 
-const RESERVATION_COLUMNS = 'id, table_id, user_id, date, start_time, end_time, status, surface, activated_at, created_at'
-const RESERVATION_ENRICHED_COLUMNS = 'id, table_id, user_id, date, start_time, end_time, status, surface, activated_at, created_at, profiles(member_number), tables(name, rooms(name)), reservation_equipment(equipment(id, name, description, created_at))'
+/**
+ * Runs a Drizzle query, translating any thrown DB/driver error into a
+ * uniform 500 ServiceError. Business-logic outcomes (e.g. "no row
+ * returned" -> 404, validation -> 400) are handled by callers, outside this
+ * wrapper, so their specific status codes aren't swallowed into a 500.
+ */
+async function runQuery<T>(query: Promise<T>): Promise<T> {
+  try {
+    return await query
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+}
 
 function parseDate(value: string): string {
   if (!isValidDateOnlyString(value)) {
@@ -157,22 +128,22 @@ function toEquipment(row: EquipmentRow): Equipment {
     id: row.id,
     name: row.name,
     description: row.description ?? null,
-    createdAt: row.created_at,
+    createdAt: row.createdAt.toISOString(),
   }
 }
 
 function mapReservation(row: ReservationRow): Reservation {
   return {
     id: row.id,
-    tableId: row.table_id,
-    userId: row.user_id,
+    tableId: row.tableId,
+    userId: row.userId,
     date: row.date,
-    startTime: normalizeTime(row.start_time),
-    endTime: normalizeTime(row.end_time),
+    startTime: normalizeTime(row.startTime),
+    endTime: normalizeTime(row.endTime),
     status: row.status,
     surface: row.surface,
-    activatedAt: row.activated_at ?? null,
-    createdAt: row.created_at,
+    activatedAt: row.activatedAt ? row.activatedAt.toISOString() : null,
+    createdAt: row.createdAt.toISOString(),
     equipment: [],
   }
 }
@@ -180,38 +151,33 @@ function mapReservation(row: ReservationRow): Reservation {
 function mapEnrichedReservation(row: EnrichedReservationRow): Reservation {
   return {
     id: row.id,
-    tableId: row.table_id,
-    userId: row.user_id,
+    tableId: row.tableId,
+    userId: row.userId,
     date: row.date,
-    startTime: normalizeTime(row.start_time),
-    endTime: normalizeTime(row.end_time),
+    startTime: normalizeTime(row.startTime),
+    endTime: normalizeTime(row.endTime),
     status: row.status,
     surface: row.surface,
-    activatedAt: row.activated_at ?? null,
-    createdAt: row.created_at,
-    memberNumber: row.profiles?.member_number ?? null,
-    roomName: row.tables?.rooms?.name ?? null,
-    tableName: row.tables?.name ?? null,
-    equipment: (row.reservation_equipment ?? [])
-      .map((item) => item.equipment)
-      .filter((item): item is EquipmentRow => item !== null)
-      .map(toEquipment),
+    activatedAt: row.activatedAt ? row.activatedAt.toISOString() : null,
+    createdAt: row.createdAt.toISOString(),
+    memberNumber: row.memberNumber,
+    roomName: row.roomName,
+    tableName: row.tableName,
+    equipment: row.equipment,
   }
 }
 
-async function getTable(tableId: string) {
-  const supabase = await getDb()
-  const tables = supabase.from('tables') as unknown as TablesLookupClient
-  const { data, error } = await tables
-    .select('id, type, room_id')
-    .eq('id', tableId)
-    .maybeSingle()
+async function getTable(tableId: string): Promise<Pick<TableRow, 'id' | 'type' | 'roomId'> | null> {
+  const db = getDrizzleDb()
+  const [row] = await runQuery(
+    db
+      .select({ id: tables.id, type: tables.type, roomId: tables.roomId })
+      .from(tables)
+      .where(eq(tables.id, tableId))
+      .limit(1),
+  )
 
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-
-  return data as TableRow | null
+  return row ?? null
 }
 
 async function hasEventBlockConflict(input: {
@@ -221,24 +187,24 @@ async function hasEventBlockConflict(input: {
   startTime: string
   endTime: string
 }) {
-  const admin = getAdminDb()
-  const { data, error } = await admin
-    .from('event_room_blocks')
-    .select('id, table_id')
-    .eq('room_id', input.roomId)
-    .eq('date', input.date)
-    .lt('start_time', input.endTime)
-    .gt('end_time', input.startTime)
-
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
+  const admin = getDrizzleAdminDb()
+  const rows = await runQuery(
+    admin
+      .select({ id: eventRoomBlocks.id, tableId: eventRoomBlocks.tableId })
+      .from(eventRoomBlocks)
+      .where(
+        and(
+          eq(eventRoomBlocks.roomId, input.roomId),
+          eq(eventRoomBlocks.date, input.date),
+          lt(eventRoomBlocks.startTime, input.endTime),
+          gt(eventRoomBlocks.endTime, input.startTime),
+        ),
+      ),
+  )
 
   // OIR-208: a block with a table_id only conflicts with that single table;
   // NULL (the pre-OIR-208 default) conflicts with every table of the room.
-  return ((data ?? []) as Array<{ id: string; table_id: string | null }>).some(
-    (block) => block.table_id == null || block.table_id === input.tableId,
-  )
+  return rows.some((block) => block.tableId == null || block.tableId === input.tableId)
 }
 
 async function hasSavedGameBottomConflict(input: {
@@ -247,33 +213,32 @@ async function hasSavedGameBottomConflict(input: {
   surface?: TableSurface
 }) {
   if (input.surface !== 'bottom') return false
-  const admin = getAdminDb()
-  const { data, error } = await admin
-    .from('saved_games')
-    .select('id')
-    .eq('table_id', input.tableId)
-    .eq('status', 'active')
-    .lte('start_date', input.date)
-    .gte('end_date', input.date)
-    .limit(1)
+  const admin = getDrizzleAdminDb()
+  const rows = await runQuery(
+    admin
+      .select({ id: savedGames.id })
+      .from(savedGames)
+      .where(
+        and(
+          eq(savedGames.tableId, input.tableId),
+          eq(savedGames.status, 'active'),
+          lte(savedGames.startDate, input.date),
+          gte(savedGames.endDate, input.date),
+        ),
+      )
+      .limit(1),
+  )
 
-  if (error) serviceError('Internal server error', 500)
-  return Boolean(data?.length)
+  return rows.length > 0
 }
 
-async function getReservationForAccess(reservationId: string) {
-  const admin = getAdminDb()
-  const reservations = admin.from('reservations') as unknown as AdminReservationsTableClient
-  const { data, error } = await reservations
-    .select(RESERVATION_COLUMNS)
-    .eq('id', reservationId)
-    .maybeSingle()
+async function getReservationForAccess(reservationId: string): Promise<ReservationRow | null> {
+  const admin = getDrizzleAdminDb()
+  const [row] = await runQuery(
+    admin.select().from(reservations).where(eq(reservations.id, reservationId)).limit(1),
+  )
 
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-
-  return data as ReservationRow | null
+  return row ?? null
 }
 
 async function listActiveReservationsForConflict(input: {
@@ -281,61 +246,67 @@ async function listActiveReservationsForConflict(input: {
   date: string
   ignoreReservationId?: string
 }) {
-  const admin = getAdminDb()
-  const query = (admin.from('reservations') as unknown as AdminReservationsTableClient)
-    .select(RESERVATION_COLUMNS)
-    .eq('table_id', input.tableId)
-    .eq('date', input.date)
-    .in('status', ['active', 'pending'])
-
-  const result = input.ignoreReservationId
-    ? await query.neq('id', input.ignoreReservationId)
-    : await query
-  const { data, error } = result
-
-  if (error) {
-    serviceError('Internal server error', 500)
+  const admin = getDrizzleAdminDb()
+  const conditions = [
+    eq(reservations.tableId, input.tableId),
+    eq(reservations.date, input.date),
+    inArray(reservations.status, ['active', 'pending']),
+  ]
+  if (input.ignoreReservationId) {
+    conditions.push(ne(reservations.id, input.ignoreReservationId))
   }
+
+  const rows = await runQuery(admin.select().from(reservations).where(and(...conditions)))
 
   // Lazy evaluation: filter out expired pending reservations
   const nowUtc = await getDatabaseNow(admin)
-  return (data ?? []).filter((row) => {
-    if (row.status === 'pending' && row.activated_at === null) {
-      return !isPendingReservationExpired(row, nowUtc)
+  return rows.filter((row) => {
+    if (row.status === 'pending' && row.activatedAt === null) {
+      return !isPendingReservationExpired(toPendingSlot(row), nowUtc)
     }
     return true // Keep active reservations
-  }) as ReservationRow[]
+  })
 }
 
 async function expireStalePendingReservations(tableId: string, date: string) {
-  const admin = getAdminDb()
+  const admin = getDrizzleAdminDb()
   const nowUtc = await getDatabaseNow(admin)
-  const { data, error } = await admin
-    .from('reservations')
-    .select(RESERVATION_COLUMNS)
-    .eq('status', 'pending')
-    .eq('table_id', tableId)
-    .eq('date', date)
-    .is('activated_at', null)
 
-  if (error) {
+  let rows: ReservationRow[]
+  try {
+    rows = await admin
+      .select()
+      .from(reservations)
+      .where(
+        and(
+          eq(reservations.status, 'pending'),
+          eq(reservations.tableId, tableId),
+          eq(reservations.date, date),
+          isNull(reservations.activatedAt),
+        ),
+      )
+  } catch (error) {
     console.error('expireStalePendingReservations failed (non-fatal):', error)
     return
   }
 
-  const expiredIds = (data ?? [])
-    .filter((row) => isPendingReservationExpired(row, nowUtc))
+  const expiredIds = rows
+    .filter((row) => isPendingReservationExpired(toPendingSlot(row), nowUtc))
     .map((row) => row.id)
 
   for (const id of expiredIds) {
-    const { error: updateError } = await admin
-      .from('reservations')
-      .update({ status: 'cancelled' })
-      .eq('id', id)
-      .eq('status', 'pending')
-      .is('activated_at', null)
-
-    if (updateError) {
+    try {
+      await admin
+        .update(reservations)
+        .set({ status: 'cancelled' })
+        .where(
+          and(
+            eq(reservations.id, id),
+            eq(reservations.status, 'pending'),
+            isNull(reservations.activatedAt),
+          ),
+        )
+    } catch (updateError) {
       console.error('expireStalePendingReservations failed (non-fatal):', updateError)
     }
   }
@@ -347,39 +318,40 @@ async function listOverlappingReservationIds(input: {
   endTime: string
   ignoreReservationId?: string
 }) {
-  const admin = getAdminDb()
+  const admin = getDrizzleAdminDb()
   const pageSize = 1000
   const reservationIds: string[] = []
   let from = 0
 
-  // Capture DB time once before the pagination loop to avoid one RPC per page.
+  // Capture DB time once before the pagination loop to avoid one round trip per page.
   const nowUtc = await getDatabaseNow(admin)
 
   // Get full rows to enable lazy evaluation filtering
   while (true) {
-    let query = (admin.from('reservations') as unknown as AdminReservationsTableClient)
-      .select(RESERVATION_COLUMNS)
-      .eq('date', input.date)
-      .in('status', ['pending', 'active'])
-      .lt('start_time', input.endTime)
-      .gt('end_time', input.startTime)
-
+    const conditions = [
+      eq(reservations.date, input.date),
+      inArray(reservations.status, ['pending', 'active']),
+      lt(reservations.startTime, input.endTime),
+      gt(reservations.endTime, input.startTime),
+    ]
     if (input.ignoreReservationId) {
-      query = query.neq('id', input.ignoreReservationId)
+      conditions.push(ne(reservations.id, input.ignoreReservationId))
     }
 
-    const { data, error } = await query.order('id', { ascending: true }).range(from, from + pageSize - 1)
-
-    if (error) {
-      serviceError('Internal server error', 500)
-    }
-
-    const rows = (data ?? []) as ReservationRow[]
+    const rows = await runQuery(
+      admin
+        .select()
+        .from(reservations)
+        .where(and(...conditions))
+        .orderBy(asc(reservations.id))
+        .limit(pageSize)
+        .offset(from),
+    )
 
     // Lazy evaluation: filter out expired pending reservations
     const filteredRows = rows.filter((row) => {
-      if (row.status === 'pending' && row.activated_at === null) {
-        return !isPendingReservationExpired(row, nowUtc)
+      if (row.status === 'pending' && row.activatedAt === null) {
+        return !isPendingReservationExpired(toPendingSlot(row), nowUtc)
       }
       return true
     })
@@ -393,50 +365,54 @@ async function listOverlappingReservationIds(input: {
   return reservationIds
 }
 
+/** @deprecated Currently unused (carried over unchanged from the pre-migration file); retained to avoid unrelated cleanup in this migration. */
 async function listRoomDefaultEquipment(roomId: string) {
-  const admin = getAdminDb()
-  const { data, error } = await admin
-    .from('room_default_equipment')
-    .select('equipment(id, name, description, created_at)')
-    .eq('room_id', roomId)
+  const admin = getDrizzleAdminDb()
+  const rows = await runQuery(
+    admin
+      .select({
+        id: equipment.id,
+        name: equipment.name,
+        description: equipment.description,
+        createdAt: equipment.createdAt,
+      })
+      .from(roomDefaultEquipment)
+      .innerJoin(equipment, eq(roomDefaultEquipment.equipmentId, equipment.id))
+      .where(eq(roomDefaultEquipment.roomId, roomId)),
+  )
 
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-
-  return ((data ?? []) as Array<{ equipment: EquipmentRow | null }>)
-    .map((row) => row.equipment)
-    .filter((row): row is EquipmentRow => row !== null)
+  return rows
 }
 
-async function listAllEquipment() {
-  const admin = getAdminDb()
-  const { data, error } = await admin
-    .from('equipment')
-    .select('id, name, description, created_at')
-    .order('name', { ascending: true })
+async function listAllEquipment(): Promise<EquipmentRow[]> {
+  const admin = getDrizzleAdminDb()
+  const rows = await runQuery(
+    admin
+      .select({
+        id: equipment.id,
+        name: equipment.name,
+        description: equipment.description,
+        createdAt: equipment.createdAt,
+      })
+      .from(equipment)
+      .orderBy(asc(equipment.name)),
+  )
 
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-
-  return (data ?? []) as EquipmentRow[]
+  return rows
 }
 
 async function listEquipmentLockedToOtherRooms(roomId: string): Promise<Set<string>> {
-  const admin = getAdminDb()
-  const { data, error } = await admin
-    .from('room_default_equipment')
-    .select('equipment_id, room_id')
-
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
+  const admin = getDrizzleAdminDb()
+  const rows = await runQuery(
+    admin
+      .select({ equipmentId: roomDefaultEquipment.equipmentId, roomId: roomDefaultEquipment.roomId })
+      .from(roomDefaultEquipment),
+  )
 
   const lockedToOther = new Set<string>()
-  for (const row of (data ?? []) as Array<{ equipment_id: string; room_id: string }>) {
-    if (row.room_id !== roomId) {
-      lockedToOther.add(row.equipment_id)
+  for (const row of rows) {
+    if (row.roomId !== roomId) {
+      lockedToOther.add(row.equipmentId)
     }
   }
   return lockedToOther
@@ -492,18 +468,20 @@ async function listConflictingEquipmentIds(input: {
     return new Set<string>()
   }
 
-  const admin = getAdminDb()
-  const { data, error } = await admin
-    .from('reservation_equipment')
-    .select('equipment_id')
-    .in('reservation_id', overlappingReservationIds)
-    .in('equipment_id', input.equipmentIds)
+  const admin = getDrizzleAdminDb()
+  const rows = await runQuery(
+    admin
+      .select({ equipmentId: reservationEquipment.equipmentId })
+      .from(reservationEquipment)
+      .where(
+        and(
+          inArray(reservationEquipment.reservationId, overlappingReservationIds),
+          inArray(reservationEquipment.equipmentId, input.equipmentIds),
+        ),
+      ),
+  )
 
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-
-  return new Set((data ?? []).map((row) => row.equipment_id))
+  return new Set(rows.map((row) => row.equipmentId))
 }
 
 async function assertEquipmentSelectionAllowed(input: {
@@ -545,45 +523,33 @@ async function assertEquipmentSelectionAllowed(input: {
 }
 
 async function saveReservationEquipment(reservationId: string, equipmentIds: string[]) {
-  const admin = getAdminDb()
-  const { error: deleteError } = await admin
-    .from('reservation_equipment')
-    .delete()
-    .eq('reservation_id', reservationId)
+  const admin = getDrizzleAdminDb()
 
-  if (deleteError) {
-    serviceError('Internal server error', 500)
-  }
+  await runQuery(
+    admin.delete(reservationEquipment).where(eq(reservationEquipment.reservationId, reservationId)),
+  )
 
   if (equipmentIds.length === 0) {
     return
   }
 
-  const inserts: TablesInsert<'reservation_equipment'>[] = equipmentIds.map((equipment_id) => ({
-    reservation_id: reservationId,
-    equipment_id,
-  }))
-  const { error: insertError } = await admin
-    .from('reservation_equipment')
-    .insert(inserts)
-
-  if (insertError) {
-    serviceError('Internal server error', 500)
-  }
+  await runQuery(
+    admin.insert(reservationEquipment).values(
+      equipmentIds.map((equipmentId) => ({ reservationId, equipmentId })),
+    ),
+  )
 }
 
 async function getReservationEquipmentIds(reservationId: string) {
-  const admin = getAdminDb()
-  const { data, error } = await admin
-    .from('reservation_equipment')
-    .select('equipment_id')
-    .eq('reservation_id', reservationId)
+  const admin = getDrizzleAdminDb()
+  const rows = await runQuery(
+    admin
+      .select({ equipmentId: reservationEquipment.equipmentId })
+      .from(reservationEquipment)
+      .where(eq(reservationEquipment.reservationId, reservationId)),
+  )
 
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-
-  return (data ?? []).map((row) => row.equipment_id)
+  return rows.map((row) => row.equipmentId)
 }
 
 function hasReservationConflict(
@@ -599,8 +565,8 @@ function hasReservationConflict(
       return false
     }
 
-    const reservationStart = normalizeTime(reservation.start_time)
-    const reservationEnd = normalizeTime(reservation.end_time)
+    const reservationStart = normalizeTime(reservation.startTime)
+    const reservationEnd = normalizeTime(reservation.endTime)
     return reservationStart < input.endTime && input.startTime < reservationEnd
   })
 }
@@ -612,13 +578,23 @@ function assertReservationAccess(
   if (!reservation) {
     serviceError('Reservation not found', 404)
   }
-  if (session.role !== 'admin' && reservation.user_id !== session.id) {
+  if (session.role !== 'admin' && reservation.userId !== session.id) {
     serviceError('Forbidden', 403)
   }
 }
 
-function isConflictError(error: PostgrestErrorLike | null | undefined) {
-  return error?.code === '23P01'
+/**
+ * `node-postgres` (the driver behind the Drizzle/Neon seam) throws raw `pg`
+ * `DatabaseError` instances with a `code` shape on constraint violations; it
+ * does not wrap them. Duck-typed here rather than importing `pg`'s error
+ * class to keep this check dependency-light (same convention as
+ * `lib/server/equipment/equipment-service.ts`). 23P01 is exclusion_violation,
+ * raised by the `reservations_no_pending_active_overlap_top`/`_bottom`
+ * EXCLUDE constraints.
+ */
+function isConflictError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false
+  return (error as { code?: unknown }).code === '23P01'
 }
 
 function throwSlotTaken(): never {
@@ -631,55 +607,91 @@ export async function listVisibleReservations(input: {
   tableId?: string | null
   date?: string | null
 }) {
-  // Admin client required: RLS is removed in Phase 2. Member isolation is
-  // enforced by deriving effectiveUserId from session.id for non-admin callers
-  // (see line below), ensuring members can only query their own reservations.
-  const supabase = getAdminDb()
+  // Admin client required: RLS is removed. Member isolation is enforced by
+  // deriving effectiveUserId from session.id for non-admin callers (see line
+  // below), ensuring members can only query their own reservations.
+  const admin = getDrizzleAdminDb()
   const effectiveUserId = input.session.role === 'admin' ? input.userId ?? undefined : input.session.id
   const effectiveDate = input.date != null && input.date !== '' ? parseDate(input.date) : undefined
 
-  let query = (supabase.from('reservations') as unknown as EnrichedReservationsTableClient)
-    .select(RESERVATION_ENRICHED_COLUMNS)
-    .order('date', { ascending: true })
-    .order('start_time', { ascending: true })
+  const conditions = []
+  if (effectiveUserId) conditions.push(eq(reservations.userId, effectiveUserId))
+  if (input.tableId) conditions.push(eq(reservations.tableId, input.tableId))
+  if (effectiveDate) conditions.push(eq(reservations.date, effectiveDate))
 
-  if (effectiveUserId) {
-    query = query.eq('user_id', effectiveUserId)
-  }
-  if (input.tableId) {
-    query = query.eq('table_id', input.tableId)
-  }
-  if (effectiveDate) {
-    query = query.eq('date', effectiveDate)
-  }
-
-  const { data, error } = await query
-
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
+  const rows = await runQuery(
+    admin
+      .select({
+        id: reservations.id,
+        tableId: reservations.tableId,
+        userId: reservations.userId,
+        date: reservations.date,
+        startTime: reservations.startTime,
+        endTime: reservations.endTime,
+        status: reservations.status,
+        surface: reservations.surface,
+        activatedAt: reservations.activatedAt,
+        createdAt: reservations.createdAt,
+        memberNumber: profiles.memberNumber,
+        tableName: tables.name,
+        roomName: rooms.name,
+      })
+      .from(reservations)
+      .leftJoin(profiles, eq(reservations.userId, profiles.id))
+      .leftJoin(tables, eq(reservations.tableId, tables.id))
+      .leftJoin(rooms, eq(tables.roomId, rooms.id))
+      .where(conditions.length > 0 ? and(...conditions) : undefined)
+      .orderBy(asc(reservations.date), asc(reservations.startTime)),
+  )
 
   // Defense-in-depth: verify the query filter held before mapping rows out.
-  const rawRows = assertMemberRowsScoped(
-    (data ?? []) as EnrichedReservationRow[],
+  const scopedRows = assertMemberRowsScoped(
+    rows.map((row) => ({ ...row, user_id: row.userId })),
     input.session,
   )
 
-  const isAdmin = input.session.role === 'admin'
-  const nowUtc = await getDatabaseNow(supabase)
+  const reservationIds = scopedRows.map((row) => row.id)
+  const equipmentRows = reservationIds.length > 0
+    ? await runQuery(
+        admin
+          .select({
+            reservationId: reservationEquipment.reservationId,
+            id: equipment.id,
+            name: equipment.name,
+            description: equipment.description,
+            createdAt: equipment.createdAt,
+          })
+          .from(reservationEquipment)
+          .innerJoin(equipment, eq(reservationEquipment.equipmentId, equipment.id))
+          .where(inArray(reservationEquipment.reservationId, reservationIds)),
+      )
+    : []
 
-  return rawRows
+  const equipmentByReservationId = new Map<string, Equipment[]>()
+  for (const row of equipmentRows) {
+    const list = equipmentByReservationId.get(row.reservationId) ?? []
+    list.push(toEquipment(row))
+    equipmentByReservationId.set(row.reservationId, list)
+  }
+
+  const isAdmin = input.session.role === 'admin'
+  const nowUtc = await getDatabaseNow(admin)
+
+  return scopedRows
     .filter((row) => {
       // Lazy evaluation: treat expired pending reservations as cancelled
-      if (row.status === 'pending' && row.activated_at === null) {
-        if (isPendingReservationExpired(row, nowUtc)) {
+      if (row.status === 'pending' && row.activatedAt === null) {
+        if (isPendingReservationExpired(toPendingSlot(row), nowUtc)) {
           return false // Exclude expired pending reservations
         }
       }
       return true
     })
     .map((row) => {
-      const reservation = mapEnrichedReservation(row)
+      const reservation = mapEnrichedReservation({
+        ...row,
+        equipment: equipmentByReservationId.get(row.id) ?? [],
+      })
       if (!isAdmin) {
         reservation.memberNumber = undefined
       }
@@ -715,32 +727,27 @@ async function checkUserSlotOverlap(
   date: string,
   startTime: string,
   endTime: string,
-  supabase: Awaited<ReturnType<typeof getDb>>,
+  db: DbClient,
   ignoreReservationId?: string,
 ) {
-  let query = (supabase.from('reservations') as unknown as UserSlotOverlapTableClient)
-    .select(RESERVATION_COLUMNS)
-    .eq('user_id', userId)
-    .eq('date', date)
-    .in('status', ['pending', 'active'])
-    .lt('start_time', endTime)
-    .gt('end_time', startTime)
-
+  const conditions = [
+    eq(reservations.userId, userId),
+    eq(reservations.date, date),
+    inArray(reservations.status, ['pending', 'active']),
+    lt(reservations.startTime, endTime),
+    gt(reservations.endTime, startTime),
+  ]
   if (ignoreReservationId) {
-    query = query.neq('id', ignoreReservationId)
+    conditions.push(ne(reservations.id, ignoreReservationId))
   }
 
-  const { data, error } = await query
-
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
+  const rows = await runQuery(db.select().from(reservations).where(and(...conditions)))
 
   // Lazy evaluation: filter out expired pending reservations
-  const nowUtc = await getDatabaseNow()
-  const activeReservations = (data ?? []).filter((row) => {
-    if (row.status === 'pending' && row.activated_at === null) {
-      return !isPendingReservationExpired(row, nowUtc)
+  const nowUtc = await getDatabaseNow(db)
+  const activeReservations = rows.filter((row) => {
+    if (row.status === 'pending' && row.activatedAt === null) {
+      return !isPendingReservationExpired(toPendingSlot(row), nowUtc)
     }
     return true
   })
@@ -785,57 +792,65 @@ export async function createReservationForSession(
   assertReservationNotInPast(date, startTime)
   assertReservationWithinBookingWindow(date)
 
-  const supabase = await getDb()
+  const db = getDrizzleDb()
 
   await expireStalePendingReservations(tableId, date)
-  await checkUserSlotOverlap(session.id, date, startTime, endTime, supabase)
+  await checkUserSlotOverlap(session.id, date, startTime, endTime, db)
 
   const conflictingReservations = await listActiveReservationsForConflict({ tableId, date })
   if (hasReservationConflict(conflictingReservations, { startTime, endTime, surface })) {
     throwSlotTaken()
   }
-  if (await hasEventBlockConflict({ roomId: table.room_id, tableId, date, startTime, endTime })) {
+  if (await hasEventBlockConflict({ roomId: table.roomId, tableId, date, startTime, endTime })) {
     serviceError(ERROR_CODES.ROOM_BLOCKED_BY_EVENT, 409)
   }
   if (await hasSavedGameBottomConflict({ tableId, date, surface })) {
     serviceError(ERROR_CODES.SAVED_GAME_BOTTOM_RESERVED, 409)
   }
   await assertEquipmentSelectionAllowed({
-    roomId: table.room_id,
+    roomId: table.roomId,
     equipmentIds,
     date,
     startTime,
     endTime,
   })
-  const insertPayload: TablesInsert<'reservations'> = {
-    table_id: tableId,
-    user_id: session.id,
-    date,
-    start_time: startTime,
-    end_time: endTime,
-    surface: surface ?? null,
-  }
-  const reservations = supabase.from('reservations') as unknown as SessionReservationsTableClient
-  const { data, error } = await reservations
-    .insert(insertPayload)
-    .select(RESERVATION_COLUMNS)
-    .single()
 
-  if (error || !data) {
+  let created: ReservationRow | undefined
+  try {
+    ;[created] = await db
+      .insert(reservations)
+      .values({
+        tableId,
+        userId: session.id,
+        date,
+        startTime,
+        endTime,
+        surface: surface ?? null,
+      })
+      .returning()
+  } catch (error) {
     if (isConflictError(error)) {
       throwSlotTaken()
     }
     serviceError('Internal server error', 500)
   }
 
+  if (!created) {
+    serviceError('Internal server error', 500)
+  }
+
   try {
-    await saveReservationEquipment(data.id, equipmentIds)
+    await saveReservationEquipment(created.id, equipmentIds)
   } catch {
     // Compensating delete: remove the just-created reservation to avoid a ghost
     // row with no equipment association. Ignore errors from the delete itself —
     // the original equipment error is what the caller needs to act on.
-    const adminForRollback = getAdminDb()
-    await adminForRollback.from('reservations').delete().eq('id', data.id)
+    const adminForRollback = getDrizzleAdminDb()
+    try {
+      await adminForRollback.delete(reservations).where(eq(reservations.id, created.id))
+    } catch {
+      // Ignore — the equipment error below takes precedence over a rollback failure.
+    }
     serviceError('Failed to save equipment. Reservation was cancelled. Please try again.', 500)
   }
 
@@ -844,7 +859,7 @@ export async function createReservationForSession(
     : []
 
   return {
-    ...mapReservation(data as ReservationRow),
+    ...mapReservation(created),
     equipment: selectedEquipment,
   }
 }
@@ -875,7 +890,7 @@ export async function updateReservationForSession(
   if (nextStatus === 'cancelled' && session.role !== 'admin' && existingReservation.status !== 'cancelled') {
     const reservationStart = zonedDateTimeToUtc(
       existingReservation.date,
-      normalizeTime(existingReservation.start_time),
+      normalizeTime(existingReservation.startTime),
     )
     if (isNaN(reservationStart.getTime())) {
       serviceError('Invalid reservation time format', 500)
@@ -887,16 +902,16 @@ export async function updateReservationForSession(
   }
 
   const nextStartTime = body.startTime == null
-    ? normalizeTime(existingReservation.start_time)
+    ? normalizeTime(existingReservation.startTime)
     : parseHHMM(String(body.startTime))
   const nextEndTime = body.endTime == null
-    ? normalizeTime(existingReservation.end_time)
+    ? normalizeTime(existingReservation.endTime)
     : parseHHMM(String(body.endTime), { allow24HourBoundary: true })
   const nextDate = body.date == null ? existingReservation.date : parseDate(String(body.date))
   const nextSurface = body.surface === undefined || body.surface === null
     ? (existingReservation.surface ?? null)
     : (parseSurface(body.surface) ?? (existingReservation.surface ?? null))
-  const table = await getTable(existingReservation.table_id)
+  const table = await getTable(existingReservation.tableId)
 
   if (!table) {
     serviceError('Table not found', 404)
@@ -913,9 +928,9 @@ export async function updateReservationForSession(
     assertReservationWithinBookingWindow(nextDate)
   }
 
-  await expireStalePendingReservations(existingReservation.table_id, nextDate)
+  await expireStalePendingReservations(existingReservation.tableId, nextDate)
   const conflictingReservations = await listActiveReservationsForConflict({
-    tableId: existingReservation.table_id,
+    tableId: existingReservation.tableId,
     date: nextDate,
     ignoreReservationId: existingReservation.id,
   })
@@ -927,8 +942,8 @@ export async function updateReservationForSession(
     throwSlotTaken()
   }
   if (await hasEventBlockConflict({
-    roomId: table.room_id,
-    tableId: existingReservation.table_id,
+    roomId: table.roomId,
+    tableId: existingReservation.tableId,
     date: nextDate,
     startTime: nextStartTime,
     endTime: nextEndTime,
@@ -936,28 +951,28 @@ export async function updateReservationForSession(
     serviceError(ERROR_CODES.ROOM_BLOCKED_BY_EVENT, 409)
   }
   if (await hasSavedGameBottomConflict({
-    tableId: existingReservation.table_id,
+    tableId: existingReservation.tableId,
     date: nextDate,
     surface: nextSurface ?? undefined,
   })) {
     serviceError(ERROR_CODES.SAVED_GAME_BOTTOM_RESERVED, 409)
   }
 
-  const supabase = await getDb()
+  const db = getDrizzleDb()
   if (needsUserOverlapCheck) {
     await checkUserSlotOverlap(
-      existingReservation.user_id,
+      existingReservation.userId,
       nextDate,
       nextStartTime,
       nextEndTime,
-      supabase,
+      db,
       existingReservation.id,
     )
   }
   const existingEquipmentIds = await getReservationEquipmentIds(existingReservation.id)
   if (isScheduleChange && existingEquipmentIds.length > 0) {
     await assertEquipmentSelectionAllowed({
-      roomId: table.room_id,
+      roomId: table.roomId,
       equipmentIds: existingEquipmentIds,
       date: nextDate,
       startTime: nextStartTime,
@@ -965,49 +980,56 @@ export async function updateReservationForSession(
       ignoreReservationId: existingReservation.id,
     })
   }
-  const updatePayload: TablesUpdate<'reservations'> = {
-    date: nextDate,
-    start_time: nextStartTime,
-    end_time: nextEndTime,
-    surface: nextSurface,
-    status: nextStatus == null ? existingReservation.status : String(nextStatus) as ReservationRow['status'],
-  }
-  const reservations = supabase.from('reservations') as unknown as SessionReservationsTableClient
-  const { data, error } = await reservations
-    .update(updatePayload)
-    .eq('id', reservationId)
-    .select(RESERVATION_COLUMNS)
-    .single()
 
-  if (error || !data) {
+  let updated: ReservationRow | undefined
+  try {
+    ;[updated] = await db
+      .update(reservations)
+      .set({
+        date: nextDate,
+        startTime: nextStartTime,
+        endTime: nextEndTime,
+        surface: nextSurface,
+        status: nextStatus == null ? existingReservation.status : (String(nextStatus) as ReservationRow['status']),
+      })
+      .where(eq(reservations.id, reservationId))
+      .returning()
+  } catch (error) {
     if (isConflictError(error)) {
       throwSlotTaken()
     }
     serviceError('Internal server error', 500)
   }
 
-  return mapReservation(data as ReservationRow)
+  if (!updated) {
+    serviceError('Internal server error', 500)
+  }
+
+  return mapReservation(updated)
 }
 
 export async function markNoShowReservations(): Promise<number> {
-  const admin = getAdminDb()
-  const { data, error } = await (admin as unknown as {
-    rpc: (fn: string, args?: unknown) => Promise<{ data: number | null; error: unknown }>
-  }).rpc('mark_no_show_reservations', {
-    club_timezone: CLUB_TIMEZONE,
-  })
-  if (error) serviceError('Internal server error', 500)
-  return (data as number | null) ?? 0
-}
+  const admin = getDrizzleAdminDb()
 
-type ActivationAdminQuery = {
-  eq: (column: 'table_id' | 'date' | 'status' | 'user_id' | 'surface' | 'id', value: string) => ActivationAdminQuery
-  or: (filter: string) => ActivationAdminQuery
-  maybeSingle: () => Promise<{ data: ReservationRow | null; error: unknown }>
-  select: (columns?: string) => ActivationAdminQuery
-  update: (values: TablesUpdate<'reservations'>) => ActivationAdminQuery
-  single: () => Promise<{ data: ReservationRow | null; error: PostgrestErrorLike | null }>
-  then: Promise<{ data: ReservationRow | null; error: PostgrestErrorLike | null }>['then']
+  // Equivalent to the legacy `mark_no_show_reservations` Postgres function
+  // (see supabase/migrations/20260619000002_kim392_slot_relative_pending_expiry.sql):
+  // a pending, never-activated reservation becomes a no-show once
+  // CHECK_IN_LATE_MINUTES has elapsed past its slot start (capped at slot
+  // end), evaluated against the DB server's current time.
+  const result = await runQuery(
+    admin.execute(sql`
+      UPDATE reservations
+      SET status = 'no_show'
+      WHERE status = 'pending'
+        AND activated_at IS NULL
+        AND LEAST(
+          ((date::timestamp + start_time::time) AT TIME ZONE ${CLUB_TIMEZONE}) + interval '60 minutes',
+          ((date::timestamp + end_time::time) AT TIME ZONE ${CLUB_TIMEZONE})
+        ) < now()
+    `),
+  )
+
+  return result.rowCount ?? 0
 }
 
 export async function activateReservationByTable(
@@ -1019,66 +1041,60 @@ export async function activateReservationByTable(
   // DST transition days resolve to the correct calendar date.
   const today = getCurrentClubDate()
 
-  // Look up the table via the session-scoped client to decide whether to apply
-  // a surface filter. removable_top tables store surface='top'/'bottom'; all
-  // other types store null — filtering by surface for those would always fail.
+  // Look up the table to decide whether to apply a surface filter.
+  // removable_top tables store surface='top'/'bottom'; all other types store
+  // null — filtering by surface for those would always fail.
   const table = await getTable(tableId)
   if (!table) {
     serviceError('Table not found', 404)
   }
-  const admin = getAdminDb()
+  const admin = getDrizzleAdminDb()
 
-  let pendingQuery = (admin.from('reservations') as unknown as { select: (c: string) => ActivationAdminQuery })
-    .select(RESERVATION_COLUMNS)
-    .eq('table_id', tableId)
-    .eq('date', today)
-    .eq('user_id', userId)
-    .eq('status', 'pending')
-
+  const pendingConditions = [
+    eq(reservations.tableId, tableId),
+    eq(reservations.date, today),
+    eq(reservations.userId, userId),
+    eq(reservations.status, 'pending'),
+  ]
   if (side === 'inf') {
-    pendingQuery = pendingQuery.eq('surface', 'bottom')
+    pendingConditions.push(eq(reservations.surface, 'bottom'))
   }
 
-  const { data: pendingData, error: pendingError } = await pendingQuery.maybeSingle()
+  const [pendingRow] = await runQuery(
+    admin.select().from(reservations).where(and(...pendingConditions)).limit(1),
+  )
 
-  if (pendingError) {
-    serviceError('Internal server error', 500)
-  }
-
-  if (!pendingData) {
-    let activeQuery = (admin.from('reservations') as unknown as { select: (c: string) => ActivationAdminQuery })
-      .select(RESERVATION_COLUMNS)
-      .eq('table_id', tableId)
-      .eq('date', today)
-      .eq('user_id', userId)
-      .eq('status', 'active')
-
+  if (!pendingRow) {
+    const activeConditions = [
+      eq(reservations.tableId, tableId),
+      eq(reservations.date, today),
+      eq(reservations.userId, userId),
+      eq(reservations.status, 'active'),
+    ]
     if (side === 'inf') {
-      activeQuery = activeQuery.eq('surface', 'bottom')
+      activeConditions.push(eq(reservations.surface, 'bottom'))
     }
 
-    const { data: activeData, error: activeError } = await activeQuery.maybeSingle()
+    const [activeRow] = await runQuery(
+      admin.select().from(reservations).where(and(...activeConditions)).limit(1),
+    )
 
-    if (activeError) {
-      serviceError('Internal server error', 500)
-    }
-
-    if (activeData) {
+    if (activeRow) {
       serviceError(ERROR_CODES.CHECK_IN_ALREADY_ACTIVE, 409)
     }
 
     serviceError(ERROR_CODES.CHECK_IN_NO_RESERVATION, 404)
   }
 
-  const reservation = pendingData as ReservationRow
+  const reservation = pendingRow
 
-  if (!reservation.end_time) {
+  if (!reservation.endTime) {
     serviceError('Invalid reservation data', 500)
   }
 
   const nowUtc = await getDatabaseNow(admin)
-  const reservationStart = zonedDateTimeToUtc(reservation.date, normalizeTime(reservation.start_time))
-  const reservationEnd = zonedDateTimeToUtc(reservation.date, normalizeTime(reservation.end_time))
+  const reservationStart = zonedDateTimeToUtc(reservation.date, normalizeTime(reservation.startTime))
+  const reservationEnd = zonedDateTimeToUtc(reservation.date, normalizeTime(reservation.endTime))
 
   if (reservationEnd <= reservationStart) {
     serviceError('Invalid reservation data', 500)
@@ -1087,7 +1103,7 @@ export async function activateReservationByTable(
   // Allow check-in starting CHECK_IN_EARLY_MINUTES before the slot begins,
   // up to CHECK_IN_LATE_MINUTES after start (capped at reservation end).
   const windowStart = new Date(reservationStart.getTime() - CHECK_IN_EARLY_MINUTES * 60 * 1000)
-  const windowEnd = getPendingCheckInDeadline(reservation)
+  const windowEnd = getPendingCheckInDeadline(toPendingSlot(reservation))
 
   if (nowUtc < windowStart) {
     serviceError(ERROR_CODES.CHECK_IN_TOO_EARLY, 400)
@@ -1096,26 +1112,22 @@ export async function activateReservationByTable(
     serviceError(ERROR_CODES.CHECK_IN_TOO_LATE, 400)
   }
 
-  const { data: updated, error: updateError } = await admin
-    .from('reservations')
-    .update({ status: 'active', activated_at: nowUtc.toISOString() })
-    .eq('id', reservation.id)
-    .eq('status', 'pending')
-    .select(RESERVATION_COLUMNS)
-    .single()
-
-  // PGRST116: PostgREST returns this code when .single() matches zero rows.
-  // Here it means the reservation was already activated by a concurrent request
-  // (TOCTOU race) between our read and this UPDATE. Return 409, not 500.
-  if ((updateError as PostgrestErrorLike | null)?.code === 'PGRST116') {
-    serviceError(ERROR_CODES.CHECK_IN_ALREADY_ACTIVE, 409)
-  }
-  if (updateError) {
+  let updated: ReservationRow | undefined
+  try {
+    ;[updated] = await admin
+      .update(reservations)
+      .set({ status: 'active', activatedAt: nowUtc })
+      .where(and(eq(reservations.id, reservation.id), eq(reservations.status, 'pending')))
+      .returning()
+  } catch {
     serviceError('Internal server error', 500)
   }
+
+  // No row updated means the reservation was already activated by a
+  // concurrent request (TOCTOU race) between our read and this UPDATE.
   if (!updated) {
     serviceError(ERROR_CODES.CHECK_IN_ALREADY_ACTIVE, 409)
   }
 
-  return mapReservation(updated as ReservationRow)
+  return mapReservation(updated)
 }
