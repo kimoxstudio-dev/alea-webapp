@@ -1,37 +1,32 @@
 import 'server-only'
 import bcrypt from 'bcryptjs'
-import { getAuthDbPool } from '@/lib/authjs/db'
+import { eq } from 'drizzle-orm'
+import { getDrizzleDb } from '@/lib/db'
+import { profiles } from '@/lib/db/schema'
 
 export interface AuthJsUser {
   id: string
   email: string
   name?: string | null
-}
-
-interface ProfileRow {
-  id: string
-  email: string
-  password_hash: string | null
-  full_name: string | null
+  role: 'member' | 'admin'
+  isActive: boolean
 }
 
 /**
- * Looks up a user by email in the target schema's `profiles` table and
- * verifies the supplied password against `profiles.password_hash`.
+ * Looks up a user by email in `profiles` (via the Drizzle/Neon seam,
+ * `getDrizzleDb()` — see `lib/db/index.ts`) and verifies the supplied
+ * password against `profiles.password_hash`.
  *
  * `password_hash` is expected to be bcryptjs-compatible — see the F2
  * cutover note in Linear KIM-393..422 (Supabase→Neon migration), which copies hashes
  * straight from `auth.users.encrypted_password` with no re-hash.
  *
- * NOTE: `profiles.password_hash` now exists in the F1 Drizzle schema
- * (KIM-417, PR #169 — see `lib/db/schema/profiles.ts` and
- * `lib/db/migrations/0000_fine_magma.sql`), but it is **unpopulated** until
- * the F2 cutover migration runs. Supabase never had this column either,
- * since password hashes live in Supabase-managed
- * `auth.users.encrypted_password` today; the F2 cutover runbook (KIM-419)
- * copies those hashes into `profiles.password_hash` verbatim. Until that
- * cutover happens, every row's `password_hash` is `null`, so this function
- * still returns `null` for every lookup in practice.
+ * NOTE: `profiles.password_hash` exists in the Drizzle schema (KIM-417 —
+ * see `lib/db/schema/profiles.ts`), but it is **unpopulated** until the F2
+ * cutover migration runs (KIM-419), which copies
+ * `auth.users.encrypted_password` into `profiles.password_hash` verbatim.
+ * Until that cutover happens, every row's `password_hash` is `null`, so
+ * this function still returns `null` for every lookup in practice.
  *
  * This is defensive scaffolding: the schema column exists, but the data
  * behind it does not yet. Any failure — connection error, no matching row,
@@ -40,31 +35,33 @@ interface ProfileRow {
  * route is also gated 404-by-default behind `AUTH_JS_ENABLED` (see
  * app/api/authjs/[...nextauth]/route.ts) so this code path cannot be
  * reached in any deployed environment before the F2 cutover intentionally
- * enables it.
+ * enables it, even though KIM-433 wires it into the live session path
+ * (`lib/server/auth/auth-service.ts`).
  */
 export async function verifyCredentials(
   email: string,
   password: string
 ): Promise<AuthJsUser | null> {
-  const pool = getAuthDbPool()
-
-  if (!pool) {
-    return null
-  }
-
   try {
-    const result = await pool.query<ProfileRow>(
-      'SELECT id, email, password_hash, full_name FROM profiles WHERE email = $1 LIMIT 1',
-      [email]
-    )
+    const db = getDrizzleDb()
+    const [row] = await db
+      .select({
+        id: profiles.id,
+        email: profiles.email,
+        fullName: profiles.fullName,
+        passwordHash: profiles.passwordHash,
+        role: profiles.role,
+        isActive: profiles.isActive,
+      })
+      .from(profiles)
+      .where(eq(profiles.email, email))
+      .limit(1)
 
-    const row = result.rows[0]
-
-    if (!row || !row.password_hash) {
+    if (!row || !row.passwordHash) {
       return null
     }
 
-    const passwordMatches = await bcrypt.compare(password, row.password_hash)
+    const passwordMatches = await bcrypt.compare(password, row.passwordHash)
 
     if (!passwordMatches) {
       return null
@@ -72,11 +69,13 @@ export async function verifyCredentials(
 
     return {
       id: row.id,
-      email: row.email,
-      name: row.full_name,
+      email: row.email ?? email,
+      name: row.fullName,
+      role: row.role,
+      isActive: row.isActive,
     }
   } catch {
-    // Table may not exist yet, connection may fail, etc. Never leak
+    // Connection may fail, table shape may be unexpected, etc. Never leak
     // internals — treat every failure as "no such user" from the caller's
     // perspective.
     return null

@@ -1,6 +1,8 @@
 import type { User } from '@/lib/types'
 import type { SessionUser } from '@/lib/server/auth/auth'
 import { createHash, randomBytes } from 'node:crypto'
+import { AuthError } from 'next-auth'
+import { signIn as authJsSignIn, signOut as authJsSignOut } from '@/lib/authjs/auth'
 import { getDatabaseNow } from '@/lib/server/shared/database-time'
 import { serviceError } from '@/lib/server/shared/service-error'
 import { getAdminDb, getDb } from '@/lib/db'
@@ -8,7 +10,6 @@ import {
   createAuthUser,
   deleteAuthUser,
   signInWithPassword as authSignInWithPassword,
-  signOut as authSignOut,
   updateAuthUserById,
 } from '@/lib/auth/session'
 import type { Tables, TablesInsert } from '@/lib/supabase/types'
@@ -97,6 +98,42 @@ type AuthClient = {
   }
 }
 
+/**
+ * Establishes an Auth.js session for the given credentials, via the same
+ * Credentials provider `lib/authjs/config.ts` registers (which delegates to
+ * `lib/authjs/credentials-user.ts#verifyCredentials`). Used by `login()`
+ * directly, and by `activateAccount()`/`recoverAccount()` after their
+ * custom token/password logic finishes, to issue the post-activation /
+ * post-recovery session that Supabase Auth's `signInWithPassword` used to
+ * issue there.
+ *
+ * Returns `false` (never throws) when the Credentials provider rejects the
+ * sign-in (`AuthError`/`CredentialsSignin` — invalid credentials, inactive
+ * account, etc.) so callers can map that to a uniform 401/failure response,
+ * mirroring the previous Supabase-based code's `if (error) ...` check.
+ * Any other, unexpected error is rethrown so it still surfaces as a 500
+ * instead of being silently reinterpreted as "invalid credentials".
+ */
+async function signInWithAuthJs(email: string, password: string): Promise<boolean> {
+  try {
+    await authJsSignIn('credentials', { email, password, redirect: false })
+    return true
+  } catch (error) {
+    if (error instanceof AuthError) {
+      return false
+    }
+    throw error
+  }
+}
+
+/** Ends the current Auth.js session. Throws a 500 `ServiceError` on failure, same contract as the previous Supabase `signOut()`-based implementation. */
+async function signOutWithAuthJs(): Promise<void> {
+  try {
+    await authJsSignOut({ redirect: false })
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+}
 
 function getProfilesTable(client: ProfileLookupClient) {
   return client.from('profiles') as PublicProfilesTableClient
@@ -437,9 +474,19 @@ export async function activateAccount(input: { token: unknown; password: unknown
     serviceError('Failed to activate account', 500)
   }
 
+  // Establish the post-activation session. Previously the route handler
+  // did this via Supabase's `signInWithPassword`; now it's done here so the
+  // route handler doesn't need any auth-client construction of its own.
+  // Account activation has already succeeded at this point regardless of
+  // whether this sign-in attempt succeeds — `signInFailed` lets the route
+  // handler report that distinction to the client (same behavior as before).
+  const authEmail = profile.auth_email ?? profile.email ?? ''
+  const signedIn = await signInWithAuthJs(authEmail, parsed.data.password)
+
   return {
-    authEmail: profile.auth_email ?? profile.email ?? '',
+    authEmail,
     user: toPublicUser(updatedProfile),
+    signInFailed: !signedIn,
   }
 }
 
@@ -528,15 +575,20 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
     serviceError('Failed to recover account', 500)
   }
 
+  // Establish the post-recovery session — see the matching comment in
+  // `activateAccount()` above for why this moved here from the route handler.
+  const authEmail = profile.auth_email ?? profile.email ?? ''
+  const signedIn = await signInWithAuthJs(authEmail, parsed.data.password)
+
   return {
-    authEmail: profile.auth_email,
+    authEmail,
     user: toPublicUser(updatedProfile),
+    signInFailed: !signedIn,
   }
 }
 
 export async function login(
   input: { identifier?: unknown; password?: unknown },
-  client?: AuthClient,
 ): Promise<User> {
   const identifier = String(input.identifier ?? '').trim()
   const password = String(input.password ?? '')
@@ -555,7 +607,7 @@ export async function login(
   const authEmail = credentialProfile.auth_email ?? credentialProfile.email
 
   if (!authEmail) {
-    // Profile has no email set — cannot authenticate via Supabase Auth.
+    // Profile has no email set — cannot authenticate.
     serviceError('Invalid credentials', 401)
   }
 
@@ -564,19 +616,9 @@ export async function login(
     serviceError('Invalid credentials', 401)
   }
 
-  const supabase = client ?? await getDb()
-  const { data, error } = await authSignInWithPassword(supabase, {
-    email: authEmail,
-    password,
-  })
+  const signedIn = await signInWithAuthJs(authEmail, password)
 
-  if (error || !data.user) {
-    serviceError('Invalid credentials', 401)
-  }
-
-  if (data.user.id !== credentialProfile.id) {
-    // Guard against profile/auth drift: the authenticated Supabase user must match
-    // the profile resolved by member number.
+  if (!signedIn) {
     serviceError('Invalid credentials', 401)
   }
 
@@ -682,22 +724,20 @@ export async function getCurrentUser(
 }
 
 export async function logout() {
-  const supabase = await getDb()
-  const { error } = await authSignOut(supabase)
-
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
+  await signOutWithAuthJs()
 
   return { success: true }
 }
 
-export async function logoutWithClient(client: AuthClient) {
-  const { error } = await authSignOut(client)
-
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
+/**
+ * @param _client Unused — kept only so existing call sites (and the
+ * exported name itself) don't need to change. Auth.js's `signOut()` reads
+ * the session cookie from the ambient request context (`next/headers`)
+ * rather than through an injected client, unlike the Supabase Auth client
+ * this replaces.
+ */
+export async function logoutWithClient(_client?: AuthClient) {
+  await signOutWithAuthJs()
 
   return { success: true }
 }
