@@ -32,7 +32,13 @@ function parseDatabaseNow(rawValue: unknown) {
     serviceError('Internal server error', 500)
   }
 
-  const value = new Date(String(rawValue))
+  // node-postgres (used by the Drizzle/Neon seam) auto-parses `timestamptz`
+  // columns into a JS `Date` before this helper ever sees the value. Legacy
+  // Supabase RPC responses, on the other hand, arrive as an ISO string.
+  // `Date.prototype.toString()` (invoked implicitly by `String(rawValue)`)
+  // truncates to whole seconds, so coercing an already-parsed `Date` through
+  // `String()` silently drops milliseconds. Use the `Date` directly instead.
+  const value = rawValue instanceof Date ? rawValue : new Date(String(rawValue))
   if (isNaN(value.getTime())) {
     serviceError('Internal server error', 500)
   }

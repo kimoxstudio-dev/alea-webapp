@@ -1,17 +1,21 @@
 import 'server-only'
-import type { SupabaseClient } from '@supabase/supabase-js'
-import { createSupabaseServerAdminClient } from '@/lib/supabase/server'
-import type { Database } from '@/lib/supabase/types'
+import {
+  uploadToStorage as putToVercelBlob,
+  getPublicStorageUrl as getVercelBlobPublicUrl,
+  removeFromStorage as removeFromVercelBlob,
+} from './vercel-blob'
 
 /**
- * lib/storage/qr — single seam for Supabase Storage access.
+ * lib/storage/qr — single seam for storage access, backing both the
+ * admin-generated table QR codes (lib/server/tables/tables-service.ts) and
+ * admin-uploaded landing-media images (lib/server/uploads/uploads-service.ts).
  *
- * This is an F0 abstraction seam (see Linear KIM-393..422, Supabase→Neon migration):
- * it introduces indirection with zero behavior change so a later phase (F1+)
- * can swap the underlying storage backend (Supabase Storage -> Vercel Blob)
- * without touching call sites again. For F0 this is intentionally a thin
- * wrapper around today's Supabase Storage admin client calls — not a
- * redesign, and Supabase Storage remains the actual backend for now.
+ * F3 cutover (see Linear KIM-393..422, Supabase→Vercel migration; this file
+ * wired up in KIM-431): this seam now delegates to the Vercel Blob adapter
+ * (./vercel-blob.ts) rather than Supabase Storage. Call sites are unchanged —
+ * this module still exports the same `uploadToStorage` / `getPublicStorageUrl`
+ * / `removeFromStorage` signatures and the same `StorageErrorDetail` shape, so
+ * lib/server/uploads/uploads-service.ts required no edits to keep working.
  *
  * NOTE on the directory name: this module is named after the migration
  * issue's original shorthand label ("Storage/QR"), but it also backs the
@@ -20,12 +24,7 @@ import type { Database } from '@/lib/supabase/types'
  * directory name is fixed per the tracked migration plan; the exported
  * function names below are intentionally generic/accurate rather than
  * QR-specific, since this seam wraps Storage access for more than QR codes.
- *
- * All Storage writes go through the admin (RLS-bypassing) client, matching
- * the existing call sites this seam replaces.
  */
-
-type StorageClient = SupabaseClient<Database>['storage']
 
 export interface StorageUploadOptions {
   contentType?: string
@@ -33,12 +32,13 @@ export interface StorageUploadOptions {
 }
 
 /**
- * Structured diagnostic detail preserved from a Supabase Storage error.
+ * Structured diagnostic detail preserved from a storage backend error.
  * Mirrors the fields exposed by `StorageError`/`StorageApiError` in
- * @supabase/storage-js (`name`, `message`, `status`, `statusCode`) so
- * server-side logs can distinguish bucket misconfiguration, permissions,
- * quota, and backend-outage failures instead of collapsing every failure
- * down to a bare message string.
+ * @supabase/storage-js (`name`, `message`, `status`, `statusCode`) — the
+ * Vercel Blob adapter (./vercel-blob.ts) normalizes its own errors into this
+ * same shape — so server-side logs can distinguish permissions, quota, and
+ * backend-outage failures instead of collapsing every failure down to a bare
+ * message string.
  */
 export interface StorageErrorDetail {
   message: string
@@ -55,36 +55,34 @@ export interface StoragePublicUrlResult {
   publicUrl: string | null
 }
 
-function getAdminStorage(): StorageClient {
-  return createSupabaseServerAdminClient().storage
-}
-
 /**
- * Extracts structured diagnostic fields from a Supabase Storage error
- * without leaking a non-serializable error instance across the seam
- * boundary. Keeps `name`/`status`/`statusCode` when present (as on
- * `StorageError`/`StorageApiError`) so callers can log a fuller diagnostic
- * picture than just `.message`.
+ * Maximum accepted upload body size, in bytes (5 MB).
+ *
+ * Previously enforced by Supabase Storage's per-bucket `file_size_limit`
+ * config (see supabase/migrations/20260704000005, "landing-media" bucket).
+ * Vercel Blob has no equivalent bucket-level setting, so this seam now
+ * enforces the cap in application code before any body reaches the adapter.
+ * This is defense-in-depth: lib/server/uploads/uploads-service.ts already
+ * validates `file.size` against the same 5 MB limit before calling
+ * `uploadToStorage()`, but this check ensures the limit holds for every
+ * current and future caller of this seam (e.g.
+ * lib/server/tables/tables-service.ts), not just that one call site.
  */
-function toStorageErrorDetail(error: unknown): StorageErrorDetail | null {
-  if (!error) return null
+const MAX_UPLOAD_SIZE_BYTES = 5 * 1024 * 1024 // 5 MB
 
-  if (typeof error === 'object') {
-    const candidate = error as { message?: unknown; name?: unknown; status?: unknown; statusCode?: unknown }
-    return {
-      message: typeof candidate.message === 'string' ? candidate.message : String(error),
-      name: typeof candidate.name === 'string' ? candidate.name : undefined,
-      status: typeof candidate.status === 'number' ? candidate.status : undefined,
-      statusCode: typeof candidate.statusCode === 'string' ? candidate.statusCode : undefined,
-    }
+function payloadTooLargeError(byteLength: number): StorageErrorDetail {
+  return {
+    message: `File exceeds the maximum allowed size of ${MAX_UPLOAD_SIZE_BYTES} bytes (5 MB); received ${byteLength} bytes`,
+    name: 'StoragePayloadTooLargeError',
+    status: 413,
+    statusCode: '413',
   }
-
-  return { message: String(error) }
 }
 
 /**
- * Uploads a file body to the given bucket/path via the admin (RLS-bypassing)
- * Storage client. Wraps `admin.storage.from(bucket).upload(...)`.
+ * Uploads a file body to the given bucket/path via the Vercel Blob adapter.
+ * Rejects bodies over the 5 MB cap (see MAX_UPLOAD_SIZE_BYTES) before
+ * delegating to the adapter.
  */
 export async function uploadToStorage(
   bucket: string,
@@ -92,35 +90,27 @@ export async function uploadToStorage(
   body: Buffer | Uint8Array,
   options: StorageUploadOptions = {},
 ): Promise<StorageOperationResult> {
-  const storage = getAdminStorage()
-  const { error } = await storage.from(bucket).upload(path, body, {
-    contentType: options.contentType,
-    upsert: options.upsert ?? false,
-  })
+  if (body.byteLength > MAX_UPLOAD_SIZE_BYTES) {
+    return { error: payloadTooLargeError(body.byteLength) }
+  }
 
-  return { error: toStorageErrorDetail(error) }
+  return putToVercelBlob(bucket, path, body, options)
 }
 
 /**
  * Resolves the public URL for an object in the given bucket/path via the
- * admin Storage client. Wraps `admin.storage.from(bucket).getPublicUrl(...)`.
+ * Vercel Blob adapter.
  */
 export function getPublicStorageUrl(bucket: string, path: string): StoragePublicUrlResult {
-  const storage = getAdminStorage()
-  const { data } = storage.from(bucket).getPublicUrl(path)
-
-  return { publicUrl: data?.publicUrl ?? null }
+  return getVercelBlobPublicUrl(bucket, path)
 }
 
 /**
- * Removes one or more objects from the given bucket via the admin Storage
- * client. Wraps `admin.storage.from(bucket).remove(...)`. Not currently
- * called by any service, but included so the seam covers the full
- * upload/get-url/delete surface referenced by the migration plan.
+ * Removes one or more objects from the given bucket via the Vercel Blob
+ * adapter. Not currently called by any service, but included so the seam
+ * covers the full upload/get-url/delete surface referenced by the migration
+ * plan.
  */
 export async function removeFromStorage(bucket: string, paths: string[]): Promise<StorageOperationResult> {
-  const storage = getAdminStorage()
-  const { error } = await storage.from(bucket).remove(paths)
-
-  return { error: toStorageErrorDetail(error) }
+  return removeFromVercelBlob(bucket, paths)
 }
