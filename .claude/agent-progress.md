@@ -1777,3 +1777,9 @@ No blocking issues. No modifications needed. Code is ready for security-reviewer
 - [10:19] No secrets/.env values in diff (grep scan clean, only false-positive match was "primaryKey"). git status matches expected 7 files (6 code/test files + this log entry).
 - [10:19] Agreed redundant index (room_default_equipment_equipment_id_idx) alongside new unique constraint is acceptable to leave as follow-up cleanup — not a correctness/security concern, just a minor schema tidiness item.
 - [10:19] Verdict: APPROVE. Committing and pushing.
+
+#### [PR178-FIX] software-engineer — database-time ms truncation
+- [15:35] Started
+- [15:41] Fixed lib/server/shared/database-time.ts: parseDatabaseNow() now branches on `rawValue instanceof Date` and uses it directly instead of coercing through String(rawValue), which truncated milliseconds via Date.prototype.toString(). Legacy Supabase RPC string branch unchanged.
+- [15:44] pnpm typecheck: pass. pnpm lint: pass (no warnings/errors). pnpm vitest run tests/unit/server/database-time.test.ts: 3/3 pass (no new test added — test files owned by qa-engineer).
+- [15:46] ✅ Complete — committed and pushed to migration-f3c-01-drizzle-seam-pilot
