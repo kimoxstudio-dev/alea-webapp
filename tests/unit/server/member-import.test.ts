@@ -27,7 +27,7 @@ const deleteUserMock = vi.fn(async () => ({ error: null }))
 // Mock createAuthUser to use createUserMock
 vi.mock('@/lib/auth/session', () => ({
   createAuthUser: vi.fn(async (admin, opts) => createUserMock(opts)),
-  deleteAuthUser: vi.fn(async (admin, id) => deleteUserMock()),
+  deleteAuthUser: vi.fn(async (admin, id) => deleteUserMock(id)),
   updateAuthUserById: vi.fn(async (id, opts) => ({ error: null })),
 }))
 
@@ -65,6 +65,87 @@ function resetProfileState() {
     blocked_until: null,
     created_at: '2026-04-01T00:00:00.000Z',
     updated_at: '2026-04-01T00:00:00.000Z',
+  })
+}
+
+type ProfileStateRow = ReturnType<typeof profileState.get> extends infer T ? NonNullable<T> : never
+
+/**
+ * Converts a snake_case `profileState` fixture row into the camelCase shape
+ * `db.select(PROFILE_COLUMNS)` returns from the real Drizzle-backed service
+ * (see `PublicProfileRow` in lib/server/users/profile-mappers.ts). Used to
+ * seed `selectMock` for the "existing member" scenarios below.
+ */
+function toSelectRow(row: ProfileStateRow) {
+  return {
+    id: row.id,
+    memberNumber: row.member_number,
+    fullName: row.full_name,
+    authEmail: row.auth_email,
+    email: row.email,
+    phone: row.phone,
+    role: row.role,
+    isActive: row.is_active,
+    activeFrom: row.active_from,
+    noShowCount: row.no_show_count,
+    blockedUntil: row.blocked_until,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+/**
+ * Gives `updateMock` real persistence behavior against `profileState` for
+ * the `importMembersFromCsv` / `importMembersFromSource` describes below.
+ * The real service (`users-service.ts`) always sets camelCase fields via
+ * `db.update(profiles).set(updates)`:
+ *  - "create new member" payloads always include `memberNumber` (see
+ *    `importMembersFromNormalizedRows`'s create-path `.set({ memberNumber, ... })`)
+ *    -> build a fresh row keyed by that member number.
+ *  - "update existing member" payloads never include `memberNumber` (only
+ *    `fullName`/`email`/`phone`) -> merge into the single pre-seeded fixture.
+ * No test in these describes mixes both scenarios in one call, so keying
+ * off `updates.memberNumber` presence is sufficient without needing to
+ * thread the real row id through the mock's `.where()` clause.
+ */
+function configureImportUpdateMock() {
+  updateMock.mockImplementation(async (updates: Record<string, unknown>) => {
+    const now = '2026-04-14T00:00:00.000Z'
+
+    if (typeof updates.memberNumber === 'string') {
+      const memberNumber = updates.memberNumber
+      const row = {
+        id: `user-${memberNumber}`,
+        member_number: memberNumber,
+        full_name: (updates.fullName as string | null | undefined) ?? null,
+        auth_email: updates.authEmail as string,
+        email: (updates.email as string | null | undefined) ?? null,
+        phone: (updates.phone as string | null | undefined) ?? null,
+        role: (updates.role as 'member' | 'admin' | undefined) ?? 'member',
+        is_active: (updates.isActive as boolean | undefined) ?? false,
+        active_from: (updates.activeFrom as string | null | undefined) ?? null,
+        psw_changed: (updates.pswChanged as string | null | undefined) ?? null,
+        no_show_count: 0,
+        blocked_until: null,
+        created_at: now,
+        updated_at: now,
+      }
+      profileState.set(memberNumber, row)
+      return [{ id: row.id }]
+    }
+
+    const [existingKey] = profileState.keys()
+    if (!existingKey) return []
+    const target = profileState.get(existingKey)!
+    const next = {
+      ...target,
+      ...(updates.fullName !== undefined ? { full_name: updates.fullName as string | null } : {}),
+      ...(updates.email !== undefined ? { email: updates.email as string | null } : {}),
+      ...(updates.phone !== undefined ? { phone: updates.phone as string | null } : {}),
+      updated_at: now,
+    }
+    profileState.set(existingKey, next)
+    return [next]
   })
 }
 
@@ -329,33 +410,21 @@ describe('importMembersFromCsv', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetProfileState()
-    createUserMock.mockImplementation(async ({ email }: { email: string }) => {
-      profileState.set('M-PLACEHOLDER-100020', {
-        id: 'user-100020',
-        member_number: 'M-PLACEHOLDER-100020',
-        full_name: null,
-        auth_email: email,
-        email: null,
-        phone: null,
-        role: 'member',
-        is_active: false,
-        active_from: null,
-        psw_changed: null,
-        no_show_count: 0,
-        blocked_until: null,
-        created_at: '2026-04-14T00:00:00.000Z',
-        updated_at: '2026-04-14T00:00:00.000Z',
-      })
-      return {
-        data: { user: { id: 'user-100020' } },
-        error: null,
-      }
-    })
+    // Real identity derivation from the row being processed (opts.email),
+    // instead of a single hardcoded placeholder — profileState population
+    // belongs in updateMock (see configureImportUpdateMock), not here.
+    createUserMock.mockImplementation(async ({ email }: { email: string }) => ({
+      data: { user: { id: `user-${email.split('@')[0]}` } },
+      error: null,
+    }))
     deleteUserMock.mockResolvedValue({ error: null })
+    configureImportUpdateMock()
   })
 
   it('updates existing members with generated fallback email and nullable phone', async () => {
     const { importMembersFromCsv } = await loadService()
+
+    selectMock.mockResolvedValue([toSelectRow(profileState.get('100001')!)])
 
     const adminSession = createAdminSession()
     const result = await importMembersFromCsv(adminSession, 'USUARIOS,ID,email,phone\nUpdated Name,100001,,\n'
@@ -393,6 +462,8 @@ describe('importMembersFromCsv', () => {
 
   it('creates new imported members as inactive profiles with internal auth email', async () => {
     const { importMembersFromCsv } = await loadService()
+
+    selectMock.mockResolvedValue([])
 
     const adminSession = createAdminSession()
     const result = await importMembersFromCsv(adminSession, 'USUARIOS,ID,email,phone\nNew Member,100020,new@alea.club,699000111\n'
@@ -432,6 +503,8 @@ describe('importMembersFromCsv', () => {
   it('fills missing source email with internal generated email and keeps phone null', async () => {
     const { importMembersFromCsv } = await loadService()
 
+    selectMock.mockResolvedValue([])
+
     const adminSession = createAdminSession()
     const result = await importMembersFromCsv(adminSession, 'USUARIOS,ID,phone\nNo Email Member,100024,\n'
     )
@@ -457,6 +530,8 @@ describe('importMembersFromCsv', () => {
 
   it('preserves existing optional contact data when optional headers are omitted', async () => {
     const { importMembersFromCsv } = await loadService()
+
+    selectMock.mockResolvedValue([toSelectRow(profileState.get('100001')!)])
 
     const adminSession = createAdminSession()
     const result = await importMembersFromCsv(adminSession, 'USUARIOS,ID\nExisting Again,100001\n'
@@ -548,54 +623,16 @@ describe('importMembersFromCsv', () => {
   })
 
   it('deletes the auth user when profile persistence returns null data', async () => {
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue({
-      from: vi.fn(() => ({
-        select: vi.fn(() => ({
-          eq: vi.fn((column: 'member_number' | 'id', value: string) => ({
-            maybeSingle: vi.fn(async () => {
-              const data = column === 'member_number'
-                ? profileState.get(value) ?? null
-                : Array.from(profileState.values()).find((row) => row.id === value) ?? null
-              return { data, error: null }
-            }),
-          })),
-        })),
-        update: vi.fn((updates: Record<string, unknown>) => ({
-          eq: vi.fn((_column: 'id', value: string) => ({
-            select: vi.fn(() => ({
-              maybeSingle: vi.fn(async () => {
-                if (value === 'user-100020') {
-                  return { data: null, error: null }
-                }
-
-                const target = Array.from(profileState.values()).find((row) => row.id === value)
-                if (!target) {
-                  return { data: null, error: { message: 'not found' } }
-                }
-
-                const next = {
-                  ...target,
-                  ...updates,
-                  updated_at: '2026-04-14T00:00:00.000Z',
-                }
-                profileState.delete(target.member_number)
-                profileState.set(next.member_number, next)
-                return { data: next, error: null }
-              }),
-            })),
-          })),
-        })),
-      })),
-      auth: {
-        admin: {
-          createUser: createUserMock,
-          deleteUser: deleteUserMock,
-        },
-      },
-    } as never)
-
     const { importMembersFromCsv } = await loadService()
+
+    // New-member path (no pre-existing 100020 row) whose persistence write
+    // is forced to fail: the real service's `db.update(profiles).set({...})
+    // .where(eq(profiles.id, authData.user.id)).returning({ id: profiles.id })`
+    // call resolves with no row, which is exactly what an empty array from
+    // `updateMock` simulates via the mocked `.returning()` chain.
+    selectMock.mockResolvedValue([])
+    updateMock.mockResolvedValueOnce([])
+
     const adminSession = createAdminSession()
     const result = await importMembersFromCsv(adminSession, 'USUARIOS,ID,email,phone\nNew Member,100020,new@alea.club,699000111\n'
     )
@@ -615,29 +652,12 @@ describe('importMembersFromSource', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetProfileState()
-    createUserMock.mockImplementation(async ({ email }: { email: string }) => {
-      profileState.set('M-PLACEHOLDER-100023', {
-        id: 'user-100023',
-        member_number: 'M-PLACEHOLDER-100023',
-        full_name: null,
-        auth_email: email,
-        email: null,
-        phone: null,
-        role: 'member',
-        is_active: false,
-        active_from: null,
-        psw_changed: null,
-        no_show_count: 0,
-        blocked_until: null,
-        created_at: '2026-04-14T00:00:00.000Z',
-        updated_at: '2026-04-14T00:00:00.000Z',
-      })
-      return {
-        data: { user: { id: 'user-100023' } },
-        error: null,
-      }
-    })
+    createUserMock.mockImplementation(async ({ email }: { email: string }) => ({
+      data: { user: { id: `user-${email.split('@')[0]}` } },
+      error: null,
+    }))
     deleteUserMock.mockResolvedValue({ error: null })
+    configureImportUpdateMock()
   })
 
   it('imports from xlsx source files and returns normalized rows for audit', async () => {
@@ -648,6 +668,8 @@ describe('importMembersFromSource', () => {
     worksheet.addRow(['New Spreadsheet Member', '100023', 'sheet@alea.club'])
     const buffer = await workbook.xlsx.writeBuffer()
     const bytes = new Uint8Array(buffer as ArrayBuffer)
+
+    selectMock.mockResolvedValue([])
 
     const adminSession = createAdminSession()
     const result = await importMembersFromSource(adminSession, {
@@ -678,6 +700,8 @@ describe('importMembersFromSource', () => {
   it('limits normalizedRows to a bounded preview size', async () => {
     const { importMembersFromCsv } = await loadService()
     const adminSession = createAdminSession()
+
+    selectMock.mockResolvedValue([])
 
     const rows = ['USUARIOS,ID,email']
     for (let index = 0; index < 60; index += 1) {
