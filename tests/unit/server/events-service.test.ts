@@ -9,6 +9,7 @@ import {
   insertMock,
   updateMock,
   deleteMock,
+  executeMock,
   createAdminSession,
   createMemberSession,
 } from '@/tests/unit/mocks/drizzle-mock'
@@ -49,6 +50,7 @@ async function loadEventsService() {
     deleteEvent: mod.deleteEvent,
     isClubEventRow: mod.isClubEventRow,
     deleteEventCascade: mod.deleteEventCascade,
+    cancelSavedGamesForBlockedRoom: mod.cancelSavedGamesForBlockedRoom,
   }
 }
 
@@ -398,5 +400,86 @@ describe('events-service — Member-role denial', () => {
     const memberSession = createMemberSession()
     const { deleteEvent } = await loadEventsService()
     await expect(deleteEvent(memberSession, 'evt-1')).rejects.toThrow(MockServiceError)
+  })
+})
+
+describe('events-service — cancelSavedGamesForBlockedRoom cascade (KIM-434 PR #182 review fix)', () => {
+  beforeEach(() => {
+    resetFixtures()
+    vi.clearAllMocks()
+  })
+
+  it('cancels active saved_games on OTHER tables in the same room, not just the blocked table (room-scoped, not table-scoped)', async () => {
+    // "room-1" has two tables. The block only names the room (the cascade
+    // is deliberately room-scoped — see the doc comment above
+    // cancelSavedGamesForBlockedRoom in events-service.ts), so an active
+    // saved_games row on EITHER table must be a cancellation candidate.
+    setFixture('tables', [{ id: 'table-A' }, { id: 'table-B' }])
+    // Stands in for the DB's WHERE clause (status='active' AND date overlap
+    // AND table_id IN <all tables in the room>) already narrowing this down
+    // to the one qualifying row — which lives on table-B, the table NOT
+    // explicitly named by the block.
+    setFixture('saved_games', [{ id: 'sg-other-table' }])
+    updateMock.mockResolvedValue([{ id: 'sg-other-table' }])
+
+    const { cancelSavedGamesForBlockedRoom } = await loadEventsService()
+    const builder = createTransactionAwareMockBuilder()
+
+    const cancelledCount = await builder.transaction((tx) =>
+      cancelSavedGamesForBlockedRoom(tx, [{ roomId: 'room-1', date: '2026-07-10' }]),
+    )
+
+    expect(cancelledCount).toBe(1)
+    expect(updateMock).toHaveBeenCalledTimes(1)
+
+    // Advisory lock taken once per table in the room, in ascending id order
+    // (hashtextextended(table_id, 0) — same key/order as the dropped
+    // trigger), and all locks acquired before the cancellation update runs.
+    expect(executeMock).toHaveBeenCalledTimes(2)
+    expect(executeMock.mock.calls[0][0].queryChunks[1]).toBe('table-A')
+    expect(executeMock.mock.calls[1][0].queryChunks[1]).toBe('table-B')
+
+    const lastExecuteOrder = Math.max(...executeMock.mock.invocationCallOrder)
+    const firstUpdateOrder = Math.min(...updateMock.mock.invocationCallOrder)
+    expect(lastExecuteOrder).toBeLessThan(firstUpdateOrder)
+  })
+
+  it('does not cancel anything when no active saved_games overlap the block', async () => {
+    // Empty candidate set stands in for a DB-side WHERE clause that already
+    // excluded a row for any of: a different room, a non-overlapping date
+    // range, or a status other than 'active' (already 'cancelled'/etc.) —
+    // in every case the SELECT the code trusts returns nothing, so no
+    // update should ever be attempted.
+    setFixture('tables', [{ id: 'table-A' }])
+    setFixture('saved_games', [])
+
+    const { cancelSavedGamesForBlockedRoom } = await loadEventsService()
+    const builder = createTransactionAwareMockBuilder()
+
+    const cancelledCount = await builder.transaction((tx) =>
+      cancelSavedGamesForBlockedRoom(tx, [{ roomId: 'room-1', date: '2026-07-10' }]),
+    )
+
+    expect(cancelledCount).toBe(0)
+    expect(updateMock).not.toHaveBeenCalled()
+    // The advisory lock loop still runs — it must serialize against
+    // validate_saved_game's matching lock regardless of whether anything
+    // ends up being cancelled.
+    expect(executeMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('takes no advisory locks and performs no update when the blocked room has no tables', async () => {
+    setFixture('tables', [])
+
+    const { cancelSavedGamesForBlockedRoom } = await loadEventsService()
+    const builder = createTransactionAwareMockBuilder()
+
+    const cancelledCount = await builder.transaction((tx) =>
+      cancelSavedGamesForBlockedRoom(tx, [{ roomId: 'room-empty', date: '2026-07-10' }]),
+    )
+
+    expect(cancelledCount).toBe(0)
+    expect(executeMock).not.toHaveBeenCalled()
+    expect(updateMock).not.toHaveBeenCalled()
   })
 })

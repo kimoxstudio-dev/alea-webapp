@@ -102,6 +102,32 @@ export const updateMock = vi.fn()
 export const deleteMock = vi.fn()
 
 /**
+ * Mock response for `tx.execute(sql\`...\`)` calls — raw SQL statements run
+ * directly against a transaction (e.g. the `pg_advisory_xact_lock(...)`
+ * calls in `cancelSavedGamesForBlockedRoom`, KIM-434 PR #182 review fix).
+ *
+ * Unlike insert/update/delete, production code here only calls `tx.execute`
+ * for its side effect (taking an advisory lock) and never reads the
+ * resolved value, so the default (`{ rows: [] }`) is a stand-in shape, not
+ * real data. Inspectable/configurable the same way as insertMock/updateMock/
+ * deleteMock:
+ * - Assert call count/args: `expect(executeMock).toHaveBeenCalledTimes(2)`
+ * - Override the resolved value for a test: `executeMock.mockReturnValueOnce({ rows: [...] })`
+ */
+export const executeMock = vi.fn()
+
+/**
+ * Wraps `executeMock` with the same "call it, fall back to a sane default
+ * if unmocked" pattern used elsewhere in this file (e.g. the per-table
+ * insert/update/delete resolvers), so `tx.execute(...)` never throws just
+ * because a test didn't explicitly configure `executeMock`.
+ */
+function resolveExecute(...args: unknown[]) {
+  const result = executeMock(...args)
+  return Promise.resolve(result !== undefined ? result : { rows: [] })
+}
+
+/**
  * Captures the arguments passed to every `.where(...)` call across the
  * chainable query builder (select/update/delete), so tests can assert that
  * an authorization/scoping filter (e.g. `eq(partners.active, true)`, the
@@ -255,6 +281,8 @@ export function createDrizzleQueryBuilder() {
     // Support db.transaction() wrapper for atomic operations.
     // The callback receives a query builder (tx) with the same chainable structure.
     transaction: vi.fn(async (callback) => callback(createDrizzleQueryBuilder())),
+    // Support `tx.execute(sql\`...\`)` for raw SQL (e.g. advisory locks).
+    execute: vi.fn((...args) => resolveExecute(...args)),
   }
 }
 
@@ -655,6 +683,7 @@ export function createDrizzleQueryBuilderWithDispatching() {
       })),
     })),
     transaction: vi.fn(async (callback) => callback(createDrizzleQueryBuilderWithDispatching())),
+    execute: vi.fn((...args) => resolveExecute(...args)),
   }
 }
 
@@ -840,6 +869,7 @@ function createTransactionScopedBuilder(scope: TransactionScope) {
       })),
     })),
     transaction: vi.fn(async (callback) => callback(createTransactionScopedBuilder(scope))),
+    execute: vi.fn((...args) => resolveExecute(...args)),
   }
 }
 
@@ -903,5 +933,6 @@ export function createTransactionAwareMockBuilder() {
         }
       )
     },
+    execute: vi.fn((...args) => resolveExecute(...args)),
   }
 }
