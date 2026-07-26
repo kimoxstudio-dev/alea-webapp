@@ -29,6 +29,28 @@ async function loadModule() {
   return import('@/lib/server/equipment/equipment-service')
 }
 
+/**
+ * Swap the admin `db` for the NEXT `getDrizzleAdminDb()` call only.
+ *
+ * The state-driven store always persists what it is told to insert, so a few
+ * defensive branches in the service (`INSERT ... RETURNING` coming back with
+ * no row) are unreachable through `seed()` / `failNextQuery()` alone. Those
+ * outcomes are real at the driver level, just not expressible in an in-memory
+ * store, so this narrowly overrides one builder for one call and leaves every
+ * other query on the real state-driven mock.
+ *
+ * Must be called AFTER `loadModule()`: `vi.resetModules()` re-runs the
+ * `vi.mock('@/lib/db')` factory, so the service and this helper only share the
+ * same mock instance once the module has been (re)loaded.
+ */
+async function overrideNextAdminDb(partial: Record<string, unknown>): Promise<void> {
+  const dbModule = await import('@/lib/db')
+  vi.mocked(dbModule.getDrizzleAdminDb).mockReturnValueOnce({
+    ...createStatefulDrizzleDb(),
+    ...partial,
+  } as unknown as ReturnType<typeof dbModule.getDrizzleAdminDb>)
+}
+
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 const equipmentRow = {
   id: 'eq-1',
@@ -44,25 +66,40 @@ describe('listEquipment', () => {
     vi.clearAllMocks()
   })
 
-  it('returns all equipment rows', async () => {
+  it('returns mapped equipment list on success', async () => {
     seedTable('equipment', [equipmentRow])
     const { listEquipment } = await loadModule()
+
     const result = await listEquipment()
+
     expect(result).toHaveLength(1)
-    expect(result[0].name).toBe('Projector')
+    expect(result[0]).toMatchObject({ id: 'eq-1', name: 'Projector', description: 'HD projector' })
+    expect(result[0].createdAt).toBe('2025-01-01T00:00:00.000Z')
   })
 
-  it('returns an empty array when no equipment exists', async () => {
+  it('returns empty array when no equipment exists', async () => {
     seedTable('equipment', [])
     const { listEquipment } = await loadModule()
+
     const result = await listEquipment()
+
     expect(result).toEqual([])
   })
 
-  it('throws 500 when the database query fails', async () => {
+  it('throws 500 ServiceError when query throws', async () => {
     failNextQuery({ op: 'select', table: 'equipment' })
     const { listEquipment } = await loadModule()
-    await expect(listEquipment()).rejects.toMatchObject({ statusCode: 500 })
+
+    await expect(listEquipment()).rejects.toMatchObject({ name: 'ServiceError', statusCode: 500 })
+  })
+
+  it('maps description: null to null (not empty string)', async () => {
+    seedTable('equipment', [{ ...equipmentRow, description: null }])
+    const { listEquipment } = await loadModule()
+
+    const result = await listEquipment()
+
+    expect(result[0].description).toBeNull()
   })
 })
 
@@ -73,29 +110,92 @@ describe('createEquipment', () => {
     vi.clearAllMocks()
   })
 
-  it('inserts and returns the new equipment', async () => {
+  it('returns created equipment on success', async () => {
     const { createEquipment } = await loadModule()
     const adminSession = createAdminSession()
-    const result = await createEquipment(adminSession, { name: 'Projector' })
-    expect(result).toMatchObject({ name: 'Projector' })
+
+    const result = await createEquipment(adminSession, { name: 'Projector', description: 'HD projector' })
+
+    expect(result).toMatchObject({ name: 'Projector', description: 'HD projector' })
+    expect(typeof result.id).toBe('string')
+    // The row is really persisted by the insert, not just echoed back.
     expect(getRows('equipment')).toHaveLength(1)
+    expect(getRows('equipment')[0]).toMatchObject({ name: 'Projector', description: 'HD projector' })
   })
 
   it('throws 403 when session role is not admin', async () => {
     const { createEquipment } = await loadModule()
     const memberSession = createMemberSession()
+
     await expect(createEquipment(memberSession, { name: 'Projector' })).rejects.toMatchObject({
       statusCode: 403,
     })
+    // The guard runs before any write reaches the database.
+    expect(getRows('equipment')).toHaveLength(0)
   })
 
-  it('throws 500 when the database insert fails', async () => {
+  it('throws 400 when name is empty string', async () => {
+    const { createEquipment } = await loadModule()
+    const adminSession = createAdminSession()
+
+    await expect(createEquipment(adminSession, { name: '' })).rejects.toMatchObject({
+      name: 'ServiceError',
+      statusCode: 400,
+    })
+  })
+
+  it('throws 400 when name is missing (undefined)', async () => {
+    const { createEquipment } = await loadModule()
+    const adminSession = createAdminSession()
+
+    await expect(createEquipment(adminSession, {})).rejects.toMatchObject({
+      name: 'ServiceError',
+      statusCode: 400,
+    })
+  })
+
+  it('trims whitespace from name', async () => {
+    const { createEquipment } = await loadModule()
+    const adminSession = createAdminSession()
+
+    const result = await createEquipment(adminSession, { name: '  Projector  ' })
+
+    expect(result.name).toBe('Projector')
+    expect(getRows('equipment')[0].name).toBe('Projector')
+
+    // Whitespace-only is empty after trim, so it is rejected as a missing name.
+    await expect(createEquipment(adminSession, { name: '   ' })).rejects.toMatchObject({ statusCode: 400 })
+  })
+
+  it('throws 500 when insert throws error', async () => {
     failNextQuery({ op: 'insert', table: 'equipment' })
     const { createEquipment } = await loadModule()
     const adminSession = createAdminSession()
+
+    await expect(createEquipment(adminSession, { name: 'Projector' })).rejects.toMatchObject({ statusCode: 500 })
+  })
+
+  it('throws 500 when insert returns empty array (unexpected)', async () => {
+    const { createEquipment } = await loadModule()
+    await overrideNextAdminDb({
+      insert: vi.fn(() => ({ values: vi.fn(() => ({ returning: vi.fn(async () => []) })) })),
+    })
+    const adminSession = createAdminSession()
+
     await expect(createEquipment(adminSession, { name: 'Projector' })).rejects.toMatchObject({
+      name: 'ServiceError',
       statusCode: 500,
     })
+  })
+
+  it('stores null description when description is falsy', async () => {
+    const { createEquipment } = await loadModule()
+    const adminSession = createAdminSession()
+
+    const result = await createEquipment(adminSession, { name: 'Projector', description: '' })
+
+    expect(result.description).toBeNull()
+    expect(getRows('equipment')[0].description).toBeNull()
   })
 })
 
@@ -106,30 +206,73 @@ describe('updateEquipment', () => {
     vi.clearAllMocks()
   })
 
-  it('updates and returns the equipment', async () => {
+  it('returns updated equipment on success', async () => {
     seedTable('equipment', [equipmentRow])
     const { updateEquipment } = await loadModule()
     const adminSession = createAdminSession()
-    const result = await updateEquipment(adminSession, 'eq-1', { name: 'Updated Projector' })
-    expect(result).toMatchObject({ name: 'Updated Projector' })
+
+    const result = await updateEquipment(adminSession, 'eq-1', { name: 'Updated' })
+
+    expect(result).toMatchObject({ id: 'eq-1', name: 'Updated' })
+    expect(getRows('equipment')[0].name).toBe('Updated')
   })
 
   it('throws 403 when session role is not admin', async () => {
+    seedTable('equipment', [equipmentRow])
     const { updateEquipment } = await loadModule()
     const memberSession = createMemberSession()
+
     await expect(updateEquipment(memberSession, 'eq-1', { name: 'Updated' })).rejects.toMatchObject({
       statusCode: 403,
     })
+    // The guard runs before any write reaches the database.
+    expect(getRows('equipment')[0].name).toBe('Projector')
   })
 
-  it('throws 500 when the database update fails', async () => {
+  it('throws 400 when name is explicitly set to empty string', async () => {
+    seedTable('equipment', [equipmentRow])
+    const { updateEquipment } = await loadModule()
+    const adminSession = createAdminSession()
+
+    await expect(updateEquipment(adminSession, 'eq-1', { name: '' })).rejects.toMatchObject({ statusCode: 400 })
+  })
+
+  it('throws 400 when no updatable fields are provided', async () => {
+    seedTable('equipment', [equipmentRow])
+    const { updateEquipment } = await loadModule()
+    const adminSession = createAdminSession()
+
+    await expect(updateEquipment(adminSession, 'eq-1', {})).rejects.toMatchObject({ statusCode: 400 })
+  })
+
+  it('throws 404 when equipment not found (empty array)', async () => {
+    seedTable('equipment', [equipmentRow])
+    const { updateEquipment } = await loadModule()
+    const adminSession = createAdminSession()
+
+    await expect(updateEquipment(adminSession, 'nonexistent', { name: 'X' })).rejects.toMatchObject({
+      statusCode: 404,
+    })
+  })
+
+  it('throws 500 when DB throws error', async () => {
     seedTable('equipment', [equipmentRow])
     failNextQuery({ op: 'update', table: 'equipment' })
     const { updateEquipment } = await loadModule()
     const adminSession = createAdminSession()
-    await expect(updateEquipment(adminSession, 'eq-1', { name: 'Updated' })).rejects.toMatchObject({
-      statusCode: 500,
-    })
+
+    await expect(updateEquipment(adminSession, 'eq-1', { name: 'X' })).rejects.toMatchObject({ statusCode: 500 })
+  })
+
+  it('sets description to null when passed null', async () => {
+    seedTable('equipment', [equipmentRow])
+    const { updateEquipment } = await loadModule()
+    const adminSession = createAdminSession()
+
+    const result = await updateEquipment(adminSession, 'eq-1', { description: null })
+
+    expect(result.description).toBeNull()
+    expect(getRows('equipment')[0].description).toBeNull()
   })
 })
 
@@ -140,30 +283,41 @@ describe('deleteEquipment', () => {
     vi.clearAllMocks()
   })
 
-  it('deletes equipment and returns void', async () => {
+  it('resolves without error when deletion succeeds', async () => {
     seedTable('equipment', [equipmentRow])
     const { deleteEquipment } = await loadModule()
     const adminSession = createAdminSession()
+
     await expect(deleteEquipment(adminSession, 'eq-1')).resolves.toBeUndefined()
     expect(getRows('equipment')).toHaveLength(0)
   })
 
   it('throws 403 when session role is not admin', async () => {
+    seedTable('equipment', [equipmentRow])
     const { deleteEquipment } = await loadModule()
     const memberSession = createMemberSession()
-    await expect(deleteEquipment(memberSession, 'eq-1')).rejects.toMatchObject({
-      statusCode: 403,
-    })
+
+    await expect(deleteEquipment(memberSession, 'eq-1')).rejects.toMatchObject({ statusCode: 403 })
+    // The guard runs before the delete reaches the database.
+    expect(getRows('equipment')).toHaveLength(1)
   })
 
-  it('throws 500 when the database delete fails', async () => {
+  it('throws 404 when no row was deleted (equipment not found)', async () => {
+    seedTable('equipment', [equipmentRow])
+    const { deleteEquipment } = await loadModule()
+    const adminSession = createAdminSession()
+
+    await expect(deleteEquipment(adminSession, 'nonexistent')).rejects.toMatchObject({ statusCode: 404 })
+    expect(getRows('equipment')).toHaveLength(1)
+  })
+
+  it('throws 500 when DB throws error', async () => {
     seedTable('equipment', [equipmentRow])
     failNextQuery({ op: 'delete', table: 'equipment' })
     const { deleteEquipment } = await loadModule()
     const adminSession = createAdminSession()
-    await expect(deleteEquipment(adminSession, 'eq-1')).rejects.toMatchObject({
-      statusCode: 500,
-    })
+
+    await expect(deleteEquipment(adminSession, 'eq-1')).rejects.toMatchObject({ statusCode: 500 })
   })
 })
 
@@ -174,37 +328,46 @@ describe('getRoomDefaultEquipment', () => {
     vi.clearAllMocks()
   })
 
-  it('returns equipment for a room', async () => {
+  it('returns equipment items for a room', async () => {
     // Real innerJoin between room_default_equipment and equipment now, so
     // both sides of the relation must be seeded (the old sequence-driven
     // mock let the fixture stand in directly for the joined result — the
-    // new state-driven mock evaluates the join for real).
+    // new state-driven mock evaluates the join for real). A third row on
+    // another room proves the roomId filter is actually applied.
     seed({
       equipment: [
-        { id: 'eq-1', name: 'Dice Set', description: 'Standard dice', createdAt: new Date('2025-01-01') },
-        { id: 'eq-2', name: 'Cards', description: 'Playing cards', createdAt: new Date('2025-01-02') },
+        equipmentRow,
+        { id: 'eq-2', name: 'Cards', description: 'Playing cards', createdAt: new Date('2025-01-02T00:00:00.000Z') },
+        { id: 'eq-3', name: 'Other gear', description: null, createdAt: new Date('2025-01-03T00:00:00.000Z') },
       ],
       room_default_equipment: [
         { roomId: 'room-1', equipmentId: 'eq-1' },
         { roomId: 'room-1', equipmentId: 'eq-2' },
+        { roomId: 'room-2', equipmentId: 'eq-3' },
       ],
     })
     const { getRoomDefaultEquipment } = await loadModule()
+
     const result = await getRoomDefaultEquipment('room-1')
+
     expect(result).toHaveLength(2)
-    expect(result.map((row) => row.name).sort()).toEqual(['Cards', 'Dice Set'])
+    expect(result.map((row) => row.name).sort()).toEqual(['Cards', 'Projector'])
+    expect(result.find((row) => row.id === 'eq-1')).toMatchObject({ id: 'eq-1', name: 'Projector' })
   })
 
-  it('returns an empty array when room has no defaults', async () => {
-    seed({ equipment: [], room_default_equipment: [] })
+  it('returns empty array when room has no default equipment', async () => {
+    seed({ equipment: [equipmentRow], room_default_equipment: [] })
     const { getRoomDefaultEquipment } = await loadModule()
+
     const result = await getRoomDefaultEquipment('room-1')
-    expect(result).toEqual([])
+
+    expect(result).toHaveLength(0)
   })
 
-  it('throws 500 when the database query fails', async () => {
+  it('throws 500 when query throws error', async () => {
     failNextQuery({ op: 'select', table: 'room_default_equipment' })
     const { getRoomDefaultEquipment } = await loadModule()
+
     await expect(getRoomDefaultEquipment('room-1')).rejects.toMatchObject({ statusCode: 500 })
   })
 })
@@ -218,10 +381,12 @@ describe('setRoomDefaultEquipment', () => {
   })
 
   it('clears defaults when equipmentIds is empty', async () => {
+    seedTable('room_default_equipment', [{ roomId: 'room-1', equipmentId: 'eq-1' }])
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
     await expect(setRoomDefaultEquipment(adminSession, 'room-1', [])).resolves.toBeUndefined()
+    expect(getRows('room_default_equipment')).toHaveLength(0)
   })
 
   it('inserts new defaults when no conflicts exist', async () => {
