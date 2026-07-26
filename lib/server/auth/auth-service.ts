@@ -2,7 +2,7 @@ import type { User } from '@/lib/types'
 import type { SessionUser } from '@/lib/server/auth/auth'
 import { createHash, randomBytes } from 'node:crypto'
 import { AuthError } from 'next-auth'
-import { signIn as authJsSignIn, signOut as authJsSignOut } from '@/lib/authjs/auth'
+import { auth as authJsAuth, signIn as authJsSignIn, signOut as authJsSignOut } from '@/lib/authjs/auth'
 import { getDatabaseNow } from '@/lib/server/shared/database-time'
 import { serviceError } from '@/lib/server/shared/service-error'
 import { getAdminDb, getDb } from '@/lib/db'
@@ -107,23 +107,35 @@ type AuthClient = {
  * post-recovery session that Supabase Auth's `signInWithPassword` used to
  * issue there.
  *
- * Returns `false` (never throws) when the Credentials provider rejects the
- * sign-in (`AuthError`/`CredentialsSignin` — invalid credentials, inactive
- * account, etc.) so callers can map that to a uniform 401/failure response,
- * mirroring the previous Supabase-based code's `if (error) ...` check.
- * Any other, unexpected error is rethrown so it still surfaces as a 500
- * instead of being silently reinterpreted as "invalid credentials".
+ * Returns the `id` of the profile Auth.js actually authenticated (read back
+ * from the freshly-established session via `auth()`, called immediately
+ * after `signIn()` resolves — both operate against the same request-scoped
+ * cookie store, so this reflects the session `signIn()` just wrote, not a
+ * stale one), or `null` (never throws) when the Credentials provider
+ * rejects the sign-in (`AuthError`/`CredentialsSignin` — invalid
+ * credentials, inactive account, etc.) so callers can map that to a
+ * uniform 401/failure response, mirroring the previous Supabase-based
+ * code's `if (error) ...` check. Any other, unexpected error is rethrown so
+ * it still surfaces as a 500 instead of being silently reinterpreted as
+ * "invalid credentials".
+ *
+ * Callers that resolve their own profile row by a different lookup than
+ * `verifyCredentials()` uses (e.g. `login()` resolves by `member_number`)
+ * MUST compare this returned id against that profile's `id` before trusting
+ * the session — see the identity-drift guard in `login()` below.
  */
-async function signInWithAuthJs(email: string, password: string): Promise<boolean> {
+async function signInWithAuthJs(email: string, password: string): Promise<string | null> {
   try {
     await authJsSignIn('credentials', { email, password, redirect: false })
-    return true
   } catch (error) {
     if (error instanceof AuthError) {
-      return false
+      return null
     }
     throw error
   }
+
+  const session = await authJsAuth()
+  return session?.user?.id ?? null
 }
 
 /** Ends the current Auth.js session. Throws a 500 `ServiceError` on failure, same contract as the previous Supabase `signOut()`-based implementation. */
@@ -132,6 +144,23 @@ async function signOutWithAuthJs(): Promise<void> {
     await authJsSignOut({ redirect: false })
   } catch {
     serviceError('Internal server error', 500)
+  }
+}
+
+/**
+ * Best-effort sign-out used only to invalidate a session that
+ * `signInWithAuthJs()` already established but that we've since determined
+ * must NOT be trusted (identity-drift mismatch — see `login()`). Unlike
+ * `signOutWithAuthJs()`, this never throws: an already-detected security
+ * failure (mismatched identity) must still fail closed even if the
+ * best-effort cookie cleanup itself errors, so that failure cannot swallow
+ * or replace the caller's authoritative 401 / `signInFailed` result.
+ */
+async function signOutQuietly(): Promise<void> {
+  try {
+    await authJsSignOut({ redirect: false })
+  } catch {
+    // Intentionally ignored — see doc comment above.
   }
 }
 
@@ -481,12 +510,25 @@ export async function activateAccount(input: { token: unknown; password: unknown
   // whether this sign-in attempt succeeds — `signInFailed` lets the route
   // handler report that distinction to the client (same behavior as before).
   const authEmail = profile.auth_email ?? profile.email ?? ''
-  const signedIn = await signInWithAuthJs(authEmail, parsed.data.password)
+  const authenticatedUserId = await signInWithAuthJs(authEmail, parsed.data.password)
+
+  // Defense-in-depth, mirroring login()'s identity-drift guard: `profile`
+  // here was resolved by activation token -> profile_id (unique), so this
+  // mismatch shouldn't be reachable in practice (verifyCredentials() now
+  // keys on the uniquely-indexed auth_email column — see
+  // lib/authjs/credentials-user.ts). Still checked, and the session torn
+  // down on mismatch, so a future regression there can't silently hand back
+  // a session authenticated as a different profile than the one just
+  // activated.
+  const identityMismatch = authenticatedUserId !== null && authenticatedUserId !== profile.id
+  if (identityMismatch) {
+    await signOutQuietly()
+  }
 
   return {
     authEmail,
     user: toPublicUser(updatedProfile),
-    signInFailed: !signedIn,
+    signInFailed: !authenticatedUserId || identityMismatch,
   }
 }
 
@@ -578,12 +620,19 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
   // Establish the post-recovery session — see the matching comment in
   // `activateAccount()` above for why this moved here from the route handler.
   const authEmail = profile.auth_email ?? profile.email ?? ''
-  const signedIn = await signInWithAuthJs(authEmail, parsed.data.password)
+  const authenticatedUserId = await signInWithAuthJs(authEmail, parsed.data.password)
+
+  // Defense-in-depth identity-drift guard — see the matching comment in
+  // `activateAccount()` above.
+  const identityMismatch = authenticatedUserId !== null && authenticatedUserId !== profile.id
+  if (identityMismatch) {
+    await signOutQuietly()
+  }
 
   return {
     authEmail,
     user: toPublicUser(updatedProfile),
-    signInFailed: !signedIn,
+    signInFailed: !authenticatedUserId || identityMismatch,
   }
 }
 
@@ -616,9 +665,23 @@ export async function login(
     serviceError('Invalid credentials', 401)
   }
 
-  const signedIn = await signInWithAuthJs(authEmail, password)
+  const authenticatedUserId = await signInWithAuthJs(authEmail, password)
 
-  if (!signedIn) {
+  if (!authenticatedUserId) {
+    serviceError('Invalid credentials', 401)
+  }
+
+  if (authenticatedUserId !== credentialProfile.id) {
+    // Guard against profile/auth drift: the identity Auth.js actually
+    // authenticated (read back from the session it just established) must
+    // match the profile resolved by member number above. Without this, a
+    // non-unique lookup inside verifyCredentials() could authenticate a
+    // different profile than the one whose data we're about to return —
+    // the caller would get profile A's data while holding a session
+    // authenticated as profile B. The mismatched session must not be left
+    // valid, so it's torn down before failing closed with the same generic
+    // error as ordinary bad credentials (never reveal which check failed).
+    await signOutQuietly()
     serviceError('Invalid credentials', 401)
   }
 

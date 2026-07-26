@@ -13,9 +13,20 @@ export interface AuthJsUser {
 }
 
 /**
- * Looks up a user by email in `profiles` (via the Drizzle/Neon seam,
+ * Looks up a user by `profiles.auth_email` (via the Drizzle/Neon seam,
  * `getDrizzleDb()` — see `lib/db/index.ts`) and verifies the supplied
  * password against `profiles.password_hash`.
+ *
+ * Keyed on `auth_email` — not `profiles.email` — because every caller
+ * (`login()`, `activateAccount()`, `recoverAccount()` in
+ * `lib/server/auth/auth-service.ts`) resolves a profile first and then
+ * signs in using that profile's `auth_email` (falling back to `email` only
+ * if `auth_email` were ever absent, which the `NOT NULL` constraint on that
+ * column prevents in practice). `auth_email` also carries a DB-level unique
+ * index (`profiles_auth_email_key`), unlike `email`, which has none — so a
+ * lookup here can only ever match the single profile whose `auth_email` was
+ * passed in, closing off the cross-profile identity-drift that querying by
+ * the non-unique `email` column previously allowed (KIM-433 follow-up fix).
  *
  * `password_hash` is expected to be bcryptjs-compatible — see the F2
  * cutover note in Linear KIM-393..422 (Supabase→Neon migration), which copies hashes
@@ -39,7 +50,7 @@ export interface AuthJsUser {
  * (`lib/server/auth/auth-service.ts`).
  */
 export async function verifyCredentials(
-  email: string,
+  authEmail: string,
   password: string
 ): Promise<AuthJsUser | null> {
   try {
@@ -54,7 +65,7 @@ export async function verifyCredentials(
         isActive: profiles.isActive,
       })
       .from(profiles)
-      .where(eq(profiles.email, email))
+      .where(eq(profiles.authEmail, authEmail))
       .limit(1)
 
     if (!row || !row.passwordHash) {
@@ -69,7 +80,7 @@ export async function verifyCredentials(
 
     return {
       id: row.id,
-      email: row.email ?? email,
+      email: row.email ?? authEmail,
       name: row.fullName,
       role: row.role,
       isActive: row.isActive,
