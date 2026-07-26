@@ -1,27 +1,28 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest'
 import { toPublicUser } from '@/lib/server/users/profile-mappers'
-import type { Tables } from '@/lib/supabase/types'
+import type { profiles } from '@/lib/db/schema'
 
-type ProfileRow = Tables<'profiles'>
+type ProfileRow = typeof profiles.$inferSelect
 
 describe('profile mappers', () => {
   describe('toPublicUser', () => {
     it('maps a complete profile row to User with all fields', () => {
       const profile: ProfileRow = {
         id: 'user-123',
-        member_number: '100001',
-        full_name: 'John Doe',
-        auth_email: 'john@alea.club',
+        memberNumber: '100001',
+        fullName: 'John Doe',
+        authEmail: 'john@alea.club',
         email: 'john.doe@personal.com',
         phone: '+34 123 456 789',
         role: 'member',
-        is_active: true,
-        active_from: '2024-01-15T10:00:00.000Z',
-        no_show_count: 2,
-        blocked_until: null,
-        created_at: '2024-01-01T00:00:00.000Z',
-        updated_at: '2024-06-20T14:30:00.000Z',
+        isActive: true,
+        activeFrom: new Date('2024-01-15T10:00:00.000Z'),
+        noShowCount: 2,
+        blockedUntil: null,
+        createdAt: new Date('2024-01-01T00:00:00.000Z'),
+        updatedAt: new Date('2024-06-20T14:30:00.000Z'),
+        pswChanged: null,
       }
 
       const user = toPublicUser(profile)
@@ -45,18 +46,19 @@ describe('profile mappers', () => {
     it('handles null/optional fields correctly', () => {
       const profile: ProfileRow = {
         id: 'user-456',
-        member_number: '100002',
-        full_name: null,
-        auth_email: 'user@alea.club',
+        memberNumber: '100002',
+        fullName: null,
+        authEmail: 'user@alea.club',
         email: null,
         phone: null,
         role: 'admin',
-        is_active: false,
-        active_from: null,
-        no_show_count: 0,
-        blocked_until: null,
-        created_at: '2024-02-01T00:00:00.000Z',
-        updated_at: '2024-02-01T00:00:00.000Z',
+        isActive: false,
+        activeFrom: null,
+        noShowCount: 0,
+        blockedUntil: null,
+        createdAt: new Date('2024-02-01T00:00:00.000Z'),
+        updatedAt: new Date('2024-02-01T00:00:00.000Z'),
+        pswChanged: null,
       }
 
       const user = toPublicUser(profile)
@@ -78,73 +80,76 @@ describe('profile mappers', () => {
     })
 
     it('preserves blocked_until when set', () => {
-      const blockDate = '2024-07-01T00:00:00.000Z'
+      const blockDate = new Date('2024-07-01T00:00:00.000Z')
       const profile: ProfileRow = {
         id: 'user-blocked',
-        member_number: '100003',
-        full_name: 'Blocked User',
-        auth_email: 'blocked@alea.club',
+        memberNumber: '100003',
+        fullName: 'Blocked User',
+        authEmail: 'blocked@alea.club',
         email: 'blocked@personal.com',
         phone: null,
         role: 'member',
-        is_active: true,
-        active_from: '2024-01-01T00:00:00.000Z',
-        no_show_count: 5,
-        blocked_until: blockDate,
-        created_at: '2024-01-01T00:00:00.000Z',
-        updated_at: '2024-06-20T14:30:00.000Z',
+        isActive: true,
+        activeFrom: new Date('2024-01-01T00:00:00.000Z'),
+        noShowCount: 5,
+        blockedUntil: blockDate,
+        createdAt: new Date('2024-01-01T00:00:00.000Z'),
+        updatedAt: new Date('2024-06-20T14:30:00.000Z'),
+        pswChanged: null,
       }
 
       const user = toPublicUser(profile)
 
-      expect(user.blockedUntil).toBe(blockDate)
+      expect(user.blockedUntil).toBe(blockDate.toISOString())
     })
 
     it('converts snake_case column names to camelCase', () => {
       const profile: ProfileRow = {
         id: 'test-user',
-        member_number: '999999',
-        full_name: 'Test Name',
-        auth_email: 'test@alea.club',
+        memberNumber: '999999',
+        fullName: 'Test Name',
+        authEmail: 'test@alea.club',
         email: 'test@personal.com',
         phone: '555-1234',
         role: 'member',
-        is_active: true,
-        active_from: '2024-06-01T00:00:00.000Z',
-        no_show_count: 1,
-        blocked_until: null,
-        created_at: '2024-06-20T00:00:00.000Z',
-        updated_at: '2024-06-20T12:00:00.000Z',
+        isActive: true,
+        activeFrom: new Date('2024-06-01T00:00:00.000Z'),
+        noShowCount: 1,
+        blockedUntil: null,
+        createdAt: new Date('2024-06-20T00:00:00.000Z'),
+        updatedAt: new Date('2024-06-20T12:00:00.000Z'),
+        pswChanged: null,
       }
 
       const user = toPublicUser(profile)
 
-      // Verify all snake_case fields are converted to camelCase
-      expect(user).toHaveProperty('memberNumber', profile.member_number)
-      expect(user).toHaveProperty('fullName', profile.full_name)
-      expect(user).toHaveProperty('isActive', profile.is_active)
-      expect(user).toHaveProperty('activeFrom', profile.active_from)
-      expect(user).toHaveProperty('noShowCount', profile.no_show_count)
-      expect(user).toHaveProperty('blockedUntil', profile.blocked_until)
-      expect(user).toHaveProperty('createdAt', profile.created_at)
-      expect(user).toHaveProperty('updatedAt', profile.updated_at)
+      // Verify all camelCase fields are present
+      expect(user).toHaveProperty('memberNumber', profile.memberNumber)
+      expect(user).toHaveProperty('fullName', profile.fullName)
+      expect(user).toHaveProperty('isActive', profile.isActive)
+      expect(user).toHaveProperty('activeFrom', profile.activeFrom.toISOString())
+      expect(user).toHaveProperty('noShowCount', profile.noShowCount)
+      expect(user).toHaveProperty('blockedUntil', profile.blockedUntil)
+      expect(user).toHaveProperty('createdAt', profile.createdAt.toISOString())
+      expect(user).toHaveProperty('updatedAt', profile.updatedAt.toISOString())
     })
 
     it('handles admin role', () => {
       const profile: ProfileRow = {
         id: 'admin-user',
-        member_number: '100000',
-        full_name: 'Admin User',
-        auth_email: 'admin@alea.club',
+        memberNumber: '100000',
+        fullName: 'Admin User',
+        authEmail: 'admin@alea.club',
         email: 'admin@personal.com',
         phone: null,
         role: 'admin',
-        is_active: true,
-        active_from: '2024-01-01T00:00:00.000Z',
-        no_show_count: 0,
-        blocked_until: null,
-        created_at: '2024-01-01T00:00:00.000Z',
-        updated_at: '2024-01-01T00:00:00.000Z',
+        isActive: true,
+        activeFrom: new Date('2024-01-01T00:00:00.000Z'),
+        noShowCount: 0,
+        blockedUntil: null,
+        createdAt: new Date('2024-01-01T00:00:00.000Z'),
+        updatedAt: new Date('2024-01-01T00:00:00.000Z'),
+        pswChanged: null,
       }
 
       const user = toPublicUser(profile)
@@ -155,18 +160,19 @@ describe('profile mappers', () => {
     it('handles zero and negative no_show_count values', () => {
       const profileZero: ProfileRow = {
         id: 'user-zero',
-        member_number: '100010',
-        full_name: 'Zero Shows',
-        auth_email: 'zero@alea.club',
+        memberNumber: '100010',
+        fullName: 'Zero Shows',
+        authEmail: 'zero@alea.club',
         email: null,
         phone: null,
         role: 'member',
-        is_active: true,
-        active_from: '2024-06-01T00:00:00.000Z',
-        no_show_count: 0,
-        blocked_until: null,
-        created_at: '2024-06-20T00:00:00.000Z',
-        updated_at: '2024-06-20T00:00:00.000Z',
+        isActive: true,
+        activeFrom: new Date('2024-06-01T00:00:00.000Z'),
+        noShowCount: 0,
+        blockedUntil: null,
+        createdAt: new Date('2024-06-20T00:00:00.000Z'),
+        updatedAt: new Date('2024-06-20T00:00:00.000Z'),
+        pswChanged: null,
       }
 
       const user = toPublicUser(profileZero)
@@ -177,18 +183,19 @@ describe('profile mappers', () => {
     it('handles long no_show_count values', () => {
       const profile: ProfileRow = {
         id: 'user-many',
-        member_number: '100011',
-        full_name: 'Many Shows',
-        auth_email: 'many@alea.club',
+        memberNumber: '100011',
+        fullName: 'Many Shows',
+        authEmail: 'many@alea.club',
         email: null,
         phone: null,
         role: 'member',
-        is_active: false,
-        active_from: null,
-        no_show_count: 10,
-        blocked_until: null,
-        created_at: '2024-06-20T00:00:00.000Z',
-        updated_at: '2024-06-20T00:00:00.000Z',
+        isActive: false,
+        activeFrom: null,
+        noShowCount: 10,
+        blockedUntil: null,
+        createdAt: new Date('2024-06-20T00:00:00.000Z'),
+        updatedAt: new Date('2024-06-20T00:00:00.000Z'),
+        pswChanged: null,
       }
 
       const user = toPublicUser(profile)
@@ -199,18 +206,19 @@ describe('profile mappers', () => {
     it('preserves active_from as nullable', () => {
       const profileWithActiveFrom: ProfileRow = {
         id: 'user-active',
-        member_number: '100012',
-        full_name: 'Active User',
-        auth_email: 'active@alea.club',
+        memberNumber: '100012',
+        fullName: 'Active User',
+        authEmail: 'active@alea.club',
         email: null,
         phone: null,
         role: 'member',
-        is_active: true,
-        active_from: '2025-01-01T00:00:00.000Z',
-        no_show_count: 0,
-        blocked_until: null,
-        created_at: '2024-06-20T00:00:00.000Z',
-        updated_at: '2024-06-20T00:00:00.000Z',
+        isActive: true,
+        activeFrom: new Date('2025-01-01T00:00:00.000Z'),
+        noShowCount: 0,
+        blockedUntil: null,
+        createdAt: new Date('2024-06-20T00:00:00.000Z'),
+        updatedAt: new Date('2024-06-20T00:00:00.000Z'),
+        pswChanged: null,
       }
 
       const user = toPublicUser(profileWithActiveFrom)
@@ -219,7 +227,7 @@ describe('profile mappers', () => {
 
       const profileWithoutActiveFrom: ProfileRow = {
         ...profileWithActiveFrom,
-        active_from: null,
+        activeFrom: null,
       }
 
       const user2 = toPublicUser(profileWithoutActiveFrom)
