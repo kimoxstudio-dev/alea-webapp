@@ -1667,3 +1667,26 @@ No blocking issues. No modifications needed. Code is ready for security-reviewer
 - [12:06] Started
 - [12:07] Strengthened test-file-ownership rule; added product-manager single-instance reinforcement; added new "Agent Working Agreements" section (Reporting Standards, Test Integrity, Shared Working Directory, Stopping and Escalating, Tooling)
 - [12:07] ✅ Complete — 34 lines added / 1 removed in CLAUDE.md, all 11 rules covered
+#### [KIM-432] software-engineer — Dev seed + admin bootstrap on Neon
+- Started. Branch migration-f2b-dev-seed-admin-bootstrap created off origin/develop.
+- Added scripts/seed.ts: Drizzle/Neon-native TS seed (own local pg.Pool + drizzle-orm/node-postgres client, does not touch lib/db/index.ts or lib/authjs/db.ts). Seeds 1 admin + 3 member profiles (email == authEmail for Auth.js credentials-user.ts compat, isActive=true, bcryptjs passwordHash), 2 rooms, 5 tables (varied type). Profiles upserted via onConflictDoUpdate on authEmail; rooms/tables via check-then-insert by name (documented in-file).
+- Guard: aborts unless NODE_ENV!=='production' AND DEV_SEED_CONFIRM===YES_SEED_NEON_DEV_DB. Verified all 3 abort paths (missing confirm, NODE_ENV=production, missing POSTGRES_URL) exit 1 before any Pool/connection is created — never ran against a real DB.
+- Added tsx ^4.23.1 devDependency + "db:seed": "tsx scripts/seed.ts" script. Documented DEV_SEED_CONFIRM in .env.example (name only) and added README.md "Dev seed on Neon" section with dev-only seeded credentials.
+- Validation: pnpm typecheck ✅, pnpm lint ✅. Did not run drizzle-kit push/migrate or pnpm db:seed for real, per hard constraint.
+- ✅ Complete — branch migration-f2b-dev-seed-admin-bootstrap, committed locally (not pushed, no PR opened per instructions).
+
+#### [KIM-432] security-reviewer — Dev seed + admin bootstrap security review
+- [08:08] Started. Read-only inspection via git show/git diff, no checkout of shared repo.
+- [08:08] scripts/seed.ts: confirmed assertDevSeedAllowed() runs first in main(), before createSeedDbClient() — no bypass path. No POSTGRES_URL*/password values logged anywhere. bcryptjs salt rounds=10 (reasonable default). Drizzle query builder used throughout (eq/and), no raw SQL/string concat — no injection surface.
+- [08:08] pnpm-lock.yaml diff verified minimal and expected: tsx@4.23.1 was already a transitive dep (via vite/vitest) in develop's lockfile; this PR only promotes it to an explicit devDependency — no new/unexpected packages pulled in.
+- [08:08] .env.example / README.md changes document DEV_SEED_CONFIRM by name only; README's seeded credentials table is clearly dev-only/placeholder (admin@devseed.local etc, password dev-only-Seed123!), not a real secret.
+- [08:08] Confirmed lib/db/index.ts, lib/authjs/db.ts, lib/db/schema/*, supabase/migrations/, supabase/seed.sql are untouched (empty diff).
+- [08:08] tests/unit/seed-guard.test.ts: reimplements guard logic inline rather than importing scripts/seed.ts; does not touch a DB or leak anything. LOW note: could drift from the real implementation over time (QA follow-up, non-blocking).
+- [08:08] ✅ Complete — APPROVE. No CRITICAL/HIGH findings. Pushing branch and opening PR.
+
+#### [KIM-432] security-reviewer — PR opened after isolated-worktree unblock
+- [08:40] Push from shared checkout failed due to stale node_modules there (pre-existing env drift unrelated to this change, missing drizzle-orm/next-auth/pg/bcryptjs/@vercel/blob despite develop's own package.json declaring them).
+- [08:40] Used a fresh throwaway worktree outside the shared checkout for pnpm install + re-verification only — shared checkout HEAD/node_modules never touched.
+- [08:40] Re-ran full validation in the clean worktree: typecheck OK, lint OK, test OK (1151 passed, 21 skipped, 0 failed), build OK.
+- [08:40] Pushed migration-f2b-dev-seed-admin-bootstrap and opened PR.
+- [08:40] Complete — PR #177: https://github.com/KimoxStudio/alea-webapp/pull/177
