@@ -4,6 +4,7 @@ import {
   createTransactionAwareMockBuilder,
   resetFixtures,
   setFixture,
+  setInsertFixture,
   createMockServiceError,
   MockServiceError,
   insertMock,
@@ -133,7 +134,7 @@ describe('events-service — createEvent multi-day (schedules)', () => {
     ]
 
     insertMock.mockResolvedValue([newEventRow])
-    setFixture('event_room_blocks', blocks)
+    setInsertFixture('event_room_blocks', blocks)
     setFixture('tables', [])
 
     const { createEvent } = await loadEventsService()
@@ -191,7 +192,7 @@ describe('events-service — createEvent multi-day (schedules)', () => {
     }]
 
     insertMock.mockResolvedValue([newEventRow])
-    setFixture('event_room_blocks', blocks)
+    setInsertFixture('event_room_blocks', blocks)
     setFixture('tables', [])
 
     const { createEvent } = await loadEventsService()
@@ -247,7 +248,7 @@ describe('events-service — createEvent multi-day (schedules)', () => {
     }]
 
     insertMock.mockResolvedValue([newEventRow])
-    setFixture('event_room_blocks', blocks)
+    setInsertFixture('event_room_blocks', blocks)
     setFixture('tables', [])
 
     const { createEvent } = await loadEventsService()
@@ -520,7 +521,7 @@ describe('events-service — createEvent multi-day (schedules)', () => {
     ]
 
     insertMock.mockResolvedValue([newEventRow])
-    setFixture('event_room_blocks', blocks)
+    setInsertFixture('event_room_blocks', blocks)
     setFixture('tables', [])
 
     const { createEvent } = await loadEventsService()
@@ -591,7 +592,7 @@ describe('events-service — createEvent multi-day (schedules)', () => {
     ]
 
     insertMock.mockResolvedValue([newEventRow])
-    setFixture('event_room_blocks', blocks)
+    setInsertFixture('event_room_blocks', blocks)
     setFixture('tables', [])
 
     const { createEvent } = await loadEventsService()
@@ -685,7 +686,8 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
 
     setFixture('events', [currentRow])
     updateMock.mockResolvedValue([updatedRow])
-    setFixture('event_room_blocks', blocks)
+    deleteMock.mockResolvedValue([])
+    setInsertFixture('event_room_blocks', blocks)
     setFixture('tables', [])
 
     const { updateEvent } = await loadEventsService()
@@ -737,6 +739,7 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
 
     setFixture('events', [currentRow])
     updateMock.mockResolvedValue([updatedRow])
+    deleteMock.mockResolvedValue([])
     setFixture('event_room_blocks', [])
 
     const { updateEvent } = await loadEventsService()
@@ -876,7 +879,8 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
     }
 
     updateMock.mockResolvedValue([updatedRow])
-    setFixture('event_room_blocks', [{
+    deleteMock.mockResolvedValue([])
+    setInsertFixture('event_room_blocks', [{
       id: 'b-shrink',
       eventId: 'evt-shrink',
       roomId: 'room-1',
@@ -933,7 +937,8 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
     }
 
     updateMock.mockResolvedValue([updatedRow])
-    setFixture('event_room_blocks', [
+    deleteMock.mockResolvedValue([])
+    setInsertFixture('event_room_blocks', [
       {
         id: 'b-grow-1',
         eventId: 'evt-grow',
