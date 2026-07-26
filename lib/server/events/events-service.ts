@@ -1,6 +1,6 @@
 import 'server-only'
 import { and, asc, eq, gt, inArray, isNull, lt, or } from 'drizzle-orm'
-import { getAdminDb, getDrizzleAdminDb, getDrizzleDb } from '@/lib/db'
+import { getAdminDb, getDrizzleAdminDb, getDrizzleDb, type AdminDbClient } from '@/lib/db'
 import { events, eventRoomBlocks, tables } from '@/lib/db/schema'
 import { ServiceError, serviceError } from '@/lib/server/shared/service-error'
 import type { AdminEvent, AdminEventRoomBlock, AdminEventSchedule } from '@/lib/types'
@@ -417,6 +417,43 @@ async function updateEventAtomic(
   return toAdminEvent(result.eventRow, result.insertedBlocks)
 }
 
+// ---------------------------------------------------------------------------
+// room_id/table_id consistency guard (PR #182 review fix).
+//
+// The removed create_event_with_blocks/update_event_with_blocks RPCs
+// (supabase/migrations/20260704000006_oir208_table_blocks_and_materials.sql)
+// verified that a block's table_id actually belongs to its room_id before
+// inserting: independent FKs on room_id/table_id alone are not sufficient,
+// since a table_id from an unrelated room still passes FK checks. This
+// Drizzle rewrite must reimplement that same guard explicitly.
+// ---------------------------------------------------------------------------
+type AdminTx = Parameters<Parameters<AdminDbClient['transaction']>[0]>[0]
+
+async function assertBlocksTableRoomConsistency(
+  tx: AdminTx,
+  blocksWithRoom: Array<{ room_id: string; table_id: string | null }>,
+): Promise<void> {
+  const tableIds = [...new Set(
+    blocksWithRoom.filter((b) => b.table_id !== null).map((b) => b.table_id as string),
+  )]
+  if (tableIds.length === 0) return
+
+  const tableRows = await tx
+    .select({ id: tables.id, roomId: tables.roomId })
+    .from(tables)
+    .where(inArray(tables.id, tableIds))
+
+  const tableRoomMap = new Map(tableRows.map((t) => [t.id, t.roomId]))
+
+  for (const block of blocksWithRoom) {
+    if (block.table_id === null) continue
+    const actualRoomId = tableRoomMap.get(block.table_id)
+    if (actualRoomId === undefined || actualRoomId !== block.room_id) {
+      serviceError(`table_id ${block.table_id} does not belong to room_id ${block.room_id}`, 400)
+    }
+  }
+}
+
 async function createEventWithBlocksAtomic(
   title: string,
   description: string | null,
@@ -446,6 +483,8 @@ async function createEventWithBlocksAtomic(
       const blocksWithRoom = normBlocks.filter(
         (b): b is NormalisedEventSchedule & { room_id: string } => b.room_id !== null,
       )
+
+      await assertBlocksTableRoomConsistency(tx, blocksWithRoom)
 
       let insertedBlocks: EventRoomBlockRow[] = []
       if (blocksWithRoom.length > 0) {
@@ -520,6 +559,8 @@ async function updateEventWithBlocksAtomic(
       const blocksWithRoom = normBlocks.filter(
         (b): b is NormalisedEventSchedule & { room_id: string } => b.room_id !== null,
       )
+
+      await assertBlocksTableRoomConsistency(tx, blocksWithRoom)
 
       let insertedBlocks: EventRoomBlockRow[] = []
       if (blocksWithRoom.length > 0) {
@@ -896,7 +937,13 @@ export async function previewEventConflicts(body: {
   let total = 0
 
   for (const block of roomedBlocks) {
-    const tableIds = roomTableMap.get(block.room_id) ?? []
+    // Match cancelOverlappingReservationsForBlocks()'s scoping rule: a
+    // table-level block (table_id set) only counts against that single
+    // table; a room-level block (table_id null) falls back to the room's
+    // full table list. Counting against the whole room regardless of
+    // table_id would overstate how many reservations will actually be
+    // cancelled for a table-level block.
+    const tableIds = block.table_id ? [block.table_id] : (roomTableMap.get(block.room_id) ?? [])
 
     if (tableIds.length === 0) {
       resultBlocks.push({ date: block.date, roomId: block.room_id, count: 0 })
