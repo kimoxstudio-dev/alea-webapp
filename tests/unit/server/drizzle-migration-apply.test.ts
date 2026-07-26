@@ -30,28 +30,55 @@ function parseMigrationStatements(sql: string): string[] {
 function extractSchemaDefinitions(schemaSource: string) {
   const tables: Record<string, string[]> = {}
   const constraints: Record<string, boolean> = {}
-  const enums: Record<string, string[]> = {}
 
-  const tablePattern = /pgTable\(\s*['"'"`]([^'"'"`]+)['"'"`]\s*,\s*\{/g
+  const tablePattern = /pgTable\(\s*['"`]([^'"`]+)['"`]\s*,\s*\{/g
   let tableMatch
   while ((tableMatch = tablePattern.exec(schemaSource)) !== null) {
     tables[tableMatch[1]] = []
   }
 
-  const namedConstraintPattern = /(check|index|unique|uniqueIndex)\(\s*['"'"`]([^'"'"`]+)["'"`]/g
+  const namedConstraintPattern = /(check|index|unique|uniqueIndex)\(\s*['"`]([^'"`]+)["'`]/g
   let constraintMatch
   while ((constraintMatch = namedConstraintPattern.exec(schemaSource)) !== null) {
     constraints[constraintMatch[2]] = true
   }
 
-  const enumNames = ["reservation_status", "role", "table_surface", "table_type"]
-  for (const enumName of enumNames) {
-    if (schemaSource.includes(enumName)) {
-      enums[enumName] = true
-    }
-  }
+  return { tables, constraints }
+}
 
-  return { tables, constraints, enums }
+// Dynamic enum discovery: derived directly from the migration SQL instead of
+// a hardcoded list, so an enum added to a future migration is picked up
+// automatically instead of being silently skipped.
+function extractEnumNamesFromSql(sql: string): string[] {
+  const enumPattern = /create\s+type\s+(?:"[^"]+"\.)?"?([a-zA-Z0-9_]+)"?\s+as\s+enum/gi
+  const names: string[] = []
+  let match
+  while ((match = enumPattern.exec(sql)) !== null) {
+    names.push(match[1])
+  }
+  return names
+}
+
+// Dynamic EXCLUDE constraint discovery: derived directly from the migration
+// SQL instead of a hardcoded pair of names, so a new EXCLUDE constraint
+// (e.g. a "bottom" surface counterpart) is picked up automatically.
+function extractExcludeConstraintNames(sql: string): string[] {
+  const excludePattern = /add\s+constraint\s+"([^"]+)"\s+exclude\s+using\s+gist/gi
+  const names: string[] = []
+  let match
+  while ((match = excludePattern.exec(sql)) !== null) {
+    names.push(match[1])
+  }
+  return names
+}
+
+// Extracts the declared SQL type for a single-line quoted column definition,
+// e.g. `"password_hash" text,` -> "text". Used to verify column *type*, not
+// just that the column name appears somewhere in the SQL.
+function extractColumnType(tableSql: string, columnName: string): string | null {
+  const pattern = new RegExp(`"${columnName}"\\s+([a-zA-Z0-9_]+(?:\\s*\\([^)]*\\))?)`, "i")
+  const match = tableSql.match(pattern)
+  return match ? match[1].trim().toLowerCase() : null
 }
 
 describe("F1 Drizzle Migration Static SQL Verification (Zero DB)", () => {
@@ -73,7 +100,20 @@ describe("F1 Drizzle Migration Static SQL Verification (Zero DB)", () => {
   })
 
   it("extracts table names from lib/db/schema/*.ts", () => {
-    expect(Object.keys(schema.tables).length).toBeGreaterThan(0)
+    // A zero-table extraction (e.g. from a regex broken by reformatted,
+    // multiline pgTable() calls) must fail loudly instead of vacuously
+    // passing every "table X exists" assertion that follows.
+    const extractedTableCount = Object.keys(schema.tables).length
+    expect(extractedTableCount).toBeGreaterThan(0)
+
+    // Sanity-check the extraction against an independently-derived count:
+    // the number of `CREATE TABLE "..."` statements in the migration SQL.
+    // If these diverge, either the pgTable() regex or the migration SQL
+    // itself has drifted from what's expected.
+    const migrationTableCount = (allMigrationsSql.match(/create table\s+"/gi) || []).length
+    expect(migrationTableCount).toBeGreaterThan(0)
+    expect(extractedTableCount).toBe(migrationTableCount)
+
     expect(schema.tables["profiles"]).toBeDefined()
   })
 
@@ -88,13 +128,20 @@ describe("F1 Drizzle Migration Static SQL Verification (Zero DB)", () => {
       }
     })
 
-    it("password_hash column in profiles (critical Auth.js cutover)", () => {
+    it("password_hash column in profiles is declared as text (critical Auth.js cutover)", () => {
       expect(allSchemaSrc).toContain("password_hash")
       expect(concatenatedSql).toContain("password_hash")
+
       const profilesSection = allMigrationsSql.substring(
         allMigrationsSql.indexOf("CREATE TABLE \"profiles\"")
       )
       expect(profilesSection).toContain("password_hash")
+
+      // Verify the *declared type*, not just that the column name appears
+      // somewhere in the SQL -- a bare substring match would still pass if
+      // the column were mistakenly declared e.g. `integer`.
+      const declaredType = extractColumnType(profilesSection, "password_hash")
+      expect(declaredType).toBe("text")
     })
   })
 
@@ -105,9 +152,21 @@ describe("F1 Drizzle Migration Static SQL Verification (Zero DB)", () => {
       }
     })
 
-    it("EXCLUDE constraints present (hand-written in 0001)", () => {
-      expect(concatenatedSql).toContain("reservations_no_pending_active_overlap_top")
-      expect(concatenatedSql).toContain("saved_games_no_active_overlap")
+    it("EXCLUDE constraints present (hand-written in 0001, discovered dynamically)", () => {
+      const excludeConstraintNames = extractExcludeConstraintNames(allMigrationsSql)
+
+      expect(excludeConstraintNames.length).toBeGreaterThan(0)
+
+      // Cross-check the extraction against an independently-derived count
+      // (the number of `EXCLUDE USING gist (` clauses) so a constraint whose
+      // name the regex fails to capture doesn't silently disappear from
+      // coverage.
+      const rawExcludeClauseCount = (concatenatedSql.match(/exclude using gist\s*\(/g) || []).length
+      expect(excludeConstraintNames.length).toBe(rawExcludeClauseCount)
+
+      for (const constraintName of excludeConstraintNames) {
+        expect(concatenatedSql).toContain(constraintName.toLowerCase())
+      }
       expect(concatenatedSql).toContain("exclude using gist")
     })
   })
@@ -122,10 +181,16 @@ describe("F1 Drizzle Migration Static SQL Verification (Zero DB)", () => {
     })
   })
 
-  describe("ENUMs (derived from schema)", () => {
-    it("all schema-referenced enums defined in migration SQL", () => {
-      for (const enumName of Object.keys(schema.enums)) {
-        expect(concatenatedSql).toContain(enumName)
+  describe("ENUMs (derived from migration SQL)", () => {
+    const migrationEnumNames = extractEnumNamesFromSql(allMigrationsSql)
+
+    it("discovers at least one enum type in the migration SQL", () => {
+      expect(migrationEnumNames.length).toBeGreaterThan(0)
+    })
+
+    it("every migration-declared enum is referenced in the Drizzle schema", () => {
+      for (const enumName of migrationEnumNames) {
+        expect(allSchemaSrc).toContain(enumName)
       }
     })
   })
