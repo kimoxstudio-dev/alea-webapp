@@ -189,9 +189,16 @@ async function importMembersFromNormalizedRows(input: {
 
     let persistedProfile: { id: string } | undefined
     try {
+      // Under the legacy Supabase setup, a DB trigger auto-created the
+      // matching `profiles` row whenever an `auth.users` row was created, so
+      // this step only had to UPDATE it. Neon/Drizzle has no such trigger
+      // (see lib/db/schema/profiles.ts), so the `profiles` row must be
+      // explicitly INSERTed here, keyed by the new auth user's id, or
+      // nothing is ever persisted for brand-new members.
       ;[persistedProfile] = await db
-        .update(profiles)
-        .set({
+        .insert(profiles)
+        .values({
+          id: authData.user.id,
           memberNumber: row.memberNumber,
           fullName: row.fullName,
           authEmail,
@@ -202,7 +209,6 @@ async function importMembersFromNormalizedRows(input: {
           activeFrom: null,
           pswChanged: null,
         })
-        .where(eq(profiles.id, authData.user.id))
         .returning({ id: profiles.id })
     } catch {
       persistedProfile = undefined
