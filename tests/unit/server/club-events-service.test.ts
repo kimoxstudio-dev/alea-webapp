@@ -49,12 +49,16 @@ vi.mock('@/lib/club-time', () => ({
   isValidDateOnlyString: vi.fn((s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s)),
 }))
 
-vi.mock('@/lib/server/events/events-service', () => ({
-  validateAndNormaliseSchedule: vi.fn(() => []),
-  isClubEventRow: vi.fn((row) => row.titleEs !== null && row.titleEn !== null),
-  cancelOverlappingReservationsForBlocksTx: vi.fn(async () => {}),
-  deleteEventCascade: vi.fn(async () => {}),
-}))
+vi.mock('@/lib/server/events/events-service', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/server/events/events-service')>('@/lib/server/events/events-service')
+  return {
+    ...actual,
+    validateAndNormaliseSchedule: vi.fn(() => []),
+    isClubEventRow: vi.fn((row) => row.titleEs !== null && row.titleEn !== null),
+    cancelOverlappingReservationsForBlocksTx: vi.fn(async () => {}),
+    deleteEventCascade: vi.fn(async () => {}),
+  }
+})
 
 type SessionUser = {
   id: string
