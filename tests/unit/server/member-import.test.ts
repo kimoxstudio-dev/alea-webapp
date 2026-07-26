@@ -18,7 +18,7 @@ function createMemberSession(): SessionUser {
 }
 
 
-const createUserMock = vi.fn(async () => ({
+const createUserMock = vi.fn(async (opts?: any) => ({
   data: { user: { id: 'new-user-' + Math.random().toString(36).substr(2, 9) } },
   error: null,
 }))
@@ -26,7 +26,7 @@ const deleteUserMock = vi.fn(async () => ({ error: null }))
 
 // Mock createAuthUser to use createUserMock
 vi.mock('@/lib/auth/session', () => ({
-  createAuthUser: vi.fn(async (admin, opts) => createUserMock()),
+  createAuthUser: vi.fn(async (admin, opts) => createUserMock(opts)),
   deleteAuthUser: vi.fn(async (admin, id) => deleteUserMock()),
   updateAuthUserById: vi.fn(async (id, opts) => ({ error: null })),
 }))
