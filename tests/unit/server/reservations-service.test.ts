@@ -430,6 +430,9 @@ describe('reservations service', () => {
       vi.useFakeTimers()
       const { listVisibleReservations, GRACE_PERIOD_MINUTES } = await loadReservationModules()
 
+      selectMock.mockResolvedValueOnce([{ ...validPendingReservation, memberNumber: 'M-00000002', tableName: 'Mesa 1', roomName: 'Sala Mirkwood' } as EnrichedReservationRow])
+      selectMock.mockResolvedValueOnce([])
+
       const baseTime = new Date('2026-12-31T12:00:00.000Z')
       vi.setSystemTime(baseTime)
 
@@ -461,6 +464,9 @@ describe('reservations service', () => {
     it('respects the slot-relative check-in deadline boundary', async () => {
       vi.useFakeTimers()
       const { listVisibleReservations, GRACE_PERIOD_MINUTES } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([{ ...pendingReservation, memberNumber: 'M-00000002', tableName: 'Mesa 1', roomName: 'Sala Mirkwood' } as EnrichedReservationRow])
+      selectMock.mockResolvedValueOnce([])
 
       const baseTime = new Date('2026-12-31T12:00:00.000Z')
       vi.setSystemTime(baseTime)
@@ -500,6 +506,9 @@ describe('reservations service', () => {
     it('always includes active (activated) reservations regardless of grace period', async () => {
       vi.useFakeTimers()
       const { listVisibleReservations, GRACE_PERIOD_MINUTES } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([{ ...activeReservation, memberNumber: 'M-00000002', tableName: 'Mesa 1', roomName: 'Sala Mirkwood' } as EnrichedReservationRow])
+      selectMock.mockResolvedValueOnce([])
 
       const baseTime = new Date('2026-12-31T12:00:00.000Z')
       vi.setSystemTime(baseTime)
@@ -568,6 +577,8 @@ describe('reservations service', () => {
     it('marks overlapping equipment as unavailable', async () => {
       const { listAvailableEquipmentForReservation } = await loadReservationModules()
 
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date(), available: false }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date(), available: true }])
+
       selectMock.mockResolvedValueOnce([
         { id: 'eq-1', name: 'Projector', description: null, createdAt: new Date(), available: false } as any,
         { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date(), available: true } as any,
@@ -620,6 +631,20 @@ describe('reservations service', () => {
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      insertMock.mockResolvedValueOnce([makeReservation()])
+      deleteMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
       deleteMock.mockResolvedValueOnce([])
 
       insertMock.mockResolvedValueOnce([makeReservation()])
@@ -652,6 +677,20 @@ describe('reservations service', () => {
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      insertMock.mockResolvedValueOnce([makeReservation()])
+      deleteMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
 
       insertMock.mockResolvedValueOnce([makeReservation()])
 
@@ -665,6 +704,21 @@ describe('reservations service', () => {
 
     it('creates a reservation with optional equipment when available', async () => {
       const { createReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      insertMock.mockResolvedValueOnce([makeReservation()])
+      deleteMock.mockResolvedValueOnce([])
+      insertMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
 
       selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
       selectMock.mockResolvedValueOnce([])
@@ -697,6 +751,8 @@ describe('reservations service', () => {
 
       selectMock.mockResolvedValueOnce([makeReservation({ type: 'removable_top' } as any)])
 
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'removable_top' } as any)])
+
       await expect(createReservationForSession(memberSession, {
         tableId: 't3',
         date: '2026-12-31',
@@ -710,6 +766,11 @@ describe('reservations service', () => {
 
     it('maps conflicting slots to a 409 service error', async () => {
       const { createReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([makeReservation()])
 
       selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
       selectMock.mockResolvedValueOnce([])
@@ -733,6 +794,11 @@ describe('reservations service', () => {
 
       selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
       selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([makeReservation()])
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([
         makeReservation({ userId: '3', startTime: '12:00', endTime: '13:00' }),
       ])
@@ -750,6 +816,20 @@ describe('reservations service', () => {
 
     it('maps database exclusion conflicts to SLOT_TAKEN when the insert races', async () => {
       const { createReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      insertMock.mockResolvedValueOnce([makeReservation()])
+      deleteMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
 
       selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
       selectMock.mockResolvedValueOnce([])
@@ -821,6 +901,20 @@ describe('reservations service', () => {
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      insertMock.mockResolvedValueOnce([makeReservation()])
+      deleteMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
 
       insertMock.mockResolvedValueOnce([makeReservation({ startTime: '00:00', endTime: '01:00' })])
 
@@ -840,6 +934,20 @@ describe('reservations service', () => {
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      insertMock.mockResolvedValueOnce([makeReservation()])
+      deleteMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
 
       insertMock.mockResolvedValueOnce([makeReservation({ startTime: '23:00', endTime: '24:00' })])
 
@@ -853,6 +961,20 @@ describe('reservations service', () => {
 
     it('ignores non-active reservations when checking conflicts', async () => {
       const { createReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      insertMock.mockResolvedValueOnce([makeReservation()])
+      deleteMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
 
       selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
       selectMock.mockResolvedValueOnce([])
@@ -878,6 +1000,11 @@ describe('reservations service', () => {
 
       selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
       selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([makeReservation()])
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([
         makeReservation({ status: 'pending', startTime: '12:00', endTime: '13:00', activatedAt: null }),
       ])
@@ -897,6 +1024,11 @@ describe('reservations service', () => {
       const { createReservationForSession } = await loadReservationModules()
 
       selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([makeReservation()])
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
       selectMock.mockResolvedValueOnce([
         { id: 'block-1', roomId: 'room-1', tableId: null, date: '2026-12-31', startTime: '12:00', endTime: '13:00' },
       ])
@@ -914,6 +1046,20 @@ describe('reservations service', () => {
 
     it('allows overlapping opposite surfaces on removable-top tables', async () => {
       const { createReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      insertMock.mockResolvedValueOnce([makeReservation()])
+      deleteMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
 
       selectMock.mockResolvedValueOnce([makeReservation({ type: 'removable_top' } as any)])
       selectMock.mockResolvedValueOnce([])
@@ -937,6 +1083,11 @@ describe('reservations service', () => {
 
     it('rejects overlapping same surfaces on removable-top tables', async () => {
       const { createReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([makeReservation()])
 
       selectMock.mockResolvedValueOnce([makeReservation({ type: 'removable_top' } as any)])
       selectMock.mockResolvedValueOnce([])
@@ -964,6 +1115,20 @@ describe('reservations service', () => {
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      insertMock.mockResolvedValueOnce([makeReservation()])
+      deleteMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
 
       updateMock.mockResolvedValueOnce([])
 
@@ -979,6 +1144,20 @@ describe('reservations service', () => {
 
     it('does not cancel an old future pending booking during concurrent cleanup', async () => {
       const { createReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      insertMock.mockResolvedValueOnce([makeReservation()])
+      deleteMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
 
       selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
       selectMock.mockResolvedValueOnce([])
@@ -1021,6 +1200,20 @@ describe('reservations service', () => {
 
     it('rejects equipment already reserved in an overlapping booking', async () => {
       const { createReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      insertMock.mockResolvedValueOnce([makeReservation()])
+      deleteMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
 
       selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
       selectMock.mockResolvedValueOnce([])
@@ -1069,6 +1262,20 @@ describe('reservations service', () => {
 
       selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
       selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      insertMock.mockResolvedValueOnce([makeReservation()])
+      deleteMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([
         makeReservation({ date: '2026-12-30', startTime: '12:00', endTime: '13:00' }),
       ])
@@ -1088,6 +1295,20 @@ describe('reservations service', () => {
 
     it('allows a reservation that starts exactly when another ends', async () => {
       const { createReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      insertMock.mockResolvedValueOnce([makeReservation()])
+      deleteMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
 
       selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
       selectMock.mockResolvedValueOnce([])
@@ -1114,6 +1335,20 @@ describe('reservations service', () => {
       selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      insertMock.mockResolvedValueOnce([makeReservation()])
+      deleteMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([
         makeReservation({ status: 'cancelled', startTime: '12:00', endTime: '13:00' }),
       ])
@@ -1133,6 +1368,11 @@ describe('reservations service', () => {
 
     it('counts pending reservations as blocking overlaps for the same user', async () => {
       const { createReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([makeReservation()])
 
       selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
       selectMock.mockResolvedValueOnce([])
@@ -1197,6 +1437,14 @@ describe('reservations service', () => {
       const { updateReservationForSession } = await loadReservationModules()
 
       selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
 
       await expect(updateReservationForSession(memberSession, 'r1', {
         status: 'invalid_status',
@@ -1210,6 +1458,14 @@ describe('reservations service', () => {
       const { updateReservationForSession } = await loadReservationModules()
 
       selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
 
       await expect(updateReservationForSession(memberSession, 'r1', {
         status: 'active',
@@ -1221,6 +1477,14 @@ describe('reservations service', () => {
 
     it('rejects status completed for non-admin users with 403', async () => {
       const { updateReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
 
       selectMock.mockResolvedValueOnce([makeReservation()])
 
@@ -1239,6 +1503,14 @@ describe('reservations service', () => {
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
 
       updateMock.mockResolvedValueOnce([makeReservation({ status: 'completed' })])
 
@@ -1251,6 +1523,14 @@ describe('reservations service', () => {
 
     it('allows admins to set status to active', async () => {
       const { updateReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
 
       selectMock.mockResolvedValueOnce([makeReservation()])
       selectMock.mockResolvedValueOnce([])
@@ -1285,6 +1565,14 @@ describe('reservations service', () => {
     it('rejects updates from non-owners', async () => {
       const { updateReservationForSession } = await loadReservationModules()
 
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
+
       selectMock.mockResolvedValueOnce([makeReservation({ userId: '9' })])
 
       await expect(updateReservationForSession(memberSession, 'r1', {
@@ -1297,6 +1585,14 @@ describe('reservations service', () => {
 
     it('treats null status as absent', async () => {
       const { updateReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
 
       selectMock.mockResolvedValueOnce([makeReservation()])
       selectMock.mockResolvedValueOnce([])
@@ -1315,6 +1611,14 @@ describe('reservations service', () => {
 
     it('treats null date and times as absent while applying explicit updates', async () => {
       const { updateReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
 
       selectMock.mockResolvedValueOnce([makeReservation()])
       selectMock.mockResolvedValueOnce([])
@@ -1339,6 +1643,14 @@ describe('reservations service', () => {
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
 
       updateMock.mockResolvedValueOnce([makeReservation({ date: '2027-01-01', startTime: '14:00', endTime: '15:00' })])
 
@@ -1355,6 +1667,14 @@ describe('reservations service', () => {
 
     it('surface stays null when body.surface is null', async () => {
       const { updateReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
 
       selectMock.mockResolvedValueOnce([makeReservation({ surface: 'top' })])
       selectMock.mockResolvedValueOnce([])
@@ -1373,6 +1693,14 @@ describe('reservations service', () => {
     it('surface stays null when body.surface is undefined', async () => {
       const { updateReservationForSession } = await loadReservationModules()
 
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
+
       selectMock.mockResolvedValueOnce([makeReservation({ surface: null })])
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
@@ -1389,6 +1717,14 @@ describe('reservations service', () => {
 
     it('accepts midnight "00:00" as a valid startTime', async () => {
       const { updateReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
 
       selectMock.mockResolvedValueOnce([makeReservation()])
       selectMock.mockResolvedValueOnce([])
@@ -1412,6 +1748,14 @@ describe('reservations service', () => {
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
 
       updateMock.mockResolvedValueOnce([makeReservation({ startTime: '23:00', endTime: '24:00' })])
 
@@ -1425,6 +1769,14 @@ describe('reservations service', () => {
 
     it('rejects updates that move into an event-blocked range', async () => {
       const { updateReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
 
       selectMock.mockResolvedValueOnce([makeReservation()])
       selectMock.mockResolvedValueOnce([])
@@ -1444,6 +1796,14 @@ describe('reservations service', () => {
 
     it('ignores the current reservation when checking conflicts during updates', async () => {
       const { updateReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
 
       selectMock.mockResolvedValueOnce([makeReservation()])
       selectMock.mockResolvedValueOnce([])
@@ -1468,6 +1828,14 @@ describe('reservations service', () => {
     it('rejects updates that reschedule a reservation into a past same-day slot', async () => {
       const { updateReservationForSession } = await loadReservationModules()
 
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
+
       vi.setSystemTime(new Date('2026-12-31T13:00:00.000Z'))
 
       selectMock.mockResolvedValueOnce([makeReservation()])
@@ -1484,6 +1852,14 @@ describe('reservations service', () => {
 
     it('rejects updates that overlap another reservation owned by same user', async () => {
       const { updateReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
 
       selectMock.mockResolvedValueOnce([makeReservation({ id: 'r1', tableId: 't1' })])
       selectMock.mockResolvedValueOnce([])
@@ -1505,6 +1881,14 @@ describe('reservations service', () => {
     it('allows status-only updates even when reservation start is already in the past', async () => {
       const { updateReservationForSession } = await loadReservationModules()
 
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
+
       vi.setSystemTime(new Date('2026-12-31T18:00:00.000Z'))
 
       selectMock.mockResolvedValueOnce([makeReservation()])
@@ -1523,6 +1907,14 @@ describe('reservations service', () => {
 
     it('checks overlap against reservation owner when admin reschedules another user reservation', async () => {
       const { updateReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
 
       selectMock.mockResolvedValueOnce([makeReservation({ userId: '3' })])
       selectMock.mockResolvedValueOnce([])
@@ -1548,6 +1940,14 @@ describe('reservations service', () => {
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
 
       updateMock.mockResolvedValueOnce([makeReservation({ status: 'completed' })])
 
@@ -1560,6 +1960,14 @@ describe('reservations service', () => {
 
     it('maps database exclusion conflicts to SLOT_TAKEN when update races', async () => {
       const { updateReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
 
       selectMock.mockResolvedValueOnce([makeReservation()])
       selectMock.mockResolvedValueOnce([])
@@ -1586,6 +1994,14 @@ describe('reservations service', () => {
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
 
       updateMock.mockResolvedValueOnce([])
       updateMock.mockResolvedValueOnce([makeReservation()])
@@ -1602,6 +2018,14 @@ describe('reservations service', () => {
     describe('cancellation cutoff (60-minute restriction)', () => {
       it('member cancels reservation > 60 min in future → allowed', async () => {
         const { updateReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
 
         vi.setSystemTime(new Date('2026-12-31T10:00:00.000Z'))
 
@@ -1622,6 +2046,14 @@ describe('reservations service', () => {
       it('member cancels reservation exactly 60 min away → allowed (at boundary)', async () => {
         const { updateReservationForSession } = await loadReservationModules()
 
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
+
         vi.setSystemTime(new Date('2026-12-31T11:00:00.000Z'))
 
         selectMock.mockResolvedValueOnce([makeReservation({ startTime: '12:00', endTime: '13:00' })])
@@ -1641,6 +2073,14 @@ describe('reservations service', () => {
       it('member cancels reservation within 60 min → blocked with CANCELLATION_CUTOFF', async () => {
         const { updateReservationForSession } = await loadReservationModules()
 
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
+
         vi.setSystemTime(new Date('2026-12-31T11:30:00.000Z'))
 
         selectMock.mockResolvedValueOnce([makeReservation({ startTime: '12:00', endTime: '13:00' })])
@@ -1656,6 +2096,14 @@ describe('reservations service', () => {
       it('member cancels reservation after start time → blocked with CANCELLATION_CUTOFF', async () => {
         const { updateReservationForSession } = await loadReservationModules()
 
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
+
         vi.setSystemTime(new Date('2026-12-31T13:00:00.000Z'))
 
         selectMock.mockResolvedValueOnce([makeReservation({ startTime: '12:00', endTime: '13:00' })])
@@ -1670,6 +2118,14 @@ describe('reservations service', () => {
 
       it('admin cancels reservation within 60 min → allowed (bypass)', async () => {
         const { updateReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
 
         vi.setSystemTime(new Date('2026-12-31T11:30:00.000Z'))
 
@@ -1690,6 +2146,14 @@ describe('reservations service', () => {
       it('member changes status to pending within 60 min → cutoff does NOT fire', async () => {
         const { updateReservationForSession } = await loadReservationModules()
 
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
+
         vi.setSystemTime(new Date('2026-12-31T11:30:00.000Z'))
 
         selectMock.mockResolvedValueOnce([makeReservation({ startTime: '12:00', endTime: '13:00' })])
@@ -1708,6 +2172,14 @@ describe('reservations service', () => {
 
       it('member re-cancels already-cancelled reservation within 60 min → idempotent (no CANCELLATION_CUTOFF)', async () => {
         const { updateReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
 
         vi.setSystemTime(new Date('2026-12-31T11:30:00.000Z'))
 
@@ -1728,6 +2200,14 @@ describe('reservations service', () => {
       it('member cancels pending reservation > 60 min away → succeeds', async () => {
         const { updateReservationForSession } = await loadReservationModules()
 
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
+
         vi.setSystemTime(new Date('2026-12-31T10:00:00.000Z'))
 
         selectMock.mockResolvedValueOnce([makeReservation({ status: 'pending', startTime: '12:00', endTime: '13:00' })])
@@ -1747,6 +2227,14 @@ describe('reservations service', () => {
       it('member cancels pending reservation within 60 min → blocked with CANCELLATION_CUTOFF', async () => {
         const { updateReservationForSession } = await loadReservationModules()
 
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
+
         vi.setSystemTime(new Date('2026-12-31T11:30:00.000Z'))
 
         selectMock.mockResolvedValueOnce([makeReservation({ status: 'pending', startTime: '12:00', endTime: '13:00' })])
@@ -1761,6 +2249,14 @@ describe('reservations service', () => {
 
       it('admin cancels pending reservation within 60 min → allowed (bypass)', async () => {
         const { updateReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      updateMock.mockResolvedValueOnce([makeReservation()])
 
         vi.setSystemTime(new Date('2026-12-31T11:30:00.000Z'))
 
@@ -1784,6 +2280,8 @@ describe('reservations service', () => {
     it('throws 404 when reservation is not found', async () => {
       const { checkReservationAccess } = await loadReservationModules()
 
+      selectMock.mockResolvedValueOnce([makeReservation()])
+
       selectMock.mockResolvedValueOnce([])
 
       await expect(checkReservationAccess(memberSession, 'r999')).rejects.toMatchObject({
@@ -1794,6 +2292,8 @@ describe('reservations service', () => {
 
     it('throws 403 when a member accesses another user reservation', async () => {
       const { checkReservationAccess } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation()])
 
       selectMock.mockResolvedValueOnce([makeReservation({ userId: '9' })])
 
@@ -1808,6 +2308,8 @@ describe('reservations service', () => {
 
       selectMock.mockResolvedValueOnce([makeReservation()])
 
+      selectMock.mockResolvedValueOnce([makeReservation()])
+
       await expect(checkReservationAccess(memberSession, 'r1')).resolves.toBeUndefined()
     })
   })
@@ -1815,6 +2317,8 @@ describe('reservations service', () => {
   describe('markNoShowReservations', () => {
     it('calls admin.rpc with mark_no_show_reservations and returns count', async () => {
       const { markNoShowReservations } = await loadReservationModules()
+
+      executeMock.mockResolvedValueOnce({ rowCount: 5 })
 
       executeMock.mockResolvedValueOnce({ rowCount: 5 })
 
@@ -1826,6 +2330,8 @@ describe('reservations service', () => {
     it('returns 0 when no reservations need marking', async () => {
       const { markNoShowReservations } = await loadReservationModules()
 
+      executeMock.mockResolvedValueOnce({ rowCount: 5 })
+
       executeMock.mockResolvedValueOnce({ rowCount: 0 })
 
       const result = await markNoShowReservations()
@@ -1835,6 +2341,8 @@ describe('reservations service', () => {
 
     it('throws serviceError when rpc returns error', async () => {
       const { markNoShowReservations } = await loadReservationModules()
+
+      executeMock.mockResolvedValueOnce({ rowCount: 5 })
 
       executeMock.mockRejectedValueOnce(new Error('DB error'))
 
@@ -1846,6 +2354,8 @@ describe('reservations service', () => {
 
     it('returns 0 when rpc returns null data without error', async () => {
       const { markNoShowReservations } = await loadReservationModules()
+
+      executeMock.mockResolvedValueOnce({ rowCount: 5 })
 
       executeMock.mockResolvedValueOnce({ rowCount: null })
 
@@ -1863,6 +2373,20 @@ describe('reservations service', () => {
 
       it('Test B: exclusivity violation — cannot select equipment locked to another room', async () => {
         const { createReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      insertMock.mockResolvedValueOnce([makeReservation()])
+      deleteMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
 
         selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
         selectMock.mockResolvedValueOnce([])
@@ -1885,6 +2409,20 @@ describe('reservations service', () => {
 
       it('Test F: overlapping reservations — equipment already reserved in overlapping slot', async () => {
         const { createReservationForSession } = await loadReservationModules()
+
+      selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([])
+      insertMock.mockResolvedValueOnce([makeReservation()])
+      deleteMock.mockResolvedValueOnce([])
+      selectMock.mockResolvedValueOnce([{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }, { id: 'eq-2', name: 'Speaker Kit', description: null, createdAt: new Date() }])
 
         selectMock.mockResolvedValueOnce([makeReservation({ type: 'large' } as any)])
         selectMock.mockResolvedValueOnce([])
