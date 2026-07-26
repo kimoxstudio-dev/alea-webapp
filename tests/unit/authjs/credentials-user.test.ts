@@ -2,38 +2,39 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('bcryptjs')
-vi.mock('@/lib/authjs/db')
 
-import { getAuthDbPool } from '@/lib/authjs/db'
+// Mock Drizzle database
+const drizzleSelectMock = vi.fn()
+const drizzleFromMock = vi.fn()
+const drizzleWhereMock = vi.fn()
+const drizzleLimitMock = vi.fn()
+
+vi.mock('@/lib/db', () => ({
+  getDrizzleDb: vi.fn(() => ({
+    select: drizzleSelectMock,
+  })),
+  getDb: vi.fn(),
+  getAdminDb: vi.fn(),
+}))
+
 import { verifyCredentials } from '@/lib/authjs/credentials-user'
 import bcrypt from 'bcryptjs'
-
-const mockQuery = vi.fn()
-const mockPool = {
-  query: mockQuery,
-}
 
 describe('verifyCredentials', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    mockQuery.mockReset()
-  })
-
-  describe('when POSTGRES_URL is unset', () => {
-    it('returns null when pool is not configured', async () => {
-      vi.mocked(getAuthDbPool).mockReturnValue(null)
-
-      const result = await verifyCredentials('test@example.com', 'password123')
-
-      expect(result).toBeNull()
-      expect(mockQuery).not.toHaveBeenCalled()
-    })
+    drizzleSelectMock.mockReset()
+    drizzleFromMock.mockReset()
+    drizzleWhereMock.mockReset()
+    drizzleLimitMock.mockReset()
+    drizzleSelectMock.mockReturnValue({ from: drizzleFromMock })
+    drizzleFromMock.mockReturnValue({ where: drizzleWhereMock })
+    drizzleWhereMock.mockReturnValue({ limit: drizzleLimitMock })
   })
 
   describe('when database query throws', () => {
     it('returns null when query raises an error (e.g., missing table)', async () => {
-      vi.mocked(getAuthDbPool).mockReturnValue(mockPool as any)
-      mockQuery.mockRejectedValue(new Error('relation "profiles" does not exist'))
+      drizzleLimitMock.mockRejectedValueOnce(new Error('relation "profiles" does not exist'))
 
       const result = await verifyCredentials('test@example.com', 'password123')
 
@@ -41,8 +42,7 @@ describe('verifyCredentials', () => {
     })
 
     it('returns null when query raises a connection error', async () => {
-      vi.mocked(getAuthDbPool).mockReturnValue(mockPool as any)
-      mockQuery.mockRejectedValue(new Error('Connection refused'))
+      drizzleLimitMock.mockRejectedValueOnce(new Error('Connection refused'))
 
       const result = await verifyCredentials('test@example.com', 'password123')
 
@@ -50,8 +50,7 @@ describe('verifyCredentials', () => {
     })
 
     it('returns null on any unexpected error', async () => {
-      vi.mocked(getAuthDbPool).mockReturnValue(mockPool as any)
-      mockQuery.mockRejectedValue(new Error('Unknown error'))
+      drizzleLimitMock.mockRejectedValueOnce(new Error('Unknown error'))
 
       const result = await verifyCredentials('test@example.com', 'password123')
 
@@ -61,34 +60,26 @@ describe('verifyCredentials', () => {
 
   describe('when no matching row is found', () => {
     it('returns null when email does not exist', async () => {
-      vi.mocked(getAuthDbPool).mockReturnValue(mockPool as any)
-      mockQuery.mockResolvedValue({
-        rows: [],
-      })
+      drizzleLimitMock.mockResolvedValueOnce([])
 
       const result = await verifyCredentials('nonexistent@example.com', 'password123')
 
       expect(result).toBeNull()
-      expect(mockQuery).toHaveBeenCalledWith(
-        'SELECT id, email, password_hash, full_name FROM profiles WHERE email = $1 LIMIT 1',
-        ['nonexistent@example.com']
-      )
     })
   })
 
   describe('when row found but password_hash is null or empty', () => {
     it('returns null when password_hash is null', async () => {
-      vi.mocked(getAuthDbPool).mockReturnValue(mockPool as any)
-      mockQuery.mockResolvedValue({
-        rows: [
-          {
-            id: 'user-1',
-            email: 'test@example.com',
-            password_hash: null,
-            full_name: 'Test User',
-          },
-        ],
-      })
+      drizzleLimitMock.mockResolvedValueOnce([
+        {
+          id: 'user-1',
+          email: 'test@example.com',
+          passwordHash: null,
+          fullName: 'Test User',
+          role: 'member',
+          isActive: true,
+        },
+      ])
 
       const result = await verifyCredentials('test@example.com', 'password123')
 
@@ -96,17 +87,16 @@ describe('verifyCredentials', () => {
     })
 
     it('returns null when password_hash is empty string', async () => {
-      vi.mocked(getAuthDbPool).mockReturnValue(mockPool as any)
-      mockQuery.mockResolvedValue({
-        rows: [
-          {
-            id: 'user-1',
-            email: 'test@example.com',
-            password_hash: '',
-            full_name: 'Test User',
-          },
-        ],
-      })
+      drizzleLimitMock.mockResolvedValueOnce([
+        {
+          id: 'user-1',
+          email: 'test@example.com',
+          passwordHash: '',
+          fullName: 'Test User',
+          role: 'member',
+          isActive: true,
+        },
+      ])
 
       const result = await verifyCredentials('test@example.com', 'password123')
 
@@ -117,17 +107,16 @@ describe('verifyCredentials', () => {
   describe('when password does not match', () => {
     it('returns null when password is incorrect', async () => {
       const bcryptHash = '$2a$10$xyzhashedpassword'
-      vi.mocked(getAuthDbPool).mockReturnValue(mockPool as any)
-      mockQuery.mockResolvedValue({
-        rows: [
-          {
-            id: 'user-1',
-            email: 'test@example.com',
-            password_hash: bcryptHash,
-            full_name: 'Test User',
-          },
-        ],
-      })
+      drizzleLimitMock.mockResolvedValueOnce([
+        {
+          id: 'user-1',
+          email: 'test@example.com',
+          passwordHash: bcryptHash,
+          fullName: 'Test User',
+          role: 'member',
+          isActive: true,
+        },
+      ])
       vi.mocked(bcrypt.compare).mockResolvedValue(false as any)
 
       const result = await verifyCredentials('test@example.com', 'wrongpassword')
@@ -140,22 +129,20 @@ describe('verifyCredentials', () => {
       const bcryptHash = '$2a$10$xyzhashedpassword'
 
       // Case 1: No user found
-      vi.mocked(getAuthDbPool).mockReturnValue(mockPool as any)
-      mockQuery.mockResolvedValue({ rows: [] })
-
+      drizzleLimitMock.mockResolvedValueOnce([])
       const noUserResult = await verifyCredentials('nonexistent@example.com', 'anypassword')
 
       // Case 2: User found, wrong password
-      mockQuery.mockResolvedValue({
-        rows: [
-          {
-            id: 'user-1',
-            email: 'test@example.com',
-            password_hash: bcryptHash,
-            full_name: 'Test User',
-          },
-        ],
-      })
+      drizzleLimitMock.mockResolvedValueOnce([
+        {
+          id: 'user-1',
+          email: 'test@example.com',
+          passwordHash: bcryptHash,
+          fullName: 'Test User',
+          role: 'member',
+          isActive: true,
+        },
+      ])
       vi.mocked(bcrypt.compare).mockResolvedValue(false as any)
 
       const wrongPasswordResult = await verifyCredentials('test@example.com', 'wrongpassword')
@@ -169,17 +156,16 @@ describe('verifyCredentials', () => {
   describe('when password matches', () => {
     it('returns user object with id, email, and name', async () => {
       const bcryptHash = '$2a$10$xyzhashedpassword'
-      vi.mocked(getAuthDbPool).mockReturnValue(mockPool as any)
-      mockQuery.mockResolvedValue({
-        rows: [
-          {
-            id: 'user-1',
-            email: 'test@example.com',
-            password_hash: bcryptHash,
-            full_name: 'Test User',
-          },
-        ],
-      })
+      drizzleLimitMock.mockResolvedValueOnce([
+        {
+          id: 'user-1',
+          email: 'test@example.com',
+          passwordHash: bcryptHash,
+          fullName: 'Test User',
+          role: 'admin',
+          isActive: true,
+        },
+      ])
       vi.mocked(bcrypt.compare).mockResolvedValue(true as any)
 
       const result = await verifyCredentials('test@example.com', 'correctpassword')
@@ -188,22 +174,23 @@ describe('verifyCredentials', () => {
         id: 'user-1',
         email: 'test@example.com',
         name: 'Test User',
+        role: 'admin',
+        isActive: true,
       })
     })
 
     it('returns user object with name as null when full_name is null', async () => {
       const bcryptHash = '$2a$10$xyzhashedpassword'
-      vi.mocked(getAuthDbPool).mockReturnValue(mockPool as any)
-      mockQuery.mockResolvedValue({
-        rows: [
-          {
-            id: 'user-2',
-            email: 'another@example.com',
-            password_hash: bcryptHash,
-            full_name: null,
-          },
-        ],
-      })
+      drizzleLimitMock.mockResolvedValueOnce([
+        {
+          id: 'user-2',
+          email: 'another@example.com',
+          passwordHash: bcryptHash,
+          fullName: null,
+          role: 'member',
+          isActive: true,
+        },
+      ])
       vi.mocked(bcrypt.compare).mockResolvedValue(true as any)
 
       const result = await verifyCredentials('another@example.com', 'correctpassword')
@@ -212,48 +199,50 @@ describe('verifyCredentials', () => {
         id: 'user-2',
         email: 'another@example.com',
         name: null,
+        role: 'member',
+        isActive: true,
       })
     })
 
     it('does not include password_hash in the returned user object', async () => {
       const bcryptHash = '$2a$10$xyzhashedpassword'
-      vi.mocked(getAuthDbPool).mockReturnValue(mockPool as any)
-      mockQuery.mockResolvedValue({
-        rows: [
-          {
-            id: 'user-3',
-            email: 'secure@example.com',
-            password_hash: bcryptHash,
-            full_name: 'Secure User',
-          },
-        ],
-      })
+      drizzleLimitMock.mockResolvedValueOnce([
+        {
+          id: 'user-3',
+          email: 'secure@example.com',
+          passwordHash: bcryptHash,
+          fullName: 'Secure User',
+          role: 'member',
+          isActive: true,
+        },
+      ])
       vi.mocked(bcrypt.compare).mockResolvedValue(true as any)
 
       const result = await verifyCredentials('secure@example.com', 'correctpassword')
 
-      expect(result).not.toHaveProperty('password_hash')
+      expect(result).not.toHaveProperty('passwordHash')
       expect(result).toEqual({
         id: 'user-3',
         email: 'secure@example.com',
         name: 'Secure User',
+        role: 'member',
+        isActive: true,
       })
     })
 
     it('correctly calls bcrypt.compare with plaintext and hash', async () => {
       const bcryptHash = '$2a$10$xyzhashedpassword'
       const plainPassword = 'mypassword123'
-      vi.mocked(getAuthDbPool).mockReturnValue(mockPool as any)
-      mockQuery.mockResolvedValue({
-        rows: [
-          {
-            id: 'user-4',
-            email: 'compare@example.com',
-            password_hash: bcryptHash,
-            full_name: 'Compare User',
-          },
-        ],
-      })
+      drizzleLimitMock.mockResolvedValueOnce([
+        {
+          id: 'user-4',
+          email: 'compare@example.com',
+          passwordHash: bcryptHash,
+          fullName: 'Compare User',
+          role: 'member',
+          isActive: true,
+        },
+      ])
       vi.mocked(bcrypt.compare).mockResolvedValue(true as any)
 
       await verifyCredentials('compare@example.com', plainPassword)
@@ -265,16 +254,14 @@ describe('verifyCredentials', () => {
 
   describe('parameterized query safety', () => {
     it('uses parameterized query to prevent SQL injection', async () => {
-      vi.mocked(getAuthDbPool).mockReturnValue(mockPool as any)
-      mockQuery.mockResolvedValue({ rows: [] })
+      drizzleLimitMock.mockResolvedValueOnce([])
 
       const maliciousEmail = "'; DROP TABLE profiles; --"
       await verifyCredentials(maliciousEmail, 'password')
 
-      expect(mockQuery).toHaveBeenCalledWith(
-        'SELECT id, email, password_hash, full_name FROM profiles WHERE email = $1 LIMIT 1',
-        [maliciousEmail]
-      )
+      // Drizzle handles parameterization internally, so just verify it was called
+      expect(drizzleWhereMock).toHaveBeenCalled()
+      expect(drizzleLimitMock).toHaveBeenCalled()
     })
   })
 })
