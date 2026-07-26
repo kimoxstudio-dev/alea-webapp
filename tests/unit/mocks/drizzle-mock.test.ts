@@ -555,6 +555,365 @@ describe('AC4 concurrent and interleaved calls', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
+// AC4b — order-independence: the SAME operation set under DIFFERENT arrival
+// orders must produce the SAME outcome.
+//
+// The AC4 block above fires one `Promise.all` and checks the result. That
+// proves the flows do not contaminate each other on that particular run; it
+// does not prove the outcome is a function of the operations rather than of
+// the schedule. `importMembersFromCsv` runs at `concurrencyLimit = 10`, so
+// there is no call order to design against — the same ten flows may arrive in
+// any order and must still land the same way. These tests re-run one fixed
+// operation set under materially different interleavings and compare.
+//
+// Two things keep them from being vacuous:
+//
+//   1. Flows yield *between* their read and their write. Awaiting a
+//      `Promise.all` over builders that each run to completion in one turn
+//      interleaves nothing; the schedules below place some writes between
+//      other flows' reads, which is where cross-contamination would show.
+//   2. Arrival orders are fixed permutations, never `Math.random()`, so a
+//      failure reproduces on the next run instead of flaking.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Yield `count` microtask turns, so concurrent flows can be pulled apart. */
+const yieldTicks = async (count: number): Promise<void> => {
+  for (let index = 0; index < count; index += 1) await Promise.resolve()
+}
+
+/** Fixed arrival orders — hardcoded permutations, deliberately not random. */
+const TEN_FLOW_ORDERS: ReadonlyArray<readonly [string, readonly number[]]> = [
+  ['forward', [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]],
+  ['reversed', [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]],
+  ['shuffled', [3, 7, 0, 9, 4, 1, 8, 2, 6, 5]],
+]
+
+/**
+ * Turn an arrival order into a per-flow schedule.
+ *
+ * The flow scheduled first reads first but waits longest before writing, so
+ * writes land *between* later flows' reads rather than after all of them. Reads
+ * fall on ticks 0, 3, 6 … and the first flow's write on tick ~20 — i.e. some
+ * reads genuinely observe other flows' completed writes, which is the only
+ * arrangement in which cross-contamination could be detected.
+ */
+const scheduleFor = (order: readonly number[], flowIndex: number) => {
+  const slot = order.indexOf(flowIndex)
+  return { beforeRead: slot * 3, betweenReadAndWrite: (order.length - slot) * 2 }
+}
+
+/** Compare stores as multisets: row *order* is not something Postgres promises. */
+const byId = (rows: MockRowLike[]): MockRowLike[] =>
+  [...rows].sort((left, right) => String(left.id).localeCompare(String(right.id)))
+
+type MockRowLike = Record<string, unknown>
+
+describe('AC4b order-independence across arrival orders', () => {
+  it('produces an identical store and identical per-flow results under forward, reversed and shuffled arrival orders', async () => {
+    // Modelled on `importMembersFromCsv`: ten flows look their member up and
+    // then write it. Five members exist (the write updates them); five do not
+    // (the UPDATE must affect zero rows and create nothing, exactly as in
+    // Postgres). The operation set is identical in all three runs — only the
+    // order the flows arrive in changes.
+    const runBatch = async (order: readonly number[]) => {
+      resetDb()
+      seed({
+        profiles: Array.from({ length: 5 }, (_, index) => ({
+          id: `p${index}`,
+          memberNumber: `M${index}`,
+          fullName: `Existing ${index}`,
+          noShowCount: 0,
+        })),
+      })
+
+      const results = await Promise.all(
+        Array.from({ length: 10 }, async (_, flowIndex) => {
+          const { beforeRead, betweenReadAndWrite } = scheduleFor(order, flowIndex)
+          const handle = db()
+
+          await yieldTicks(beforeRead)
+          const [existing] = await handle
+            .select({ id: profiles.id })
+            .from(profiles)
+            .where(eq(profiles.memberNumber, `M${flowIndex}`))
+            .limit(1)
+
+          await yieldTicks(betweenReadAndWrite)
+          const written = await handle
+            .update(profiles)
+            .set({ fullName: `Imported ${flowIndex}`, noShowCount: flowIndex })
+            .where(eq(profiles.memberNumber, `M${flowIndex}`))
+            .returning({ id: profiles.id, fullName: profiles.fullName })
+
+          return { flowIndex, foundId: existing?.id ?? null, written }
+        }),
+      )
+
+      return { results, stored: getRows('profiles'), log: getQueryLog() }
+    }
+
+    const batches: Array<Awaited<ReturnType<typeof runBatch>>> = []
+    for (const [, order] of TEN_FLOW_ORDERS) batches.push(await runBatch(order))
+    const [forward, reversed, shuffled] = batches
+
+    // Anti-vacuity guard. If the three schedules collapsed to the same
+    // interleaving, "identical outcome" would be trivially true and this whole
+    // test would assert nothing. The query log is the observable arrival order.
+    const signature = (batch: (typeof batches)[number]) =>
+      batch.log.map((entry) => `${entry.op}:${entry.rowCount}`).join('|')
+    expect(signature(forward)).not.toEqual(signature(reversed))
+    expect(signature(forward)).not.toEqual(signature(shuffled))
+
+    // Each flow read its own member and wrote its own member.
+    expect(forward.results.map((result) => result.foundId)).toEqual([
+      'p0',
+      'p1',
+      'p2',
+      'p3',
+      'p4',
+      null,
+      null,
+      null,
+      null,
+      null,
+    ])
+    for (const result of forward.results) {
+      expect(result.written).toEqual(
+        result.foundId === null ? [] : [{ id: result.foundId, fullName: `Imported ${result.flowIndex}` }],
+      )
+    }
+
+    // The five UPDATEs that matched nothing created nothing.
+    expect(forward.stored).toHaveLength(5)
+    for (let index = 0; index < 5; index += 1) {
+      const row = forward.stored.find((candidate) => candidate.memberNumber === `M${index}`)
+      expect(row?.fullName).toBe(`Imported ${index}`)
+      expect(row?.noShowCount).toBe(index)
+    }
+
+    // The criterion itself: same operations, different arrival orders, same
+    // outcome — both the returned results and the resulting store.
+    expect(reversed.results).toEqual(forward.results)
+    expect(shuffled.results).toEqual(forward.results)
+    expect(byId(reversed.stored)).toEqual(byId(forward.stored))
+    expect(byId(shuffled.stored)).toEqual(byId(forward.stored))
+  })
+
+  it('resolves a write against the store at await time, not against a snapshot taken when the builder was constructed', async () => {
+    seed({
+      profiles: Array.from({ length: 4 }, (_, index) => ({
+        id: `p${index}`,
+        memberNumber: `M${index}`,
+        fullName: `Existing ${index}`,
+      })),
+    })
+
+    // Build every update up front, before any of them runs. AC1 covers the
+    // read-side of this; the write side is a different failure mode — a helper
+    // that captured its matching rows at construction time would still be
+    // holding a row set that no longer reflects the store.
+    const builders = Array.from({ length: 4 }, (_, index) =>
+      db()
+        .update(profiles)
+        .set({ fullName: `Renamed ${index}` })
+        .where(eq(profiles.memberNumber, `M${index}`))
+        .returning({ id: profiles.id, fullName: profiles.fullName }),
+    )
+
+    // Change the store after construction but before a single builder is awaited.
+    await db().delete(profiles).where(eq(profiles.memberNumber, 'M2'))
+    await db().insert(profiles).values({ id: 'p9', memberNumber: 'M9', authEmail: 'm9@example.com' })
+
+    // Await them in reverse construction order for good measure.
+    const awaited: unknown[] = []
+    for (let index = builders.length - 1; index >= 0; index -= 1) awaited[index] = await builders[index]
+
+    expect(awaited[0]).toEqual([{ id: 'p0', fullName: 'Renamed 0' }])
+    expect(awaited[1]).toEqual([{ id: 'p1', fullName: 'Renamed 1' }])
+    // M2 was deleted after this builder was constructed, so it now matches
+    // nothing — a construction-time snapshot would still have found and
+    // "updated" a row that is no longer in the store.
+    expect(awaited[2]).toEqual([])
+    expect(awaited[3]).toEqual([{ id: 'p3', fullName: 'Renamed 3' }])
+
+    // The deleted row was not resurrected and the late insert was untouched.
+    expect(getRows('profiles').map((row) => row.id).sort()).toEqual(['p0', 'p1', 'p3', 'p9'])
+    expect(getRows('profiles').find((row) => row.id === 'p9')?.fullName).toBeNull()
+  })
+
+  it('produces an identical multi-table outcome for a mixed insert/update/delete workload under different arrival orders', async () => {
+    // Nine flows spanning three tables and all three write operations. The
+    // existing AC4 coverage runs concurrent writes on different tables once;
+    // this re-runs the same nine under three schedules and compares the whole
+    // three-table store.
+    const orders: ReadonlyArray<readonly number[]> = [
+      [0, 1, 2, 3, 4, 5, 6, 7, 8],
+      [8, 7, 6, 5, 4, 3, 2, 1, 0],
+      [4, 0, 7, 2, 8, 5, 1, 6, 3],
+    ]
+
+    const runBatch = async (order: readonly number[]) => {
+      resetDb()
+      seed({
+        profiles: [
+          { id: 'p1', memberNumber: 'M1', fullName: 'Ann' },
+          { id: 'p2', memberNumber: 'M2', fullName: 'Bob' },
+        ],
+        rooms: [
+          { id: 'r1', name: 'Main' },
+          { id: 'r2', name: 'Side' },
+        ],
+        tables: [
+          { id: 't1', roomId: 'r1', name: 'Table 1' },
+          { id: 't2', roomId: 'r2', name: 'Table 2' },
+        ],
+      })
+
+      const flows: Array<() => Promise<unknown>> = [
+        () => db().insert(profiles).values({ id: 'p3', memberNumber: 'M3', authEmail: 'm3@example.com' }),
+        () => db().insert(rooms).values({ id: 'r3', name: 'Annex' }),
+        () => db().insert(tables).values({ id: 't3', roomId: 'r1', name: 'Table 3' }),
+        () => db().update(profiles).set({ fullName: 'Ann Updated' }).where(eq(profiles.id, 'p1')),
+        () => db().update(rooms).set({ name: 'Main Updated' }).where(eq(rooms.id, 'r1')),
+        () => db().update(tables).set({ name: 'Table 1 Updated' }).where(eq(tables.id, 't1')),
+        () => db().delete(profiles).where(eq(profiles.id, 'p2')),
+        () => db().delete(rooms).where(eq(rooms.id, 'r2')),
+        () => db().delete(tables).where(eq(tables.id, 't2')),
+      ]
+
+      await Promise.all(
+        flows.map(async (flow, flowIndex) => {
+          await yieldTicks(order.indexOf(flowIndex) * 2)
+          await flow()
+        }),
+      )
+
+      // `createdAt` / `updatedAt` are `defaultNow()` columns: they carry the
+      // wall clock at insert time, so they differ between two batches by
+      // however many milliseconds elapsed — exactly as `now()` would across two
+      // real transactions. Comparing them across batches would measure the
+      // clock, not the mock, so every Date-valued column is dropped here and
+      // their presence is asserted separately below.
+      const clockColumns = (row: MockRowLike) =>
+        Object.keys(row)
+          .filter((key) => row[key] instanceof Date)
+          .sort()
+
+      const withoutClock = (rows: MockRowLike[]) =>
+        byId(rows).map((row) =>
+          Object.fromEntries(Object.entries(row).filter(([, value]) => !(value instanceof Date))),
+        )
+
+      return {
+        profiles: withoutClock(getRows('profiles')),
+        rooms: withoutClock(getRows('rooms')),
+        tables: withoutClock(getRows('tables')),
+        // The inserted room proves the dropped columns were actually populated.
+        insertedRoomClockColumns: byId(getRows('rooms'))
+          .filter((row) => row.id === 'r3')
+          .map(clockColumns),
+      }
+    }
+
+    const batches: Array<Awaited<ReturnType<typeof runBatch>>> = []
+    for (const order of orders) batches.push(await runBatch(order))
+    const [baseline] = batches
+
+    expect(baseline.profiles.map((row) => row.id)).toEqual(['p1', 'p3'])
+    expect(baseline.profiles.find((row) => row.id === 'p1')?.fullName).toBe('Ann Updated')
+    expect(baseline.rooms.map((row) => row.id)).toEqual(['r1', 'r3'])
+    expect(baseline.rooms.find((row) => row.id === 'r1')?.name).toBe('Main Updated')
+    expect(baseline.tables.map((row) => row.id)).toEqual(['t1', 't3'])
+    expect(baseline.tables.find((row) => row.id === 't1')?.name).toBe('Table 1 Updated')
+    // The excluded columns were still populated by the insert in every batch.
+    for (const batch of batches) expect(batch.insertedRoomClockColumns).toEqual([['createdAt']])
+
+    for (const batch of batches.slice(1)) expect(batch).toEqual(baseline)
+  })
+
+  it('never lets an interleaved read observe a half-applied multi-column write', async () => {
+    seed({ profiles: [{ id: 'p1', memberNumber: 'M1', fullName: 'gen-0', phone: 'gen-0', email: 'gen-0' }] })
+
+    // Six writers each bump three columns to the same generation marker; twelve
+    // readers interleave between them. A write that became visible column by
+    // column would let a reader see a mixed generation — the read-side of the
+    // cross-contamination criterion, which the AC4 block only checks per row.
+    const observed: Array<[unknown, unknown, unknown]> = []
+
+    await Promise.all([
+      ...Array.from({ length: 6 }, async (_, index) => {
+        await yieldTicks(index * 2 + 1)
+        await db()
+          .update(profiles)
+          .set({ fullName: `gen-${index + 1}`, phone: `gen-${index + 1}`, email: `gen-${index + 1}` })
+          .where(eq(profiles.id, 'p1'))
+      }),
+      ...Array.from({ length: 12 }, async (_, index) => {
+        await yieldTicks(index)
+        const [row] = await db()
+          .select({ fullName: profiles.fullName, phone: profiles.phone, email: profiles.email })
+          .from(profiles)
+          .where(eq(profiles.id, 'p1'))
+        observed.push([row.fullName, row.phone, row.email])
+      }),
+    ])
+
+    expect(observed).toHaveLength(12)
+    for (const [fullName, phone, email] of observed) {
+      expect(phone).toBe(fullName)
+      expect(email).toBe(fullName)
+    }
+
+    // Anti-vacuity: the readers really did straddle the writers rather than all
+    // landing before or after them.
+    expect(new Set(observed.map(([fullName]) => fullName)).size).toBeGreaterThan(1)
+
+    const [final] = await db().select().from(profiles)
+    expect(final.fullName).toBe('gen-6')
+    expect(getRows('profiles')).toHaveLength(1)
+  })
+
+  it('resolves concurrent writes to the same column of the same row deterministically for a given schedule', async () => {
+    // AC4 already covers concurrent updates that set *different* columns. Same
+    // column, same row is genuinely schedule-dependent — in Postgres too — so
+    // the criterion here is that a given schedule always yields the same value
+    // and the store is never corrupted, not that all schedules agree.
+    const runOnce = async (order: readonly number[]) => {
+      resetDb()
+      seed({ profiles: [{ id: 'p1', memberNumber: 'M1', fullName: 'Original', noShowCount: 7 }] })
+
+      await Promise.all(
+        order.map(async (writerIndex, slot) => {
+          await yieldTicks(slot * 2)
+          await db().update(profiles).set({ fullName: `Writer ${writerIndex}` }).where(eq(profiles.id, 'p1'))
+        }),
+      )
+
+      return getRows('profiles')
+    }
+
+    const forward = await runOnce([0, 1, 2, 3, 4])
+    const forwardAgain = await runOnce([0, 1, 2, 3, 4])
+    const reversed = await runOnce([4, 3, 2, 1, 0])
+
+    // Repeating a schedule repeats the outcome exactly.
+    expect(forwardAgain).toEqual(forward)
+
+    // Last write wins, and "last" follows the schedule rather than the order
+    // the writers were declared in.
+    expect(forward).toHaveLength(1)
+    expect(forward[0].fullName).toBe('Writer 4')
+    expect(reversed).toHaveLength(1)
+    expect(reversed[0].fullName).toBe('Writer 0')
+
+    // Five concurrent writers left one row, and columns nobody set are intact.
+    expect(forward[0].id).toBe('p1')
+    expect(forward[0].noShowCount).toBe(7)
+    expect(reversed[0].noShowCount).toBe(7)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
 // AC5 — chained joins
 // ─────────────────────────────────────────────────────────────────────────────
 
