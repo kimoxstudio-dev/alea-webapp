@@ -6,6 +6,8 @@ import {
   resetFixtures,
   setFixture,
   setInsertFixture,
+  setUpdateFixture,
+  setDeleteFixture,
   insertMock,
   updateMock,
   selectMock,
@@ -595,7 +597,7 @@ describe('club-events-service', () => {
         },
       ])
 
-      setInsertFixture('events', [
+      setUpdateFixture('events', [
         {
           id: 'evt-1',
           title: 'Updated Event',
