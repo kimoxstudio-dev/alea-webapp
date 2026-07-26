@@ -1,18 +1,18 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import type { SessionUser } from "@/lib/server/auth/auth"
 import {
-  createDrizzleQueryBuilder,
+  createStatefulDrizzleDb,
   createAdminSession,
   createMemberSession,
-  selectMock,
-  updateMock,
-  deleteMock,
+  resetDb,
+  seed,
+  getRows,
+  failNextQuery,
 } from "@/tests/unit/mocks/drizzle-mock"
+import { profiles } from "@/lib/db/schema"
 
 const deleteAuthUserMock = vi.fn(() => Promise.resolve({ error: null }))
 const updateAuthUserByIdMock = vi.fn(() => Promise.resolve({ error: null }))
-
 
 vi.mock("@/lib/auth/session", () => ({
   createAuthUser: vi.fn(),
@@ -21,83 +21,58 @@ vi.mock("@/lib/auth/session", () => ({
 }))
 
 vi.mock("@/lib/db", () => ({
-  getDrizzleAdminDb: vi.fn(() => createDrizzleQueryBuilder()),
-  getDrizzleDb: vi.fn(() => createDrizzleQueryBuilder()),
+  getDrizzleAdminDb: vi.fn(() => createStatefulDrizzleDb()),
+  getDrizzleDb: vi.fn(() => createStatefulDrizzleDb()),
 }))
 
 vi.mock("@/lib/supabase/server", () => ({
   createSupabaseServerAdminClient: vi.fn(() => ({})),
 }))
 
-// Test data in Drizzle format (camelCase, Date objects for timestamps)
-const profileRows = [
-  {
-    id: "1",
-    memberNumber: "100001",
-    fullName: "Admin User",
-    authEmail: "100001@members.alea.internal",
-    email: "admin@alea.club",
-    phone: "600000001",
-    role: "admin" as const,
-    isActive: true,
-    activeFrom: new Date("2024-01-01T00:00:00.000Z"),
-    noShowCount: 0,
-    blockedUntil: null,
-    createdAt: new Date("2024-01-01T00:00:00.000Z"),
-    updatedAt: new Date("2024-01-01T00:00:00.000Z"),
-  },
-  {
-    id: "2",
-    memberNumber: "100002",
-    fullName: "Member User",
-    authEmail: "100002@members.alea.internal",
-    email: "socio@alea.club",
-    phone: "600000002",
-    role: "member" as const,
-    isActive: true,
-    activeFrom: new Date("2024-01-02T00:00:00.000Z"),
-    noShowCount: 0,
-    blockedUntil: null,
-    createdAt: new Date("2024-01-02T00:00:00.000Z"),
-    updatedAt: new Date("2024-01-02T00:00:00.000Z"),
-  },
-]
+// Test data mirrors the Drizzle-inferred profiles row shape (camelCase,
+// Date instances for timestamp columns -- toPublicUser calls .toISOString()
+// on these, so plain strings would throw).
+type ProfileRow = typeof profiles.$inferSelect
+
+const adminProfile: ProfileRow = {
+  id: "1",
+  memberNumber: "100001",
+  fullName: "Admin User",
+  authEmail: "100001@members.alea.internal",
+  email: "admin@alea.club",
+  phone: "600000001",
+  role: "admin",
+  isActive: true,
+  activeFrom: new Date("2024-01-01T00:00:00.000Z"),
+  noShowCount: 0,
+  blockedUntil: null,
+  createdAt: new Date("2024-01-01T00:00:00.000Z"),
+  updatedAt: new Date("2024-01-01T00:00:00.000Z"),
+  pswChanged: null,
+  passwordHash: null,
+}
+
+const memberProfile: ProfileRow = {
+  ...adminProfile,
+  id: "2",
+  memberNumber: "100002",
+  fullName: "Member User",
+  authEmail: "100002@members.alea.internal",
+  email: "socio@alea.club",
+  phone: "600000002",
+  role: "member",
+  activeFrom: new Date("2024-01-02T00:00:00.000Z"),
+  createdAt: new Date("2024-01-02T00:00:00.000Z"),
+  updatedAt: new Date("2024-01-02T00:00:00.000Z"),
+}
+
+const profileRows = [adminProfile, memberProfile]
 
 function resetMocks() {
   deleteAuthUserMock.mockReset()
+  deleteAuthUserMock.mockResolvedValue({ error: null })
   updateAuthUserByIdMock.mockReset()
-  selectMock.mockReset()
-  updateMock.mockReset()
-  deleteMock.mockReset()
-}
-
-/**
- * `listPaginatedUsers` issues two concurrent `db.select(...)` queries — one
- * for the page of rows (`.select(PROFILE_COLUMNS)`), one for the total count
- * (`.select({ value: count() })`) — and both route through the same shared
- * `selectMock` singleton (see tests/unit/mocks/drizzle-mock.ts). The columns
- * object each call was made with is threaded through to `selectMock` as its
- * first argument, so it can be used to tell the two queries apart: the count
- * query's columns object is always the single-key `{ value: <count SQL> }`
- * shape; the row-select's `PROFILE_COLUMNS` never has a key named `value`.
- *
- * Before this helper existed, both queries shared one `mockResolvedValue`,
- * so `countRows[0]?.value` was always `undefined` -> `total` was always
- * silently coerced to 0 by `?? 0`, regardless of how many rows were
- * returned. `data.length > 0 && total === 0` could happen in every test
- * below without a single assertion catching it (KIM-440 Finding C). This
- * helper gives each query a distinct, realistic response instead.
- */
-function isCountQueryColumns(columns: unknown): boolean {
-  return !!columns && typeof columns === 'object' && !Array.isArray(columns)
-    && Object.keys(columns as object).length === 1 && 'value' in (columns as object)
-}
-
-function configureListMocks(rows: typeof profileRows, total: number = rows.length) {
-  selectMock.mockImplementation(async (columns?: unknown) => {
-    if (isCountQueryColumns(columns)) return [{ value: total }]
-    return rows
-  })
+  updateAuthUserByIdMock.mockResolvedValue({ error: null })
 }
 
 async function loadUsersModules() {
@@ -110,12 +85,13 @@ describe("listPaginatedUsers", () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
+    resetDb()
     resetMocks()
+    seed({ profiles: profileRows })
   })
 
   it("clamps page=0 to 1", async () => {
     const adminSession = createAdminSession()
-    configureListMocks(profileRows.slice(0, 2))
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: 0, limit: 10 })
@@ -125,7 +101,6 @@ describe("listPaginatedUsers", () => {
 
   it("clamps page=-5 to 1", async () => {
     const adminSession = createAdminSession()
-    configureListMocks(profileRows.slice(0, 2))
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: -5, limit: 10 })
@@ -135,7 +110,6 @@ describe("listPaginatedUsers", () => {
 
   it("clamps limit=0 to default and totalPages is not Infinity", async () => {
     const adminSession = createAdminSession()
-    configureListMocks(profileRows.slice(0, 2))
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: 1, limit: 0 })
@@ -146,7 +120,6 @@ describe("listPaginatedUsers", () => {
 
   it("clamps limit=-10 to 1", async () => {
     const adminSession = createAdminSession()
-    configureListMocks(profileRows.slice(0, 2))
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: 1, limit: -10 })
@@ -156,7 +129,6 @@ describe("listPaginatedUsers", () => {
 
   it("clamps limit=200 to 100", async () => {
     const adminSession = createAdminSession()
-    configureListMocks(profileRows.slice(0, 2))
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: 1, limit: 200 })
@@ -166,7 +138,6 @@ describe("listPaginatedUsers", () => {
 
   it("returns limit=50 as-is when within bounds", async () => {
     const adminSession = createAdminSession()
-    configureListMocks(profileRows.slice(0, 2))
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: 1, limit: 50 })
@@ -176,34 +147,31 @@ describe("listPaginatedUsers", () => {
 
   it("filters by memberNumber substring case-insensitively", async () => {
     const adminSession = createAdminSession()
-    configureListMocks(profileRows)
     const { listPaginatedUsers } = await loadUsersModules()
 
-    await listPaginatedUsers(adminSession, { page: 1, limit: 10, search: "ADMIN" })
+    const result = await listPaginatedUsers(adminSession, { page: 1, limit: 10, search: "ADMIN" })
 
-    expect(selectMock).toHaveBeenCalled()
+    expect(result.data).toHaveLength(1)
+    expect(result.data[0]?.id).toBe("1")
   })
 
   it("filters by memberNumber substring", async () => {
     const adminSession = createAdminSession()
-    const filtered = profileRows.filter(r => r.memberNumber.includes("100002"))
-    configureListMocks(filtered)
+    const filtered = profileRows.filter((r) => r.memberNumber.includes("100002"))
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: 1, limit: 10, search: "100002" })
 
     expect(result.data.length).toBeGreaterThan(0)
-    // KIM-440 Finding C: `total` must reflect the count query, not just
-    // "however many rows the (indistinguishable) mock happened to return" --
-    // a service bug returning `data.length > 0` alongside `total === 0` must
-    // fail this assertion.
+    // KIM-440 Finding C: total must reflect the real count() aggregate over
+    // the same filter, not just however many rows the row-select query
+    // happened to return -- a service bug that returns data.length as total
+    // must fail this assertion.
     expect(result.total).toBe(filtered.length)
   })
 
   it("filters by full name substring", async () => {
     const adminSession = createAdminSession()
-    const filtered = profileRows.filter(r => r.fullName.includes("Member"))
-    configureListMocks(filtered)
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: 1, limit: 10, search: "member user" })
@@ -215,8 +183,6 @@ describe("listPaginatedUsers", () => {
 
   it("filters by email substring", async () => {
     const adminSession = createAdminSession()
-    const filtered = profileRows.filter(r => r.email.includes("admin@alea.club"))
-    configureListMocks(filtered)
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: 1, limit: 10, search: "admin@alea.club" })
@@ -228,7 +194,6 @@ describe("listPaginatedUsers", () => {
 
   it("returns all users when search is empty", async () => {
     const adminSession = createAdminSession()
-    configureListMocks(profileRows)
     const { listPaginatedUsers } = await loadUsersModules()
 
     const all = await listPaginatedUsers(adminSession, { page: 1, limit: 100 })
@@ -240,25 +205,24 @@ describe("listPaginatedUsers", () => {
 
   it("does not filter out suspended users from the admin listing", async () => {
     const adminSession = createAdminSession()
-    configureListMocks(profileRows)
     const { listPaginatedUsers } = await loadUsersModules()
 
-    await listPaginatedUsers(adminSession, { page: 1, limit: 10 })
+    const result = await listPaginatedUsers(adminSession, { page: 1, limit: 10 })
 
-    expect(selectMock).toHaveBeenCalled()
+    expect(result.data.some((u) => u.id === "2")).toBe(true)
   })
 
-  // KIM-440 Finding C: with the shared `selectMock` singleton previously
-  // resolving to the same value for both the row query and the count query,
-  // `countRows[0]?.value` was always `undefined` (a row object has no
-  // `value` key) and silently coerced to 0 by `?? 0` -- so `data.length > 0`
-  // and `total === 0` could coexist in every test above without any
-  // assertion ever catching it. This test pins that exact combination down
-  // directly: a page of real rows alongside a distinctly-configured,
-  // realistic total.
+  // KIM-440 Finding C: with the legacy mock previously resolving the same
+  // response for both the row query and the count query, countRows[0]?.value
+  // was always undefined (a row object has no value key) and silently
+  // coerced to 0 by ?? 0 -- so data.length > 0 and total === 0 could coexist
+  // in every test above without any assertion ever catching it. This test
+  // pins that exact combination down directly, driven by the real, separate
+  // select() and select({ value: count() }) queries against seeded rows
+  // (not stubbed responses), so a regression that conflates them again is
+  // caught here.
   it("reports a total independent of and consistent with the returned page of data", async () => {
     const adminSession = createAdminSession()
-    configureListMocks(profileRows.slice(0, 1), 2)
     const { listPaginatedUsers } = await loadUsersModules()
 
     const result = await listPaginatedUsers(adminSession, { page: 1, limit: 1 })
@@ -279,17 +243,16 @@ describe("listPaginatedUsers", () => {
   })
 })
 
-
 describe("updateUser", () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
+    resetDb()
     resetMocks()
   })
 
   it("returns the updated public user payload for the correct user id", async () => {
-    updateMock.mockResolvedValue([profileRows[1]])
-    selectMock.mockResolvedValue([profileRows[1]])
+    seed({ profiles: profileRows })
     const adminSession = createAdminSession()
     const { updateUser } = await loadUsersModules()
 
@@ -320,8 +283,7 @@ describe("updateUser", () => {
   })
 
   it("accepts memberNumber of exactly 10 digits", async () => {
-    updateMock.mockResolvedValue([profileRows[0]])
-    selectMock.mockResolvedValue([profileRows[0]])
+    seed({ profiles: profileRows })
     const adminSession = createAdminSession()
     const { updateUser } = await loadUsersModules()
 
@@ -358,8 +320,7 @@ describe("updateUser", () => {
   })
 
   it("accepts memberNumber of single digit zero", async () => {
-    updateMock.mockResolvedValue([profileRows[0]])
-    selectMock.mockResolvedValue([profileRows[0]])
+    seed({ profiles: profileRows })
     const adminSession = createAdminSession()
     const { updateUser } = await loadUsersModules()
 
@@ -367,38 +328,41 @@ describe("updateUser", () => {
   })
 
   it("accepts is_active boolean and includes it in the update", async () => {
-    updateMock.mockResolvedValue([profileRows[0]])
-    selectMock.mockResolvedValue([profileRows[0]])
+    seed({ profiles: profileRows })
     const adminSession = createAdminSession()
     const { updateUser } = await loadUsersModules()
 
     await updateUser(adminSession, "1", { is_active: false })
 
-    expect(updateMock).toHaveBeenCalled()
+    const row = getRows(profiles).find((r) => r.id === "1")
+    expect(row?.isActive).toBe(false)
   })
 
   it("accepts fullName, email, and phone updates", async () => {
-    const updated = { ...profileRows[0], fullName: "Updated User", email: "updated@alea.club", phone: "699000111" }
-    selectMock.mockResolvedValue([profileRows[0]])
-    updateMock.mockResolvedValue([updated])
+    seed({ profiles: profileRows })
     const adminSession = createAdminSession()
     const { updateUser } = await loadUsersModules()
 
     await updateUser(adminSession, "1", { fullName: "Updated User", email: "updated@alea.club", phone: "699000111" })
 
-    expect(updateMock).toHaveBeenCalled()
+    const row = getRows(profiles).find((r) => r.id === "1")
+    expect(row).toMatchObject({
+      fullName: "Updated User",
+      email: "updated@alea.club",
+      phone: "699000111",
+    })
   })
 
   it("keeps internal auth email aligned when memberNumber changes", async () => {
-    const updated = { ...profileRows[0], memberNumber: "100123", authEmail: "100123@members.alea.internal" }
-    selectMock.mockResolvedValue([profileRows[0]])
-    updateMock.mockResolvedValue([updated])
+    seed({ profiles: profileRows })
     const adminSession = createAdminSession()
     const { updateUser } = await loadUsersModules()
 
     await updateUser(adminSession, "1", { memberNumber: "100123" })
 
-    expect(updateMock).toHaveBeenCalled()
+    const row = getRows(profiles).find((r) => r.id === "1")
+    expect(row?.memberNumber).toBe("100123")
+    expect(row?.authEmail).toBe("100123@members.alea.internal")
     expect(updateAuthUserByIdMock).toHaveBeenCalled()
   })
 
@@ -455,16 +419,16 @@ describe("updateUser", () => {
   })
 })
 
-
 describe("deleteUser", () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
+    resetDb()
     resetMocks()
   })
 
   it("deletes the auth user after confirming the profile exists", async () => {
-    selectMock.mockResolvedValue([profileRows[0]])
+    seed({ profiles: profileRows })
     const adminSession = createAdminSession()
     const { deleteUser } = await loadUsersModules()
 
@@ -483,28 +447,31 @@ describe("deleteUser", () => {
   })
 })
 
-
 describe("resetNoShows", () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
+    resetDb()
     resetMocks()
   })
 
   it("sets no_show_count=0 and blocked_until=null for the user", async () => {
-    selectMock.mockResolvedValue([profileRows[0]])
-    updateMock.mockResolvedValue([{ ...profileRows[0], noShowCount: 0, blockedUntil: null }])
+    seed({
+      profiles: [{ ...adminProfile, id: "user-123", noShowCount: 5, blockedUntil: new Date("2026-05-01T00:00:00.000Z") }],
+    })
     const adminSession = createAdminSession()
     const { resetNoShows } = await loadUsersModules()
 
     await resetNoShows(adminSession, "user-123")
 
-    expect(updateMock).toHaveBeenCalled()
+    const row = getRows(profiles).find((r) => r.id === "user-123")
+    expect(row?.noShowCount).toBe(0)
+    expect(row?.blockedUntil).toBeNull()
   })
 
   it("throws a service error when update fails", async () => {
-    selectMock.mockResolvedValue([profileRows[0]])
-    updateMock.mockRejectedValue(new Error("DB error"))
+    seed({ profiles: [{ ...adminProfile, id: "user-123" }] })
+    failNextQuery({ op: "update", table: profiles })
     const adminSession = createAdminSession()
     const { resetNoShows } = await loadUsersModules()
 
@@ -525,28 +492,30 @@ describe("resetNoShows", () => {
   })
 })
 
-
 describe("unblockUser", () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
+    resetDb()
     resetMocks()
   })
 
   it("sets blocked_until=null for the user", async () => {
-    selectMock.mockResolvedValue([profileRows[0]])
-    updateMock.mockResolvedValue([{ ...profileRows[0], blockedUntil: null }])
+    seed({
+      profiles: [{ ...adminProfile, id: "user-456", blockedUntil: new Date("2026-05-01T00:00:00.000Z") }],
+    })
     const adminSession = createAdminSession()
     const { unblockUser } = await loadUsersModules()
 
     await unblockUser(adminSession, "user-456")
 
-    expect(updateMock).toHaveBeenCalled()
+    const row = getRows(profiles).find((r) => r.id === "user-456")
+    expect(row?.blockedUntil).toBeNull()
   })
 
   it("throws a service error when update fails", async () => {
-    selectMock.mockResolvedValue([profileRows[0]])
-    updateMock.mockRejectedValue(new Error("DB error"))
+    seed({ profiles: [{ ...adminProfile, id: "user-456" }] })
+    failNextQuery({ op: "update", table: profiles })
     const adminSession = createAdminSession()
     const { unblockUser } = await loadUsersModules()
 
