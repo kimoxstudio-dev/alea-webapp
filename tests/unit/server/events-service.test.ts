@@ -1,15 +1,16 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import {
-  createTransactionAwareMockBuilder,
-  resetFixtures,
-  setFixture,
+  createStatefulDrizzleDb,
+  resetDb,
+  seed,
+  seedTable,
+  getRows,
+  getQueryLog,
+  failNextQuery,
+  executeMock,
   createMockServiceError,
   MockServiceError,
-  insertMock,
-  updateMock,
-  deleteMock,
-  executeMock,
   createAdminSession,
   createMemberSession,
 } from '@/tests/unit/mocks/drizzle-mock'
@@ -17,8 +18,8 @@ import {
 vi.mock('server-only', () => ({}))
 
 vi.mock('@/lib/db', () => ({
-  getDrizzleDb: vi.fn(() => createTransactionAwareMockBuilder()),
-  getDrizzleAdminDb: vi.fn(() => createTransactionAwareMockBuilder()),
+  getDrizzleDb: vi.fn(() => createStatefulDrizzleDb()),
+  getDrizzleAdminDb: vi.fn(() => createStatefulDrizzleDb()),
   getAdminDb: vi.fn(() => ({
     from: vi.fn(() => ({
       update: vi.fn(() => ({
@@ -56,35 +57,30 @@ async function loadEventsService() {
 
 describe('events-service — createEvent with roomId cancellation', () => {
   beforeEach(() => {
-    resetFixtures()
+    resetDb()
     vi.clearAllMocks()
   })
 
   it('calls create_event_atomic with correct parameters', async () => {
     const adminSession = createAdminSession()
-    insertMock.mockResolvedValue([{
-      id: 'evt-1', title: 'Game Night', description: 'Weekly session',
-      date: '2026-04-15', startTime: '18:00:00', endTime: '22:00:00',
-      createdAt: new Date(),
-    }])
-    setFixture('event_room_blocks', [])
     const { createEvent } = await loadEventsService()
     const result = await createEvent(adminSession, {
       title: 'Game Night', description: 'Weekly session',
       date: '2026-04-15', startTime: '18:00', endTime: '22:00',
       roomId: 'room-1', allDay: false,
     })
-    expect(result.id).toBe('evt-1')
+    // The mock now materialises a real row from .values(), so the id is a
+    // genuinely generated uuid rather than a canned string — assert on the
+    // fields the test actually cares about instead of a hardcoded id.
+    expect(typeof result.id).toBe('string')
+    expect(result.id.length).toBeGreaterThan(0)
+    expect(result.title).toBe('Game Night')
+    expect(result.roomBlocks).toHaveLength(1)
+    expect(result.roomBlocks[0].roomId).toBe('room-1')
   })
 
   it('does not attempt cancellation when roomId is not provided', async () => {
     const adminSession = createAdminSession()
-    insertMock.mockResolvedValue([{
-      id: 'evt-2', title: 'Announcement', description: null,
-      date: '2026-04-15', startTime: '19:00:00', endTime: '20:00:00',
-      createdAt: new Date(),
-    }])
-    setFixture('event_room_blocks', [])
     const { createEvent } = await loadEventsService()
     const result = await createEvent(adminSession, {
       title: 'Announcement', description: null,
@@ -96,12 +92,6 @@ describe('events-service — createEvent with roomId cancellation', () => {
 
   it('includes description when provided', async () => {
     const adminSession = createAdminSession()
-    insertMock.mockResolvedValue([{
-      id: 'evt-3', title: 'Tournament', description: 'Competitive',
-      date: '2026-04-20', startTime: '14:00:00', endTime: '18:00:00',
-      createdAt: new Date(),
-    }])
-    setFixture('event_room_blocks', [])
     const { createEvent } = await loadEventsService()
     const result = await createEvent(adminSession, {
       title: 'Tournament', description: 'Competitive',
@@ -113,7 +103,7 @@ describe('events-service — createEvent with roomId cancellation', () => {
 
   it('throws 500 when DB transaction fails', async () => {
     const adminSession = createAdminSession()
-    insertMock.mockRejectedValue(new Error('Failed'))
+    failNextQuery({ op: 'insert', table: 'events', error: new Error('Failed') })
     const { createEvent } = await loadEventsService()
     await expect(createEvent(adminSession, {
       title: 'Game Night', description: null,
@@ -125,24 +115,18 @@ describe('events-service — createEvent with roomId cancellation', () => {
 
 describe('events-service — updateEvent with cancellation', () => {
   beforeEach(() => {
-    resetFixtures()
+    resetDb()
     vi.clearAllMocks()
   })
 
   it('calls update_event_atomic with updated values', async () => {
     const adminSession = createAdminSession()
-    setFixture('events', [{
-      title: 'Old', description: null,
+    seedTable('events', [{
+      id: 'evt-4', title: 'Old', description: null,
       date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
       titleEs: null, titleEn: null,
+      createdAt: new Date('2025-01-01T00:00:00.000Z'),
     }])
-    updateMock.mockResolvedValue([{
-      id: 'evt-4', title: 'Updated',
-      description: null, date: '2026-04-20',
-      startTime: '16:00:00', endTime: '20:00:00', createdAt: new Date(),
-    }])
-    deleteMock.mockResolvedValue([])
-    setFixture('event_room_blocks', [])
     const { updateEvent } = await loadEventsService()
     const result = await updateEvent(adminSession, 'evt-4', {
       title: 'Updated', description: null,
@@ -154,21 +138,11 @@ describe('events-service — updateEvent with cancellation', () => {
 
   it('loads existing room when roomId is not provided', async () => {
     const adminSession = createAdminSession()
-    setFixture('events', [{
-      title: 'Event', description: null,
-      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
-      titleEs: null, titleEn: null,
-    }])
-    updateMock.mockResolvedValue([{
+    seedTable('events', [{
       id: 'evt-5', title: 'Event', description: null,
       date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
-      createdAt: new Date(),
-    }])
-    deleteMock.mockResolvedValue([])
-    setFixture('event_room_blocks', [{
-      id: 'b1', eventId: 'evt-5', roomId: 'room-2',
-      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
-      allDay: false, tableId: null,
+      titleEs: null, titleEn: null,
+      createdAt: new Date('2025-01-01T00:00:00.000Z'),
     }])
     const { updateEvent } = await loadEventsService()
     const result = await updateEvent(adminSession, 'evt-5', {
@@ -181,21 +155,11 @@ describe('events-service — updateEvent with cancellation', () => {
 
   it('keeps existing room when allDay is updated', async () => {
     const adminSession = createAdminSession()
-    setFixture('events', [{
-      title: 'All-Day', description: null,
-      date: '2026-04-20', startTime: '00:00:00', endTime: '23:59:00',
-      titleEs: null, titleEn: null,
-    }])
-    updateMock.mockResolvedValue([{
+    seedTable('events', [{
       id: 'evt-6', title: 'All-Day', description: null,
       date: '2026-04-20', startTime: '00:00:00', endTime: '23:59:00',
-      createdAt: new Date(),
-    }])
-    deleteMock.mockResolvedValue([])
-    setFixture('event_room_blocks', [{
-      id: 'b2', eventId: 'evt-6', roomId: 'room-3',
-      date: '2026-04-20', startTime: '00:00:00', endTime: '23:59:00',
-      allDay: true, tableId: null,
+      titleEs: null, titleEn: null,
+      createdAt: new Date('2025-01-01T00:00:00.000Z'),
     }])
     const { updateEvent } = await loadEventsService()
     const result = await updateEvent(adminSession, 'evt-6', {
@@ -208,28 +172,12 @@ describe('events-service — updateEvent with cancellation', () => {
 
   it('updates room when roomId is provided', async () => {
     const adminSession = createAdminSession()
-    setFixture('events', [{
-      title: 'Event', description: null,
-      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
-      titleEs: null, titleEn: null,
-    }])
-    updateMock.mockResolvedValue([{
+    seedTable('events', [{
       id: 'evt-7', title: 'Event', description: null,
       date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
-      createdAt: new Date(),
+      titleEs: null, titleEn: null,
+      createdAt: new Date('2025-01-01T00:00:00.000Z'),
     }])
-    deleteMock.mockResolvedValue([])
-    insertMock.mockResolvedValue([{
-      id: 'b3', eventId: 'evt-7', roomId: 'room-new',
-      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
-      allDay: false, tableId: null,
-    }])
-    setFixture('event_room_blocks', [{
-      id: 'b3', eventId: 'evt-7', roomId: 'room-new',
-      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
-      allDay: false, tableId: null,
-    }])
-    setFixture('tables', [])
     const { updateEvent } = await loadEventsService()
     const result = await updateEvent(adminSession, 'evt-7', {
       title: 'Event', description: null,
@@ -237,22 +185,18 @@ describe('events-service — updateEvent with cancellation', () => {
       roomId: 'room-new', allDay: false,
     })
     expect(result.id).toBe('evt-7')
+    expect(result.roomBlocks).toHaveLength(1)
+    expect(result.roomBlocks[0].roomId).toBe('room-new')
   })
 
   it('removes room when roomId is explicitly set to null', async () => {
     const adminSession = createAdminSession()
-    setFixture('events', [{
-      title: 'Event', description: null,
-      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
-      titleEs: null, titleEn: null,
-    }])
-    updateMock.mockResolvedValue([{
+    seedTable('events', [{
       id: 'evt-8', title: 'Event', description: null,
       date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
-      createdAt: new Date(),
+      titleEs: null, titleEn: null,
+      createdAt: new Date('2025-01-01T00:00:00.000Z'),
     }])
-    deleteMock.mockResolvedValue([])
-    setFixture('event_room_blocks', [])
     const { updateEvent } = await loadEventsService()
     const result = await updateEvent(adminSession, 'evt-8', {
       title: 'Event', description: null,
@@ -264,7 +208,6 @@ describe('events-service — updateEvent with cancellation', () => {
 
   it('throws 404 when event not found', async () => {
     const adminSession = createAdminSession()
-    setFixture('events', [])
     const { updateEvent } = await loadEventsService()
     await expect(updateEvent(adminSession, 'evt-missing', {
       title: 'Title', description: null,
@@ -275,12 +218,13 @@ describe('events-service — updateEvent with cancellation', () => {
 
   it('throws 500 when update fails', async () => {
     const adminSession = createAdminSession()
-    setFixture('events', [{
-      title: 'Event', description: null,
+    seedTable('events', [{
+      id: 'evt-9', title: 'Event', description: null,
       date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
       titleEs: null, titleEn: null,
+      createdAt: new Date('2025-01-01T00:00:00.000Z'),
     }])
-    updateMock.mockRejectedValue(new Error('DB error'))
+    failNextQuery({ op: 'update', table: 'events', error: new Error('DB error') })
     const { updateEvent } = await loadEventsService()
     await expect(updateEvent(adminSession, 'evt-9', {
       title: 'Title', description: null,
@@ -291,10 +235,11 @@ describe('events-service — updateEvent with cancellation', () => {
 
   it('rejects non-hour start times', async () => {
     const adminSession = createAdminSession()
-    setFixture('events', [{
-      title: 'Event', description: null,
+    seedTable('events', [{
+      id: 'evt-10', title: 'Event', description: null,
       date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
       titleEs: null, titleEn: null,
+      createdAt: new Date('2025-01-01T00:00:00.000Z'),
     }])
     const { updateEvent } = await loadEventsService()
     await expect(updateEvent(adminSession, 'evt-10', {
@@ -307,16 +252,17 @@ describe('events-service — updateEvent with cancellation', () => {
 
 describe('events-service — isClubEventRow guard', () => {
   beforeEach(() => {
-    resetFixtures()
+    resetDb()
     vi.clearAllMocks()
   })
 
   it('updateEvent rejects club event rows (both bilingual)', async () => {
     const adminSession = createAdminSession()
-    setFixture('events', [{
-      title: 'Club', description: null,
+    seedTable('events', [{
+      id: 'evt-club', title: 'Club', description: null,
       date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
       titleEs: 'Club', titleEn: 'Club',
+      createdAt: new Date('2025-01-01T00:00:00.000Z'),
     }])
     const { updateEvent } = await loadEventsService()
     await expect(updateEvent(adminSession, 'evt-club', {
@@ -328,8 +274,9 @@ describe('events-service — isClubEventRow guard', () => {
 
   it('deleteEvent rejects club event rows', async () => {
     const adminSession = createAdminSession()
-    setFixture('events', [{
+    seedTable('events', [{
       id: 'evt-club', titleEs: 'Club', titleEn: 'Club',
+      createdAt: new Date('2025-01-01T00:00:00.000Z'),
     }])
     const { deleteEvent } = await loadEventsService()
     await expect(deleteEvent(adminSession, 'evt-club')).rejects.toThrow(MockServiceError)
@@ -337,18 +284,12 @@ describe('events-service — isClubEventRow guard', () => {
 
   it('updateEvent allows legacy rows (one bilingual)', async () => {
     const adminSession = createAdminSession()
-    setFixture('events', [{
-      title: 'Legacy', description: null,
-      date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
-      titleEs: null, titleEn: 'Legacy',
-    }])
-    updateMock.mockResolvedValue([{
+    seedTable('events', [{
       id: 'evt-legacy', title: 'Legacy', description: null,
       date: '2026-04-20', startTime: '18:00:00', endTime: '22:00:00',
-      createdAt: new Date(),
+      titleEs: null, titleEn: 'Legacy',
+      createdAt: new Date('2025-01-01T00:00:00.000Z'),
     }])
-    deleteMock.mockResolvedValue([])
-    setFixture('event_room_blocks', [])
     const { updateEvent } = await loadEventsService()
     const result = await updateEvent(adminSession, 'evt-legacy', {
       title: 'Updated Legacy', description: null,
@@ -360,11 +301,10 @@ describe('events-service — isClubEventRow guard', () => {
 
   it('deleteEvent allows legacy rows', async () => {
     const adminSession = createAdminSession()
-    setFixture('events', [{
+    seedTable('events', [{
       id: 'evt-legacy-del', titleEs: null, titleEn: 'Legacy',
+      createdAt: new Date('2025-01-01T00:00:00.000Z'),
     }])
-    setFixture('event_room_blocks', [])
-    deleteMock.mockResolvedValue([])
     const { deleteEvent } = await loadEventsService()
     await expect(deleteEvent(adminSession, 'evt-legacy-del')).resolves.not.toThrow()
   })
@@ -372,7 +312,7 @@ describe('events-service — isClubEventRow guard', () => {
 
 describe('events-service — Member-role denial', () => {
   beforeEach(() => {
-    resetFixtures()
+    resetDb()
     vi.clearAllMocks()
   })
 
@@ -405,7 +345,7 @@ describe('events-service — Member-role denial', () => {
 
 describe('events-service — cancelSavedGamesForBlockedRoom cascade (KIM-434 PR #182 review fix)', () => {
   beforeEach(() => {
-    resetFixtures()
+    resetDb()
     vi.clearAllMocks()
   })
 
@@ -414,23 +354,28 @@ describe('events-service — cancelSavedGamesForBlockedRoom cascade (KIM-434 PR 
     // is deliberately room-scoped — see the doc comment above
     // cancelSavedGamesForBlockedRoom in events-service.ts), so an active
     // saved_games row on EITHER table must be a cancellation candidate.
-    setFixture('tables', [{ id: 'table-A' }, { id: 'table-B' }])
-    // Stands in for the DB's WHERE clause (status='active' AND date overlap
-    // AND table_id IN <all tables in the room>) already narrowing this down
-    // to the one qualifying row — which lives on table-B, the table NOT
-    // explicitly named by the block.
-    setFixture('saved_games', [{ id: 'sg-other-table' }])
-    updateMock.mockResolvedValue([{ id: 'sg-other-table' }])
+    seed({
+      tables: [
+        { id: 'table-A', roomId: 'room-1' },
+        { id: 'table-B', roomId: 'room-1' },
+      ],
+      // The one row that qualifies (status active, date within range) lives
+      // on table-B — the table NOT explicitly named by the block.
+      saved_games: [{
+        id: 'sg-other-table', tableId: 'table-B', userId: 'u1', status: 'active',
+        startDate: '2026-07-01', endDate: '2026-07-20',
+      }],
+    })
 
     const { cancelSavedGamesForBlockedRoom } = await loadEventsService()
-    const builder = createTransactionAwareMockBuilder()
+    const db = createStatefulDrizzleDb()
 
-    const cancelledCount = await builder.transaction((tx) =>
+    const cancelledCount = await db.transaction((tx) =>
       cancelSavedGamesForBlockedRoom(tx, [{ roomId: 'room-1', date: '2026-07-10' }]),
     )
 
     expect(cancelledCount).toBe(1)
-    expect(updateMock).toHaveBeenCalledTimes(1)
+    expect(getRows('saved_games')[0].status).toBe('cancelled')
 
     // Advisory lock taken once per table in the room, in ascending id order
     // (hashtextextended(table_id, 0) — same key/order as the dropped
@@ -439,9 +384,15 @@ describe('events-service — cancelSavedGamesForBlockedRoom cascade (KIM-434 PR 
     expect(executeMock.mock.calls[0][0].queryChunks[1]).toBe('table-A')
     expect(executeMock.mock.calls[1][0].queryChunks[1]).toBe('table-B')
 
-    const lastExecuteOrder = Math.max(...executeMock.mock.invocationCallOrder)
-    const firstUpdateOrder = Math.min(...updateMock.mock.invocationCallOrder)
-    expect(lastExecuteOrder).toBeLessThan(firstUpdateOrder)
+    // The query log is the shared, operation-agnostic record of call order
+    // across both flavours of the mock — use it (rather than a legacy
+    // *Mock.mock.invocationCallOrder, which the state-driven mock does not
+    // populate) to assert both executes happened strictly before the update.
+    const log = getQueryLog()
+    const lastExecuteIndex = log.map((entry) => entry.op).lastIndexOf('execute')
+    const updateIndex = log.findIndex((entry) => entry.op === 'update')
+    expect(lastExecuteIndex).toBeGreaterThanOrEqual(0)
+    expect(updateIndex).toBeGreaterThan(lastExecuteIndex)
   })
 
   it('does not cancel anything when no active saved_games overlap the block', async () => {
@@ -450,18 +401,17 @@ describe('events-service — cancelSavedGamesForBlockedRoom cascade (KIM-434 PR 
     // range, or a status other than 'active' (already 'cancelled'/etc.) —
     // in every case the SELECT the code trusts returns nothing, so no
     // update should ever be attempted.
-    setFixture('tables', [{ id: 'table-A' }])
-    setFixture('saved_games', [])
+    seed({ tables: [{ id: 'table-A', roomId: 'room-1' }], saved_games: [] })
 
     const { cancelSavedGamesForBlockedRoom } = await loadEventsService()
-    const builder = createTransactionAwareMockBuilder()
+    const db = createStatefulDrizzleDb()
 
-    const cancelledCount = await builder.transaction((tx) =>
+    const cancelledCount = await db.transaction((tx) =>
       cancelSavedGamesForBlockedRoom(tx, [{ roomId: 'room-1', date: '2026-07-10' }]),
     )
 
     expect(cancelledCount).toBe(0)
-    expect(updateMock).not.toHaveBeenCalled()
+    expect(getQueryLog().filter((entry) => entry.op === 'update')).toHaveLength(0)
     // The advisory lock loop still runs — it must serialize against
     // validate_saved_game's matching lock regardless of whether anything
     // ends up being cancelled.
@@ -469,17 +419,17 @@ describe('events-service — cancelSavedGamesForBlockedRoom cascade (KIM-434 PR 
   })
 
   it('takes no advisory locks and performs no update when the blocked room has no tables', async () => {
-    setFixture('tables', [])
+    seed({ tables: [] })
 
     const { cancelSavedGamesForBlockedRoom } = await loadEventsService()
-    const builder = createTransactionAwareMockBuilder()
+    const db = createStatefulDrizzleDb()
 
-    const cancelledCount = await builder.transaction((tx) =>
+    const cancelledCount = await db.transaction((tx) =>
       cancelSavedGamesForBlockedRoom(tx, [{ roomId: 'room-empty', date: '2026-07-10' }]),
     )
 
     expect(cancelledCount).toBe(0)
     expect(executeMock).not.toHaveBeenCalled()
-    expect(updateMock).not.toHaveBeenCalled()
+    expect(getQueryLog().filter((entry) => entry.op === 'update')).toHaveLength(0)
   })
 })
