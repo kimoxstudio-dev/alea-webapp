@@ -1,5 +1,5 @@
 import 'server-only'
-import { and, asc, eq, gt, gte, inArray, isNull, lt, lte, or } from 'drizzle-orm'
+import { and, asc, eq, gt, gte, inArray, isNull, lt, lte, or, sql } from 'drizzle-orm'
 import { getAdminDb, getDrizzleAdminDb, getDrizzleDb, type AdminDbClient } from '@/lib/db'
 import { events, eventRoomBlocks, savedGames, tables } from '@/lib/db/schema'
 import { ServiceError, serviceError } from '@/lib/server/shared/service-error'
@@ -349,15 +349,36 @@ export async function cancelOverlappingReservationsForBlocks(
 // event_room_blocks insert, giving true all-or-nothing atomicity: a rollback
 // of the block write also rolls back this cascade.
 //
-// Known, disclosed gap vs. the trigger: the `pg_advisory_xact_lock` loop
-// above is NOT reimplemented here. It guarded a race between this UPDATE and
-// a concurrent saved-game creation racing the `saved_games_no_active_overlap`
-// EXCLUDE constraint — a defense-in-depth concurrency guard, not the
-// business rule under regression (the missing cancellation itself). It is
-// intentionally out of scope for this fix: it needs a raw `tx.execute(sql\`...\`)`
-// call that tests/unit/mocks/drizzle-mock.ts's shared transaction builder has
-// no chain for, and per repo convention test infra is qa-engineer-owned, not
-// software-engineer's to extend. Flagged for qa/security follow-up.
+// Concurrency guard (reimplemented, not dropped — see decision writeup in
+// the PR description / handoff notes for the full reasoning): the
+// `pg_advisory_xact_lock` loop IS reimplemented below via `tx.execute(sql\`...\`)`,
+// in the same per-table, id-ascending order the trigger used. Investigation
+// (reading `saved_games_no_active_overlap`'s actual definition in
+// supabase/migrations/20260619000003_kim384_create_saved_games.sql) showed it
+// is NOT a substitute for this lock: that EXCLUDE constraint only prevents
+// two `saved_games` rows from overlapping on the same table_id + daterange
+// while both `active` — it says nothing about a `saved_games` row overlapping
+// an `event_room_blocks` row. The actual race this lock guards against is
+// between THIS cascade and `validate_saved_game`'s BEFORE INSERT/UPDATE
+// trigger on `saved_games` (supabase/migrations/20260619000006_kim384_saved_game_validation_trigger.sql),
+// which takes the SAME advisory lock key (`hashtextextended(table_id::text, 0)`)
+// before checking for an event-block conflict (`SAVED_GAME_EVENT_CONFLICT`).
+// Without a matching lock here, a member's "create saved_game" transaction
+// and an admin's "create/update event block that cancels saved_games"
+// transaction can each run their conflict check against data that doesn't
+// yet reflect the other's uncommitted write (both under READ COMMITTED),
+// letting a new active saved_games row survive uncancelled for a room/date
+// that's actually blocked, or vice versa. Taking the same advisory lock
+// forces one of the two transactions to block until the other commits, so
+// whichever runs second always sees the final, committed state of the
+// other. This IS reimplemented for that reason.
+//
+// Test-infra gap (does not block the fix above): tests/unit/mocks/drizzle-mock.ts's
+// shared transaction builder has no chain for `tx.execute(...)`, so
+// `pnpm test` is expected to newly fail wherever a test exercises this
+// function against the mock. Per repo convention test infra is
+// qa-engineer-owned, not software-engineer's — qa-engineer should add a
+// `tx.execute` mock (e.g. resolving to `{ rows: [] }`) to close that gap.
 //
 // Exported (same pattern as deleteEventCascade below) so
 // lib/server/events/club-events-service.ts can reuse it once its own
@@ -381,6 +402,15 @@ export async function cancelSavedGamesForBlockedRoom(
 
     const tableIds = roomTables.map((t) => t.id)
     if (tableIds.length === 0) continue
+
+    // Reimplemented `pg_advisory_xact_lock` loop (see doc comment above for
+    // the full race-condition rationale) — same key
+    // (`hashtextextended(table_id, 0)`) and same id-ascending order as the
+    // trigger, so this serializes against `validate_saved_game`'s matching
+    // lock acquisition on `saved_games` inserts/updates for these tables.
+    for (const tableId of tableIds) {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${tableId}::text, 0))`)
+    }
 
     // Pre-select the exact candidate rows the trigger's UPDATE would have
     // matched, and only issue the UPDATE when there's at least one — same
