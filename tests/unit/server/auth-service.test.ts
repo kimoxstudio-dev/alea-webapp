@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 // Mock Auth.js and related modules early to prevent loading next-auth
 const authJsSignInMock = vi.fn()
 const authJsSignOutMock = vi.fn()
+const authJsAuthMock = vi.fn()
 const authSignInWithPasswordMock = vi.fn()
 const authCreateUserMock = vi.fn()
 const authDeleteUserMock = vi.fn()
@@ -11,7 +12,7 @@ const authDeleteUserMock = vi.fn()
 vi.mock('@/lib/authjs/auth', () => ({
   signIn: authJsSignInMock,
   signOut: authJsSignOutMock,
-  auth: vi.fn(),
+  auth: authJsAuthMock,
   handlers: { GET: vi.fn(), POST: vi.fn() },
 }))
 
@@ -147,6 +148,7 @@ describe('auth service', () => {
     adminState.byMemberNumber.clear()
     adminState.byId.clear()
     authJsSignInMock.mockResolvedValue({ ok: true })
+    authJsAuthMock.mockResolvedValue({ user: { id: 'user-1' } })
     authJsSignOutMock.mockResolvedValue(undefined)
     authSignInWithPasswordMock.mockResolvedValue({ user: { id: 'auth-user-1' }, session: null })
     authCreateUserMock.mockResolvedValue({ data: { user: { id: 'auth-user-1' } }, error: null })
@@ -232,6 +234,24 @@ describe('auth service', () => {
     })
 
   })
+
+    it('rejects when Auth.js authenticates a different user id than the resolved profile', async () => {
+      const profile = makeProfile({ member_number: '100001' })
+      adminState.byMemberNumber.set('100001', profile)
+      adminState.byId.set('user-1', profile)
+      adminState.byEmail.set('admin@alea.club', profile)
+      
+      // Auth.js sign-in succeeds
+      authJsSignInMock.mockResolvedValueOnce({ ok: true })
+      // But auth() returns a session with a different user ID (identity drift)
+      authJsAuthMock.mockResolvedValueOnce({ user: { id: 'different-user-id' } } as any)
+
+      const { login } = await loadService()
+
+      await expect(login({ identifier: '100001', password: 'Admin123' })).rejects.toThrow('Invalid credentials')
+      // Must verify the mismatched session was torn down (signOutQuietly calls authJsSignOut)
+      expect(authJsSignOutMock).toHaveBeenCalled()
+    })
 
   describe('register', () => {
     it('creates a Supabase Auth user, updates the trigger-created profile row, and returns the public user', async () => {
