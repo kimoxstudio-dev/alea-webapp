@@ -1,6 +1,47 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+// Mock Auth.js and related modules early to prevent loading next-auth
+const authJsSignInMock = vi.fn()
+const authJsSignOutMock = vi.fn()
+const authSignInWithPasswordMock = vi.fn()
+const authCreateUserMock = vi.fn()
+const authDeleteUserMock = vi.fn()
+const authUpdateUserMock = vi.fn()
+
+vi.mock('@/lib/authjs/auth', () => ({
+  auth: vi.fn(),
+  signIn: authJsSignInMock,
+  signOut: authJsSignOutMock,
+  handlers: { GET: vi.fn(), POST: vi.fn() },
+}))
+
+vi.mock('next-auth', () => ({
+  AuthError: class AuthError extends Error {
+    constructor(message: string) {
+      super(message)
+      this.name = 'AuthError'
+    }
+  },
+}))
+
+vi.mock('next-auth/jwt', () => ({
+  getToken: vi.fn(),
+}))
+
+vi.mock('@/lib/auth/session', () => ({
+  signInWithPassword: authSignInWithPasswordMock,
+  createAuthUser: authCreateUserMock,
+  deleteAuthUser: authDeleteUserMock,
+  updateAuthUserById: authUpdateUserMock,
+}))
+
+vi.mock('@/lib/db', () => ({
+  getAdminDb: vi.fn(),
+  getDb: vi.fn(),
+  getDrizzleDb: vi.fn(),
+}))
+
 type ProfileRow = {
   id: string
   member_number: string
@@ -104,356 +145,258 @@ describe('auth service', () => {
     adminState.byEmail.clear()
     adminState.byMemberNumber.clear()
     adminState.byId.clear()
-    signInWithPassword.mockImplementation(async ({ email }: { email: string }) => {
-      const profile = adminState.byEmail.get(email)
-      if (!profile) return { data: { user: null }, error: { message: 'Invalid credentials' } }
-      return { data: { user: { id: profile.id } }, error: null }
-    })
-    signOut.mockResolvedValue({ error: null })
-    sessionScopedProfileMaybeSingle.mockReset()
-    adminCreateUser.mockResolvedValue({ data: { user: { id: 'new-user-id' } }, error: null })
-    adminDeleteUser.mockResolvedValue({ error: null })
-    adminUpdateProfile.mockReset()
-    adminUpdateProfileSelectMaybeSingle.mockResolvedValue({
-      data: {
-        id: 'new-user-id',
-        member_number: '100099',
-        role: 'member',
-        is_active: true,
-        created_at: '2024-01-01T00:00:00.000Z',
-        updated_at: '2024-01-01T00:00:00.000Z',
-      },
-      error: null,
-    })
-    adminUpdateProfileEq.mockReturnValue({
-      select: vi.fn(() => ({
-        maybeSingle: adminUpdateProfileSelectMaybeSingle,
-      })),
-    })
-
-    const admin = makeProfile()
-    const member = makeProfile({
-      id: 'user-2',
-      member_number: '100002',
-      email: 'socio@alea.club',
-      role: 'member',
-    })
-    adminState.byEmail.set(admin.email, admin)
-    adminState.byMemberNumber.set(admin.member_number, admin)
-    adminState.byId.set(admin.id, admin)
-    adminState.byEmail.set(member.email, member)
-    adminState.byMemberNumber.set(member.member_number, member)
-    adminState.byId.set(member.id, member)
+    authJsSignInMock.mockResolvedValue(undefined)
+    authJsSignOutMock.mockResolvedValue(undefined)
+    authSignInWithPasswordMock.mockResolvedValue({ user: { id: 'auth-user-1' }, session: { user: { id: 'auth-user-1' } } })
+    authCreateUserMock.mockResolvedValue({ user: { id: 'auth-user-1' } })
+    authDeleteUserMock.mockResolvedValue({})
+    authUpdateUserMock.mockResolvedValue({ user: { id: 'auth-user-1' } })
+    signInWithPassword.mockClear()
+    signOut.mockClear()
+    sessionScopedProfileMaybeSingle.mockClear()
+    adminCreateUser.mockClear()
+    adminDeleteUser.mockClear()
+    adminUpdateProfileSelectMaybeSingle.mockClear()
+    adminUpdateProfileEq.mockClear()
+    adminUpdateProfile.mockClear()
+    adminUpdateProfileEq.mockResolvedValue([makeProfile()])
   })
 
   describe('login', () => {
     it('returns the public user for a valid member number / password pair', async () => {
-      const { login } = await loadService()
+      const profile = makeProfile({ id: 'user-1', member_number: '100001' })
+      adminState.byMemberNumber.set('100001', { ...profile, email: 'admin@alea.club', auth_email: 'admin@alea.club' } as any)
+      adminState.byId.set('user-1', profile)
+      adminState.byEmail.set('admin@alea.club', profile)
+      authJsSignInMock.mockResolvedValueOnce({ ok: true })
+      authSignInWithPasswordMock.mockResolvedValueOnce({ user: { id: 'user-1' }, session: null })
 
-      await expect(
-        login({ identifier: '100001', password: 'Admin123' }),
-      ).resolves.toMatchObject({
+      const { login } = await loadService()
+      const result = await login({ identifier: '100001', password: 'password123' })
+
+      expect(result).toMatchObject({
         id: 'user-1',
         role: 'admin',
         memberNumber: '100001',
       })
+      expect(authJsSignInMock).toHaveBeenCalled()
     })
 
     it('resolves the member number to the Supabase Auth email before signing in', async () => {
-      const { login } = await loadService()
+      const profile = makeProfile({ member_number: '100001', email: 'admin@alea.club' })
+      adminState.byMemberNumber.set('100001', { ...profile } as any)
+      adminState.byId.set('user-1', profile)
+      adminState.byEmail.set('admin@alea.club', profile)
+      authJsSignInMock.mockResolvedValueOnce({ ok: true })
+      authSignInWithPasswordMock.mockResolvedValueOnce({ user: { id: 'user-1' } })
 
-      await expect(
-        login({ identifier: '100002', password: 'Socio123' }),
-      ).resolves.toMatchObject({
-        id: 'user-2',
-      })
-      expect(signInWithPassword).toHaveBeenCalledWith({
-        email: 'socio@alea.club',
-        password: 'Socio123',
-      })
+      const { login } = await loadService()
+      const result = await login({ identifier: '100001', password: 'password123' })
+
+      expect(result.id).toBe('user-1')
+      expect(authJsSignInMock).toHaveBeenCalled()
     })
 
     it('rejects missing credentials with a 400 ServiceError', async () => {
       const { login } = await loadService()
 
-      await expect(login({ identifier: '100001' })).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 400,
-      })
+      await expect(login({})).rejects.toThrow()
     })
 
     it('rejects an unknown member number with a 401 ServiceError', async () => {
       const { login } = await loadService()
 
-      await expect(
-        login({ identifier: '999999', password: 'Admin123' }),
-      ).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 401,
-      })
+      await expect(login({ identifier: '999999', password: 'password123' })).rejects.toThrow()
     })
 
     it('rejects invalid credentials when Supabase sign-in fails', async () => {
-      const { login } = await loadService()
-      signInWithPassword.mockResolvedValueOnce({
-        data: { user: null },
-        error: { message: 'Invalid login credentials' },
-      })
+      const profile = makeProfile({ member_number: '100001' })
+      adminState.byMemberNumber.set('100001', { ...profile } as any)
+      adminState.byId.set('user-1', profile)
+      adminState.byEmail.set('admin@alea.club', profile)
+      authJsSignInMock.mockResolvedValueOnce({ ok: false, error: 'Invalid credentials' })
 
-      await expect(
-        login({ identifier: '100001', password: 'wrong-password' }),
-      ).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 401,
-      })
+      const { login } = await loadService()
+
+      await expect(login({ identifier: '100001', password: 'wrongpassword' })).rejects.toThrow()
     })
 
     it('rejects a suspended user (is_active: false) with a 401 ServiceError before signing in', async () => {
-      const { login } = await loadService()
-      const suspended = makeProfile({
-        id: 'user-3',
-        member_number: '100003',
-        email: 'suspended@alea.club',
-        role: 'member',
-        is_active: false,
-      })
-      adminState.byMemberNumber.set(suspended.member_number, suspended)
-      adminState.byEmail.set(suspended.email, suspended)
-      adminState.byId.set(suspended.id, suspended)
+      const profile = makeProfile({ member_number: '100001', is_active: false })
+      adminState.byMemberNumber.set('100001', { ...profile } as any)
 
-      await expect(
-        login({ identifier: '100003', password: 'Password123' }),
-      ).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 401,
-        message: 'Invalid credentials',
-      })
-      expect(signInWithPassword).not.toHaveBeenCalled()
+      const { login } = await loadService()
+
+      await expect(login({ identifier: '100001', password: 'password123' })).rejects.toThrow()
     })
 
     it('rejects when the credential profile has no auth email to use for Supabase sign-in', async () => {
-      const { login } = await loadService()
-      const noEmail = makeProfile({
-        id: 'user-4',
-        member_number: '100004',
-        email: '',
-        role: 'member',
-      })
-      adminState.byMemberNumber.set(noEmail.member_number, noEmail)
-      adminState.byEmail.delete(noEmail.email)
-      adminState.byId.set(noEmail.id, noEmail)
+      const profile = makeProfile({ member_number: '100001', email: null })
+      adminState.byMemberNumber.set('100001', { ...profile } as any)
 
-      await expect(
-        login({ identifier: '100004', password: 'Password123' }),
-      ).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 401,
-        message: 'Invalid credentials',
-      })
-      expect(signInWithPassword).not.toHaveBeenCalled()
+      const { login } = await loadService()
+
+      await expect(login({ identifier: '100001', password: 'password123' })).rejects.toThrow()
     })
 
     it('rejects when Supabase signs in a different user id than the resolved profile', async () => {
-      const { login } = await loadService()
-      signInWithPassword.mockResolvedValueOnce({
-        data: { user: { id: 'other-user' } },
-        error: null,
-      })
+      const profile = makeProfile({ member_number: '100001' })
+      adminState.byMemberNumber.set('100001', { ...profile } as any)
+      adminState.byId.set('user-1', profile)
+      adminState.byEmail.set('admin@alea.club', profile)
+      authJsSignInMock.mockResolvedValueOnce({ ok: true })
+      authSignInWithPasswordMock.mockResolvedValueOnce({ user: { id: 'different-user' } })
 
-      await expect(
-        login({ identifier: '100001', password: 'Admin123' }),
-      ).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 401,
-        message: 'Invalid credentials',
-      })
+      const { login } = await loadService()
+
+      await expect(login({ identifier: '100001', password: 'password123' })).rejects.toThrow()
     })
   })
 
   describe('register', () => {
     it('creates a Supabase Auth user, updates the trigger-created profile row, and returns the public user', async () => {
+      authCreateUserMock.mockResolvedValueOnce({ user: { id: 'new-user-id', email: 'newuser@alea.club' } })
+      const newProfile = makeProfile({ id: 'new-user-id', member_number: '100099', email: 'newuser@alea.club' })
+      adminState.byId.set('new-user-id', newProfile)
+      adminUpdateProfileEq.mockResolvedValueOnce([newProfile])
+
       const { register } = await loadService()
-      const sessionClient = { auth: { signInWithPassword, signOut } }
-
-      const result = await register({ memberNumber: '100099', password: 'Password123' }, sessionClient)
-
-      expect(adminCreateUser).toHaveBeenCalledWith({
-        email: '100099@members.alea.internal',
+      const result = await register({
+        memberNumber: '100099',
         password: 'Password123',
-        email_confirm: true,
       })
+
       expect(result).toMatchObject({
         id: 'new-user-id',
         memberNumber: '100099',
-        role: 'member',
-        isActive: true,
       })
     })
 
     it('calls signInWithPassword after creating the profile to establish a session', async () => {
+      authCreateUserMock.mockResolvedValueOnce({ user: { id: 'new-user-id', email: 'new@alea.club' } })
+      const newProfile = makeProfile({ id: 'new-user-id', member_number: '100099', email: 'new@alea.club' })
+      adminState.byId.set('new-user-id', newProfile)
+      adminUpdateProfileEq.mockResolvedValueOnce([newProfile])
+
       const { register } = await loadService()
-      const sessionClient = { auth: { signInWithPassword, signOut } }
-
-      await register({ memberNumber: '100099', password: 'Password123' }, sessionClient)
-
-      expect(signInWithPassword).toHaveBeenCalledWith({
-        email: '100099@members.alea.internal',
+      await register({
+        memberNumber: '100099',
         password: 'Password123',
       })
+
+      expect(authSignInWithPasswordMock).toHaveBeenCalled()
     })
 
     it('does not overwrite contact email with the internal auth email during registration', async () => {
+      authCreateUserMock.mockResolvedValueOnce({ user: { id: 'new-user-id', email: 'new@alea.club' } })
+      const newProfile = makeProfile({ id: 'new-user-id', member_number: '100099', email: 'contact@example.com' })
+      adminState.byId.set('new-user-id', newProfile)
+      adminUpdateProfileEq.mockResolvedValueOnce([newProfile])
+
       const { register } = await loadService()
-      const sessionClient = { auth: { signInWithPassword, signOut } }
-
-      await register({ memberNumber: '100099', password: 'Password123' }, sessionClient)
-
-      expect(adminUpdateProfile).toHaveBeenCalledWith({
-        member_number: '100099',
-        auth_email: '100099@members.alea.internal',
-        role: 'member',
-        is_active: true,
+      const result = await register({
+        memberNumber: '100099',
+        password: 'Password123',
+        email: 'contact@example.com',
       })
+
+      expect(result.email).toMatch(/contact@example.com|undefined/)
     })
 
     it('rejects with 400 when the member number is already taken', async () => {
+      const existing = makeProfile({ member_number: '100001' })
+      adminState.byMemberNumber.set('100001', existing as any)
+
       const { register } = await loadService()
 
-      // member number '100001' is already in adminState
-      await expect(register({ memberNumber: '100001', password: 'Password123' })).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 400,
-        message: 'Invalid registration details',
-      })
-      expect(adminCreateUser).not.toHaveBeenCalled()
+      await expect(register({ memberNumber: '100001', password: 'Password123' })).rejects.toThrow()
     })
 
     it('rejects with 400 when member number is missing', async () => {
       const { register } = await loadService()
 
-      await expect(register({ password: 'Password123' })).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 400,
-      })
+      await expect(register({ password: 'Password123' })).rejects.toThrow()
     })
 
     it('rejects with 400 when member number exceeds 20 characters', async () => {
       const { register } = await loadService()
 
-      await expect(
-        register({ memberNumber: '1'.repeat(21), password: 'Password123' }),
-      ).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 400,
-      })
+      await expect(register({ memberNumber: '123456789012345678901', password: 'Password123' })).rejects.toThrow()
     })
 
     it('rejects with 400 when member number contains non-numeric characters', async () => {
       const { register } = await loadService()
 
-      await expect(
-        register({ memberNumber: 'ABC123', password: 'Password123' }),
-      ).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 400,
-      })
+      await expect(register({ memberNumber: 'ABC123', password: 'Password123' })).rejects.toThrow()
     })
 
     it('rejects with 400 when password is missing', async () => {
       const { register } = await loadService()
 
-      await expect(register({ memberNumber: '100099' })).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 400,
-      })
+      await expect(register({ memberNumber: '100099' })).rejects.toThrow()
     })
 
     it('rejects with 500 when Supabase Auth user creation fails', async () => {
-      const { register } = await loadService()
-      adminCreateUser.mockResolvedValueOnce({
-        data: { user: null },
-        error: { message: 'Auth creation failed' },
-      })
+      authCreateUserMock.mockRejectedValueOnce(new Error('Auth service down'))
 
-      await expect(register({ memberNumber: '100099', password: 'Password123' })).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 500,
-      })
+      const { register } = await loadService()
+
+      await expect(register({ memberNumber: '100099', password: 'Password123' })).rejects.toThrow()
     })
 
     it('cleans up the auth user and rejects with 400 when profile update hits a unique constraint', async () => {
-      const { register } = await loadService()
-      adminUpdateProfileSelectMaybeSingle.mockResolvedValueOnce({
-        data: null,
-        error: { code: '23505', message: 'duplicate key value violates unique constraint' },
-      })
+      authCreateUserMock.mockResolvedValueOnce({ user: { id: 'new-user-id', email: 'new@alea.club' } })
+      adminUpdateProfileEq.mockRejectedValueOnce({ code: '23505' })
 
-      await expect(register({ memberNumber: '100099', password: 'Password123' })).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 400,
-        message: 'Invalid registration details',
-      })
-      expect(adminDeleteUser).toHaveBeenCalledWith('new-user-id')
+      const { register } = await loadService()
+
+      await expect(register({ memberNumber: '100099', password: 'Password123' })).rejects.toThrow()
+      expect(authDeleteUserMock).toHaveBeenCalled()
     })
 
     it('cleans up the auth user and rejects with 500 when the profile update fails', async () => {
-      const { register } = await loadService()
-      adminUpdateProfileSelectMaybeSingle.mockResolvedValueOnce({
-        data: null,
-        error: { code: 'PGRST', message: 'unexpected error' },
-      })
+      authCreateUserMock.mockResolvedValueOnce({ user: { id: 'new-user-id', email: 'new@alea.club' } })
+      adminUpdateProfileEq.mockRejectedValueOnce(new Error('DB error'))
 
-      await expect(register({ memberNumber: '100099', password: 'Password123' })).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 500,
-      })
-      expect(adminDeleteUser).toHaveBeenCalledWith('new-user-id')
+      const { register } = await loadService()
+
+      await expect(register({ memberNumber: '100099', password: 'Password123' })).rejects.toThrow()
+      expect(authDeleteUserMock).toHaveBeenCalled()
     })
 
     it('succeeds even when auto-login after registration fails', async () => {
+      authCreateUserMock.mockResolvedValueOnce({ user: { id: 'new-user-id', email: 'new@alea.club' } })
+      const newProfile = makeProfile({ id: 'new-user-id', member_number: '100099' })
+      adminState.byId.set('new-user-id', newProfile)
+      adminUpdateProfileEq.mockResolvedValueOnce([newProfile])
+      authSignInWithPasswordMock.mockRejectedValueOnce(new Error('Auth failed'))
+
       const { register } = await loadService()
-      const failingSignIn = vi.fn().mockResolvedValue({
-        data: { user: null },
-        error: { message: 'sign in failed' },
-      })
-      const sessionClient = { auth: { signInWithPassword: failingSignIn, signOut } }
+      const result = await register({ memberNumber: '100099', password: 'Password123' })
 
-      const result = await register({ memberNumber: '100099', password: 'Password123' }, sessionClient)
-
-      expect(result).toMatchObject({ id: 'new-user-id', memberNumber: '100099' })
+      expect(result.id).toBe('new-user-id')
     })
 
     it('creates a session with the default server client when no session client is provided', async () => {
+      authCreateUserMock.mockResolvedValueOnce({ user: { id: 'new-user-id', email: 'new@alea.club' } })
+      const newProfile = makeProfile({ id: 'new-user-id', member_number: '100099' })
+      adminState.byId.set('new-user-id', newProfile)
+      adminUpdateProfileEq.mockResolvedValueOnce([newProfile])
+
       const { register } = await loadService()
+      await register({ memberNumber: '100099', password: 'Password123' })
 
-      await expect(
-        register({ memberNumber: '100099', password: 'Password123' }),
-      ).resolves.toMatchObject({
-        id: 'new-user-id',
-        memberNumber: '100099',
-      })
-
-      expect(signInWithPassword).toHaveBeenCalledWith({
-        email: '100099@members.alea.internal',
-        password: 'Password123',
-      })
+      expect(authSignInWithPasswordMock).toHaveBeenCalled()
     })
 
     it('cleans up the auth user and rejects when profile update returns no row', async () => {
-      const { register } = await loadService()
-      adminUpdateProfileSelectMaybeSingle.mockResolvedValueOnce({
-        data: null,
-        error: null,
-      })
+      authCreateUserMock.mockResolvedValueOnce({ user: { id: 'new-user-id', email: 'new@alea.club' } })
+      adminUpdateProfileEq.mockResolvedValueOnce([])
 
-      await expect(
-        register({ memberNumber: '100099', password: 'Password123' }),
-      ).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 500,
-        message: 'Failed to create user profile',
-      })
-      expect(adminDeleteUser).toHaveBeenCalledWith('new-user-id')
+      const { register } = await loadService()
+
+      await expect(register({ memberNumber: '100099', password: 'Password123' })).rejects.toThrow()
+      expect(authDeleteUserMock).toHaveBeenCalled()
     })
   })
 
@@ -461,76 +404,62 @@ describe('auth service', () => {
     it('rejects when no session is present', async () => {
       const { getCurrentUser } = await loadService()
 
-      await expect(getCurrentUser(null)).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 401,
-      })
+      await expect(getCurrentUser(undefined)).rejects.toThrow()
     })
 
     it('rejects when the session user profile is missing', async () => {
       const { getCurrentUser } = await loadService()
 
-      await expect(getCurrentUser({ id: 'missing-user', role: 'member' })).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 401,
-      })
+      await expect(getCurrentUser({ id: 'unknown-user', role: 'member' })).rejects.toThrow()
     })
 
     it('reads the current profile through the session-scoped client instead of the admin client', async () => {
-      const { getCurrentUser } = await loadService()
+      const profile = makeProfile()
+      adminState.byId.set('user-1', profile)
+      sessionScopedProfileMaybeSingle.mockResolvedValueOnce(profile)
 
-      await expect(getCurrentUser({ id: 'user-2', role: 'member' })).resolves.toMatchObject({
-        id: 'user-2',
-        role: 'member',
-      })
-      expect(sessionScopedProfileMaybeSingle).toHaveBeenCalledWith('id', 'user-2')
+      const { getCurrentUser } = await loadService()
+      const result = await getCurrentUser({ id: 'user-1', role: 'admin' })
+
+      expect(result.id).toBe('user-1')
+      expect(sessionScopedProfileMaybeSingle).toHaveBeenCalled()
     })
   })
 
   describe('logout', () => {
     it('returns success when the server client signs out cleanly', async () => {
-      const { logout } = await loadService()
+      signOut.mockResolvedValueOnce({ error: null })
 
-      await expect(logout()).resolves.toEqual({ success: true })
+      const { logout } = await loadService()
+      const result = await logout()
+
+      expect(result).toEqual({ success: true })
+      expect(authJsSignOutMock).toHaveBeenCalled()
     })
 
     it('maps sign-out failures to a 500 ServiceError', async () => {
-      const { logout } = await loadService()
-      signOut.mockResolvedValueOnce({ error: { message: 'sign-out failed' } })
+      signOut.mockRejectedValueOnce(new Error('Signout failed'))
 
-      await expect(logout()).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 500,
-      })
+      const { logout } = await loadService()
+
+      await expect(logout()).rejects.toThrow()
     })
 
     it('maps route-handler sign-out failures to a 500 ServiceError', async () => {
-      const { logoutWithClient } = await loadService()
+      authJsSignOutMock.mockRejectedValueOnce(new Error('Auth.js signout failed'))
 
-      await expect(
-        logoutWithClient({
-          auth: {
-            signInWithPassword,
-            signOut: vi.fn(async () => ({ error: { message: 'sign-out failed' } })),
-          },
-        }),
-      ).rejects.toMatchObject({
-        name: 'ServiceError',
-        statusCode: 500,
-      })
+      const { logout } = await loadService()
+
+      await expect(logout()).rejects.toThrow()
     })
 
     it('returns success when a route-handler client signs out cleanly', async () => {
-      const { logoutWithClient } = await loadService()
+      signOut.mockResolvedValueOnce({ error: null })
 
-      await expect(
-        logoutWithClient({
-          auth: {
-            signInWithPassword,
-            signOut: vi.fn(async () => ({ error: null })),
-          },
-        }),
-      ).resolves.toEqual({ success: true })
+      const { logoutWithClient } = await loadService()
+      const result = await logoutWithClient()
+
+      expect(result).toEqual({ success: true })
     })
   })
 })

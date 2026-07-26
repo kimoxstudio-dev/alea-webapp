@@ -2,64 +2,64 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { NextRequest, NextResponse } from 'next/server'
 
-const routeGetUser = vi.fn()
-const serverGetUser = vi.fn()
-const profileMaybeSingle = vi.fn()
-const routeApplyCookies = vi.fn((response: NextResponse) => response)
+const authJsAuthMock = vi.fn()
+const drizzleSelectMock = vi.fn()
+const drizzleFromMock = vi.fn()
+const drizzleWhereMock = vi.fn()
+const drizzleLimitMock = vi.fn()
 
-function buildProfileClient(getUser: typeof routeGetUser | typeof serverGetUser) {
-  return {
-    auth: {
-      getUser,
-    },
-    from: vi.fn(() => ({
-      select: vi.fn(() => ({
-        eq: vi.fn(() => ({
-          maybeSingle: profileMaybeSingle,
-        })),
-      })),
-    })),
-  }
-}
+// Mock Auth.js auth() to prevent loading next-auth
+vi.mock('@/lib/authjs/auth', () => ({
+  auth: authJsAuthMock,
+  handlers: { GET: vi.fn(), POST: vi.fn() },
+}))
 
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseRouteHandlerClient: vi.fn(() => ({
-    supabase: buildProfileClient(routeGetUser),
-    applyCookies: routeApplyCookies,
+// Mock Drizzle database
+vi.mock('@/lib/db', () => ({
+  getDrizzleDb: vi.fn(() => ({
+    select: drizzleSelectMock,
   })),
-  createSupabaseServerClient: vi.fn(async () => buildProfileClient(serverGetUser)),
+  getDb: vi.fn(),
+  getAdminDb: vi.fn(),
+}))
+
+// Mock next-auth/jwt to prevent loading next-auth
+vi.mock('next-auth/jwt', () => ({
+  getToken: vi.fn(),
 }))
 
 function withSession(userId = 'user-1', role: 'member' | 'admin' = 'admin') {
-  const authResult = { data: { user: { id: userId } }, error: null }
-  const profileResult = {
-    data: {
+  const sessionResult = { user: { id: userId } }
+  const profileResult = [
+    {
       id: userId,
       role,
-      is_active: true,
+      isActive: true,
       email: 'admin@alea.club',
-      member_number: '100001',
-      created_at: '2024-01-01T00:00:00.000Z',
-      updated_at: '2024-01-01T00:00:00.000Z',
+      memberNumber: '100001',
+      createdAt: '2024-01-01T00:00:00.000Z',
+      updatedAt: '2024-01-01T00:00:00.000Z',
     },
-    error: null,
-  }
-  routeGetUser.mockResolvedValue(authResult)
-  serverGetUser.mockResolvedValue(authResult)
-  profileMaybeSingle.mockResolvedValue(profileResult)
+  ]
+  authJsAuthMock.mockResolvedValue(sessionResult)
+  drizzleSelectMock.mockReturnValue({ from: drizzleFromMock })
+  drizzleFromMock.mockReturnValue({ where: drizzleWhereMock })
+  drizzleWhereMock.mockReturnValue({ limit: drizzleLimitMock })
+  drizzleLimitMock.mockResolvedValue(profileResult)
 }
 
 describe('server auth helpers', () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
-    routeGetUser.mockResolvedValue({ data: { user: null }, error: null })
-    serverGetUser.mockResolvedValue({ data: { user: null }, error: null })
-    profileMaybeSingle.mockResolvedValue({ data: null, error: null })
-    routeApplyCookies.mockImplementation((response: NextResponse) => response)
+    authJsAuthMock.mockResolvedValue(null)
+    drizzleSelectMock.mockReturnValue({ from: drizzleFromMock })
+    drizzleFromMock.mockReturnValue({ where: drizzleWhereMock })
+    drizzleWhereMock.mockReturnValue({ limit: drizzleLimitMock })
+    drizzleLimitMock.mockResolvedValue([])
   })
 
-  it('reads the session from a request-scoped Supabase client', async () => {
+  it('reads the session from a request-scoped Drizzle client', async () => {
     withSession('user-1', 'admin')
     const { getSessionFromRequest } = await import('@/lib/server/auth/auth')
 
@@ -82,8 +82,8 @@ describe('server auth helpers', () => {
   })
 
   it('returns null when the profile lookup fails after a valid auth session', async () => {
-    routeGetUser.mockResolvedValueOnce({ data: { user: { id: 'user-1' } }, error: null })
-    profileMaybeSingle.mockResolvedValueOnce({ data: null, error: { message: 'db failed' } })
+    authJsAuthMock.mockResolvedValueOnce({ user: { id: 'user-1' } })
+    drizzleLimitMock.mockResolvedValueOnce([])
     const { getSessionFromRequest } = await import('@/lib/server/auth/auth')
 
     await expect(
@@ -92,11 +92,10 @@ describe('server auth helpers', () => {
   })
 
   it('returns null when the profile is inactive', async () => {
-    routeGetUser.mockResolvedValueOnce({ data: { user: { id: 'user-1' } }, error: null })
-    profileMaybeSingle.mockResolvedValueOnce({
-      data: { id: 'user-1', role: 'admin', is_active: false },
-      error: null,
-    })
+    authJsAuthMock.mockResolvedValueOnce({ user: { id: 'user-1' } })
+    drizzleLimitMock.mockResolvedValueOnce([
+      { id: 'user-1', role: 'admin', isActive: false },
+    ])
     const { getSessionFromRequest } = await import('@/lib/server/auth/auth')
 
     await expect(
@@ -104,13 +103,12 @@ describe('server auth helpers', () => {
     ).resolves.toMatchObject({ session: null })
   })
 
-  it('returns 401 from requireAuth when no Supabase user is present', async () => {
+  it('returns 401 from requireAuth when no Auth.js session is present', async () => {
     const { requireAuth } = await import('@/lib/server/auth/auth')
 
     const response = await requireAuth(new NextRequest('http://localhost:3000/api/users'))
     expect(response).toBeInstanceOf(NextResponse)
     expect((response as NextResponse).status).toBe(401)
-    expect(routeApplyCookies).toHaveBeenCalledTimes(1)
   })
 
   it('returns 403 from requireAdmin for authenticated members', async () => {
@@ -120,7 +118,6 @@ describe('server auth helpers', () => {
     const response = await requireAdmin(new NextRequest('http://localhost:3000/api/users'))
     expect(response).toBeInstanceOf(NextResponse)
     expect((response as NextResponse).status).toBe(403)
-    expect(routeApplyCookies).toHaveBeenCalledTimes(1)
   })
 
   it('returns the session user from requireAdmin for admins', async () => {

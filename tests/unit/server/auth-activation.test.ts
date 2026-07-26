@@ -1,5 +1,27 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+// Mock Auth.js early to prevent loading next-auth
+vi.mock('@/lib/authjs/auth', () => ({
+  auth: vi.fn(),
+  signIn: vi.fn(),
+  signOut: vi.fn(),
+  handlers: { GET: vi.fn(), POST: vi.fn() },
+}))
+
+vi.mock('next-auth', () => ({
+  AuthError: class AuthError extends Error {
+    constructor(message: string) {
+      super(message)
+      this.name = 'AuthError'
+    }
+  },
+}))
+
+vi.mock('next-auth/jwt', () => ({
+  getToken: vi.fn(),
+}))
+
 import { createHash } from 'node:crypto'
 
 

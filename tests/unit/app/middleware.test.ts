@@ -1,39 +1,22 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { NextRequest, NextResponse } from 'next/server'
-import type { CookieOptions } from '@supabase/ssr'
 
 const createI18nResponse = vi.fn((request: NextRequest) =>
   NextResponse.redirect(new URL('/es', request.url)),
 )
-const getUserMock = vi.fn()
-const createServerClientMock = vi.fn()
+const getTokenMock = vi.fn()
 
 vi.mock('next-intl/middleware', () => ({
   default: vi.fn(() => (request: NextRequest) => createI18nResponse(request)),
 }))
 
-vi.mock('@supabase/ssr', () => ({
-  createServerClient: createServerClientMock.mockImplementation((_url: string, _key: string, options: {
-    cookieOptions?: CookieOptions & { name?: string }
-    cookies: {
-      setAll: (cookiesToSet: { name: string; value: string; options: CookieOptions }[]) => void
-    }
-  }) => ({
-    auth: {
-      getUser: vi.fn(async () => {
-        options.cookies.setAll([
-          {
-            name: 'sb-access-token',
-            value: 'refreshed-token',
-            options: { path: '/', httpOnly: true, sameSite: 'lax' },
-          },
-        ])
+vi.mock('next-auth/jwt', () => ({
+  getToken: getTokenMock,
+}))
 
-        return getUserMock()
-      }),
-    },
-  })),
+vi.mock('@/lib/authjs/config-edge', () => ({
+  AUTHJS_SESSION_COOKIE_NAME: 'authjs.session-token',
 }))
 
 describe('middleware', () => {
@@ -41,32 +24,25 @@ describe('middleware', () => {
     vi.resetModules()
     vi.clearAllMocks()
     vi.unstubAllEnvs()
-    vi.stubEnv('NEXT_PUBLIC_SUPABASE_URL', 'https://example.supabase.co')
-    vi.stubEnv('NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY', 'anon-key')
-    getUserMock.mockResolvedValue({ data: { user: null }, error: null })
+    vi.stubEnv('AUTH_SECRET', 'test-secret')
+    getTokenMock.mockResolvedValue(null)
   })
 
-  it('preserves the locale middleware response while applying refreshed Supabase cookies', async () => {
+  it('preserves the locale middleware response while reading Auth.js JWT session', async () => {
     const middleware = (await import('@/middleware')).default
 
     const response = await middleware(new NextRequest('http://localhost:3000/rooms'))
 
     expect(response.headers.get('location')).toBe('http://localhost:3000/es')
-    expect(response.cookies.get('sb-access-token')?.value).toBe('refreshed-token')
     const csrfCookie = response.cookies.get('alea-csrf-token')
     expect(csrfCookie?.value).toBeTruthy()
     expect(csrfCookie?.httpOnly).toBe(false)
     expect(csrfCookie?.sameSite).toBe('lax')
-    expect(createServerClientMock).toHaveBeenCalledWith(
-      'https://example.supabase.co',
-      'anon-key',
+    expect(getTokenMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        cookieOptions: expect.objectContaining({
-          httpOnly: true,
-          path: '/',
-          sameSite: 'lax',
-          secure: false,
-        }),
+        req: expect.any(NextRequest),
+        secret: 'test-secret',
+        cookieName: 'authjs.session-token',
       }),
     )
   })
@@ -83,22 +59,17 @@ describe('middleware', () => {
     expect(response.cookies.get('alea-csrf-token')).toBeUndefined()
   })
 
-  it('switches the Supabase auth cookie policy to secure cookies when COOKIE_SECURE is set to true', async () => {
-    vi.stubEnv('COOKIE_SECURE', 'true')
+  it('reads Auth.js session token with correct configuration when AUTH_SECRET is set', async () => {
+    vi.stubEnv('AUTH_SECRET', 'custom-secret')
     const middleware = (await import('@/middleware')).default
 
     await middleware(new NextRequest('https://app.alea.club/rooms'))
 
-    expect(createServerClientMock).toHaveBeenCalledWith(
-      'https://example.supabase.co',
-      'anon-key',
+    expect(getTokenMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        cookieOptions: expect.objectContaining({
-          httpOnly: true,
-          path: '/',
-          sameSite: 'lax',
-          secure: true,
-        }),
+        req: expect.any(NextRequest),
+        secret: 'custom-secret',
+        cookieName: 'authjs.session-token',
       }),
     )
   })
