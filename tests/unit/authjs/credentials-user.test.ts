@@ -32,6 +32,19 @@ describe('verifyCredentials', () => {
     drizzleWhereMock.mockReturnValue({ limit: drizzleLimitMock })
   })
 
+  describe('when database is unavailable', () => {
+    it('returns null when Drizzle db is not configured', async () => {
+      const { getDrizzleDb } = await import('@/lib/db')
+      vi.mocked(getDrizzleDb).mockImplementationOnce(() => {
+        throw new Error('Database not configured')
+      })
+
+      const result = await verifyCredentials('test@example.com', 'password123')
+
+      expect(result).toBeNull()
+    })
+  })
+
   describe('when database query throws', () => {
     it('returns null when query raises an error (e.g., missing table)', async () => {
       drizzleLimitMock.mockRejectedValueOnce(new Error('relation "profiles" does not exist'))
