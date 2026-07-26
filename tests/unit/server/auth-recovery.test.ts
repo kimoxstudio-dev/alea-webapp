@@ -22,6 +22,22 @@ vi.mock('next-auth/jwt', () => ({
   getToken: vi.fn(),
 }))
 
+vi.mock('@/lib/db', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/db')>('@/lib/db')
+  return {
+    ...actual,
+    getDrizzleAdminDb: vi.fn(async () => ({
+      update: vi.fn(() => ({
+        set: vi.fn(() => ({
+          where: vi.fn(() => ({
+            returning: vi.fn(async () => [{ id: 'member-1' }]),
+          })),
+        })),
+      })),
+    })),
+  }
+})
+
 import { createHash } from 'node:crypto'
 
 
