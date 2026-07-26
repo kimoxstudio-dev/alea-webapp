@@ -1,15 +1,14 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import {
-  createTransactionAwareMockBuilder,
-  resetFixtures,
-  setFixture,
-  setInsertFixture,
+  createStatefulDrizzleDb,
+  resetDb,
+  seed,
+  seedTable,
+  getQueryLog,
+  failNextQuery,
   createMockServiceError,
   MockServiceError,
-  insertMock,
-  updateMock,
-  deleteMock,
   createAdminSession,
   createMemberSession,
 } from '@/tests/unit/mocks/drizzle-mock'
@@ -32,8 +31,8 @@ import {
 vi.mock('server-only', () => ({}))
 
 vi.mock('@/lib/db', () => ({
-  getDrizzleDb: vi.fn(() => createTransactionAwareMockBuilder()),
-  getDrizzleAdminDb: vi.fn(() => createTransactionAwareMockBuilder()),
+  getDrizzleDb: vi.fn(() => createStatefulDrizzleDb()),
+  getDrizzleAdminDb: vi.fn(() => createStatefulDrizzleDb()),
   getAdminDb: vi.fn(() => ({
     from: vi.fn(() => ({
       update: vi.fn(() => ({
@@ -70,73 +69,12 @@ async function loadEventsService() {
 
 describe('events-service — createEvent multi-day (schedules)', () => {
   beforeEach(() => {
-    resetFixtures()
+    resetDb()
     vi.clearAllMocks()
   })
 
   it('calls create_event_with_blocks when schedules array is provided', async () => {
     const adminSession = createAdminSession()
-
-    const newEventRow = {
-      id: 'evt-multiday-1',
-      title: 'Multi-Day Tournament',
-      description: '3-day board game tournament',
-      date: '2026-07-10',
-      startTime: '09:00:00',
-      endTime: '17:00:00',
-      titleEs: null,
-      titleEn: null,
-      createdBy: null,
-      createdAt: new Date('2026-07-01'),
-      dateKind: 'single',
-      endDate: null,
-      imageUrl: null,
-      linkUrl: null,
-      blurbEs: null,
-      blurbEn: null,
-      recurrenceLabelEs: null,
-      recurrenceLabelEn: null,
-      categoryEs: null,
-      categoryEn: null,
-    }
-
-    const blocks = [
-      {
-        id: 'block-1',
-        eventId: 'evt-multiday-1',
-        roomId: 'room-a',
-        date: '2026-07-10',
-        startTime: '09:00:00',
-        endTime: '17:00:00',
-        allDay: false,
-        tableId: null,
-      },
-      {
-        id: 'block-2',
-        eventId: 'evt-multiday-1',
-        roomId: 'room-b',
-        date: '2026-07-11',
-        startTime: '10:00:00',
-        endTime: '18:00:00',
-        allDay: false,
-        tableId: null,
-      },
-      {
-        id: 'block-3',
-        eventId: 'evt-multiday-1',
-        roomId: 'room-a',
-        date: '2026-07-12',
-        startTime: '09:00:00',
-        endTime: '16:00:00',
-        allDay: false,
-        tableId: null,
-      },
-    ]
-
-    insertMock.mockResolvedValue([newEventRow])
-    setInsertFixture('event_room_blocks', blocks)
-    setFixture('tables', [])
-
     const { createEvent } = await loadEventsService()
 
     const result = await createEvent(adminSession, {
@@ -149,52 +87,16 @@ describe('events-service — createEvent multi-day (schedules)', () => {
       ],
     })
 
-    expect(result.id).toBe('evt-multiday-1')
+    // The mock materialises a real generated id now, rather than the
+    // canned string the old fixture returned — check the field under test.
+    expect(typeof result.id).toBe('string')
+    expect(result.id.length).toBeGreaterThan(0)
     expect(result.roomBlocks).toHaveLength(3)
     expect(result.schedules).toHaveLength(3)
   })
 
   it('populates schedules and roomBlocks from created blocks', async () => {
     const adminSession = createAdminSession()
-
-    const newEventRow = {
-      id: 'evt-sched-1',
-      title: 'Schedule Test',
-      description: null,
-      date: '2026-05-15',
-      startTime: '14:00:00',
-      endTime: '18:00:00',
-      titleEs: null,
-      titleEn: null,
-      createdBy: null,
-      createdAt: new Date('2026-05-01'),
-      dateKind: 'single',
-      endDate: null,
-      imageUrl: null,
-      linkUrl: null,
-      blurbEs: null,
-      blurbEn: null,
-      recurrenceLabelEs: null,
-      recurrenceLabelEn: null,
-      categoryEs: null,
-      categoryEn: null,
-    }
-
-    const blocks = [{
-      id: 'block-sched',
-      eventId: 'evt-sched-1',
-      roomId: 'room-1',
-      date: '2026-05-15',
-      startTime: '14:00:00',
-      endTime: '18:00:00',
-      allDay: false,
-      tableId: null,
-    }]
-
-    insertMock.mockResolvedValue([newEventRow])
-    setInsertFixture('event_room_blocks', blocks)
-    setFixture('tables', [])
-
     const { createEvent } = await loadEventsService()
 
     const result = await createEvent(adminSession, {
@@ -212,45 +114,6 @@ describe('events-service — createEvent multi-day (schedules)', () => {
 
   it('sets allDay=true for a block when allDay flag is set', async () => {
     const adminSession = createAdminSession()
-
-    const newEventRow = {
-      id: 'evt-allday',
-      title: 'All Day Event',
-      description: null,
-      date: '2026-06-20',
-      startTime: '00:00:00',
-      endTime: '23:59:00',
-      titleEs: null,
-      titleEn: null,
-      createdBy: null,
-      createdAt: new Date('2026-06-01'),
-      dateKind: 'single',
-      endDate: null,
-      imageUrl: null,
-      linkUrl: null,
-      blurbEs: null,
-      blurbEn: null,
-      recurrenceLabelEs: null,
-      recurrenceLabelEn: null,
-      categoryEs: null,
-      categoryEn: null,
-    }
-
-    const blocks = [{
-      id: 'block-allday',
-      eventId: 'evt-allday',
-      roomId: 'room-1',
-      date: '2026-06-20',
-      startTime: '00:00:00',
-      endTime: '23:59:00',
-      allDay: true,
-      tableId: null,
-    }]
-
-    insertMock.mockResolvedValue([newEventRow])
-    setInsertFixture('event_room_blocks', blocks)
-    setFixture('tables', [])
-
     const { createEvent } = await loadEventsService()
 
     const result = await createEvent(adminSession, {
@@ -315,33 +178,6 @@ describe('events-service — createEvent multi-day (schedules)', () => {
 
   it('accepts schedules with null roomId (no room blocked)', async () => {
     const adminSession = createAdminSession()
-
-    const newEventRow = {
-      id: 'evt-noroom',
-      title: 'No Room Blocked',
-      description: null,
-      date: '2026-06-20',
-      startTime: '14:00:00',
-      endTime: '18:00:00',
-      titleEs: null,
-      titleEn: null,
-      createdBy: null,
-      createdAt: new Date('2026-06-01'),
-      dateKind: 'single',
-      endDate: null,
-      imageUrl: null,
-      linkUrl: null,
-      blurbEs: null,
-      blurbEn: null,
-      recurrenceLabelEs: null,
-      recurrenceLabelEn: null,
-      categoryEs: null,
-      categoryEn: null,
-    }
-
-    insertMock.mockResolvedValue([newEventRow])
-    setFixture('event_room_blocks', [])
-
     const { createEvent } = await loadEventsService()
 
     const result = await createEvent(adminSession, {
@@ -352,15 +188,14 @@ describe('events-service — createEvent multi-day (schedules)', () => {
       ],
     })
 
-    expect(result.id).toBe('evt-noroom')
+    expect(typeof result.id).toBe('string')
     expect(result.roomBlocks).toHaveLength(0)
     expect(result.schedules).toHaveLength(1)
   })
 
   it('throws 500 when create_event_with_blocks RPC fails', async () => {
     const adminSession = createAdminSession()
-
-    insertMock.mockRejectedValue(new Error('RPC call failed'))
+    failNextQuery({ op: 'insert', table: 'events', error: new Error('RPC call failed') })
 
     const { createEvent } = await loadEventsService()
 
@@ -420,33 +255,6 @@ describe('events-service — createEvent multi-day (schedules)', () => {
 
   it('passes p_created_by when createdBy is provided in body', async () => {
     const adminSession = createAdminSession()
-
-    const newEventRow = {
-      id: 'evt-created-by',
-      title: 'Event with Creator',
-      description: null,
-      date: '2026-06-20',
-      startTime: '14:00:00',
-      endTime: '18:00:00',
-      titleEs: null,
-      titleEn: null,
-      createdBy: 'user-123',
-      createdAt: new Date('2026-06-01'),
-      dateKind: 'single',
-      endDate: null,
-      imageUrl: null,
-      linkUrl: null,
-      blurbEs: null,
-      blurbEn: null,
-      recurrenceLabelEs: null,
-      recurrenceLabelEn: null,
-      categoryEs: null,
-      categoryEn: null,
-    }
-
-    insertMock.mockResolvedValue([newEventRow])
-    setFixture('event_room_blocks', [])
-
     const { createEvent } = await loadEventsService()
 
     const result = await createEvent(adminSession, {
@@ -463,67 +271,6 @@ describe('events-service — createEvent multi-day (schedules)', () => {
 
   it('derives anchor date as earliest block and sorts schedules ascending', async () => {
     const adminSession = createAdminSession()
-
-    const newEventRow = {
-      id: 'evt-anchor',
-      title: 'Anchor Derive Test',
-      description: null,
-      date: '2026-06-20',
-      startTime: '09:00:00',
-      endTime: '14:00:00',
-      titleEs: null,
-      titleEn: null,
-      createdBy: null,
-      createdAt: new Date('2026-06-01'),
-      dateKind: 'single',
-      endDate: null,
-      imageUrl: null,
-      linkUrl: null,
-      blurbEs: null,
-      blurbEn: null,
-      recurrenceLabelEs: null,
-      recurrenceLabelEn: null,
-      categoryEs: null,
-      categoryEn: null,
-    }
-
-    const blocks = [
-      {
-        id: 'b1',
-        eventId: 'evt-anchor',
-        roomId: 'room-1',
-        date: '2026-06-20',
-        startTime: '09:00:00',
-        endTime: '14:00:00',
-        allDay: false,
-        tableId: null,
-      },
-      {
-        id: 'b2',
-        eventId: 'evt-anchor',
-        roomId: 'room-2',
-        date: '2026-06-22',
-        startTime: '10:00:00',
-        endTime: '15:00:00',
-        allDay: false,
-        tableId: null,
-      },
-      {
-        id: 'b3',
-        eventId: 'evt-anchor',
-        roomId: 'room-3',
-        date: '2026-06-21',
-        startTime: '14:00:00',
-        endTime: '18:00:00',
-        allDay: false,
-        tableId: null,
-      },
-    ]
-
-    insertMock.mockResolvedValue([newEventRow])
-    setInsertFixture('event_room_blocks', blocks)
-    setFixture('tables', [])
-
     const { createEvent } = await loadEventsService()
 
     const result = await createEvent(adminSession, {
@@ -544,57 +291,6 @@ describe('events-service — createEvent multi-day (schedules)', () => {
 
   it('handles multi-room single-day event (two rooms, same day)', async () => {
     const adminSession = createAdminSession()
-
-    const newEventRow = {
-      id: 'evt-multiroom',
-      title: 'Multi-Room Single Day',
-      description: null,
-      date: '2026-06-20',
-      startTime: '09:00:00',
-      endTime: '18:00:00',
-      titleEs: null,
-      titleEn: null,
-      createdBy: null,
-      createdAt: new Date('2026-06-01'),
-      dateKind: 'single',
-      endDate: null,
-      imageUrl: null,
-      linkUrl: null,
-      blurbEs: null,
-      blurbEn: null,
-      recurrenceLabelEs: null,
-      recurrenceLabelEn: null,
-      categoryEs: null,
-      categoryEn: null,
-    }
-
-    const blocks = [
-      {
-        id: 'b-mr-1',
-        eventId: 'evt-multiroom',
-        roomId: 'room-north',
-        date: '2026-06-20',
-        startTime: '09:00:00',
-        endTime: '13:00:00',
-        allDay: false,
-        tableId: null,
-      },
-      {
-        id: 'b-mr-2',
-        eventId: 'evt-multiroom',
-        roomId: 'room-south',
-        date: '2026-06-20',
-        startTime: '14:00:00',
-        endTime: '18:00:00',
-        allDay: false,
-        tableId: null,
-      },
-    ]
-
-    insertMock.mockResolvedValue([newEventRow])
-    setInsertFixture('event_room_blocks', blocks)
-    setFixture('tables', [])
-
     const { createEvent } = await loadEventsService()
 
     const result = await createEvent(adminSession, {
@@ -613,10 +309,11 @@ describe('events-service — createEvent multi-day (schedules)', () => {
 
   it('maps PG check-constraint error 23514 to 400', async () => {
     const adminSession = createAdminSession()
-
-    const pgError = new Error('check constraint violation') as any
-    pgError.code = '23514'
-    insertMock.mockRejectedValue(pgError)
+    failNextQuery({
+      op: 'insert',
+      table: 'events',
+      error: Object.assign(new Error('check constraint violation'), { code: '23514' }),
+    })
 
     const { createEvent } = await loadEventsService()
 
@@ -634,61 +331,19 @@ describe('events-service — createEvent multi-day (schedules)', () => {
 
 describe('events-service — updateEvent multi-day (schedules)', () => {
   beforeEach(() => {
-    resetFixtures()
+    resetDb()
     vi.clearAllMocks()
   })
 
   it('calls update_event_with_blocks when schedules array is provided', async () => {
     const adminSession = createAdminSession()
 
-    const currentRow = {
-      title: 'Old Title',
-      description: null,
-      titleEs: null,
-      titleEn: null,
-    }
-
-    const updatedRow = {
-      id: 'evt-update-multi',
-      title: 'Updated Multi-Block',
-      description: null,
-      date: '2026-07-10',
-      startTime: '10:00:00',
-      endTime: '16:00:00',
-      titleEs: null,
-      titleEn: null,
-      createdBy: null,
-      createdAt: new Date('2026-07-01'),
-      dateKind: 'single',
-      endDate: null,
-      imageUrl: null,
-      linkUrl: null,
-      blurbEs: null,
-      blurbEn: null,
-      recurrenceLabelEs: null,
-      recurrenceLabelEn: null,
-      categoryEs: null,
-      categoryEn: null,
-    }
-
-    const blocks = [
-      {
-        id: 'b-u1',
-        eventId: 'evt-update-multi',
-        roomId: 'room-1',
-        date: '2026-07-10',
-        startTime: '10:00:00',
-        endTime: '16:00:00',
-        allDay: false,
-        tableId: null,
-      },
-    ]
-
-    setFixture('events', [currentRow])
-    updateMock.mockResolvedValue([updatedRow])
-    deleteMock.mockResolvedValue([])
-    setInsertFixture('event_room_blocks', blocks)
-    setFixture('tables', [])
+    seedTable('events', [{
+      id: 'evt-update-multi', title: 'Old Title', description: null,
+      date: '2026-07-01', startTime: '00:00:00', endTime: '01:00:00',
+      titleEs: null, titleEn: null,
+      createdAt: new Date('2026-07-01T00:00:00.000Z'),
+    }])
 
     const { updateEvent } = await loadEventsService()
 
@@ -707,40 +362,12 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
   it('derives title from current event row when not provided in update body', async () => {
     const adminSession = createAdminSession()
 
-    const currentRow = {
-      title: 'Keep This Title',
-      description: 'Old desc',
-      titleEs: null,
-      titleEn: null,
-    }
-
-    const updatedRow = {
-      id: 'evt-keep-title',
-      title: 'Keep This Title',
-      description: null,
-      date: '2026-07-10',
-      startTime: '10:00:00',
-      endTime: '16:00:00',
-      titleEs: null,
-      titleEn: null,
-      createdBy: null,
-      createdAt: new Date('2026-07-01'),
-      dateKind: 'single',
-      endDate: null,
-      imageUrl: null,
-      linkUrl: null,
-      blurbEs: null,
-      blurbEn: null,
-      recurrenceLabelEs: null,
-      recurrenceLabelEn: null,
-      categoryEs: null,
-      categoryEn: null,
-    }
-
-    setFixture('events', [currentRow])
-    updateMock.mockResolvedValue([updatedRow])
-    deleteMock.mockResolvedValue([])
-    setFixture('event_room_blocks', [])
+    seedTable('events', [{
+      id: 'evt-keep-title', title: 'Keep This Title', description: 'Old desc',
+      date: '2026-07-01', startTime: '00:00:00', endTime: '01:00:00',
+      titleEs: null, titleEn: null,
+      createdAt: new Date('2026-07-01T00:00:00.000Z'),
+    }])
 
     const { updateEvent } = await loadEventsService()
 
@@ -757,8 +384,6 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
   it('throws 404 when event does not exist', async () => {
     const adminSession = createAdminSession()
 
-    setFixture('events', [])
-
     const { updateEvent } = await loadEventsService()
 
     await expect(
@@ -773,13 +398,13 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
   it('throws 500 when update_event_with_blocks RPC fails', async () => {
     const adminSession = createAdminSession()
 
-    setFixture('events', [{
-      title: 'Event',
-      description: null,
-      titleEs: null,
-      titleEn: null,
+    seedTable('events', [{
+      id: 'evt-1', title: 'Event', description: null,
+      date: '2026-07-01', startTime: '00:00:00', endTime: '01:00:00',
+      titleEs: null, titleEn: null,
+      createdAt: new Date('2026-07-01T00:00:00.000Z'),
     }])
-    updateMock.mockRejectedValue(new Error('RPC failed'))
+    failNextQuery({ op: 'update', table: 'events', error: new Error('RPC failed') })
 
     const { updateEvent } = await loadEventsService()
 
@@ -795,11 +420,11 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
   it('rejects empty schedules array with 400 on update', async () => {
     const adminSession = createAdminSession()
 
-    setFixture('events', [{
-      title: 'Event',
-      description: null,
-      titleEs: null,
-      titleEn: null,
+    seedTable('events', [{
+      id: 'evt-1', title: 'Event', description: null,
+      date: '2026-07-01', startTime: '00:00:00', endTime: '01:00:00',
+      titleEs: null, titleEn: null,
+      createdAt: new Date('2026-07-01T00:00:00.000Z'),
     }])
 
     const { updateEvent } = await loadEventsService()
@@ -814,11 +439,11 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
   it('rejects schedules array > 366 entries with 400 on update', async () => {
     const adminSession = createAdminSession()
 
-    setFixture('events', [{
-      title: 'Event',
-      description: null,
-      titleEs: null,
-      titleEn: null,
+    seedTable('events', [{
+      id: 'evt-1', title: 'Event', description: null,
+      date: '2026-07-01', startTime: '00:00:00', endTime: '01:00:00',
+      titleEs: null, titleEn: null,
+      createdAt: new Date('2026-07-01T00:00:00.000Z'),
     }])
 
     const bigSchedules = []
@@ -848,47 +473,11 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
   it('shrinks block count from 2 to 1 and returns correct schedules', async () => {
     const adminSession = createAdminSession()
 
-    setFixture('events', [{
-      title: 'Shrink Event',
-      description: null,
-      titleEs: null,
-      titleEn: null,
-    }])
-
-    const updatedRow = {
-      id: 'evt-shrink',
-      title: 'Shrink Event',
-      description: null,
-      date: '2026-07-10',
-      startTime: '10:00:00',
-      endTime: '14:00:00',
-      titleEs: null,
-      titleEn: null,
-      createdBy: null,
-      createdAt: new Date('2026-07-01'),
-      dateKind: 'single',
-      endDate: null,
-      imageUrl: null,
-      linkUrl: null,
-      blurbEs: null,
-      blurbEn: null,
-      recurrenceLabelEs: null,
-      recurrenceLabelEn: null,
-      categoryEs: null,
-      categoryEn: null,
-    }
-
-    updateMock.mockResolvedValue([updatedRow])
-    deleteMock.mockResolvedValue([])
-    setInsertFixture('event_room_blocks', [{
-      id: 'b-shrink',
-      eventId: 'evt-shrink',
-      roomId: 'room-1',
-      date: '2026-07-10',
-      startTime: '10:00:00',
-      endTime: '14:00:00',
-      allDay: false,
-      tableId: null,
+    seedTable('events', [{
+      id: 'evt-shrink', title: 'Shrink Event', description: null,
+      date: '2026-07-01', startTime: '00:00:00', endTime: '01:00:00',
+      titleEs: null, titleEn: null,
+      createdAt: new Date('2026-07-01T00:00:00.000Z'),
     }])
 
     const { updateEvent } = await loadEventsService()
@@ -906,70 +495,12 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
   it('grows block count from 1 to 3 and returns correct schedules', async () => {
     const adminSession = createAdminSession()
 
-    setFixture('events', [{
-      title: 'Grow Event',
-      description: null,
-      titleEs: null,
-      titleEn: null,
+    seedTable('events', [{
+      id: 'evt-grow', title: 'Grow Event', description: null,
+      date: '2026-07-01', startTime: '00:00:00', endTime: '01:00:00',
+      titleEs: null, titleEn: null,
+      createdAt: new Date('2026-07-01T00:00:00.000Z'),
     }])
-
-    const updatedRow = {
-      id: 'evt-grow',
-      title: 'Grow Event',
-      description: null,
-      date: '2026-07-10',
-      startTime: '09:00:00',
-      endTime: '17:00:00',
-      titleEs: null,
-      titleEn: null,
-      createdBy: null,
-      createdAt: new Date('2026-07-01'),
-      dateKind: 'single',
-      endDate: null,
-      imageUrl: null,
-      linkUrl: null,
-      blurbEs: null,
-      blurbEn: null,
-      recurrenceLabelEs: null,
-      recurrenceLabelEn: null,
-      categoryEs: null,
-      categoryEn: null,
-    }
-
-    updateMock.mockResolvedValue([updatedRow])
-    deleteMock.mockResolvedValue([])
-    setInsertFixture('event_room_blocks', [
-      {
-        id: 'b-grow-1',
-        eventId: 'evt-grow',
-        roomId: 'room-1',
-        date: '2026-07-10',
-        startTime: '09:00:00',
-        endTime: '13:00:00',
-        allDay: false,
-        tableId: null,
-      },
-      {
-        id: 'b-grow-2',
-        eventId: 'evt-grow',
-        roomId: 'room-2',
-        date: '2026-07-11',
-        startTime: '10:00:00',
-        endTime: '14:00:00',
-        allDay: false,
-        tableId: null,
-      },
-      {
-        id: 'b-grow-3',
-        eventId: 'evt-grow',
-        roomId: 'room-3',
-        date: '2026-07-12',
-        startTime: '11:00:00',
-        endTime: '15:00:00',
-        allDay: false,
-        tableId: null,
-      },
-    ])
 
     const { updateEvent } = await loadEventsService()
 
@@ -988,16 +519,17 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
   it('maps PG P0001 error to 404 on update', async () => {
     const adminSession = createAdminSession()
 
-    setFixture('events', [{
-      title: 'Event',
-      description: null,
-      titleEs: null,
-      titleEn: null,
+    seedTable('events', [{
+      id: 'evt-1', title: 'Event', description: null,
+      date: '2026-07-01', startTime: '00:00:00', endTime: '01:00:00',
+      titleEs: null, titleEn: null,
+      createdAt: new Date('2026-07-01T00:00:00.000Z'),
     }])
-
-    const pgError = new Error('function returned error') as any
-    pgError.code = 'P0001'
-    updateMock.mockRejectedValue(pgError)
+    failNextQuery({
+      op: 'update',
+      table: 'events',
+      error: Object.assign(new Error('function returned error'), { code: 'P0001' }),
+    })
 
     const { updateEvent } = await loadEventsService()
 
@@ -1013,16 +545,17 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
   it('maps PG check-constraint 23514 to 400 on update', async () => {
     const adminSession = createAdminSession()
 
-    setFixture('events', [{
-      title: 'Event',
-      description: null,
-      titleEs: null,
-      titleEn: null,
+    seedTable('events', [{
+      id: 'evt-1', title: 'Event', description: null,
+      date: '2026-07-01', startTime: '00:00:00', endTime: '01:00:00',
+      titleEs: null, titleEn: null,
+      createdAt: new Date('2026-07-01T00:00:00.000Z'),
     }])
-
-    const pgError = new Error('check constraint') as any
-    pgError.code = '23514'
-    updateMock.mockRejectedValue(pgError)
+    failNextQuery({
+      op: 'update',
+      table: 'events',
+      error: Object.assign(new Error('check constraint'), { code: '23514' }),
+    })
 
     const { updateEvent } = await loadEventsService()
 
@@ -1038,7 +571,7 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
 
 describe('events-service — listEventsBlockingRoom (multi-day awareness)', () => {
   beforeEach(() => {
-    resetFixtures()
+    resetDb()
     vi.clearAllMocks()
   })
 
@@ -1056,41 +589,28 @@ describe('events-service — listEventsBlockingRoom (multi-day awareness)', () =
 
 describe('events-service — deleteEvent multi-day cancellation', () => {
   beforeEach(() => {
-    resetFixtures()
+    resetDb()
     vi.clearAllMocks()
   })
 
   it('cancels reservations for every block date (multi-day event)', async () => {
     const adminSession = createAdminSession()
 
-    setFixture('events', [{
-      id: 'evt-cancel-multi',
-      titleEs: null,
-      titleEn: null,
-    }])
-    setFixture('event_room_blocks', [
-      {
-        id: 'b1',
-        eventId: 'evt-cancel-multi',
-        roomId: 'room-1',
-        date: '2026-07-10',
-        startTime: '09:00:00',
-        endTime: '17:00:00',
-        allDay: false,
-        tableId: null,
-      },
-      {
-        id: 'b2',
-        eventId: 'evt-cancel-multi',
-        roomId: 'room-2',
-        date: '2026-07-11',
-        startTime: '09:00:00',
-        endTime: '17:00:00',
-        allDay: false,
-        tableId: null,
-      },
-    ])
-    deleteMock.mockResolvedValue([])
+    seed({
+      events: [{ id: 'evt-cancel-multi', titleEs: null, titleEn: null }],
+      event_room_blocks: [
+        {
+          id: 'b1', eventId: 'evt-cancel-multi', roomId: 'room-1',
+          date: '2026-07-10', startTime: '09:00:00', endTime: '17:00:00',
+          allDay: false, tableId: null,
+        },
+        {
+          id: 'b2', eventId: 'evt-cancel-multi', roomId: 'room-2',
+          date: '2026-07-11', startTime: '09:00:00', endTime: '17:00:00',
+          allDay: false, tableId: null,
+        },
+      ],
+    })
 
     const { deleteEvent } = await loadEventsService()
 
@@ -1100,24 +620,16 @@ describe('events-service — deleteEvent multi-day cancellation', () => {
   it('skips reservation cancellation for null-room blocks', async () => {
     const adminSession = createAdminSession()
 
-    setFixture('events', [{
-      id: 'evt-noroom-cancel',
-      titleEs: null,
-      titleEn: null,
-    }])
-    setFixture('event_room_blocks', [
-      {
-        id: 'b-null',
-        eventId: 'evt-noroom-cancel',
-        roomId: null,
-        date: '2026-07-10',
-        startTime: '09:00:00',
-        endTime: '17:00:00',
-        allDay: false,
-        tableId: null,
-      },
-    ])
-    deleteMock.mockResolvedValue([])
+    seed({
+      events: [{ id: 'evt-noroom-cancel', titleEs: null, titleEn: null }],
+      event_room_blocks: [
+        {
+          id: 'b-null', eventId: 'evt-noroom-cancel', roomId: null,
+          date: '2026-07-10', startTime: '09:00:00', endTime: '17:00:00',
+          allDay: false, tableId: null,
+        },
+      ],
+    })
 
     const { deleteEvent } = await loadEventsService()
 
@@ -1127,34 +639,21 @@ describe('events-service — deleteEvent multi-day cancellation', () => {
   it('handles mixed null-room and real-room blocks', async () => {
     const adminSession = createAdminSession()
 
-    setFixture('events', [{
-      id: 'evt-mixed',
-      titleEs: null,
-      titleEn: null,
-    }])
-    setFixture('event_room_blocks', [
-      {
-        id: 'b-mixed-null',
-        eventId: 'evt-mixed',
-        roomId: null,
-        date: '2026-07-10',
-        startTime: '09:00:00',
-        endTime: '17:00:00',
-        allDay: false,
-        tableId: null,
-      },
-      {
-        id: 'b-mixed-real',
-        eventId: 'evt-mixed',
-        roomId: 'room-1',
-        date: '2026-07-11',
-        startTime: '10:00:00',
-        endTime: '18:00:00',
-        allDay: false,
-        tableId: null,
-      },
-    ])
-    deleteMock.mockResolvedValue([])
+    seed({
+      events: [{ id: 'evt-mixed', titleEs: null, titleEn: null }],
+      event_room_blocks: [
+        {
+          id: 'b-mixed-null', eventId: 'evt-mixed', roomId: null,
+          date: '2026-07-10', startTime: '09:00:00', endTime: '17:00:00',
+          allDay: false, tableId: null,
+        },
+        {
+          id: 'b-mixed-real', eventId: 'evt-mixed', roomId: 'room-1',
+          date: '2026-07-11', startTime: '10:00:00', endTime: '18:00:00',
+          allDay: false, tableId: null,
+        },
+      ],
+    })
 
     const { deleteEvent } = await loadEventsService()
 
@@ -1163,8 +662,6 @@ describe('events-service — deleteEvent multi-day cancellation', () => {
 
   it('throws 404 when deleting a non-existent event', async () => {
     const adminSession = createAdminSession()
-
-    setFixture('events', [])
 
     const { deleteEvent } = await loadEventsService()
 
@@ -1226,31 +723,7 @@ describe('events-service — deleteEvent multi-day cancellation', () => {
 
       // table-mismatch actually belongs to room-real, but the schedule below
       // declares it under room-other.
-      setFixture('tables', [{ id: 'table-mismatch', roomId: 'room-real' }])
-      insertMock.mockResolvedValue([
-        {
-          id: 'evt-guard-reject',
-          title: 'Guard Reject',
-          description: null,
-          date: '2026-08-01',
-          startTime: '10:00:00',
-          endTime: '12:00:00',
-          titleEs: null,
-          titleEn: null,
-          createdBy: null,
-          createdAt: new Date('2026-08-01'),
-          dateKind: 'single',
-          endDate: null,
-          imageUrl: null,
-          linkUrl: null,
-          blurbEs: null,
-          blurbEn: null,
-          recurrenceLabelEs: null,
-          recurrenceLabelEn: null,
-          categoryEs: null,
-          categoryEn: null,
-        },
-      ])
+      seedTable('tables', [{ id: 'table-mismatch', roomId: 'room-real' }])
 
       const { createEvent } = await loadEventsService()
 
@@ -1271,43 +744,27 @@ describe('events-service — deleteEvent multi-day cancellation', () => {
         }),
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      // The guard must fire BEFORE the event_room_blocks insert: insertMock is
-      // the shared fallback resolver used when no per-table fixture is set —
-      // it should only have been consumed once (for the `events` insert), not
-      // a second time for `event_room_blocks`, proving nothing was written
-      // for the rejected block.
-      expect(insertMock).toHaveBeenCalledTimes(1)
+      // The guard fires AFTER the events insert but BEFORE the
+      // event_room_blocks insert, inside the same transaction; the
+      // transaction rollback reverts the store but not the query log, so
+      // the log still proves exactly one insert (events) was attempted and
+      // none for event_room_blocks.
+      const inserts = getQueryLog().filter((entry) => entry.op === 'insert')
+      expect(inserts).toHaveLength(1)
+      expect(inserts[0].table).toBe('events')
     })
 
     it('rejects updateEvent when a block\'s table_id belongs to a different room than declared', async () => {
       const adminSession = createAdminSession()
 
-      setFixture('events', [
+      seedTable('events', [
         {
-          id: 'evt-guard-update',
-          title: 'Guard Update',
-          description: null,
-          date: '2026-08-02',
-          startTime: '10:00:00',
-          endTime: '12:00:00',
-          titleEs: null,
-          titleEn: null,
+          id: 'evt-guard-update', title: 'Guard Update', description: null,
+          date: '2026-08-02', startTime: '10:00:00', endTime: '12:00:00',
+          titleEs: null, titleEn: null,
         },
       ])
-      setFixture('tables', [{ id: 'table-mismatch', roomId: 'room-real' }])
-      updateMock.mockResolvedValue([
-        {
-          id: 'evt-guard-update',
-          title: 'Guard Update',
-          description: null,
-          date: '2026-08-02',
-          startTime: '10:00:00',
-          endTime: '12:00:00',
-          titleEs: null,
-          titleEn: null,
-        },
-      ])
-      deleteMock.mockResolvedValue([])
+      seedTable('tables', [{ id: 'table-mismatch', roomId: 'room-real' }])
 
       const { updateEvent } = await loadEventsService()
 
@@ -1328,54 +785,16 @@ describe('events-service — deleteEvent multi-day cancellation', () => {
         }),
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      // insertMock (event_room_blocks insert) must never be reached once the
-      // guard rejects inside the same transaction.
-      expect(insertMock).not.toHaveBeenCalled()
+      // event_room_blocks insert must never be reached once the guard
+      // rejects inside the same transaction (update has no events insert).
+      expect(getQueryLog().filter((entry) => entry.op === 'insert')).toHaveLength(0)
     })
 
     it('allows createEvent when a block\'s table_id correctly belongs to its declared room_id', async () => {
       const adminSession = createAdminSession()
 
-      const newEventRow = {
-        id: 'evt-guard-ok',
-        title: 'Guard OK',
-        description: null,
-        date: '2026-08-03',
-        startTime: '10:00:00',
-        endTime: '12:00:00',
-        titleEs: null,
-        titleEn: null,
-        createdBy: null,
-        createdAt: new Date('2026-08-01'),
-        dateKind: 'single',
-        endDate: null,
-        imageUrl: null,
-        linkUrl: null,
-        blurbEs: null,
-        blurbEn: null,
-        recurrenceLabelEs: null,
-        recurrenceLabelEn: null,
-        categoryEs: null,
-        categoryEn: null,
-      }
-
-      const blocks = [
-        {
-          id: 'block-guard-ok',
-          eventId: 'evt-guard-ok',
-          roomId: 'room-1',
-          tableId: 'table-1',
-          date: '2026-08-03',
-          startTime: '10:00:00',
-          endTime: '12:00:00',
-          allDay: false,
-        },
-      ]
-
       // table-1 correctly belongs to room-1 — the guard must allow this through.
-      setFixture('tables', [{ id: 'table-1', roomId: 'room-1' }])
-      insertMock.mockResolvedValue([newEventRow])
-      setInsertFixture('event_room_blocks', blocks)
+      seedTable('tables', [{ id: 'table-1', roomId: 'room-1' }])
 
       const { createEvent } = await loadEventsService()
 
@@ -1394,7 +813,7 @@ describe('events-service — deleteEvent multi-day cancellation', () => {
         ],
       })
 
-      expect(result.id).toBe('evt-guard-ok')
+      expect(typeof result.id).toBe('string')
       expect(result.roomBlocks).toHaveLength(1)
       expect(result.schedules[0].tableId).toBe('table-1')
     })
