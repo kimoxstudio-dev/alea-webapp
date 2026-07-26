@@ -1,4 +1,4 @@
-import { index, pgTable, primaryKey, text, timestamp, uuid } from 'drizzle-orm/pg-core'
+import { index, pgTable, primaryKey, text, timestamp, unique, uuid } from 'drizzle-orm/pg-core'
 import { rooms } from './rooms'
 import { reservations } from './reservations'
 
@@ -17,6 +17,16 @@ export const equipment = pgTable('equipment', {
  * as a room default (locks that equipment to the room).
  * (20260417000006_create_room_default_equipment_table.sql,
  *  index added in 20260528000006_supabase_linter_fixes.sql)
+ *
+ * `equipmentId` carries a UNIQUE constraint (KIM-434 PR1 hotfix,
+ * 0002_room_default_equipment_equipment_unique.sql): the exclusivity rule
+ * enforced in `setRoomDefaultEquipment()` (a piece of equipment can be the
+ * default for at most one room at a time, surfaced to callers as
+ * `EQUIPMENT_LOCKED_TO_ANOTHER_ROOM`) was previously only checked
+ * application-side via a SELECT-then-INSERT, which is race-able by two
+ * concurrent admins. The unique constraint gives a real DB-level guarantee:
+ * a concurrent conflicting INSERT now fails with a Postgres unique-violation
+ * (23505) instead of silently succeeding.
  */
 export const roomDefaultEquipment = pgTable(
   'room_default_equipment',
@@ -31,6 +41,7 @@ export const roomDefaultEquipment = pgTable(
   (t) => [
     primaryKey({ columns: [t.roomId, t.equipmentId] }),
     index('room_default_equipment_equipment_id_idx').on(t.equipmentId),
+    unique('room_default_equipment_equipment_id_unique').on(t.equipmentId),
   ],
 )
 

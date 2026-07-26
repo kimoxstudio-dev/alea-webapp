@@ -1,0 +1,1 @@
+ALTER TABLE "room_default_equipment" ADD CONSTRAINT "room_default_equipment_equipment_id_unique" UNIQUE("equipment_id");
