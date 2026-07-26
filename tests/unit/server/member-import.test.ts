@@ -2,6 +2,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SessionUser } from '@/lib/server/auth/auth'
 import ExcelJS from 'exceljs'
+import {
+  createDrizzleQueryBuilder,
+  selectMock,
+  updateMock,
+} from '@/tests/unit/mocks/drizzle-mock'
+
 
 function createAdminSession(): SessionUser {
   return { id: 'admin-1', role: 'admin', email: 'admin@example.com' }
@@ -12,8 +18,18 @@ function createMemberSession(): SessionUser {
 }
 
 
-const createUserMock = vi.fn()
-const deleteUserMock = vi.fn()
+const createUserMock = vi.fn(async () => ({
+  data: { user: { id: 'new-user-' + Math.random().toString(36).substr(2, 9) } },
+  error: null,
+}))
+const deleteUserMock = vi.fn(async () => ({ error: null }))
+
+// Mock createAuthUser to use createUserMock
+vi.mock('@/lib/auth/session', () => ({
+  createAuthUser: vi.fn(async (admin, opts) => createUserMock()),
+  deleteAuthUser: vi.fn(async (admin, id) => deleteUserMock()),
+  updateAuthUserById: vi.fn(async (id, opts) => ({ error: null })),
+}))
 
 const profileState = new Map<string, {
   id: string
@@ -52,41 +68,13 @@ function resetProfileState() {
   })
 }
 
+vi.mock('@/lib/db', () => ({
+  getDrizzleAdminDb: vi.fn(() => createDrizzleQueryBuilder()),
+  getDrizzleDb: vi.fn(() => createDrizzleQueryBuilder()),
+}))
+
 vi.mock('@/lib/supabase/server', () => ({
   createSupabaseServerAdminClient: vi.fn(() => ({
-    from: vi.fn(() => ({
-      select: vi.fn(() => ({
-        eq: vi.fn((column: 'member_number' | 'id', value: string) => ({
-          maybeSingle: vi.fn(async () => {
-            const data = column === 'member_number'
-              ? profileState.get(value) ?? null
-              : Array.from(profileState.values()).find((row) => row.id === value) ?? null
-            return { data, error: null }
-          }),
-        })),
-      })),
-      update: vi.fn((updates: Record<string, unknown>) => ({
-        eq: vi.fn((_column: 'id', value: string) => ({
-          select: vi.fn(() => ({
-            maybeSingle: vi.fn(async () => {
-              const target = Array.from(profileState.values()).find((row) => row.id === value)
-              if (!target) {
-                return { data: null, error: { message: 'not found' } }
-              }
-
-              const next = {
-                ...target,
-                ...updates,
-                updated_at: '2026-04-14T00:00:00.000Z',
-              }
-              profileState.delete(target.member_number)
-              profileState.set(next.member_number, next)
-              return { data: next, error: null }
-            }),
-          })),
-        })),
-      })),
-    })),
     auth: {
       admin: {
         createUser: createUserMock,
@@ -118,6 +106,7 @@ describe('parseMemberImportCsv', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetProfileState()
+    setupMocks()
   })
 
   it('parses the expected USUARIOS / ID CSV shape', async () => {
@@ -209,6 +198,7 @@ describe('normalizeMemberImportSource', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetProfileState()
+    setupMocks()
   })
 
   it('normalizes xlsx spreadsheets into the canonical dataset', async () => {
@@ -707,6 +697,7 @@ describe('Member-role session denial for requireAdminSession', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetProfileState()
+    setupMocks()
   })
 
   it('importMembersFromCsv throws 403 when session role is member', async () => {
@@ -733,3 +724,38 @@ describe('Member-role session denial for requireAdminSession', () => {
     })
   })
 })
+function setupMocks() {
+  // Configure selectMock to return all profiles from profileState
+  selectMock.mockImplementation(async () => {
+    return Array.from(profileState.values())
+  })
+
+  // Configure updateMock to update profileState and return the updated row
+  updateMock.mockImplementation(async (updates: Record<string, unknown>) => {
+    const entry = Object.entries(updates).find(([k]) => k === 'id' || k === 'member_number')
+    if (!entry) return []
+    
+    const [key, value] = entry
+    let target = null
+    
+    if (key === 'member_number') {
+      target = profileState.get(value)
+    } else if (key === 'id') {
+      target = Array.from(profileState.values()).find((row) => row.id === value)
+    }
+    
+    if (!target) return []
+    
+    const next = {
+      ...target,
+      ...updates,
+      updated_at: '2026-04-14T00:00:00.000Z',
+    }
+    
+    profileState.delete(target.member_number)
+    profileState.set(next.member_number, next)
+    
+    return [next]
+  })
+}
+
