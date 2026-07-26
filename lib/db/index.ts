@@ -59,6 +59,20 @@ type LegacySupabaseDbClient = SupabaseClient<Database>
 export type DbClient = NodePgDatabase<typeof schema>
 export type AdminDbClient = NodePgDatabase<typeof schema>
 
+/**
+ * Type of the transaction-scoped client passed to a `db.transaction(async
+ * (tx) => ...)` callback (KIM-438). Exported so a service can accept an
+ * already-open transaction as a parameter — e.g. a tx-aware variant of a
+ * helper that normally opens its own connection — letting a caller compose
+ * several writes (across different tables/services) into ONE atomic
+ * transaction instead of each opening its own. See
+ * `lib/server/events/events-service.ts`'s
+ * `cancelOverlappingReservationsForBlocksTx()` for the first consumer.
+ */
+export type DbTransaction = Parameters<DbClient['transaction']>[0] extends (tx: infer Tx) => Promise<unknown>
+  ? Tx
+  : never
+
 let pgPool: Pool | null = null
 let drizzleClient: NodePgDatabase<typeof schema> | null = null
 

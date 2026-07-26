@@ -1,7 +1,7 @@
 import 'server-only'
 import { and, asc, eq, gt, inArray, isNull, lt, or } from 'drizzle-orm'
-import { getAdminDb, getDrizzleAdminDb, getDrizzleDb } from '@/lib/db'
-import { events, eventRoomBlocks, tables } from '@/lib/db/schema'
+import { getAdminDb, getDrizzleAdminDb, getDrizzleDb, type DbTransaction } from '@/lib/db'
+import { events, eventRoomBlocks, reservations, tables } from '@/lib/db/schema'
 import { ServiceError, serviceError } from '@/lib/server/shared/service-error'
 import type { AdminEvent, AdminEventRoomBlock, AdminEventSchedule } from '@/lib/types'
 import type { SessionUser } from '@/lib/server/auth/auth'
@@ -315,6 +315,73 @@ export async function cancelOverlappingReservationsForBlocks(
         error,
       )
     }
+  }
+}
+
+/**
+ * KIM-438: transaction-aware variant of `cancelOverlappingReservationsForBlocks`
+ * above, for callers that need reservation cancellation to run INSIDE the
+ * same `db.transaction()` as the event/block write it follows, instead of as
+ * a separate non-transactional follow-up. Unlike the function above (which
+ * still targets the legacy Supabase seam, since `reservations` itself is not
+ * migrated — see the split-brain doc comment above), this writes to the
+ * `reservations` Drizzle/Neon table directly via the given transaction
+ * client `tx`, so a failure here rolls back the caller's whole transaction
+ * (event/block writes included) rather than leaving them committed with
+ * stale reservations.
+ *
+ * Used by `lib/server/events/club-events-service.ts` specifically (KIM-438
+ * closes the split-brain gap for that surface only — this file's own
+ * `createEventAtomic`/`updateEventAtomic`/`createEventWithBlocksAtomic`/
+ * `updateEventWithBlocksAtomic`/`deleteEventCascade` above are unchanged and
+ * still call the non-transactional `cancelOverlappingReservationsForBlocks`).
+ *
+ * Room -> table id resolution also runs against `tx` (not a fresh
+ * `getDrizzleDb()` call) so every read/write for one invocation shares the
+ * same connection/transaction. Errors are intentionally left to propagate
+ * (no try/catch swallow-and-log like the function above) so the transaction
+ * actually rolls back on failure instead of silently continuing.
+ */
+export async function cancelOverlappingReservationsForBlocksTx(
+  tx: DbTransaction,
+  blocks: EventBlockForCancellation[],
+): Promise<void> {
+  if (blocks.length === 0) return
+
+  const roomIdsNeedingLookup = [...new Set(
+    blocks.filter((b) => b.tableId === null).map((b) => b.roomId),
+  )]
+
+  const roomTableMap = new Map<string, string[]>()
+  if (roomIdsNeedingLookup.length > 0) {
+    const tableRows = await tx
+      .select({ id: tables.id, roomId: tables.roomId })
+      .from(tables)
+      .where(inArray(tables.roomId, roomIdsNeedingLookup))
+
+    for (const t of tableRows) {
+      const list = roomTableMap.get(t.roomId) ?? []
+      list.push(t.id)
+      roomTableMap.set(t.roomId, list)
+    }
+  }
+
+  for (const block of blocks) {
+    const tableIds = block.tableId ? [block.tableId] : (roomTableMap.get(block.roomId) ?? [])
+    if (tableIds.length === 0) continue
+
+    await tx
+      .update(reservations)
+      .set({ status: 'cancelled' })
+      .where(
+        and(
+          inArray(reservations.tableId, tableIds),
+          eq(reservations.date, block.date),
+          lt(reservations.startTime, block.endTime),
+          gt(reservations.endTime, block.startTime),
+          inArray(reservations.status, ['active', 'pending']),
+        ),
+      )
   }
 }
 
