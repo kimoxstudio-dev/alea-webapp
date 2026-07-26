@@ -45,6 +45,14 @@ export const AUTHJS_SESSION_COOKIE_NAME = isSecureContext()
 export const authConfigEdge = {
   session: {
     strategy: 'jwt',
+    // Explicit JWT lifetime (KIM-433 follow-up): left unset, NextAuth
+    // silently defaults to 30 days, which was never a deliberate choice for
+    // this app (develop's Supabase-based session had its own, separately
+    // configured lifetime). 7 days is chosen as a defensible balance for an
+    // authenticated members' booking app — long enough to avoid forcing
+    // frequent re-logins for routine use, short enough to bound how long a
+    // stolen/leaked session token stays valid.
+    maxAge: 60 * 60 * 24 * 7,
   },
   cookies: {
     sessionToken: {

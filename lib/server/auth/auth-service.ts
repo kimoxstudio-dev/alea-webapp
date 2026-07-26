@@ -2,7 +2,8 @@ import type { User } from '@/lib/types'
 import type { SessionUser } from '@/lib/server/auth/auth'
 import { createHash, randomBytes } from 'node:crypto'
 import { AuthError } from 'next-auth'
-import { auth as authJsAuth, signIn as authJsSignIn, signOut as authJsSignOut } from '@/lib/authjs/auth'
+import { signIn as authJsSignIn, signOut as authJsSignOut } from '@/lib/authjs/auth'
+import { verifyCredentials } from '@/lib/authjs/credentials-user'
 import { getDatabaseNow } from '@/lib/server/shared/database-time'
 import { serviceError } from '@/lib/server/shared/service-error'
 import { getAdminDb, getDb } from '@/lib/db'
@@ -101,41 +102,51 @@ type AuthClient = {
 /**
  * Establishes an Auth.js session for the given credentials, via the same
  * Credentials provider `lib/authjs/config.ts` registers (which delegates to
- * `lib/authjs/credentials-user.ts#verifyCredentials`). Used by `login()`
- * directly, and by `activateAccount()`/`recoverAccount()` after their
- * custom token/password logic finishes, to issue the post-activation /
+ * `lib/authjs/credentials-user.ts#verifyCredentials`). Used by `login()`,
+ * and by `activateAccount()`/`recoverAccount()` after their custom
+ * token/password logic finishes, to issue the post-activation /
  * post-recovery session that Supabase Auth's `signInWithPassword` used to
  * issue there.
  *
- * Returns the `id` of the profile Auth.js actually authenticated (read back
- * from the freshly-established session via `auth()`, called immediately
- * after `signIn()` resolves — both operate against the same request-scoped
- * cookie store, so this reflects the session `signIn()` just wrote, not a
- * stale one), or `null` (never throws) when the Credentials provider
- * rejects the sign-in (`AuthError`/`CredentialsSignin` — invalid
- * credentials, inactive account, etc.) so callers can map that to a
- * uniform 401/failure response, mirroring the previous Supabase-based
- * code's `if (error) ...` check. Any other, unexpected error is rethrown so
- * it still surfaces as a 500 instead of being silently reinterpreted as
- * "invalid credentials".
+ * IMPORTANT (KIM-433): this function deliberately does NOT attempt to read
+ * back which identity got authenticated by calling `auth()` immediately
+ * after `signIn()` resolves. That pattern cannot work reliably in a Route
+ * Handler: `signIn()` (`node_modules/next-auth/lib/actions.js`) writes the
+ * new session cookie via the request's *mutable* cookie jar
+ * (`await cookies()`), while zero-arg `auth()`
+ * (`node_modules/next-auth/lib/index.js`) resolves the session from
+ * `headers()` — a frozen snapshot of the *incoming* request headers taken
+ * at the start of the request. Nothing re-derives that snapshot from a
+ * cookie write that happens later in the same request. In the common case
+ * (no pre-existing Auth.js session cookie on the request), that readback
+ * always resolved to `null`, which incorrectly rejected logins that had, in
+ * fact, just succeeded — and worse, left a valid session cookie attached to
+ * that same 401 response.
  *
- * Callers that resolve their own profile row by a different lookup than
- * `verifyCredentials()` uses (e.g. `login()` resolves by `member_number`)
- * MUST compare this returned id against that profile's `id` before trusting
- * the session — see the identity-drift guard in `login()` below.
+ * Callers MUST instead resolve and compare the authenticated identity via
+ * `verifyCredentials()` (`@/lib/authjs/credentials-user`) directly, BEFORE
+ * calling this function — so that by the time a session is actually
+ * established here, the identity is already known and trusted, and a
+ * mismatch never results in a session being issued at all. See `login()`,
+ * `activateAccount()`, `recoverAccount()` below for that ordering.
+ *
+ * Returns `true` once the Credentials provider accepts the sign-in and a
+ * session cookie has been issued, or `false` (never throws) when it rejects
+ * the sign-in (`AuthError`/`CredentialsSignin` — invalid credentials,
+ * inactive account, etc.). Any other, unexpected error is rethrown so it
+ * still surfaces as a 500 instead of being silently reinterpreted as
+ * "invalid credentials".
  */
-async function signInWithAuthJs(email: string, password: string): Promise<string | null> {
+async function establishAuthJsSession(email: string, password: string): Promise<boolean> {
   try {
     await authJsSignIn('credentials', { email, password, redirect: false })
+    return true
   } catch (error) {
     if (error instanceof AuthError) {
-      return null
+      return false
     }
     throw error
   }
-
-  const session = await authJsAuth()
-  return session?.user?.id ?? null
 }
 
 /** Ends the current Auth.js session. Throws a 500 `ServiceError` on failure, same contract as the previous Supabase `signOut()`-based implementation. */
@@ -144,23 +155,6 @@ async function signOutWithAuthJs(): Promise<void> {
     await authJsSignOut({ redirect: false })
   } catch {
     serviceError('Internal server error', 500)
-  }
-}
-
-/**
- * Best-effort sign-out used only to invalidate a session that
- * `signInWithAuthJs()` already established but that we've since determined
- * must NOT be trusted (identity-drift mismatch — see `login()`). Unlike
- * `signOutWithAuthJs()`, this never throws: an already-detected security
- * failure (mismatched identity) must still fail closed even if the
- * best-effort cookie cleanup itself errors, so that failure cannot swallow
- * or replace the caller's authoritative 401 / `signInFailed` result.
- */
-async function signOutQuietly(): Promise<void> {
-  try {
-    await authJsSignOut({ redirect: false })
-  } catch {
-    // Intentionally ignored — see doc comment above.
   }
 }
 
@@ -509,26 +503,30 @@ export async function activateAccount(input: { token: unknown; password: unknown
   // Account activation has already succeeded at this point regardless of
   // whether this sign-in attempt succeeds — `signInFailed` lets the route
   // handler report that distinction to the client (same behavior as before).
+  //
+  // Identity is resolved and compared BEFORE any session is established —
+  // see `establishAuthJsSession()`'s doc comment (KIM-433) for why a
+  // same-request signIn()-then-auth() readback cannot be relied on instead.
   const authEmail = profile.auth_email ?? profile.email ?? ''
-  const authenticatedUserId = await signInWithAuthJs(authEmail, parsed.data.password)
+  const verifiedUser = await verifyCredentials(authEmail, parsed.data.password)
 
   // Defense-in-depth, mirroring login()'s identity-drift guard: `profile`
   // here was resolved by activation token -> profile_id (unique), so this
   // mismatch shouldn't be reachable in practice (verifyCredentials() now
   // keys on the uniquely-indexed auth_email column — see
-  // lib/authjs/credentials-user.ts). Still checked, and the session torn
-  // down on mismatch, so a future regression there can't silently hand back
-  // a session authenticated as a different profile than the one just
-  // activated.
-  const identityMismatch = authenticatedUserId !== null && authenticatedUserId !== profile.id
-  if (identityMismatch) {
-    await signOutQuietly()
-  }
+  // lib/authjs/credentials-user.ts). Still checked — and checked BEFORE any
+  // signIn() call — so on mismatch no session is ever issued for a profile
+  // other than the one just activated; there is nothing to tear down.
+  const identityMismatch = verifiedUser !== null && verifiedUser.id !== profile.id
+
+  const signInFailed = identityMismatch || !verifiedUser
+    ? true
+    : !(await establishAuthJsSession(authEmail, parsed.data.password))
 
   return {
     authEmail,
     user: toPublicUser(updatedProfile),
-    signInFailed: !authenticatedUserId || identityMismatch,
+    signInFailed,
   }
 }
 
@@ -618,21 +616,24 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
   }
 
   // Establish the post-recovery session — see the matching comment in
-  // `activateAccount()` above for why this moved here from the route handler.
+  // `activateAccount()` above for why this moved here from the route
+  // handler, and for why identity is resolved/compared before any session
+  // is established (KIM-433).
   const authEmail = profile.auth_email ?? profile.email ?? ''
-  const authenticatedUserId = await signInWithAuthJs(authEmail, parsed.data.password)
+  const verifiedUser = await verifyCredentials(authEmail, parsed.data.password)
 
   // Defense-in-depth identity-drift guard — see the matching comment in
   // `activateAccount()` above.
-  const identityMismatch = authenticatedUserId !== null && authenticatedUserId !== profile.id
-  if (identityMismatch) {
-    await signOutQuietly()
-  }
+  const identityMismatch = verifiedUser !== null && verifiedUser.id !== profile.id
+
+  const signInFailed = identityMismatch || !verifiedUser
+    ? true
+    : !(await establishAuthJsSession(authEmail, parsed.data.password))
 
   return {
     authEmail,
     user: toPublicUser(updatedProfile),
-    signInFailed: !authenticatedUserId || identityMismatch,
+    signInFailed,
   }
 }
 
@@ -665,23 +666,35 @@ export async function login(
     serviceError('Invalid credentials', 401)
   }
 
-  const authenticatedUserId = await signInWithAuthJs(authEmail, password)
+  // Resolve and verify the authenticated identity BEFORE issuing any
+  // session — see `establishAuthJsSession()`'s doc comment (KIM-433) for
+  // why a same-request signIn()-then-auth() readback cannot be relied on
+  // instead. `verifyCredentials()` runs the same Credentials-provider
+  // lookup/compare `signIn()` would perform internally, without touching
+  // cookies at all.
+  const verifiedUser = await verifyCredentials(authEmail, password)
 
-  if (!authenticatedUserId) {
+  if (!verifiedUser) {
     serviceError('Invalid credentials', 401)
   }
 
-  if (authenticatedUserId !== credentialProfile.id) {
-    // Guard against profile/auth drift: the identity Auth.js actually
-    // authenticated (read back from the session it just established) must
-    // match the profile resolved by member number above. Without this, a
-    // non-unique lookup inside verifyCredentials() could authenticate a
-    // different profile than the one whose data we're about to return —
-    // the caller would get profile A's data while holding a session
-    // authenticated as profile B. The mismatched session must not be left
-    // valid, so it's torn down before failing closed with the same generic
-    // error as ordinary bad credentials (never reveal which check failed).
-    await signOutQuietly()
+  if (verifiedUser.id !== credentialProfile.id) {
+    // Guard against profile/auth drift: the identity verifyCredentials()
+    // actually authenticated must match the profile resolved by member
+    // number above. Without this, a non-unique lookup could authenticate a
+    // different profile than the one whose data we're about to return.
+    // Checked BEFORE any signIn() call, so a mismatch here never results in
+    // a session cookie being issued at all — nothing to tear down, and no
+    // window where a valid cookie rides on a 401 response (unlike the
+    // previous read-back-after-signIn design this replaces).
+    serviceError('Invalid credentials', 401)
+  }
+
+  const sessionEstablished = await establishAuthJsSession(authEmail, password)
+  if (!sessionEstablished) {
+    // Extremely unlikely given verifyCredentials() above just accepted
+    // these same credentials, but fail closed rather than assume signIn()
+    // will always agree.
     serviceError('Invalid credentials', 401)
   }
 

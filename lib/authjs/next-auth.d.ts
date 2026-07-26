@@ -1,4 +1,5 @@
 import type { DefaultSession } from 'next-auth'
+import type {} from 'next-auth/jwt'
 
 /**
  * Type augmentation for Auth.js (NextAuth v5) — KIM-433, F3b login/session
