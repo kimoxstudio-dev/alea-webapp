@@ -1,8 +1,10 @@
+import { asc, count, eq, ilike, or, type SQL } from 'drizzle-orm'
 import type { MemberImportIssue, MemberImportResult, MemberImportRow, PaginatedResponse, User } from '@/lib/types'
-import { getAdminDb } from '@/lib/db'
+import { getDrizzleAdminDb } from '@/lib/db'
+import { profiles } from '@/lib/db/schema'
+import { createSupabaseServerAdminClient } from '@/lib/supabase/server'
 import { createAuthUser, deleteAuthUser, updateAuthUserById } from '@/lib/auth/session'
 import { serviceError } from '@/lib/server/shared/service-error'
-import type { TablesUpdate } from '@/lib/supabase/types'
 import { memberNumberSchema } from '@/lib/validations/auth'
 import { type PublicProfileRow, toPublicUser } from '@/lib/server/users/profile-mappers'
 import type { SessionUser } from '@/lib/server/auth/auth'
@@ -15,62 +17,52 @@ import {
 } from '@/lib/server/users/member-import'
 
 // Privilege checks (role === 'admin') live here in the service layer, not in
-// route handlers (repo convention). All functions below use the admin client
-// (bypasses RLS entirely) to read/write public.profiles, so this in-function
-// check is the only authorization guard once RLS is removed as part of the
-// Vercel/Postgres migration — mirrors profiles_admin_insert/update/delete
-// RLS policies (is_admin()). Member self-service profile reads/updates are
-// handled by a separate, non-admin surface and are not affected here.
+// route handlers (repo convention). Neon/Drizzle has no RLS, so this
+// in-function check is the only authorization guard for these mutations —
+// mirrors the profiles_admin_insert/update/delete RLS policies (is_admin())
+// this service used to rely on. Member self-service profile reads/updates
+// are handled by a separate, non-admin surface (lib/server/auth/auth*.ts)
+// and are not affected here — every function below requires an admin
+// session and reads/writes across all members, so `assertMemberRowsScoped()`
+// (member-row defense-in-depth, see lib/server/shared/data-scoping.ts) does
+// not apply to this file: there is no member-scoped "fetch my own rows" path
+// here for it to guard.
 function requireAdminSession(session: SessionUser): void {
   if (session.role !== 'admin') serviceError('Forbidden', 403)
 }
 
-type ProfilesQuery = {
-  eq: (column: string, value: unknown) => ProfilesQuery
-  or: (filter: string) => ProfilesQuery
-  maybeSingle: () => Promise<{ data: PublicProfileRow | null; error: unknown }>
-  order: (column: string, options: { ascending: boolean }) => {
-    range: (from: number, to: number) => Promise<{
-      data: PublicProfileRow[] | null
-      error: unknown
-      count: number | null
-    }>
-  }
-}
-type ProfilesTableClient = {
-  select: (columns: string, options?: { count?: 'exact' }) => ProfilesQuery
-  update: (updates: TablesUpdate<'profiles'>) => {
-    eq: (column: 'id', value: string) => {
-      select: (columns: string) => {
-        maybeSingle: () => Promise<{ data: PublicProfileRow | null; error: unknown }>
-      }
-    }
-  }
-}
-type AdminProfilesTableClient = {
-  select: (columns: string) => {
-    eq: (column: 'id', value: string) => {
-      maybeSingle: () => Promise<{ data: { id: string } | null; error: unknown }>
-    }
+/**
+ * Runs a Drizzle query, translating any thrown DB/driver error into a
+ * uniform 500 ServiceError. Business-logic outcomes (e.g. "no row
+ * returned" -> 404, validation -> 400) are handled by callers, outside this
+ * wrapper, so their specific status codes aren't swallowed into a 500.
+ */
+async function runQuery<T>(query: Promise<T>): Promise<T> {
+  try {
+    return await query
+  } catch {
+    serviceError('Internal server error', 500)
   }
 }
 
-type ProfileImportLookupResult = Promise<{ data: PublicProfileRow | null; error: unknown }>
-type ProfilesImportTableClient = {
-  select: (columns: string) => {
-    eq: (column: 'member_number' | 'id', value: string) => {
-      maybeSingle: () => ProfileImportLookupResult
-    }
-  }
-  update: (updates: TablesUpdate<'profiles'>) => {
-    eq: (column: 'id', value: string) => {
-      select: (columns: string) => {
-        maybeSingle: () => ProfileImportLookupResult
-      }
-    }
-  }
-}
-const PROFILE_COLUMNS = 'id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at'
+/** Column set returned to callers — mirrors `PublicProfileRow` (never selects `passwordHash`/`pswChanged`). */
+const PROFILE_COLUMNS = {
+  id: profiles.id,
+  memberNumber: profiles.memberNumber,
+  fullName: profiles.fullName,
+  authEmail: profiles.authEmail,
+  email: profiles.email,
+  phone: profiles.phone,
+  role: profiles.role,
+  isActive: profiles.isActive,
+  activeFrom: profiles.activeFrom,
+  noShowCount: profiles.noShowCount,
+  blockedUntil: profiles.blockedUntil,
+  createdAt: profiles.createdAt,
+  updatedAt: profiles.updatedAt,
+} as const
+
+type ProfileUpdate = Partial<typeof profiles.$inferInsert>
 
 function normalizePage(page: number) {
   return Math.max(1, Math.floor(Number(page)) || 1)
@@ -113,17 +105,18 @@ async function importMembersFromNormalizedRows(input: {
   const { totalRows, normalizedRows } = input
   const issues = [...input.issues]
   const auditedRows: MemberImportRow[] = []
-  const admin = getAdminDb()
-  const profiles = admin.from('profiles') as unknown as ProfilesImportTableClient
+  const db = getDrizzleAdminDb()
   const concurrencyLimit = 10
 
   async function processImportRow(row: MemberImportRow) {
-    const { data: existing, error: selectError } = await profiles
-      .select(PROFILE_COLUMNS)
-      .eq('member_number', row.memberNumber)
-      .maybeSingle()
-
-    if (selectError) {
+    let existing: PublicProfileRow | undefined
+    try {
+      ;[existing] = await db
+        .select(PROFILE_COLUMNS)
+        .from(profiles)
+        .where(eq(profiles.memberNumber, row.memberNumber))
+        .limit(1)
+    } catch {
       return {
         created: 0,
         updated: 0,
@@ -134,8 +127,8 @@ async function importMembersFromNormalizedRows(input: {
 
     if (existing) {
       const resolvedEmail = row.email ?? createInternalAuthEmail(row.memberNumber)
-      const updatePayload: TablesUpdate<'profiles'> = {
-        full_name: row.fullName,
+      const updatePayload: ProfileUpdate = {
+        fullName: row.fullName,
       }
       const normalizedRow: MemberImportRow = { ...row }
 
@@ -151,13 +144,9 @@ async function importMembersFromNormalizedRows(input: {
         normalizedRow.phone = existing.phone ?? null
       }
 
-      const { error: updateError } = await profiles
-        .update(updatePayload)
-        .eq('id', existing.id)
-        .select(PROFILE_COLUMNS)
-        .maybeSingle()
-
-      if (updateError) {
+      try {
+        await db.update(profiles).set(updatePayload).where(eq(profiles.id, existing.id))
+      } catch {
         return {
           created: 0,
           updated: 0,
@@ -177,7 +166,13 @@ async function importMembersFromNormalizedRows(input: {
     const authEmail = createInternalAuthEmail(row.memberNumber)
     const contactEmail = row.email ?? authEmail
     const temporaryPassword = `Temp${crypto.randomUUID().replace(/-/g, '')}Aa1`
-    const { data: authData, error: createAuthError } = await createAuthUser(admin, {
+    // Member provisioning still goes through Supabase Auth's admin API
+    // (createAuthUser/deleteAuthUser) — that's a separate seam
+    // (lib/auth/session, Supabase Auth) from `lib/db` (Postgres/profiles),
+    // and is out of scope for this migration. Only the `profiles` table
+    // access below moves to Drizzle.
+    const authAdmin = createSupabaseServerAdminClient()
+    const { data: authData, error: createAuthError } = await createAuthUser(authAdmin, {
       email: authEmail,
       password: temporaryPassword,
       email_confirm: true,
@@ -192,24 +187,29 @@ async function importMembersFromNormalizedRows(input: {
       }
     }
 
-    const { data: persistedProfile, error: updateProfileError } = await profiles
-      .update({
-        member_number: row.memberNumber,
-        full_name: row.fullName,
-        auth_email: authEmail,
-        email: contactEmail,
-        phone: row.phone,
-        role: 'member',
-        is_active: false,
-        active_from: null,
-        psw_changed: null,
-      })
-      .eq('id', authData.user.id)
-      .select(PROFILE_COLUMNS)
-      .maybeSingle()
+    let persistedProfile: { id: string } | undefined
+    try {
+      ;[persistedProfile] = await db
+        .update(profiles)
+        .set({
+          memberNumber: row.memberNumber,
+          fullName: row.fullName,
+          authEmail,
+          email: contactEmail,
+          phone: row.phone,
+          role: 'member',
+          isActive: false,
+          activeFrom: null,
+          pswChanged: null,
+        })
+        .where(eq(profiles.id, authData.user.id))
+        .returning({ id: profiles.id })
+    } catch {
+      persistedProfile = undefined
+    }
 
-    if (updateProfileError || !persistedProfile) {
-      await deleteAuthUser(admin, authData.user.id)
+    if (!persistedProfile) {
+      await deleteAuthUser(authAdmin, authData.user.id)
       return {
         created: 0,
         updated: 0,
@@ -289,28 +289,37 @@ export async function listPaginatedUsers(
   const page = normalizePage(input.page)
   const limit = normalizeLimit(input.limit)
   const search = input.search?.trim() ?? ''
-  const supabase = getAdminDb()
-  const profiles = supabase.from('profiles') as unknown as ProfilesTableClient
-  let query = profiles.select(PROFILE_COLUMNS, { count: 'exact' })
+  const db = getDrizzleAdminDb()
 
+  let whereClause: SQL | undefined
   if (search) {
     const sanitized = sanitizeSearchTerm(search)
     if (sanitized) {
-      const escaped = escapeLikeWildcards(sanitized)
-      query = query.or(`member_number.ilike.%${escaped}%,full_name.ilike.%${escaped}%,email.ilike.%${escaped}%`)
+      const pattern = `%${escapeLikeWildcards(sanitized)}%`
+      whereClause = or(
+        ilike(profiles.memberNumber, pattern),
+        ilike(profiles.fullName, pattern),
+        ilike(profiles.email, pattern),
+      )
     }
   }
 
-  const { data, error, count } = await query
-    .order('created_at', { ascending: true })
-    .range((page - 1) * limit, page * limit - 1)
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
+  const [rows, countRows] = await runQuery(
+    Promise.all([
+      db
+        .select(PROFILE_COLUMNS)
+        .from(profiles)
+        .where(whereClause)
+        .orderBy(asc(profiles.createdAt))
+        .limit(limit)
+        .offset((page - 1) * limit),
+      db.select({ value: count() }).from(profiles).where(whereClause),
+    ]),
+  )
 
-  const total = count ?? 0
+  const total = countRows[0]?.value ?? 0
   return {
-    data: ((data ?? []) as PublicProfileRow[]).map(toPublicUser),
+    data: rows.map(toPublicUser),
     total,
     page,
     limit,
@@ -324,14 +333,14 @@ export async function updateUser(
   body: { memberNumber?: unknown; fullName?: unknown; email?: unknown; phone?: unknown; role?: unknown; is_active?: unknown }
 ) {
   requireAdminSession(session)
-  const updates: TablesUpdate<'profiles'> = {}
+  const updates: ProfileUpdate = {}
   let nextMemberNumber: string | null = null
   if (body.memberNumber !== undefined) {
     const parsed = memberNumberSchema.safeParse(String(body.memberNumber))
     if (!parsed.success) {
       serviceError('Invalid member number format', 400)
     }
-    updates.member_number = parsed.data
+    updates.memberNumber = parsed.data
     nextMemberNumber = parsed.data
   }
   if (body.fullName !== undefined) {
@@ -339,7 +348,7 @@ export async function updateUser(
     if (!fullName) {
       serviceError('Full name is required', 400)
     }
-    updates.full_name = fullName
+    updates.fullName = fullName
   }
   if (body.email !== undefined) {
     assertNullableStringField(body.email, 'Email')
@@ -350,120 +359,109 @@ export async function updateUser(
     updates.phone = sanitizeOptionalUpdateValue(body.phone)
   }
   if (body.role === 'admin' || body.role === 'member') updates.role = body.role
-  if (typeof body.is_active === 'boolean') updates.is_active = body.is_active
+  if (typeof body.is_active === 'boolean') updates.isActive = body.is_active
 
   if (Object.keys(updates).length === 0) {
     serviceError('No updatable fields provided', 400)
   }
 
-  const supabase = getAdminDb()
-  const profiles = supabase.from('profiles') as unknown as ProfilesTableClient
-  const { data: existingProfile, error: existingProfileError } = await profiles
-    .select(PROFILE_COLUMNS)
-    .eq('id', id)
-    .maybeSingle()
-
-  if (existingProfileError) {
+  const db = getDrizzleAdminDb()
+  let existingProfile: PublicProfileRow | undefined
+  try {
+    ;[existingProfile] = await db.select(PROFILE_COLUMNS).from(profiles).where(eq(profiles.id, id)).limit(1)
+  } catch {
     serviceError('Internal server error', 500)
   }
   if (!existingProfile) {
     serviceError('User not found', 404)
   }
 
-  const existingInternalAuthEmail = createInternalAuthEmail(existingProfile.member_number)
+  const existingInternalAuthEmail = createInternalAuthEmail(existingProfile.memberNumber)
   if (
     nextMemberNumber !== null
-    && nextMemberNumber !== existingProfile.member_number
-    && existingProfile.auth_email === existingInternalAuthEmail
+    && nextMemberNumber !== existingProfile.memberNumber
+    && existingProfile.authEmail === existingInternalAuthEmail
   ) {
-    updates.auth_email = createInternalAuthEmail(nextMemberNumber)
+    updates.authEmail = createInternalAuthEmail(nextMemberNumber)
   }
 
-  const previousMemberNumber = existingProfile.member_number
-  const previousAuthEmail = existingProfile.auth_email
-  const { data, error } = await profiles
-    .update(updates)
-    .eq('id', id)
-    .select(PROFILE_COLUMNS)
-    .maybeSingle()
-
-  if (error) {
+  const previousMemberNumber = existingProfile.memberNumber
+  const previousAuthEmail = existingProfile.authEmail
+  let data: PublicProfileRow | undefined
+  try {
+    ;[data] = await db.update(profiles).set(updates).where(eq(profiles.id, id)).returning(PROFILE_COLUMNS)
+  } catch {
     serviceError('Internal server error', 500)
   }
   if (!data) {
     serviceError('User not found', 404)
   }
 
-  if (typeof updates.auth_email === 'string') {
-    const { error: authUpdateError } = await updateAuthUserById(supabase, id, { email: updates.auth_email })
+  if (typeof updates.authEmail === 'string') {
+    // Auth credential alignment is a Supabase Auth admin-API call, a
+    // different seam from `lib/db` — see the note in
+    // importMembersFromNormalizedRows above.
+    const authAdmin = createSupabaseServerAdminClient()
+    const { error: authUpdateError } = await updateAuthUserById(authAdmin, id, { email: updates.authEmail })
 
     if (authUpdateError) {
-      await profiles
-        .update({
-          member_number: previousMemberNumber,
-          auth_email: previousAuthEmail,
-        })
-        .eq('id', id)
+      try {
+        await db
+          .update(profiles)
+          .set({
+            memberNumber: previousMemberNumber,
+            authEmail: previousAuthEmail,
+          })
+          .where(eq(profiles.id, id))
+      } catch {
+        // Best-effort rollback of the member_number/auth_email pair — proceed
+        // to the 500 below regardless of whether the rollback itself
+        // succeeded, same as the previous (unchecked) Supabase-era behavior.
+      }
       serviceError('Failed to keep auth credentials aligned', 500)
     }
   }
 
-  return toPublicUser(data as PublicProfileRow)
+  return toPublicUser(data)
 }
 
 export async function resetNoShows(session: SessionUser, id: string) {
   requireAdminSession(session)
-  const admin = getAdminDb()
-  const profiles = admin.from('profiles') as unknown as AdminProfilesTableClient
-  const { data: existing, error: selectError } = await profiles
-    .select('id')
-    .eq('id', id)
-    .maybeSingle()
-  if (selectError) serviceError('Internal server error', 500)
-  if (!existing) serviceError('User not found', 404)
-
-  const { error } = await admin
-    .from('profiles')
-    .update({ no_show_count: 0, blocked_until: null })
-    .eq('id', id)
-  if (error) serviceError('Internal server error', 500)
+  const db = getDrizzleAdminDb()
+  const [row] = await runQuery(
+    db.update(profiles).set({ noShowCount: 0, blockedUntil: null }).where(eq(profiles.id, id)).returning({ id: profiles.id }),
+  )
+  if (!row) serviceError('User not found', 404)
 }
 
 export async function unblockUser(session: SessionUser, id: string) {
   requireAdminSession(session)
-  const admin = getAdminDb()
-  const profiles = admin.from('profiles') as unknown as AdminProfilesTableClient
-  const { data: existing, error: selectError } = await profiles
-    .select('id')
-    .eq('id', id)
-    .maybeSingle()
-  if (selectError) serviceError('Internal server error', 500)
-  if (!existing) serviceError('User not found', 404)
-
-  const { error } = await admin
-    .from('profiles')
-    .update({ blocked_until: null })
-    .eq('id', id)
-  if (error) serviceError('Internal server error', 500)
+  const db = getDrizzleAdminDb()
+  const [row] = await runQuery(
+    db.update(profiles).set({ blockedUntil: null }).where(eq(profiles.id, id)).returning({ id: profiles.id }),
+  )
+  if (!row) serviceError('User not found', 404)
 }
 
 export async function deleteUser(session: SessionUser, id: string) {
   requireAdminSession(session)
-  const admin = getAdminDb()
-  const profiles = admin.from('profiles') as unknown as AdminProfilesTableClient
-  const { data, error } = await profiles
-    .select('id')
-    .eq('id', id)
-    .maybeSingle()
-
-  if (error) {
+  const db = getDrizzleAdminDb()
+  let existing: { id: string } | undefined
+  try {
+    ;[existing] = await db.select({ id: profiles.id }).from(profiles).where(eq(profiles.id, id)).limit(1)
+  } catch {
     serviceError('Internal server error', 500)
   }
-  if (!data) {
+  if (!existing) {
     serviceError('User not found', 404)
   }
 
-  const { error: deleteError } = await deleteAuthUser(admin, id)
+  // Deleting the Supabase Auth user is a separate seam (lib/auth/session,
+  // Supabase Auth admin API) from `lib/db` (Postgres/profiles) — see the
+  // note in importMembersFromNormalizedRows above. It is out of scope for
+  // this migration; only the existence check above moved to Drizzle.
+  const authAdmin = createSupabaseServerAdminClient()
+  const { error: deleteError } = await deleteAuthUser(authAdmin, id)
   if (deleteError) {
     serviceError('Internal server error', 500)
   }

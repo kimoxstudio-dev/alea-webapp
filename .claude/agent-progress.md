@@ -1794,3 +1794,16 @@ No blocking issues. No modifications needed. Code is ready for security-reviewer
 
 #### [PR179-MERGE] software-engineer — resolve develop conflicts
 - [00:05] Started. Checked out migration-f3c-02-catalog-admin-batch in worktree (used `git checkout --ignore-other-worktrees` since another idle worktree, agent-a9c8dcca375ca9894, already had this branch checked out with HEAD exactly matching origin — no uncommitted work at risk since worktrees have independent working trees). Ran `pnpm install`.
+
+#### [KIM-440] software-engineer — migrate users-service to Drizzle
+- [17:00] Started
+- [17:05] Read reference migrations (equipment-service.ts, partners-service.ts) and lib/db/index.ts seam
+- [17:20] Migrated lib/server/users/users-service.ts: profiles table CRUD (list/update/import/resetNoShows/unblockUser/deleteUser) moved from getAdminDb()/Supabase query builder to getDrizzleAdminDb() + drizzle-orm query builder. Supabase Auth admin calls (createAuthUser/deleteAuthUser/updateAuthUserById) kept, now via a dedicated createSupabaseServerAdminClient() (separate seam, out of scope for the lib/db migration).
+- [17:25] Migrated lib/server/users/profile-mappers.ts: PublicProfileRow now derived from typeof profiles.$inferSelect (camelCase, Drizzle) instead of Supabase Tables<'profiles'> (snake_case); toPublicUser now converts Date -> ISO string for timestamp fields.
+- [17:30] Discovered unavoidable coupling: lib/server/auth/auth-service.ts (out of scope, still legacy Supabase seam) imported the same toPublicUser/PublicProfileRow — changing profile-mappers.ts would have silently type-checked but been wrong at runtime there. Fixed by giving auth-service.ts its own local snake_case PublicProfileRow alias + toUser() mapper (identical logic to the old toPublicUser), fully decoupling it from profile-mappers.ts. Zero behavior change to auth-service.ts.
+- [17:35] lib/server/users/member-import.ts checked: no getDb/getAdminDb usage at all (pure CSV/XLSX/ODT parsing) — left untouched, no coupling.
+- [17:36] assertMemberRowsScoped: not applicable — every users-service.ts function is admin-gated (requireAdminSession) with no member-scoped "fetch my own rows" path; documented via comment (mirrors equipment-service.ts's equivalent note). Member self-service profile reads live in lib/server/auth/*, out of scope.
+- [17:40] pnpm typecheck: clean (0 errors). pnpm lint: clean. pnpm build: exit 0 (43/43 pages generated).
+- [17:42] npx vitest run on users-service.test.ts/profile-mappers.test.ts/auth-service.test.ts: auth-service.test.ts 43/43 passed (confirms decoupling fix preserved behavior); users-service.test.ts + profile-mappers.test.ts fail (31 tests) because their mocks still target the legacy Supabase seam - expected, same pattern as prior migrations, left for qa-engineer.
+- [17:45] Committed on migration-f3c-05-users.
+- [17:45] Complete - users-service.ts + profile-mappers.ts migrated to Drizzle; auth-service.ts decoupled (local mapper); typecheck/lint/build clean; tests pending qa-engineer mock updates.
