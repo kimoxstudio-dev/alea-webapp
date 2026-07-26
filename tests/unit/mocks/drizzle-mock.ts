@@ -115,6 +115,11 @@ export const deleteMock = vi.fn()
  */
 export const whereMock = vi.fn()
 
+/**
+ * Captures the `.execute(sql\`...\`)` calls for raw SQL queries
+ */
+export const executeMock = vi.fn()
+
 // ── Session type and factories ──────────────────────────────────────────────────
 
 export type SessionUser = { id: string; role: 'admin' | 'member'; email?: string }
@@ -174,15 +179,58 @@ function createDeleteWhereReturningMock() {
 }
 
 /**
- * Create a mock for SELECT...WHERE chain.
- * Returns a function that delegates to selectMock, and also supports .orderBy().
- * Used for the `.orderBy` slot of `.select().from()` (no `.where()` in the
- * chain), so it does not itself record into `whereMock`.
+ * Create a chainable FROM/JOIN/WHERE/ORDER/LIMIT/OFFSET mock
+ * Supports all combinations of chaining methods
  */
-function createSelectWhereMock() {
-  const whereFn = vi.fn(() => selectMock())
-  whereFn.orderBy = vi.fn(() => selectMock())
-  return whereFn
+function createSelectFromChain() {
+  const executeSelect = () => selectMock()
+
+  const limitOffsetChain = {
+    offset: vi.fn(() => ({
+      then: (onFulfilled: any, onRejected: any) =>
+        executeSelect().then(onFulfilled, onRejected),
+      catch: (onRejected: any) => executeSelect().catch(onRejected),
+    })),
+    then: (onFulfilled: any, onRejected: any) =>
+      executeSelect().then(onFulfilled, onRejected),
+    catch: (onRejected: any) => executeSelect().catch(onRejected),
+  } as any
+
+  const orderByChain = {
+    limit: vi.fn(() => limitOffsetChain),
+    then: (onFulfilled: any, onRejected: any) =>
+      executeSelect().then(onFulfilled, onRejected),
+    catch: (onRejected: any) => executeSelect().catch(onRejected),
+  } as any
+
+  const whereChain = {
+    orderBy: vi.fn(() => orderByChain),
+    limit: vi.fn(() => limitOffsetChain),
+    then: (onFulfilled: any, onRejected: any) =>
+      executeSelect().then(onFulfilled, onRejected),
+    catch: (onRejected: any) => executeSelect().catch(onRejected),
+  } as any
+
+  return {
+    // Joins can be chained multiple times
+    leftJoin: vi.fn(() => createSelectFromChain()),
+    innerJoin: vi.fn(() => createSelectFromChain()),
+
+    // WHERE clause - records filter and returns chainable object
+    where: vi.fn((...args) => {
+      whereMock(...args)
+      return whereChain
+    }),
+
+    // Allow queries without WHERE to have direct access to orderBy/limit
+    orderBy: vi.fn(() => orderByChain),
+    limit: vi.fn(() => limitOffsetChain),
+
+    // Support thenable behavior for direct awaiting (for queries with no WHERE/LIMIT)
+    then: (onFulfilled: any, onRejected: any) =>
+      executeSelect().then(onFulfilled, onRejected),
+    catch: (onRejected: any) => executeSelect().catch(onRejected),
+  } as any
 }
 
 /**
@@ -190,11 +238,14 @@ function createSelectWhereMock() {
  *
  * Supports the following chains:
  * - `.select().from().where()` → resolves via `selectMock`
+ * - `.select().from().where().orderBy().limit().offset()` → resolves via `selectMock`
  * - `.select().from().orderBy()` → resolves via `selectMock`
- * - `.select().from().innerJoin().where()` → resolves via `selectMock`
+ * - `.select().from().limit().offset()` → resolves via `selectMock`
+ * - `.select().from().leftJoin().leftJoin().where()` → resolves via `selectMock`
  * - `.insert().values().returning()` → resolves via `insertMock`
  * - `.update().set().where().returning()` → resolves via `updateMock`
  * - `.delete().where().returning()` → resolves via `deleteMock`
+ * - `.execute(sql\`...\`)` → resolves via `executeMock`
  * - `.transaction(callback)` → calls callback with a new builder instance (for atomic operations)
  *
  * Usage:
@@ -208,32 +259,7 @@ function createSelectWhereMock() {
 export function createDrizzleQueryBuilder() {
   return {
     select: vi.fn(() => ({
-      from: vi.fn(() => {
-        const whereChain = createSelectWhereMock()
-        return {
-          orderBy: createSelectWhereMock(),
-          innerJoin: vi.fn(() => ({
-            where: vi.fn((...args) => {
-              whereMock(...args)
-              return selectMock()
-            }),
-          })),
-          where: vi.fn((...args) => {
-            // Record the filter condition (e.g. an RLS-replacement scope
-            // like `eq(partners.active, true)`) so tests can assert it was
-            // actually applied, not just that resolved rows look right.
-            whereMock(...args)
-            // Return an object that has both the thenable behavior and orderBy
-            const result = whereChain()
-            const chainObj = {
-              orderBy: vi.fn(() => result),
-              then: (onFulfilled, onRejected) => Promise.resolve(result).then(onFulfilled, onRejected),
-              catch: (onRejected) => Promise.resolve(result).catch(onRejected),
-            }
-            return chainObj
-          }),
-        }
-      }),
+      from: vi.fn(() => createSelectFromChain()),
     })),
     insert: vi.fn(() => ({
       values: vi.fn(() => createInsertValuesMock()),
@@ -252,6 +278,11 @@ export function createDrizzleQueryBuilder() {
         return createDeleteWhereReturningMock()
       }),
     })),
+    // Support raw SQL execution
+    execute: vi.fn((...args) => {
+      executeMock(...args)
+      return Promise.resolve({ rowCount: 0 })
+    }),
     // Support db.transaction() wrapper for atomic operations.
     // The callback receives a query builder (tx) with the same chainable structure.
     transaction: vi.fn(async (callback) => callback(createDrizzleQueryBuilder())),
