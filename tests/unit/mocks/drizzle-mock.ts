@@ -86,7 +86,8 @@
  * - `update(t).set(values).where(cond)[.returning(fields?)]`
  * - `delete(t).where(cond)[.returning(fields?)]`
  * - `transaction(cb)` — rolls the store back if `cb` throws
- * - `execute(sql)` — recorded in the query log, delegates to `executeMock`
+ * - `execute(sql)` — recorded in the query log, delegates to `executeMock`,
+ *   and honours `failNextQuery({ op: 'execute' })` like any other operation
  *
  * Conditions: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `and`, `or`, `not`,
  * `inArray`, `notInArray`, `isNull`, `isNotNull`, `between`, `notBetween`,
@@ -433,6 +434,14 @@ const queryLog: MockQueryLogEntry[] = []
 type FailureSpec = { op?: QueryOp; table?: string; times: number; error: unknown }
 const failures: FailureSpec[] = []
 
+/**
+ * Table key used for raw `db.execute(sql\`...\`)` calls, in the query log and
+ * when matching injected failures. Raw SQL names no table the mock can parse,
+ * so `execute` gets the empty key: op-only and unfiltered failures match it,
+ * table-scoped ones deliberately do not.
+ */
+const EXECUTE_TABLE_KEY = ''
+
 /** Normalise any table reference to a single store key. */
 function tableKey(ref: TableRef): string {
   const name = typeof ref === 'string' ? ref : getTableName(ref)
@@ -496,6 +505,17 @@ export function getQueryLog(): MockQueryLogEntry[] {
  * failNextQuery({ op: 'update', table: profiles })
  * // the service's catch-block path is now exercised
  * ```
+ *
+ * Applies to every operation in {@link QueryOp}, `execute` included:
+ *
+ * ```typescript
+ * failNextQuery({ op: 'execute' })
+ * // the next db.execute(sql`...`) rejects; the one after it resolves normally
+ * ```
+ *
+ * `table` cannot be used together with `op: 'execute'` — a raw-SQL statement
+ * names no table the mock can parse, so such a spec could never match. That
+ * combination throws here rather than sitting in the queue and never firing.
  */
 export function failNextQuery(spec: {
   op?: QueryOp
@@ -503,6 +523,12 @@ export function failNextQuery(spec: {
   times?: number
   error?: unknown
 } = {}): void {
+  if (spec.op === 'execute' && spec.table !== undefined) {
+    throw mockError(
+      "failNextQuery({ op: 'execute' }) cannot be scoped by table — raw SQL names no table the mock can " +
+        'parse. Drop the `table` field to fail the next execute regardless of the statement.',
+    )
+  }
   failures.push({
     op: spec.op,
     table: spec.table === undefined ? undefined : tableKey(spec.table),
@@ -1535,10 +1561,28 @@ export function createStatefulDrizzleDb() {
       set: vi.fn((values: MockRow) => new MockUpdateBuilder(table, values)),
     })),
     delete: vi.fn((table: Table) => new MockDeleteBuilder(table)),
-    execute: vi.fn((...args: unknown[]) => {
-      queryLog.push({ op: 'execute', table: '', rowCount: 0 })
+    /**
+     * Raw SQL passthrough. The store is never consulted (arbitrary SQL cannot be
+     * evaluated without a SQL engine), so the result comes from `executeMock`,
+     * defaulting to `{ rows: [], rowCount: 0 }`.
+     *
+     * Failure injection applies here exactly as it does to the other operations:
+     * `failNextQuery({ op: 'execute' })` — or an unfiltered `failNextQuery()` —
+     * makes the next call reject *before* `executeMock` is reached, and the
+     * rejected call is left out of the query log.
+     *
+     * A raw-SQL statement names no table the mock can parse, so `execute` is
+     * matched against {@link EXECUTE_TABLE_KEY} (the empty key) rather than a
+     * real one: a table-scoped failure such as `failNextQuery({ table: rooms })`
+     * deliberately does not fire on `execute`. The one combination that could
+     * never fire — an explicit `{ op: 'execute', table }` — is rejected up front
+     * by {@link failNextQuery} rather than silently ignored.
+     */
+    execute: vi.fn(async (...args: unknown[]) => {
+      consumeFailure('execute', EXECUTE_TABLE_KEY)
+      queryLog.push({ op: 'execute', table: EXECUTE_TABLE_KEY, rowCount: 0 })
       const result = executeMock(...args)
-      return Promise.resolve(result ?? { rows: [], rowCount: 0 })
+      return result ?? { rows: [], rowCount: 0 }
     }),
     /**
      * Runs `callback` against the same store. If it throws, every write made
