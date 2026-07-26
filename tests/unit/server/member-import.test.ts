@@ -4,6 +4,7 @@ import type { SessionUser } from '@/lib/server/auth/auth'
 import ExcelJS from 'exceljs'
 import {
   createDrizzleQueryBuilder,
+  insertMock,
   selectMock,
   updateMock,
 } from '@/tests/unit/mocks/drizzle-mock'
@@ -153,6 +154,43 @@ function configureImportUpdateMock() {
     }
     profileState.set(target.member_number, next)
     return [next]
+  })
+}
+
+/**
+ * Gives `insertMock` real persistence behavior against `profileState` for
+ * the new-member creation path in `importMembersFromNormalizedRows`.
+ *
+ * Models a real `INSERT INTO profiles (...) VALUES (...) RETURNING id`:
+ * it always creates exactly the row it was given (keyed by the new auth
+ * user's id passed in `values.id`), independent of anything already in
+ * `profileState` — unlike `configureImportUpdateMock` above, there is no
+ * "does a matching row already exist?" check here, because a real INSERT
+ * doesn't need one (see KIM-440 Finding A: `users-service.ts` now does
+ * `db.insert(profiles).values({ id: authData.user.id, ... }).returning(...)`
+ * instead of an `UPDATE ... WHERE id = :newId` that could never match).
+ */
+function configureImportInsertMock() {
+  insertMock.mockImplementation(async (values: Record<string, unknown>) => {
+    const now = '2026-04-14T00:00:00.000Z'
+    const row = {
+      id: values.id as string,
+      member_number: values.memberNumber as string,
+      full_name: (values.fullName as string | null) ?? null,
+      auth_email: values.authEmail as string,
+      email: (values.email as string | null) ?? null,
+      phone: (values.phone as string | null) ?? null,
+      role: (values.role as 'member' | 'admin') ?? 'member',
+      is_active: (values.isActive as boolean) ?? false,
+      active_from: (values.activeFrom as string | null) ?? null,
+      psw_changed: (values.pswChanged as string | null) ?? null,
+      no_show_count: 0,
+      blocked_until: null,
+      created_at: now,
+      updated_at: now,
+    }
+    profileState.set(row.member_number, row)
+    return [{ id: row.id }]
   })
 }
 
@@ -419,13 +457,15 @@ describe('importMembersFromCsv', () => {
     resetProfileState()
     // Real identity derivation from the row being processed (opts.email),
     // instead of a single hardcoded placeholder — profileState population
-    // belongs in updateMock (see configureImportUpdateMock), not here.
+    // belongs in updateMock/insertMock (see configureImportUpdateMock /
+    // configureImportInsertMock), not here.
     createUserMock.mockImplementation(async ({ email }: { email: string }) => ({
       data: { user: { id: `user-${email.split('@')[0]}` } },
       error: null,
     }))
     deleteUserMock.mockResolvedValue({ error: null })
     configureImportUpdateMock()
+    configureImportInsertMock()
   })
 
   it('updates existing members with generated fallback email and nullable phone', async () => {
@@ -507,17 +547,19 @@ describe('importMembersFromCsv', () => {
     ])
   })
 
-  // KIM-440 Finding A evidence: isolates *why* new-member creation fails,
-  // independently of the assertions above. `createAuthUser` succeeds (a real
-  // Supabase Auth user is provisioned), but the follow-up
-  // `db.update(profiles).set({...}).where(eq(profiles.id, authData.user.id))`
-  // matches zero rows on Neon/Postgres (no DB trigger populates `profiles`
-  // for a new auth user the way the legacy Supabase trigger did), so the
-  // service must take its `persist_import_failed` branch and roll back the
-  // just-created auth user. If this ever fails with a *different* issue code
-  // (e.g. `create_auth_failed`) or without `deleteUserMock` being called,
-  // that points to a mock-wiring regression rather than Finding A.
-  it('demonstrates Finding A: new-member persist fails because UPDATE-by-new-id matches zero rows', async () => {
+  // KIM-440 Finding A regression guard: isolates *why* new-member creation
+  // now succeeds, independently of the assertions above. `createAuthUser`
+  // succeeds (a real Supabase Auth user is provisioned), and the follow-up
+  // `db.insert(profiles).values({ id: authData.user.id, ... }).returning(...)`
+  // (which replaced the old `db.update(profiles).set({...}).where(eq(profiles.id,
+  // authData.user.id))` that could never match a brand-new id on Neon/Postgres,
+  // where no DB trigger pre-populates `profiles` the way the legacy Supabase
+  // trigger did) persists the new row, so the service must NOT take its
+  // `persist_import_failed` branch and must NOT roll back the just-created
+  // auth user. If this ever fails with a different issue code, or with
+  // `deleteUserMock` being called, that points to a regression in either the
+  // production fix or the insert mock wiring, not a passing test masking a bug.
+  it('persists a new member via explicit INSERT (KIM-440 Finding A regression guard)', async () => {
     const { importMembersFromCsv } = await loadService()
 
     selectMock.mockResolvedValue([])
@@ -527,14 +569,17 @@ describe('importMembersFromCsv', () => {
     )
 
     expect(createUserMock).toHaveBeenCalled()
-    expect(result.issues).toContainEqual({
-      rowNumber: 2,
-      memberNumber: '100020',
-      code: 'persist_import_failed',
-    })
-    expect(deleteUserMock).toHaveBeenCalledWith('user-100020')
-    expect(profileState.get('100020')).toBeUndefined()
-    expect(result.createdCount).toBe(0)
+    expect(result.issues).not.toContainEqual(
+      expect.objectContaining({ code: 'persist_import_failed' })
+    )
+    expect(deleteUserMock).not.toHaveBeenCalled()
+    expect(profileState.get('100020')).toEqual(
+      expect.objectContaining({
+        id: 'user-100020',
+        member_number: '100020',
+      })
+    )
+    expect(result.createdCount).toBe(1)
   })
 
   it('fills missing source email with internal generated email and keeps phone null', async () => {
@@ -663,12 +708,12 @@ describe('importMembersFromCsv', () => {
     const { importMembersFromCsv } = await loadService()
 
     // New-member path (no pre-existing 100020 row) whose persistence write
-    // is forced to fail: the real service's `db.update(profiles).set({...})
-    // .where(eq(profiles.id, authData.user.id)).returning({ id: profiles.id })`
-    // call resolves with no row, which is exactly what an empty array from
-    // `updateMock` simulates via the mocked `.returning()` chain.
+    // is forced to fail: the real service's `db.insert(profiles).values({...})
+    // .returning({ id: profiles.id })` call resolves with no row, which is
+    // exactly what an empty array from `insertMock` simulates via the mocked
+    // `.returning()` chain.
     selectMock.mockResolvedValue([])
-    updateMock.mockResolvedValueOnce([])
+    insertMock.mockResolvedValueOnce([])
 
     const adminSession = createAdminSession()
     const result = await importMembersFromCsv(adminSession, 'USUARIOS,ID,email,phone\nNew Member,100020,new@alea.club,699000111\n'
@@ -695,6 +740,7 @@ describe('importMembersFromSource', () => {
     }))
     deleteUserMock.mockResolvedValue({ error: null })
     configureImportUpdateMock()
+    configureImportInsertMock()
   })
 
   it('imports from xlsx source files and returns normalized rows for audit', async () => {
