@@ -1663,50 +1663,6 @@ No blocking issues. No modifications needed. Code is ready for security-reviewer
 - Pushed --force-with-lease to origin/docs/migration-status-update.
 - ✅ Complete — PR #175 rebased cleanly onto origin/develop, all conflicts resolved, 9 additional stale references from newer develop PRs fixed, full validation green.
 
-#### [KIM-437] software-engineer — Add agent working agreements to CLAUDE.md
-- [12:06] Started
-- [12:07] Strengthened test-file-ownership rule; added product-manager single-instance reinforcement; added new "Agent Working Agreements" section (Reporting Standards, Test Integrity, Shared Working Directory, Stopping and Escalating, Tooling)
-- [12:07] ✅ Complete — 34 lines added / 1 removed in CLAUDE.md, all 11 rules covered
-#### [KIM-432] software-engineer — Dev seed + admin bootstrap on Neon
-- Started. Branch migration-f2b-dev-seed-admin-bootstrap created off origin/develop.
-- Added scripts/seed.ts: Drizzle/Neon-native TS seed (own local pg.Pool + drizzle-orm/node-postgres client, does not touch lib/db/index.ts or lib/authjs/db.ts). Seeds 1 admin + 3 member profiles (email == authEmail for Auth.js credentials-user.ts compat, isActive=true, bcryptjs passwordHash), 2 rooms, 5 tables (varied type). Profiles upserted via onConflictDoUpdate on authEmail; rooms/tables via check-then-insert by name (documented in-file).
-- Guard: aborts unless NODE_ENV!=='production' AND DEV_SEED_CONFIRM===YES_SEED_NEON_DEV_DB. Verified all 3 abort paths (missing confirm, NODE_ENV=production, missing POSTGRES_URL) exit 1 before any Pool/connection is created — never ran against a real DB.
-- Added tsx ^4.23.1 devDependency + "db:seed": "tsx scripts/seed.ts" script. Documented DEV_SEED_CONFIRM in .env.example (name only) and added README.md "Dev seed on Neon" section with dev-only seeded credentials.
-- Validation: pnpm typecheck ✅, pnpm lint ✅. Did not run drizzle-kit push/migrate or pnpm db:seed for real, per hard constraint.
-- ✅ Complete — branch migration-f2b-dev-seed-admin-bootstrap, committed locally (not pushed, no PR opened per instructions).
-
-#### [KIM-432] security-reviewer — Dev seed + admin bootstrap security review
-- [08:08] Started. Read-only inspection via git show/git diff, no checkout of shared repo.
-- [08:08] scripts/seed.ts: confirmed assertDevSeedAllowed() runs first in main(), before createSeedDbClient() — no bypass path. No POSTGRES_URL*/password values logged anywhere. bcryptjs salt rounds=10 (reasonable default). Drizzle query builder used throughout (eq/and), no raw SQL/string concat — no injection surface.
-- [08:08] pnpm-lock.yaml diff verified minimal and expected: tsx@4.23.1 was already a transitive dep (via vite/vitest) in develop's lockfile; this PR only promotes it to an explicit devDependency — no new/unexpected packages pulled in.
-- [08:08] .env.example / README.md changes document DEV_SEED_CONFIRM by name only; README's seeded credentials table is clearly dev-only/placeholder (admin@devseed.local etc, password dev-only-Seed123!), not a real secret.
-- [08:08] Confirmed lib/db/index.ts, lib/authjs/db.ts, lib/db/schema/*, supabase/migrations/, supabase/seed.sql are untouched (empty diff).
-- [08:08] tests/unit/seed-guard.test.ts: reimplements guard logic inline rather than importing scripts/seed.ts; does not touch a DB or leak anything. LOW note: could drift from the real implementation over time (QA follow-up, non-blocking).
-- [08:08] ✅ Complete — APPROVE. No CRITICAL/HIGH findings. Pushing branch and opening PR.
-
-#### [KIM-432] security-reviewer — PR opened after isolated-worktree unblock
-- [08:40] Push from shared checkout failed due to stale node_modules there (pre-existing env drift unrelated to this change, missing drizzle-orm/next-auth/pg/bcryptjs/@vercel/blob despite develop's own package.json declaring them).
-- [08:40] Used a fresh throwaway worktree outside the shared checkout for pnpm install + re-verification only — shared checkout HEAD/node_modules never touched.
-- [08:40] Re-ran full validation in the clean worktree: typecheck OK, lint OK, test OK (1151 passed, 21 skipped, 0 failed), build OK.
-- [08:40] Pushed migration-f2b-dev-seed-admin-bootstrap and opened PR.
-- [08:40] Complete — PR #177: https://github.com/KimoxStudio/alea-webapp/pull/177
-#### [KIM-431] software-engineer — Wire lib/storage/qr seam to Vercel Blob adapter
-- Started implementation on branch migration-f3-wire-vercel-blob-seam
-- Rewired lib/storage/qr/index.ts to delegate uploadToStorage/getPublicStorageUrl/removeFromStorage to lib/storage/qr/vercel-blob.ts (removed @supabase/* import); added application-level 5MB cap in the seam
-- Fixed lib/server/tables/tables-service.ts::uploadQrCodeToStorage() to resolve URLs via getPublicStorageUrl() instead of manually building a Supabase URL (pre-documented required follow-up in vercel-blob.ts from KIM-421)
-- Added BLOB_READ_WRITE_TOKEN and BLOB_PUBLIC_BASE_URL to .env.example
-- pnpm typecheck: pass. pnpm lint: pass
-- ✅ Complete — index.ts wired to Vercel Blob adapter; uploads-service.ts untouched (no edits needed); pre-existing tests (tests/unit/lib/storage/qr.test.ts, tests/unit/server/tables-service.test.ts, tests/unit/server/uploads-service.test.ts) now fail as expected because they still mock @/lib/supabase/server instead of @vercel/blob — flagged for qa-engineer
-#### [PR180-FIX] software-engineer — harden static SQL verification
-- [15:30] Started: hardening tests/unit/server/drizzle-migration-apply.test.ts (PR #180, KIM-435)
-- [15:31] Added dynamic enum discovery from migration SQL (regex over CREATE TYPE ... AS ENUM), replacing hardcoded 4-enum list
-- [15:31] Added dynamic EXCLUDE constraint discovery, replacing hardcoded 2-name list; discovered a real gap (reservations_no_pending_active_overlap_bottom existed but was never checked by the old test)
-- [15:32] Added explicit table-extraction-count > 0 assertion cross-checked against independently-derived CREATE TABLE count (15 == 15)
-- [15:32] Changed password_hash assertion from substring match to actual declared-type check (must equal "text")
-- [15:32] Validated: pnpm typecheck clean, pnpm lint clean (no ESLint warnings/errors), vitest 20/20 passed
-- [15:33] Deliberate corruption test: changed password_hash to integer -> test correctly FAILED ("expected 'integer' to be 'text'"); reverted, test passes again
-- [15:33] Deliberate corruption test: malformed EXCLUDE constraint name (missing quotes) -> test correctly FAILED (extracted count 2 != raw clause count 3); reverted, test passes again
-- [15:34] ✅ Complete — committed and pushed to test/KIM-435-drizzle-migration-static-sql-verification
 #### [KIM-434] software-engineer — PR1 drizzle-seam-pilot
 - [09:05] Started. Worktree pre-provisioned with no node_modules; ran `pnpm install --frozen-lockfile` inside the isolated worktree (not the shared checkout).
 - [09:06] Investigated: 11 untouched `lib/db` consumers call live Supabase query-builder methods (`.from().eq()...`, `.rpc()`) directly on `getDb()`/`getAdminDb()`'s return value — a real Drizzle client cannot satisfy that API at runtime, not just at compile time. Also found `checkUserSlotOverlap()` in reservations-service.ts (untouched) calls `getDatabaseNow()` with no args, so database-time.ts's default path must stay on the legacy Supabase client too.
@@ -1822,8 +1778,19 @@ No blocking issues. No modifications needed. Code is ready for security-reviewer
 - [10:19] Agreed redundant index (room_default_equipment_equipment_id_idx) alongside new unique constraint is acceptable to leave as follow-up cleanup — not a correctness/security concern, just a minor schema tidiness item.
 - [10:19] Verdict: APPROVE. Committing and pushing.
 
-#### [PR178-FIX] software-engineer — database-time ms truncation
-- [15:35] Started
-- [15:41] Fixed lib/server/shared/database-time.ts: parseDatabaseNow() now branches on `rawValue instanceof Date` and uses it directly instead of coercing through String(rawValue), which truncated milliseconds via Date.prototype.toString(). Legacy Supabase RPC string branch unchanged.
-- [15:44] pnpm typecheck: pass. pnpm lint: pass (no warnings/errors). pnpm vitest run tests/unit/server/database-time.test.ts: 3/3 pass (no new test added — test files owned by qa-engineer).
-- [15:46] ✅ Complete — committed and pushed to migration-f3c-01-drizzle-seam-pilot
+#### [KIM-434] security-reviewer — PR2 review + PR
+- [10:56] Started review of tables/rooms/partners Drizzle migration (uncommitted worktree diff)
+- [10:56] Verified partners-service.ts listPartners applies eq(partners.active, true); only caller is app/[locale]/page.tsx public landing (listAdminPartners correctly unfiltered + admin-gated)
+- [10:56] Verified requireAdminSession preserved unchanged on all mutating ops (createPartner/updatePartner/deletePartner, createRoomEntry/updateRoom/createTableEntry, regenerateQrCodes) via diff spot-check
+- [10:56] Confirmed tables/rooms/partners are catalog/admin data, no user_id ownership column — no member-scoping requirement applies (same category as PR1 equipment)
+- [10:56] Confirmed split-brain reads (getTableAvailability/getRoomTablesAvailability) documented via header comments referencing PR description's split-brain disclosure
+- [10:56] Grepped for raw SQL (sql``, .execute, raw()) — none found; all Drizzle query-builder usage
+- [10:56] Grepped test files + mock helper for pglite/new Pool/new Client/connection strings — none found; drizzle-mock.ts is pure vi.fn() chainable mock, no real/embedded DB
+- [10:56] Spot-checked test counts (all 5 files) vs develop: tables=20/20, rooms=19/19, partners=43/43, table-mappers=14/14, oir208=34/34 — exact match, zero deletions
+- [10:56] Independently ran: tsc --noEmit clean; targeted vitest (130/130 pass); full suite 1150 passed/21 skipped; next lint clean; pnpm build succeeded
+- [10:56] No secrets/.env values found in diff (grepped for key/password/secret/PEM patterns)
+- [10:56] Verdict: APPROVE — no security concerns
+- [10:58] ✅ Complete — PR #179 opened (https://github.com/KimoxStudio/alea-webapp/pull/179)
+
+#### [PR179-MERGE] software-engineer — resolve develop conflicts
+- [00:05] Started. Checked out migration-f3c-02-catalog-admin-batch in worktree (used `git checkout --ignore-other-worktrees` since another idle worktree, agent-a9c8dcca375ca9894, already had this branch checked out with HEAD exactly matching origin — no uncommitted work at risk since worktrees have independent working trees). Ran `pnpm install`.

@@ -14,6 +14,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { readFileSync } from 'fs'
 import { join } from 'path'
 import type { ServiceError } from '@/lib/server/shared/service-error'
+import {
+  createDrizzleQueryBuilder,
+  selectMock,
+} from '@/tests/unit/mocks/drizzle-mock'
 
 vi.mock('server-only', () => ({}))
 vi.mock('@/lib/supabase/server', () => ({
@@ -31,6 +35,13 @@ vi.mock('@/lib/server/shared/service-error', () => ({
 vi.mock('@/lib/club-time', () => ({
   getCurrentClubDate: vi.fn(() => '2026-04-15'),
   isValidDateOnlyString: vi.fn((s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s)),
+}))
+
+vi.mock('@/lib/db', () => ({
+  getDrizzleDb: vi.fn(() => createDrizzleQueryBuilder()),
+  getDrizzleAdminDb: vi.fn(() => createDrizzleQueryBuilder()),
+  getAdminDb: vi.fn(),
+  getDb: vi.fn(),
 }))
 
 type EventRow = {
@@ -234,8 +245,13 @@ function buildSupabaseMock() {
 }
 
 describe('OIR-208: Unified Events', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks()
+    // Configure getAdminDb and getDb to delegate to Supabase mocks
+    const { getAdminDb, getDb } = await import('@/lib/db')
+    const { createSupabaseServerAdminClient, createSupabaseServerClient } = vi.mocked(await import('@/lib/supabase/server'))
+    vi.mocked(getAdminDb).mockImplementation(() => createSupabaseServerAdminClient())
+    vi.mocked(getDb).mockImplementation(() => createSupabaseServerClient())
   })
 
   describe('Visibility Toggle (visibleOnLanding)', () => {
@@ -1028,6 +1044,20 @@ describe('OIR-208: Unified Events', () => {
       'table-B': { id: 'table-B', room_id: ROOM, type: 'small' },
     }
 
+    function mockTableRow(id: string, roomId: string) {
+      return {
+        id,
+        roomId,
+        name: `Table ${id}`,
+        type: 'small',
+        qrCode: null,
+        posX: null,
+        posY: null,
+        createdAt: new Date('2026-01-01T00:00:00Z'),
+        qrCodeInf: null,
+      }
+    }
+
     it('getTableAvailability: block with table_id affects only that table', async () => {
       const eventBlocks = [{
         id: 'blk-1', event_id: 'evt-1', room_id: ROOM, table_id: 'table-A',
@@ -1039,6 +1069,8 @@ describe('OIR-208: Unified Events', () => {
       vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
         buildAvailabilityAdminClient(eventBlocks) as any,
       )
+      selectMock.mockResolvedValueOnce([mockTableRow('table-A', ROOM)])
+      selectMock.mockResolvedValueOnce([mockTableRow('table-B', ROOM)])
 
       const { getTableAvailability } = await import('@/lib/server/tables/tables-service')
 
@@ -1063,6 +1095,8 @@ describe('OIR-208: Unified Events', () => {
       vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
         buildAvailabilityAdminClient(eventBlocks) as any,
       )
+      selectMock.mockResolvedValueOnce([mockTableRow('table-A', ROOM)])
+      selectMock.mockResolvedValueOnce([mockTableRow('table-B', ROOM)])
 
       const { getTableAvailability } = await import('@/lib/server/tables/tables-service')
 
@@ -1083,6 +1117,7 @@ describe('OIR-208: Unified Events', () => {
       vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
         buildAvailabilityAdminClient(eventBlocks) as any,
       )
+      selectMock.mockResolvedValueOnce([mockTableRow('table-A', ROOM), mockTableRow('table-B', ROOM)])
 
       const { getRoomTablesAvailability } = await import('@/lib/server/rooms/rooms-service')
 
@@ -1102,6 +1137,7 @@ describe('OIR-208: Unified Events', () => {
       vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
         buildAvailabilityAdminClient(eventBlocks) as any,
       )
+      selectMock.mockResolvedValueOnce([mockTableRow('table-A', ROOM), mockTableRow('table-B', ROOM)])
 
       const { getRoomTablesAvailability } = await import('@/lib/server/rooms/rooms-service')
 

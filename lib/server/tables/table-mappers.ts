@@ -1,17 +1,23 @@
 import 'server-only'
 import type { GameTable } from '@/lib/types'
-import type { Tables } from '@/lib/supabase/types'
+import type { tables } from '@/lib/db/schema'
 
-type TableRow = Tables<'tables'>
+/**
+ * KIM-434 (F3c) PR2: `tables` is now Drizzle/Neon-backed (see
+ * `lib/server/tables/tables-service.ts`), so this mapper takes the Drizzle
+ * inferred row shape (camelCase) instead of the legacy Supabase
+ * `Tables<'tables'>` (snake_case) row shape.
+ */
+type TableRow = typeof tables.$inferSelect
 
 export function toGameTable(row: TableRow): GameTable {
   return {
     id: row.id,
-    roomId: row.room_id,
+    roomId: row.roomId,
     name: row.name,
     type: row.type,
-    qrCode: row.qr_code ?? '',
-    qrCodeInf: row.qr_code_inf ?? null,
-    position: row.pos_x == null || row.pos_y == null ? undefined : { x: row.pos_x, y: row.pos_y },
+    qrCode: row.qrCode ?? '',
+    qrCodeInf: row.qrCodeInf ?? null,
+    position: row.posX == null || row.posY == null ? undefined : { x: row.posX, y: row.posY },
   }
 }
