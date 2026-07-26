@@ -101,6 +101,20 @@ export const updateMock = vi.fn()
  */
 export const deleteMock = vi.fn()
 
+/**
+ * Captures the arguments passed to every `.where(...)` call across the
+ * chainable query builder (select/update/delete), so tests can assert that
+ * an authorization/scoping filter (e.g. `eq(partners.active, true)`, the
+ * service-layer replacement for a Supabase RLS policy) is actually applied
+ * — not just that the resolved rows look right.
+ *
+ * Usage:
+ * ```typescript
+ * expect(whereMock).toHaveBeenCalledWith(eq(partners.active, true))
+ * ```
+ */
+export const whereMock = vi.fn()
+
 // ── Session type and factories ──────────────────────────────────────────────────
 
 export type SessionUser = { id: string; role: 'admin' | 'member'; email?: string }
@@ -162,6 +176,8 @@ function createDeleteWhereReturningMock() {
 /**
  * Create a mock for SELECT...WHERE chain.
  * Returns a function that delegates to selectMock, and also supports .orderBy().
+ * Used for the `.orderBy` slot of `.select().from()` (no `.where()` in the
+ * chain), so it does not itself record into `whereMock`.
  */
 function createSelectWhereMock() {
   const whereFn = vi.fn(() => selectMock())
@@ -197,9 +213,16 @@ export function createDrizzleQueryBuilder() {
         return {
           orderBy: createSelectWhereMock(),
           innerJoin: vi.fn(() => ({
-            where: createSelectWhereMock(),
+            where: vi.fn((...args) => {
+              whereMock(...args)
+              return selectMock()
+            }),
           })),
-          where: vi.fn(() => {
+          where: vi.fn((...args) => {
+            // Record the filter condition (e.g. an RLS-replacement scope
+            // like `eq(partners.active, true)`) so tests can assert it was
+            // actually applied, not just that resolved rows look right.
+            whereMock(...args)
             // Return an object that has both the thenable behavior and orderBy
             const result = whereChain()
             const chainObj = {
@@ -217,13 +240,17 @@ export function createDrizzleQueryBuilder() {
     })),
     update: vi.fn(() => ({
       set: vi.fn(() => ({
-        where: vi.fn(() => ({
-          returning: vi.fn(() => updateMock()),
-        })),
+        where: vi.fn((...args) => {
+          whereMock(...args)
+          return { returning: vi.fn(() => updateMock()) }
+        }),
       })),
     })),
     delete: vi.fn(() => ({
-      where: vi.fn(() => createDeleteWhereReturningMock()),
+      where: vi.fn((...args) => {
+        whereMock(...args)
+        return createDeleteWhereReturningMock()
+      }),
     })),
     // Support db.transaction() wrapper for atomic operations.
     // The callback receives a query builder (tx) with the same chainable structure.

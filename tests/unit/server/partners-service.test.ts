@@ -4,10 +4,12 @@ import { readFileSync } from 'fs'
 import { join } from 'path'
 import type { ServiceError } from '@/lib/server/shared/service-error'
 import {
+  createDrizzleQueryBuilder,
   selectMock,
   insertMock,
   updateMock,
   deleteMock,
+  whereMock,
   createAdminSession,
   createMemberSession,
 } from '@/tests/unit/mocks/drizzle-mock'
@@ -30,48 +32,6 @@ import {
  * - Migration enables RLS, creates SELECT-only policy, seeds 20 partners
  * - Chained .order() calls: secondary order('name') tie-break for consistent results
  */
-
-/**
- * Enhanced Drizzle query builder mock that supports .where().orderBy() chaining.
- * Returns thenable objects that can also be chained with .orderBy().
- */
-function createDrizzleQueryBuilder() {
-  // Create a chainable object that's also thenable (awaitable)
-  const createChainableSelectQuery = () => {
-    return {
-      orderBy: vi.fn(() => selectMock()),
-      where: vi.fn(() => {
-        // Return something thenable that also has .orderBy()
-        const thenableWithOrderBy = selectMock() as any
-        thenableWithOrderBy.orderBy = vi.fn(() => selectMock())
-        return thenableWithOrderBy
-      }),
-    }
-  }
-
-  return {
-    select: vi.fn(() => ({
-      from: vi.fn(() => createChainableSelectQuery()),
-    })),
-    insert: vi.fn(() => ({
-      values: vi.fn(() => ({
-        returning: vi.fn(() => insertMock()),
-      })),
-    })),
-    update: vi.fn(() => ({
-      set: vi.fn(() => ({
-        where: vi.fn(() => ({
-          returning: vi.fn(() => updateMock()),
-        })),
-      })),
-    })),
-    delete: vi.fn(() => ({
-      where: vi.fn(() => ({
-        returning: vi.fn(() => deleteMock()),
-      })),
-    })),
-  }
-}
 
 vi.mock('@/lib/db', () => ({
   getDrizzleDb: vi.fn(() => createDrizzleQueryBuilder()),
@@ -165,6 +125,27 @@ describe('partners-service', () => {
       await listPartners()
 
       expect(vi.mocked(await import('@/lib/db')).getDrizzleDb).toHaveBeenCalled()
+    })
+
+    it('applies the active-only filter (RLS-replacement scoping in the service layer)', async () => {
+      // Neon has no RLS: the "partners_select_active" policy (USING (active = true))
+      // that used to gate this read on Supabase no longer exists at the DB layer.
+      // listPartners() must apply the equivalent filter itself via `.where(eq(partners.active, true))`.
+      // This test fails loudly if that filter is ever dropped from the service.
+      selectMock.mockResolvedValue([mockPartner1, mockPartner2])
+
+      const { listPartners } = await loadPartnersService()
+      await listPartners()
+
+      // `loadPartnersService()` calls `vi.resetModules()`, so the service was
+      // loaded against a fresh copy of drizzle-orm/schema. Import them the
+      // same way (after that reset) so `eq(...)` here builds a SQL condition
+      // from the *same* module instances the service used — otherwise the
+      // structurally-identical-but-different-instance objects fail toEqual.
+      const { eq } = await import('drizzle-orm')
+      const { partners } = await import('@/lib/db/schema')
+
+      expect(whereMock).toHaveBeenCalledWith(eq(partners.active, true))
     })
 
     it('maps database columns to public Partner type', async () => {
@@ -620,7 +601,8 @@ describe('partners-service', () => {
 
   describe('migration sanity checks', () => {
     const migrationPath = join(
-      '/Users/samuelromeroarbelo/Projects/Alea/alea-webapp/supabase/migrations',
+      process.cwd(),
+      'supabase/migrations',
       '20260704000002_oir204_partners_table.sql'
     )
     const migrationContent = readFileSync(migrationPath, 'utf8')

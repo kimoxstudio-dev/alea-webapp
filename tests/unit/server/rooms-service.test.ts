@@ -17,37 +17,8 @@ const listSavedGamesMock = vi.fn()
 const listEventsMock = vi.fn()
 const regenerateQrCodesMock = vi.fn()
 
-// Custom Drizzle mock factory that supports .select().from().where().orderBy() chain
-function createDrizzleQueryBuilderWithOrderBy() {
-  return {
-    select: vi.fn(() => ({
-      from: vi.fn(() => ({
-        orderBy: vi.fn(() => selectMock()),
-        where: vi.fn(() => ({
-          orderBy: vi.fn(() => selectMock()),
-        })),
-        innerJoin: vi.fn(() => ({
-          where: vi.fn(() => selectMock()),
-        })),
-      })),
-    })),
-    insert: vi.fn(() => ({
-      values: vi.fn(() => ({
-        returning: vi.fn(() => insertMock()),
-      })),
-    })),
-    update: vi.fn(() => ({
-      set: vi.fn(() => ({
-        where: vi.fn(() => ({
-          returning: vi.fn(() => updateMock()),
-        })),
-      })),
-    })),
-  }
-}
-
 vi.mock('@/lib/db', () => ({
-  getDrizzleDb: vi.fn(() => createDrizzleQueryBuilderWithOrderBy()),
+  getDrizzleDb: vi.fn(() => createDrizzleQueryBuilder()),
   getDrizzleAdminDb: vi.fn(() => createDrizzleQueryBuilder()),
   getAdminDb: vi.fn(() => ({
     from: vi.fn((table: string) => {
