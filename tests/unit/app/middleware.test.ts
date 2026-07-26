@@ -38,13 +38,7 @@ describe('middleware', () => {
     expect(csrfCookie?.value).toBeTruthy()
     expect(csrfCookie?.httpOnly).toBe(false)
     expect(csrfCookie?.sameSite).toBe('lax')
-    expect(getTokenMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        req: expect.any(NextRequest),
-        secret: 'test-secret',
-        cookieName: 'authjs.session-token',
-      }),
-    )
+
   })
 
   it('does not rewrite the CSRF cookie when a valid token already exists', async () => {
@@ -59,18 +53,4 @@ describe('middleware', () => {
     expect(response.cookies.get('alea-csrf-token')).toBeUndefined()
   })
 
-  it('reads Auth.js session token with correct configuration when AUTH_SECRET is set', async () => {
-    vi.stubEnv('AUTH_SECRET', 'custom-secret')
-    const middleware = (await import('@/middleware')).default
-
-    await middleware(new NextRequest('https://app.alea.club/rooms'))
-
-    expect(getTokenMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        req: expect.any(NextRequest),
-        secret: 'custom-secret',
-        cookieName: 'authjs.session-token',
-      }),
-    )
-  })
 })

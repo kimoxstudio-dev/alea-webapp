@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const authJsSignInMock = vi.fn()
 const authJsSignOutMock = vi.fn()
 const authJsAuthMock = vi.fn()
+const verifyCredentialsMock = vi.fn()
 const authSignInWithPasswordMock = vi.fn()
 const authCreateUserMock = vi.fn()
 const authDeleteUserMock = vi.fn()
@@ -31,6 +32,13 @@ vi.mock('next-auth/jwt', () => ({
 
 vi.mock('@/lib/auth/session', () => ({
   signInWithPassword: authSignInWithPasswordMock,
+  createAuthUser: authCreateUserMock,
+  deleteAuthUser: authDeleteUserMock,
+  updateAuthUserById: vi.fn(),
+}))
+
+vi.mock('@/lib/authjs/credentials-user', () => ({
+  verifyCredentials: verifyCredentialsMock,
   createAuthUser: authCreateUserMock,
   deleteAuthUser: authDeleteUserMock,
   updateAuthUserById: vi.fn(),
@@ -150,6 +158,16 @@ describe('auth service', () => {
     authJsSignInMock.mockResolvedValue({ ok: true })
     authJsAuthMock.mockResolvedValue({ user: { id: 'user-1' } })
     authJsSignOutMock.mockResolvedValue(undefined)
+    verifyCredentialsMock.mockResolvedValue({
+      id: 'user-1',
+      member_number: '100001',
+      auth_email: 'admin@alea.club',
+      email: 'admin@alea.club',
+      role: 'member' as const,
+      is_active: true,
+      created_at: '2024-01-01T00:00:00Z',
+      updated_at: '2024-01-01T00:00:00Z',
+    })
     authSignInWithPasswordMock.mockResolvedValue({ user: { id: 'auth-user-1' }, session: null })
     authCreateUserMock.mockResolvedValue({ data: { user: { id: 'auth-user-1' } }, error: null })
     authDeleteUserMock.mockResolvedValue({})
@@ -235,22 +253,65 @@ describe('auth service', () => {
 
   })
 
-    it('rejects when Auth.js authenticates a different user id than the resolved profile', async () => {
+    it('rejects when authenticated identity differs from member-number-resolved profile (identity-drift guard)', async () => {
+      const credentialProfile = makeProfile({ id: 'user-1', member_number: '100001' })
+      adminState.byMemberNumber.set('100001', credentialProfile)
+      adminState.byId.set('user-1', credentialProfile)
+      adminState.byEmail.set('admin@alea.club', credentialProfile)
+      
+      // verifyCredentials() authenticates a DIFFERENT user ID than the profile we resolved
+      verifyCredentialsMock.mockResolvedValueOnce({
+        id: 'different-user-id',
+        member_number: '100001',
+        auth_email: 'admin@alea.club',
+        email: 'admin@alea.club',
+        role: 'member' as const,
+        is_active: true,
+        created_at: '2024-01-01T00:00:00Z',
+        updated_at: '2024-01-01T00:00:00Z',
+      })
+
+      const { login } = await loadService()
+
+      // (a) Assertion: login rejects with 401
+      await expect(login({ identifier: '100001', password: 'Admin123' })).rejects.toThrow('Invalid credentials')
+      
+      // (b) Assertion: authJsSignIn is NEVER called
+      // This proves no session cookie was ever issued, even though credentials were valid.
+      // The new design verifies identity BEFORE calling signIn, so a mismatch never results in
+      // any session being issued at all — no window where a valid session rides on a 401 response.
+      expect(authJsSignInMock).not.toHaveBeenCalled()
+    })
+
+
+    it('never attempts same-request session readback via auth() during login (regression guard for KIM-433 root cause)', async () => {
       const profile = makeProfile({ member_number: '100001' })
       adminState.byMemberNumber.set('100001', profile)
       adminState.byId.set('user-1', profile)
       adminState.byEmail.set('admin@alea.club', profile)
       
-      // Auth.js sign-in succeeds
-      authJsSignInMock.mockResolvedValueOnce({ ok: true })
-      // But auth() returns a session with a different user ID (identity drift)
-      authJsAuthMock.mockResolvedValueOnce({ user: { id: 'different-user-id' } } as any)
+      // Mock verifyCredentials to succeed with matching ID
+      verifyCredentialsMock.mockResolvedValueOnce({
+        id: 'user-1',
+        member_number: '100001',
+        auth_email: 'admin@alea.club',
+        email: 'admin@alea.club',
+        role: 'member' as const,
+        is_active: true,
+        created_at: '2024-01-01T00:00:00Z',
+        updated_at: '2024-01-01T00:00:00Z',
+      })
 
       const { login } = await loadService()
+      await login({ identifier: '100001', password: 'Admin123' })
 
-      await expect(login({ identifier: '100001', password: 'Admin123' })).rejects.toThrow('Invalid credentials')
-      // Must verify the mismatched session was torn down (signOutQuietly calls authJsSignOut)
-      expect(authJsSignOutMock).toHaveBeenCalled()
+      // Trip-wire: auth() should NEVER be called. This guards against a regression
+      // that reintroduces the broken same-request readback pattern (see
+      // establishAuthJsSession() doc comment in lib/server/auth/auth-service.ts
+      // for why that pattern fails: auth() reads from frozen incoming-request
+      // headers snapshot while signIn() writes to mutable cookie jar; the snapshot
+      // doesn't see the write in the same request).
+      expect(authJsAuthMock).not.toHaveBeenCalled()
     })
 
   describe('register', () => {
