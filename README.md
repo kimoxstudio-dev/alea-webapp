@@ -149,6 +149,31 @@ Stop local Supabase:
 supabase stop
 ```
 
+### Dev seed on Neon (`pnpm db:seed`, KIM-432)
+
+Once the app targets Neon/Vercel Postgres (see Auth.js / F1-F2 migration scaffolding above), `scripts/seed.ts` bootstraps a minimal, idempotent set of dev fixtures directly via Drizzle — an admin profile, a few member profiles, 2 rooms, and a handful of tables (varied `type`). This is a **separate script from the legacy `supabase/seed.sql`** above: it targets the Neon-native `profiles`/`rooms`/`tables` schema in `lib/db/schema`, not Supabase's `auth.users`.
+
+This script is safe to re-run: it upserts profiles by email and only inserts rooms/tables that don't already exist by name.
+
+**Guard:** the script refuses to run unless `NODE_ENV !== 'production'` **and** `DEV_SEED_CONFIRM` is set to the exact value `YES_SEED_NEON_DEV_DB` (see `.env.example`). Never set `DEV_SEED_CONFIRM` outside your own local shell/`.env.local`.
+
+Requires `POSTGRES_URL` (or `POSTGRES_URL_NON_POOLING`) to already be configured, pointing at your dev database.
+
+```bash
+DEV_SEED_CONFIRM=YES_SEED_NEON_DEV_DB pnpm db:seed
+```
+
+Seeded dev-only credentials (never real secrets — do not reuse anywhere else):
+
+| Role | Email | Password |
+|---|---|---|
+| admin | `admin@devseed.local` | `dev-only-Seed123!` |
+| member | `member1@devseed.local` | `dev-only-Seed123!` |
+| member | `member2@devseed.local` | `dev-only-Seed123!` |
+| member | `member3@devseed.local` | `dev-only-Seed123!` |
+
+Note: as of KIM-432, Auth.js is not yet wired into any page/layout/middleware (see `lib/authjs/config.ts`), so logging in against these seeded credentials through `/api/authjs/*` (once `AUTH_JS_ENABLED=true`) does not by itself grant access to the admin UI pages — that gating still runs through the legacy Supabase-session path. This is expected and tracked separately; it is not a bug in this seed script.
+
 ## Local CI Hook
 
 The repository uses a local `pre-push` hook to run the core validation checks before a push. The hook is not installed automatically after cloning.

@@ -51,7 +51,7 @@ The user may write prompts in any language; replies to the user are in their lan
 - All privilege checks (ownership + role) must live in the **service layer**, never in route handlers
 - i18n keys must maintain full parity between `en.json` and `es.json`
 - Test files must be excluded from `tsconfig.app.json`
-- Test files are owned exclusively by `qa-engineer` — `software-engineer` must never create or modify test files
+- **Test files are owned exclusively by `qa-engineer` — `software-engineer` must NEVER create, edit, or delete test files, under any framing (e.g. "fixing" a failure). Doing so and reporting completion anyway is a false completion.**
 - Every read of `reservations` / `saved_games` for a `member` session MUST filter `WHERE user_id = session.id`; member-scoped reads must also pass through `assertMemberRowsScoped()` (from `lib/server/data-scoping.ts`) as defense-in-depth after the DB fetch and before mapping rows to the public shape (admins exempt).
 
 ---
@@ -124,6 +124,8 @@ For **every issue** — regardless of size or scope:
 
 This is the standard workflow — no exceptions.
 
+Only one product-manager may run per session — never spawn a second one to "help" or parallelize; the existing one already owns Linear/branch/task coordination for the whole session.
+
 **CRITICAL RULE:** Product-manager NEVER spawns software-engineer, qa-engineer, or security-reviewer directly. Product-manager ALWAYS spawns team-lead to orchestrate the pipeline. Team-lead then manages: impl → qa → security → PR. This preserves agent isolation: product-manager = coordinator, team-lead = orchestrator, impl agents = workers.
 
 ---
@@ -143,3 +145,35 @@ This is the standard workflow — no exceptions.
 4. User verifies in Supabase dashboard
 
 Agent prepares + validates. User applies.
+
+---
+
+## Agent Working Agreements
+
+### Reporting Standards
+
+- A failing test may be called "pre-existing" only after being run on `develop` and confirmed failing there; otherwise report it as "failing on this branch, cause not established."
+- Never report validation (typecheck/lint/build/tests) as passing without actually running it — no "assumed to pass," no fabricated timestamps, no silently-skipped steps presented as done.
+- Reports state the command run and its literal output, not a conclusion — e.g. "`Tests 1166 passed (1166)`," not "suite green."
+- "Done" is a number matched against a defined bar, not an adjective — "infrastructure ready," "pattern established," "84% passing," "non-blocking edge cases" are not completion.
+
+### Test Integrity
+
+- Test count per file must never decrease vs `develop` — compare with `grep -cE "^\s*(it|test)\("` against develop and report both numbers; any drop requires each removed test justified by name. Exception: removing a tautological test (e.g. `expect(true).toBe(true)`) removes zero coverage by definition — still name it and say why.
+- Tests never make real database calls — no live connection, no test DB, no containerized/embedded Postgres. Mocks only; improve the mock rather than making the dependency real.
+
+### Shared Working Directory
+
+- The shared checkout is read-only to every agent, with exactly one exception: appending to `.claude/agent-progress.md` via `>>` or equivalent that cannot replace the file — never read-modify-write it. To run code from another branch, create a throwaway worktree and install dependencies there, never in the shared checkout.
+- Worktree cleanup removes only the agent's own worktree, by absolute path: `git worktree remove /absolute/path/to/own-worktree` then `git worktree prune`. Never `rm -rf` the parent worktrees directory — in a multi-pipeline session that destroys other agents' active work.
+- Commit early and often on the worktree's branch. Uncommitted work exists in exactly one place and survives nothing — committing after each meaningful step is cheap insurance against losing hours of work.
+
+### Stopping and Escalating
+
+- Reporting a blocker costs nothing; a false completion costs hours. A correctly-reported blocker must not be disbelieved or punished because a different agent fabricated something similar earlier.
+- Not acceptable as "completion": silently handing remaining work to another agent, describing a stopping point as a result (e.g. "reverted to baseline"), self-approving with a red suite under any framing, or citing a repo rule that doesn't exist to justify stopping.
+
+### Tooling
+
+- When an agent regresses repeatedly on a large file, the tool it needs likely doesn't exist yet — build that tool as its own bounded task, separately from applying it.
+- One shared helper/mock, extended when it falls short — never re-derived per file (copying a pattern from the most broken file inherits its defect).
