@@ -1,7 +1,7 @@
 import 'server-only'
-import { and, asc, eq, gt, inArray, isNull, lt, or } from 'drizzle-orm'
+import { and, asc, eq, gt, gte, inArray, isNull, lt, lte, or } from 'drizzle-orm'
 import { getAdminDb, getDrizzleAdminDb, getDrizzleDb, type AdminDbClient } from '@/lib/db'
-import { events, eventRoomBlocks, tables } from '@/lib/db/schema'
+import { events, eventRoomBlocks, savedGames, tables } from '@/lib/db/schema'
 import { ServiceError, serviceError } from '@/lib/server/shared/service-error'
 import type { AdminEvent, AdminEventRoomBlock, AdminEventSchedule } from '@/lib/types'
 import type { SessionUser } from '@/lib/server/auth/auth'
@@ -319,6 +319,102 @@ export async function cancelOverlappingReservationsForBlocks(
 }
 
 // ---------------------------------------------------------------------------
+// saved_games cancellation cascade (KIM-434 PR #182 review fix).
+//
+// Reimplements the dropped Supabase trigger `event_blocks_cancel_saved_games`
+// (AFTER INSERT OR UPDATE OF room_id, date ON event_room_blocks, FOR EACH ROW
+// -> cancel_saved_games_for_event_block()), which this migration removed
+// with no Drizzle/Neon equivalent — a confirmed regression: creating or
+// updating an admin event with room blocks silently stopped cancelling
+// active saved_games rows for the blocked room/date.
+//
+// Trigger body (verbatim, from
+// supabase/migrations/20260619000010_kim384_event_cancels_saved_games.sql):
+//   FOR v_table_id IN SELECT id FROM public.tables WHERE room_id = NEW.room_id
+//     ORDER BY id LOOP
+//       PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(v_table_id::text, 0));
+//     END LOOP;
+//   UPDATE public.saved_games AS saved
+//     SET status = 'cancelled', updated_at = now()
+//     FROM public.tables AS game_table
+//     WHERE saved.table_id = game_table.id
+//       AND game_table.room_id = NEW.room_id
+//       AND saved.status = 'active'
+//       AND NEW.date BETWEEN saved.start_date AND saved.end_date;
+//
+// Unlike cancelOverlappingReservationsForBlocks() above (which must run
+// post-commit, against the still-Supabase `reservations` table), saved_games
+// is already on the Drizzle/Neon seam (PR1 — lib/db/schema/saved-games.ts),
+// so this runs INSIDE the caller's transaction, alongside the
+// event_room_blocks insert, giving true all-or-nothing atomicity: a rollback
+// of the block write also rolls back this cascade.
+//
+// Known, disclosed gap vs. the trigger: the `pg_advisory_xact_lock` loop
+// above is NOT reimplemented here. It guarded a race between this UPDATE and
+// a concurrent saved-game creation racing the `saved_games_no_active_overlap`
+// EXCLUDE constraint — a defense-in-depth concurrency guard, not the
+// business rule under regression (the missing cancellation itself). It is
+// intentionally out of scope for this fix: it needs a raw `tx.execute(sql\`...\`)`
+// call that tests/unit/mocks/drizzle-mock.ts's shared transaction builder has
+// no chain for, and per repo convention test infra is qa-engineer-owned, not
+// software-engineer's to extend. Flagged for qa/security follow-up.
+//
+// Exported (same pattern as deleteEventCascade below) so
+// lib/server/events/club-events-service.ts can reuse it once its own
+// room-block write path (KIM-438, tracked separately) is wired to call this
+// inside its own Drizzle tx — do not duplicate this logic inline there.
+// ---------------------------------------------------------------------------
+export async function cancelSavedGamesForBlockedRoom(
+  tx: AdminTx,
+  blocks: Array<{ roomId: string; date: string }>,
+): Promise<number> {
+  if (blocks.length === 0) return 0
+
+  let cancelledCount = 0
+
+  for (const block of blocks) {
+    const roomTables = await tx
+      .select({ id: tables.id })
+      .from(tables)
+      .where(eq(tables.roomId, block.roomId))
+      .orderBy(asc(tables.id))
+
+    const tableIds = roomTables.map((t) => t.id)
+    if (tableIds.length === 0) continue
+
+    // Pre-select the exact candidate rows the trigger's UPDATE would have
+    // matched, and only issue the UPDATE when there's at least one — same
+    // net effect as an UPDATE...WHERE matching zero rows, but keeps this a
+    // true no-op (no write attempted) when a block's room has no active
+    // saved_games overlapping its date.
+    const candidates = await tx
+      .select({ id: savedGames.id })
+      .from(savedGames)
+      .where(
+        and(
+          inArray(savedGames.tableId, tableIds),
+          eq(savedGames.status, 'active'),
+          lte(savedGames.startDate, block.date),
+          gte(savedGames.endDate, block.date),
+        ),
+      )
+
+    const candidateIds = candidates.map((c) => c.id)
+    if (candidateIds.length === 0) continue
+
+    const cancelled = await tx
+      .update(savedGames)
+      .set({ status: 'cancelled', updatedAt: new Date() })
+      .where(inArray(savedGames.id, candidateIds))
+      .returning({ id: savedGames.id })
+
+    cancelledCount += cancelled.length
+  }
+
+  return cancelledCount
+}
+
+// ---------------------------------------------------------------------------
 // Atomic (Neon-transaction) event+blocks write helpers, replacing the
 // removed Supabase RPCs create_event_atomic / update_event_atomic /
 // create_event_with_blocks / update_event_with_blocks. The reservation
@@ -349,6 +445,11 @@ async function createEventAtomic(
           .insert(eventRoomBlocks)
           .values({ eventId: eventRow.id, roomId, date, startTime, endTime, allDay })
           .returning()
+
+        await cancelSavedGamesForBlockedRoom(
+          tx,
+          insertedBlocks.map((b) => ({ roomId: b.roomId, date: b.date })),
+        )
       }
 
       return { eventRow, insertedBlocks }
@@ -398,6 +499,11 @@ async function updateEventAtomic(
           .insert(eventRoomBlocks)
           .values({ eventId: id, roomId, date, startTime, endTime, allDay })
           .returning()
+
+        await cancelSavedGamesForBlockedRoom(
+          tx,
+          insertedBlocks.map((b) => ({ roomId: b.roomId, date: b.date })),
+        )
       }
 
       return { eventRow, insertedBlocks }
@@ -502,6 +608,11 @@ async function createEventWithBlocksAtomic(
             })),
           )
           .returning()
+
+        await cancelSavedGamesForBlockedRoom(
+          tx,
+          insertedBlocks.map((b) => ({ roomId: b.roomId, date: b.date })),
+        )
       }
 
       return { eventRow, insertedBlocks }
@@ -578,6 +689,11 @@ async function updateEventWithBlocksAtomic(
             })),
           )
           .returning()
+
+        await cancelSavedGamesForBlockedRoom(
+          tx,
+          insertedBlocks.map((b) => ({ roomId: b.roomId, date: b.date })),
+        )
       }
 
       return { eventRow, insertedBlocks }
