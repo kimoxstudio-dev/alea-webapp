@@ -1,13 +1,32 @@
-import type { GameTable, Room, TableAvailability } from '@/lib/types'
-import { getAdminDb, getDb } from '@/lib/db'
+import { asc, eq } from 'drizzle-orm'
+import type { TableAvailability } from '@/lib/types'
+import { getAdminDb, getDrizzleAdminDb, getDrizzleDb } from '@/lib/db'
+import { rooms, tables } from '@/lib/db/schema'
 import { serviceError } from '@/lib/server/shared/service-error'
 import { resolveDate, buildAvailability } from '@/lib/server/reservations/availability'
-import type { Tables, TablesInsert, TablesUpdate } from '@/lib/supabase/types'
+import type { Tables } from '@/lib/supabase/types'
 import { regenerateQrCodes } from '@/lib/server/tables/tables-service'
 import { toGameTable } from '@/lib/server/tables/table-mappers'
 import { getDatabaseNow } from '@/lib/server/shared/database-time'
 import { isPendingReservationExpired } from '@/lib/server/reservations/pending-reservation-expiry'
 import type { SessionUser } from '@/lib/server/auth/auth'
+
+/**
+ * KIM-434 (F3c) PR2: `rooms` and `tables` reads/writes below use the
+ * Drizzle/Neon seam (`getDrizzleDb()` / `getDrizzleAdminDb()`), following the
+ * pilot pattern established in `lib/server/equipment/equipment-service.ts`
+ * (PR1).
+ *
+ * `reservations`, `event_room_blocks` and `saved_games` are owned by
+ * services NOT yet migrated (PR3-PR5), so those cross-domain reads
+ * intentionally stay on the legacy Supabase seam (`getAdminDb()`) — their
+ * source of truth hasn't moved to Neon yet. Combining a Neon read (rooms /
+ * tables) with Supabase reads (reservations/blocks/saved games) here is two
+ * independent round-trips joined in application code, same as before this
+ * PR — not a single SQL join — but see the PR description's "Split-brain
+ * disclosure" section for the consistency caveat this implies during the
+ * migration window.
+ */
 
 // Privilege checks (role === 'admin') live here in the service layer, not in
 // route handlers (repo convention). These mutations use the admin client
@@ -19,90 +38,46 @@ function requireAdminSession(session: SessionUser): void {
   if (session.role !== 'admin') serviceError('Forbidden', 403)
 }
 
-type RoomRow = Tables<'rooms'>
-type TableRow = Tables<'tables'>
 type ReservationRow = Tables<'reservations'>
 type EventBlockRow = Tables<'event_room_blocks'>
-type RoomsTableClient = {
-  select: (columns: string) => {
-    order: (column: string, options: { ascending: boolean }) => Promise<{ data: RoomRow[] | null; error: unknown }>
-  }
-  insert: (values: TablesInsert<'rooms'>) => {
-    select: (columns: string) => {
-      maybeSingle: () => Promise<{ data: RoomRow | null; error: unknown }>
-    }
-  }
-  update: (values: TablesUpdate<'rooms'>) => {
-    eq: (column: 'id', value: string) => {
-      select: (columns: string) => {
-        maybeSingle: () => Promise<{ data: RoomRow | null; error: unknown }>
-      }
-    }
-  }
-}
-type TablesByRoomClient = {
-  select: (columns: string) => {
-    eq: (column: 'room_id', value: string) => {
-      order: (column: string, options: { ascending: boolean }) => Promise<{ data: TableRow[] | null; error: unknown }>
-    }
-  }
-}
-type TablesInsertClient = {
-  insert: (values: TablesInsert<'tables'>) => {
-    select: (columns: string) => {
-      maybeSingle: () => Promise<{ data: TableRow | null; error: unknown }>
-    }
-  }
-}
-type ReservationsByTableClient = {
-  select: (columns: string) => {
-    eq: (column: 'date', value: string) => {
-      in: (column: 'status', values: string[]) => {
-        in: (column: 'table_id', values: string[]) => Promise<{ data: ReservationRow[] | null; error: unknown }>
-      }
-    }
+
+/**
+ * Runs a Drizzle query, translating any thrown DB/driver error into a
+ * uniform 500 ServiceError. Business-logic outcomes (e.g. "no row
+ * returned" -> 404, validation -> 400) are handled by callers, outside this
+ * wrapper, so their specific status codes aren't swallowed into a 500.
+ */
+async function runQuery<T>(query: Promise<T>): Promise<T> {
+  try {
+    return await query
+  } catch {
+    serviceError('Internal server error', 500)
   }
 }
 
-const ROOM_COLUMNS = 'id, name, table_count, description'
-const TABLE_COLUMNS = 'id, room_id, name, type, qr_code, qr_code_inf, pos_x, pos_y'
-
-function toRoom(row: RoomRow): Room {
+function toRoom(row: typeof rooms.$inferSelect) {
   return {
     id: row.id,
     name: row.name,
-    tableCount: row.table_count,
+    tableCount: row.tableCount,
     description: row.description ?? undefined,
   }
 }
 
 async function listTablesByRoom(roomId: string) {
-  const supabase = await getDb()
-  const tables = supabase.from('tables') as unknown as TablesByRoomClient
-  const { data, error } = await tables
-    .select(TABLE_COLUMNS)
-    .eq('room_id', roomId)
-    .order('name', { ascending: true })
+  const db = getDrizzleDb()
+  const rows = await runQuery(
+    db.select().from(tables).where(eq(tables.roomId, roomId)).orderBy(asc(tables.name)),
+  )
 
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-
-  return ((data ?? []) as TableRow[]).map(toGameTable)
+  return rows.map(toGameTable)
 }
 
 export async function listAllRooms() {
-  const supabase = await getDb()
-  const rooms = supabase.from('rooms') as unknown as RoomsTableClient
-  const { data, error } = await rooms
-    .select(ROOM_COLUMNS)
-    .order('created_at', { ascending: true })
+  const db = getDrizzleDb()
+  const rows = await runQuery(db.select().from(rooms).orderBy(asc(rooms.createdAt)))
 
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-
-  return ((data ?? []) as RoomRow[]).map(toRoom)
+  return rows.map(toRoom)
 }
 
 export async function createRoomEntry(
@@ -121,26 +96,23 @@ export async function createRoomEntry(
     serviceError('tableCount must be a non-negative integer', 400)
   }
 
-  const supabase = getAdminDb()
-  const insert: TablesInsert<'rooms'> = {
-    name,
-    table_count: tableCount,
-    description: body.description ? String(body.description) : null,
-  }
-  const rooms = supabase.from('rooms') as unknown as RoomsTableClient
-  const { data, error } = await rooms
-    .insert(insert)
-    .select(ROOM_COLUMNS)
-    .maybeSingle()
+  const db = getDrizzleAdminDb()
+  const [row] = await runQuery(
+    db
+      .insert(rooms)
+      .values({
+        name,
+        tableCount,
+        description: body.description ? String(body.description) : null,
+      })
+      .returning(),
+  )
 
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-  if (!data) {
+  if (!row) {
     serviceError('Internal server error', 500)
   }
 
-  return toRoom(data as RoomRow)
+  return toRoom(row)
 }
 
 export async function updateRoom(
@@ -158,32 +130,21 @@ export async function updateRoom(
     tableCount = raw
   }
 
-  const supabase = getAdminDb()
-  const updates: TablesUpdate<'rooms'> = {
-    name: body.name ? String(body.name) : undefined,
-    description:
-      body.description === undefined
-        ? undefined
-        : body.description === null
-          ? null
-          : String(body.description),
-    ...(tableCount !== undefined ? { table_count: tableCount } : {}),
+  const updates: Partial<{ name: string; description: string | null; tableCount: number }> = {}
+  if (body.name) updates.name = String(body.name)
+  if (body.description !== undefined) {
+    updates.description = body.description === null ? null : String(body.description)
   }
-  const rooms = supabase.from('rooms') as unknown as RoomsTableClient
-  const { data, error } = await rooms
-    .update(updates)
-    .eq('id', id)
-    .select(ROOM_COLUMNS)
-    .maybeSingle()
+  if (tableCount !== undefined) updates.tableCount = tableCount
 
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-  if (!data) {
+  const db = getDrizzleAdminDb()
+  const [row] = await runQuery(db.update(rooms).set(updates).where(eq(rooms.id, id)).returning())
+
+  if (!row) {
     serviceError('Room not found', 404)
   }
 
-  return toRoom(data as RoomRow)
+  return toRoom(row)
 }
 
 export async function listRoomTables(roomId: string) {
@@ -192,20 +153,21 @@ export async function listRoomTables(roomId: string) {
 
 export async function getRoomTablesAvailability(roomId: string, date?: string | null) {
   const effectiveDate = resolveDate(date)
-  const tables = await listTablesByRoom(roomId)
-  if (tables.length === 0) {
+  const roomTables = await listTablesByRoom(roomId)
+  if (roomTables.length === 0) {
     return {}
   }
 
   const admin = getAdminDb()
-  const reservations = admin.from('reservations') as unknown as ReservationsByTableClient
+  const tableIds = roomTables.map((table) => table.id)
 
   const [reservationsResult, eventBlocksResult, savedGamesResult, nowUtc] = await Promise.all([
-    reservations
+    admin
+      .from('reservations')
       .select('id, table_id, date, start_time, end_time, status, surface, user_id, activated_at, created_at')
       .eq('date', effectiveDate)
       .in('status', ['active', 'pending'])
-      .in('table_id', tables.map((table) => table.id)),
+      .in('table_id', tableIds),
     admin
       .from('event_room_blocks')
       .select('id, event_id, room_id, table_id, date, start_time, end_time, all_day')
@@ -217,7 +179,7 @@ export async function getRoomTablesAvailability(roomId: string, date?: string | 
       .eq('status', 'active')
       .lte('start_date', effectiveDate)
       .gte('end_date', effectiveDate)
-      .in('table_id', tables.map((table) => table.id)),
+      .in('table_id', tableIds),
     getDatabaseNow(admin),
   ])
 
@@ -274,7 +236,7 @@ export async function getRoomTablesAvailability(roomId: string, date?: string | 
       }))
   }
 
-  return tables.reduce<Record<string, TableAvailability>>((acc, table) => {
+  return roomTables.reduce<Record<string, TableAvailability>>((acc, table) => {
     acc[table.id] = buildAvailability(
       table,
       effectiveDate,
@@ -305,40 +267,34 @@ export async function createTableEntry(
   }
   const type = rawType as ValidType
 
-  const supabase = getAdminDb()
-  const insert: TablesInsert<'tables'> = {
-    room_id: roomId,
-    name,
-    type,
-  }
-  const tables = supabase.from('tables') as unknown as TablesInsertClient
-  const { data, error } = await tables
-    .insert(insert)
-    .select(TABLE_COLUMNS)
-    .maybeSingle()
-
-  if (error) {
-    const pgError = error as { code?: string }
+  const db = getDrizzleAdminDb()
+  let row: typeof tables.$inferSelect | undefined
+  try {
+    ;[row] = await db
+      .insert(tables)
+      .values({ roomId, name, type })
+      .returning()
+  } catch (err) {
+    const pgError = err as { code?: string }
     if (pgError.code === '23503') {
       // Foreign-key violation: the provided roomId does not reference an existing room.
       serviceError('Invalid room ID', 400)
     }
     serviceError('Internal server error', 500)
   }
-  if (!data) {
+
+  if (!row) {
     serviceError('Internal server error', 500)
   }
-
-  const tableRow = data as TableRow
 
   // Fire-and-forget: generate QR codes without blocking the POST response.
   // If QR generation fails the admin can regenerate later via the dashboard.
   const appUrl = (process.env.NEXT_PUBLIC_APP_URL ?? '').replace(/\/$/, '')
   if (appUrl) {
-    regenerateQrCodes(session, tableRow.id).catch((qrErr: unknown) => {
+    regenerateQrCodes(session, row.id).catch((qrErr: unknown) => {
       console.error('[createTableEntry] QR generation failed in background:', qrErr)
     })
   }
 
-  return toGameTable(tableRow)
+  return toGameTable(row)
 }

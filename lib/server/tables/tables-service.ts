@@ -1,7 +1,9 @@
+import { eq } from 'drizzle-orm'
 import qrcode from 'qrcode'
 import type { GameTable } from '@/lib/types'
-import { uploadToStorage } from '@/lib/storage/qr'
-import { getAdminDb, getDb } from '@/lib/db'
+import { uploadToStorage, getPublicStorageUrl } from '@/lib/storage/qr'
+import { getAdminDb, getDrizzleAdminDb, getDrizzleDb } from '@/lib/db'
+import { tables } from '@/lib/db/schema'
 import { serviceError } from '@/lib/server/shared/service-error'
 import { resolveDate, buildAvailability } from '@/lib/server/reservations/availability'
 import type { Tables } from '@/lib/supabase/types'
@@ -10,11 +12,24 @@ import { getDatabaseNow } from '@/lib/server/shared/database-time'
 import { isPendingReservationExpired } from '@/lib/server/reservations/pending-reservation-expiry'
 import type { SessionUser } from '@/lib/server/auth/auth'
 
-type TableRow = Tables<'tables'>
 type ReservationRow = Tables<'reservations'>
 type EventBlockRow = Tables<'event_room_blocks'>
 
-const TABLE_COLUMNS = 'id, room_id, name, type, qr_code, qr_code_inf, pos_x, pos_y'
+/**
+ * KIM-434 (F3c) PR2: `tables` reads/writes below use the Drizzle/Neon seam
+ * (`getDrizzleDb()` / `getDrizzleAdminDb()`), following the pilot pattern
+ * established in `lib/server/equipment/equipment-service.ts` (PR1).
+ *
+ * `reservations`, `event_room_blocks`, `saved_games` and `events` are owned
+ * by services NOT yet migrated (PR3-PR5), so those cross-domain reads
+ * intentionally stay on the legacy Supabase seam (`getDb()` / `getAdminDb()`)
+ * — their source of truth hasn't moved to Neon yet. Combining a Neon read
+ * (the table row) with Supabase reads (reservations/blocks/saved games) here
+ * is two independent round-trips joined in application code, same as
+ * before this PR — not a single SQL join — but see the PR description's
+ * "Split-brain disclosure" section for the consistency caveat this implies
+ * during the migration window.
+ */
 
 // Privilege checks (role === 'admin') live here in the service layer, not in
 // route handlers (repo convention). QR generation mutates the tables row and
@@ -27,10 +42,21 @@ function requireAdminSession(session: SessionUser): void {
   if (session.role !== 'admin') serviceError('Forbidden', 403)
 }
 
-async function uploadQrCodeToStorage(url: string, storagePath: string): Promise<string> {
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
-  if (!supabaseUrl) serviceError('NEXT_PUBLIC_SUPABASE_URL is not set — cannot build QR code storage URL', 500)
+/**
+ * Runs a Drizzle query, translating any thrown DB/driver error into a
+ * uniform 500 ServiceError. Business-logic outcomes (e.g. "no row
+ * returned" -> 404, validation -> 400) are handled by callers, outside this
+ * wrapper, so their specific status codes aren't swallowed into a 500.
+ */
+async function runQuery<T>(query: Promise<T>): Promise<T> {
+  try {
+    return await query
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+}
 
+async function uploadQrCodeToStorage(url: string, storagePath: string): Promise<string> {
   const buffer = await qrcode.toBuffer(url, { errorCorrectionLevel: 'M', width: 400, type: 'png' })
 
   const { error: uploadError } = await uploadToStorage('table-qr-codes', storagePath, buffer, {
@@ -42,7 +68,18 @@ async function uploadQrCodeToStorage(url: string, storagePath: string): Promise<
     serviceError('Failed to upload QR code to storage', 500)
   }
 
-  return `${supabaseUrl}/storage/v1/object/public/table-qr-codes/${storagePath}`
+  // Resolve the public URL via the storage seam (lib/storage/qr) rather than
+  // manually constructing a backend-specific path — this call site used to
+  // hardcode a Supabase Storage URL, which would have silently pointed at a
+  // nonexistent object once uploadToStorage() above started routing to
+  // Vercel Blob instead (KIM-431 F3 cutover; documented follow-up from
+  // KIM-421/lib/storage/qr/vercel-blob.ts's original doc comment).
+  const { publicUrl } = getPublicStorageUrl('table-qr-codes', storagePath)
+  if (!publicUrl) {
+    serviceError('Failed to resolve QR code public URL', 500)
+  }
+
+  return publicUrl
 }
 
 export async function generateTableQrCode(session: SessionUser, tableId: string): Promise<string> {
@@ -64,17 +101,12 @@ export async function regenerateQrCodes(
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(tableId)) {
     serviceError('Invalid table ID', 400)
   }
-  const admin = getAdminDb()
+  const db = getDrizzleAdminDb()
 
-  const { data: table, error: fetchError } = await admin
-    .from('tables')
-    .select('id, type')
-    .eq('id', tableId)
-    .maybeSingle()
+  const [table] = await runQuery(
+    db.select({ id: tables.id, type: tables.type }).from(tables).where(eq(tables.id, tableId)),
+  )
 
-  if (fetchError) {
-    serviceError('Internal server error', 500)
-  }
   if (!table) {
     serviceError('Table not found', 404)
   }
@@ -84,12 +116,15 @@ export async function regenerateQrCodes(
 
   const qr_code = await uploadQrCodeToStorage(`${appUrl}/check-in/${tableId}`, `${tableId}.png`)
 
-  const { error: updateError } = await admin
-    .from('tables')
-    .update({ qr_code, qr_code_inf: null })
-    .eq('id', tableId)
+  const [updated] = await runQuery(
+    db
+      .update(tables)
+      .set({ qrCode: qr_code, qrCodeInf: null })
+      .where(eq(tables.id, tableId))
+      .returning({ id: tables.id }),
+  )
 
-  if (updateError) {
+  if (!updated) {
     serviceError('Internal server error', 500)
   }
 
@@ -97,18 +132,9 @@ export async function regenerateQrCodes(
 }
 
 export async function getTableAvailability(tableId: string, date?: string | null) {
-  const supabase = await getDb()
-  const tableResult = await supabase
-    .from('tables')
-    .select(TABLE_COLUMNS)
-    .eq('id', tableId)
-    .maybeSingle()
-  const table = tableResult.data as TableRow | null
-  const tableError = tableResult.error
+  const db = getDrizzleDb()
+  const [table] = await runQuery(db.select().from(tables).where(eq(tables.id, tableId)))
 
-  if (tableError) {
-    serviceError('Internal server error', 500)
-  }
   if (!table) {
     serviceError('Table not found', 404)
   }
@@ -126,7 +152,7 @@ export async function getTableAvailability(tableId: string, date?: string | null
     admin
       .from('event_room_blocks')
       .select('id, event_id, room_id, table_id, date, start_time, end_time, all_day')
-      .eq('room_id', table.room_id)
+      .eq('room_id', table.roomId)
       .eq('date', effectiveDate),
     admin
       .from('saved_games')

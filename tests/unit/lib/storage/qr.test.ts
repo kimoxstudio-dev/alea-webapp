@@ -2,216 +2,64 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 
 /**
- * Smoke test for the lib/storage/qr seam (F0-07).
+ * Test coverage for lib/storage/qr — the seam for storage access backing both
+ * admin-generated table QR codes and admin-uploaded landing-media images.
  *
- * This is a pure indirection layer over lib/supabase/server's admin storage
- * client — the goal here is only to lock in that uploadToStorage(),
- * getPublicStorageUrl(), and removeFromStorage() route to the correct
- * underlying Supabase Storage admin client methods, so a future regression
- * (e.g. accidentally using a user-scoped client or wrong method) is caught
- * immediately.
- *
- * For F0 this seam remains a thin wrapper around Supabase Storage admin calls
- * with zero behavior change. Storage backend swaps (e.g. to Vercel Blob) happen
- * in later phases; this test ensures the seam correctly preserves today's
- * call signatures and error shapes.
+ * F3 cutover (KIM-431): As of this version, the seam delegates to the Vercel
+ * Blob adapter (lib/storage/qr/vercel-blob.ts) rather than Supabase Storage.
+ * Tests verify the adapter behavior and integration with call sites like
+ * lib/server/tables/tables-service.ts (now using getPublicStorageUrl for URL resolution).
  */
-
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseServerAdminClient: vi.fn(() => ({
-    storage: {
-      from: vi.fn((bucket: string) => ({
-        upload: vi.fn(),
-        getPublicUrl: vi.fn(),
-        remove: vi.fn(),
-      })),
-    },
-  })),
-}))
-
-vi.mock('qrcode', () => ({
-  default: {
-    toBuffer: vi.fn().mockResolvedValue(Buffer.from('fake-qr-png-data')),
-  },
-}))
-
-describe('lib/storage/qr seam', () => {
-  it('uploadToStorage() calls admin.storage.from(bucket).upload() with preserved options', async () => {
-    const { uploadToStorage } = await import('@/lib/storage/qr')
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-
-    const mockUpload = vi.fn().mockResolvedValue({ error: null })
-    const mockFrom = vi.fn(() => ({ upload: mockUpload }))
-    const mockStorage = { from: mockFrom }
-
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue({
-      storage: mockStorage,
-    } as never)
-
-    const testBuffer = new Uint8Array([1, 2, 3])
-    const result = await uploadToStorage('test-bucket', 'test/path.png', testBuffer, {
-      contentType: 'image/png',
-      upsert: true,
-    })
-
-    expect(mockFrom).toHaveBeenCalledWith('test-bucket')
-    expect(mockUpload).toHaveBeenCalledWith('test/path.png', testBuffer, {
-      contentType: 'image/png',
-      upsert: true,
-    })
-    expect(result.error).toBeNull()
-  })
-
-  it('uploadToStorage() wraps Supabase Storage upload errors', async () => {
-    const { uploadToStorage } = await import('@/lib/storage/qr')
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-
-    const mockError = { message: 'Upload failed' }
-    const mockUpload = vi.fn().mockResolvedValue({ error: mockError })
-    const mockFrom = vi.fn(() => ({ upload: mockUpload }))
-    const mockStorage = { from: mockFrom }
-
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue({
-      storage: mockStorage,
-    } as never)
-
-    const testBuffer = new Uint8Array([1, 2, 3])
-    const result = await uploadToStorage('test-bucket', 'test/path.png', testBuffer)
-
-    expect(result.error).toEqual({ message: 'Upload failed' })
-  })
-
-  it('uploadToStorage() preserves structured diagnostic fields (name, status, statusCode) from a StorageApiError-like error, not just message', async () => {
-    const { uploadToStorage } = await import('@/lib/storage/qr')
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-
-    const mockError = {
-      name: 'StorageApiError',
-      message: 'The resource already exists',
-      status: 409,
-      statusCode: '409',
-    }
-    const mockUpload = vi.fn().mockResolvedValue({ error: mockError })
-    const mockFrom = vi.fn(() => ({ upload: mockUpload }))
-    const mockStorage = { from: mockFrom }
-
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue({
-      storage: mockStorage,
-    } as never)
-
-    const testBuffer = new Uint8Array([1, 2, 3])
-    const result = await uploadToStorage('test-bucket', 'test/path.png', testBuffer)
-
-    expect(result.error).toEqual({
-      name: 'StorageApiError',
-      message: 'The resource already exists',
-      status: 409,
-      statusCode: '409',
-    })
-  })
-
-  it('uploadToStorage() defaults upsert to false', async () => {
-    const { uploadToStorage } = await import('@/lib/storage/qr')
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-
-    const mockUpload = vi.fn().mockResolvedValue({ error: null })
-    const mockFrom = vi.fn(() => ({ upload: mockUpload }))
-    const mockStorage = { from: mockFrom }
-
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue({
-      storage: mockStorage,
-    } as never)
-
-    const testBuffer = new Uint8Array([1, 2, 3])
-    await uploadToStorage('test-bucket', 'test/path.png', testBuffer)
-
-    const callArgs = mockUpload.mock.calls[0]
-    expect(callArgs[2].upsert).toBe(false)
-  })
-
-  it('getPublicStorageUrl() calls admin.storage.from(bucket).getPublicUrl() and extracts publicUrl', async () => {
-    const { getPublicStorageUrl } = await import('@/lib/storage/qr')
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-
-    const mockGetPublicUrl = vi.fn().mockReturnValue({
-      data: { publicUrl: 'https://example.com/public/path.png' },
-    })
-    const mockFrom = vi.fn(() => ({ getPublicUrl: mockGetPublicUrl }))
-    const mockStorage = { from: mockFrom }
-
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue({
-      storage: mockStorage,
-    } as never)
-
-    const result = getPublicStorageUrl('test-bucket', 'test/path.png')
-
-    expect(mockFrom).toHaveBeenCalledWith('test-bucket')
-    expect(mockGetPublicUrl).toHaveBeenCalledWith('test/path.png')
-    expect(result.publicUrl).toBe('https://example.com/public/path.png')
-  })
-
-  it('getPublicStorageUrl() returns null publicUrl when Supabase returns null', async () => {
-    const { getPublicStorageUrl } = await import('@/lib/storage/qr')
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-
-    const mockGetPublicUrl = vi.fn().mockReturnValue({
-      data: null,
-    })
-    const mockFrom = vi.fn(() => ({ getPublicUrl: mockGetPublicUrl }))
-    const mockStorage = { from: mockFrom }
-
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue({
-      storage: mockStorage,
-    } as never)
-
-    const result = getPublicStorageUrl('test-bucket', 'test/path.png')
-
-    expect(result.publicUrl).toBeNull()
-  })
-
-  it('removeFromStorage() calls admin.storage.from(bucket).remove() with path array', async () => {
-    const { removeFromStorage } = await import('@/lib/storage/qr')
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-
-    const mockRemove = vi.fn().mockResolvedValue({ error: null })
-    const mockFrom = vi.fn(() => ({ remove: mockRemove }))
-    const mockStorage = { from: mockFrom }
-
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue({
-      storage: mockStorage,
-    } as never)
-
-    const paths = ['path1.png', 'path2.png']
-    const result = await removeFromStorage('test-bucket', paths)
-
-    expect(mockFrom).toHaveBeenCalledWith('test-bucket')
-    expect(mockRemove).toHaveBeenCalledWith(paths)
-    expect(result.error).toBeNull()
-  })
-
-  it('removeFromStorage() wraps Supabase Storage remove errors', async () => {
-    const { removeFromStorage } = await import('@/lib/storage/qr')
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-
-    const mockError = { message: 'Remove failed' }
-    const mockRemove = vi.fn().mockResolvedValue({ error: mockError })
-    const mockFrom = vi.fn(() => ({ remove: mockRemove }))
-    const mockStorage = { from: mockFrom }
-
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue({
-      storage: mockStorage,
-    } as never)
-
-    const result = await removeFromStorage('test-bucket', ['path.png'])
-
-    expect(result.error).toEqual({ message: 'Remove failed' })
-  })
-})
 
 vi.mock('@vercel/blob', () => ({
   put: vi.fn(),
   del: vi.fn(),
 }))
+
+describe('lib/storage/qr seam (size validation)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('uploadToStorage() enforces 5MB size cap, rejecting oversized payloads', async () => {
+    const { uploadToStorage } = await import('@/lib/storage/qr')
+
+    const oversizedBuffer = Buffer.alloc(5 * 1024 * 1024 + 1) // 5MB + 1 byte
+    const result = await uploadToStorage('bucket', 'large-file.bin', oversizedBuffer)
+
+    expect(result.error).toBeDefined()
+    expect(result.error?.name).toBe('StoragePayloadTooLargeError')
+    expect(result.error?.status).toBe(413)
+    expect(result.error?.statusCode).toBe('413')
+    expect(result.error?.message).toContain('exceeds the maximum allowed size')
+  })
+
+  it('uploadToStorage() accepts payloads at exactly 5MB', async () => {
+    const { uploadToStorage } = await import('@/lib/storage/qr')
+    const { put } = await import('@vercel/blob')
+
+    vi.mocked(put).mockResolvedValue({} as never)
+
+    const exactBuffer = Buffer.alloc(5 * 1024 * 1024) // Exactly 5MB
+    const result = await uploadToStorage('bucket', 'max-file.bin', exactBuffer)
+
+    expect(result.error).toBeNull()
+    expect(vi.mocked(put)).toHaveBeenCalled()
+  })
+
+  it('uploadToStorage() accepts payloads under 5MB', async () => {
+    const { uploadToStorage } = await import('@/lib/storage/qr')
+    const { put } = await import('@vercel/blob')
+
+    vi.mocked(put).mockResolvedValue({} as never)
+
+    const smallBuffer = Buffer.alloc(1024) // 1KB
+    const result = await uploadToStorage('bucket', 'small-file.bin', smallBuffer)
+
+    expect(result.error).toBeNull()
+    expect(vi.mocked(put)).toHaveBeenCalled()
+  })
+})
 
 describe('lib/storage/qr/vercel-blob (F3 adapter)', () => {
   beforeEach(() => {
@@ -460,97 +308,54 @@ describe('lib/storage/qr/vercel-blob (F3 adapter)', () => {
 })
 
 /**
- * Integration test documenting the current state of lib/server/tables/tables-service.ts.
+ * Integration test verifying the F3 cutover: lib/server/tables/tables-service.ts
+ * now calls getPublicStorageUrl() from the storage seam to resolve QR code URLs.
  *
- * As of KIM-421, the QR code URL construction in tables-service.ts::uploadQrCodeToStorage()
- * still manually builds Supabase Storage URLs from NEXT_PUBLIC_SUPABASE_URL directly
- * (line 33: `${supabaseUrl}/storage/v1/object/public/table-qr-codes/${storagePath}`)
- * instead of calling getPublicStorageUrl() from the storage seam.
- *
- * This test documents that this gap is INTENTIONAL for the inert F3 scaffold:
- * - F3 introduces the Vercel Blob adapter (vercel-blob.ts) in parallel
- * - But does NOT yet activate it or refactor call sites
- * - Refactoring tables-service.ts to use getPublicStorageUrl() belongs to the REAL F3
- *   cutover step (a separate, user/infra-gated change requiring BLOB_READ_WRITE_TOKEN)
- * - This test WILL FAIL once that cutover refactors the call site (expected — that's
- *   the signal to remove/update this test as part of cutover completion)
- *
- * See: lib/storage/qr/vercel-blob.ts doc comment for full context on F3 scaffold goals.
+ * This is the F3 CUTOVER follow-up work (KIM-431): tables-service.ts was refactored
+ * to use getPublicStorageUrl() instead of manually constructing Supabase Storage URLs.
+ * This test verifies that the call path now exercises the seam for URL resolution.
  */
-
-/**
- * Integration test documenting the current state of lib/server/tables/tables-service.ts
- * QR code URL construction (F3 scaffold - intentional gap).
- *
- * As of KIM-421, the QR code URL in tables-service.ts::uploadQrCodeToStorage()
- * is still manually built from NEXT_PUBLIC_SUPABASE_URL directly
- * (line 33: `${supabaseUrl}/storage/v1/object/public/table-qr-codes/${storagePath}`)
- * instead of calling getPublicStorageUrl() from the storage seam.
- *
- * This test exercises the REAL generateTableQrCode() call path to document
- * and defend this gap:
- * - F3 introduces the Vercel Blob adapter (vercel-blob.ts) in parallel
- * - But does NOT yet activate it or refactor call sites
- * - The refactoring belongs to the F3 CUTOVER step (separate, user/infra-gated,
- *   requiring BLOB_READ_WRITE_TOKEN)
- * - This test WILL FAIL (expected signal to remove/update as part of cutover)
- *
- * See: lib/storage/qr/vercel-blob.ts doc comment for full F3 scaffold context.
- */
-describe('lib/server/tables/tables-service (QR call-site URL construction gap)', () => {
-  it('exercises real generateTableQrCode() call path: uploadToStorage() IS called, getPublicStorageUrl() is NOT', async () => {
-    // Import and configure mocks for the real dependencies
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
+describe('lib/server/tables/tables-service (F3 cutover integration)', () => {
+  it('generateTableQrCode() calls uploadToStorage() and getPublicStorageUrl() via the seam', async () => {
     const storageQr = await import('@/lib/storage/qr')
-
+    
     // Set up environment for the call path
-    const originalSupabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
+    const originalBlobBaseUrl = process.env.BLOB_PUBLIC_BASE_URL
     const originalAppUrl = process.env.NEXT_PUBLIC_APP_URL
-    process.env.NEXT_PUBLIC_SUPABASE_URL = 'https://example.supabase.co'
+    process.env.BLOB_PUBLIC_BASE_URL = 'https://example.public.blob.vercel-storage.com'
     process.env.NEXT_PUBLIC_APP_URL = 'https://example.com'
 
-    // Configure the Supabase admin client mock so uploadToStorage() can succeed
-    const mockUpload = vi.fn().mockResolvedValue({ error: null })
-    const mockFrom = vi.fn(() => ({ upload: mockUpload }))
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue({
-      storage: { from: mockFrom },
-    } as never)
-
-    // Spy on getPublicStorageUrl to verify it's NOT called (documenting the gap)
-    const getPublicStorageUrlSpy = vi.spyOn(storageQr, 'getPublicStorageUrl')
+    // Mock both seam functions
+    const uploadSpy = vi.spyOn(storageQr, 'uploadToStorage').mockResolvedValue({ error: null })
+    const getUrlSpy = vi.spyOn(storageQr, 'getPublicStorageUrl').mockReturnValue({
+      publicUrl: 'https://example.public.blob.vercel-storage.com/table-qr-codes/a1b2c3d4-e5f6-7890-abcd-ef1234567890.png',
+    })
 
     try {
-      // Import and call the real generateTableQrCode() function
-      // This exercises the full call path: generateTableQrCode → uploadQrCodeToStorage → uploadToStorage
       const tablesService = await import('@/lib/server/tables/tables-service')
       const tableId = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
-      // KIM-418 (migration-f1-rls-service-layer): generateTableQrCode() now
-      // requires an admin SessionUser as its first argument (service-layer
-      // admin gating hardening) — this call path is otherwise unaffected.
       const adminSession = { id: 'admin-1', role: 'admin' as const, email: 'admin@example.com' }
 
       const result = await tablesService.generateTableQrCode(adminSession, tableId)
 
-      // Assertions documenting the current (F3 scaffold) state:
-
-      // 1. The seam's uploadToStorage() WAS called (real code path exercises it)
-      expect(mockFrom).toHaveBeenCalledWith('table-qr-codes')
-      expect(mockUpload).toHaveBeenCalledWith(
+      // Verify uploadToStorage() was called for the QR code generation
+      expect(uploadSpy).toHaveBeenCalledWith(
+        'table-qr-codes',
         `${tableId}.png`,
         expect.any(Buffer),
         expect.objectContaining({ contentType: 'image/png', upsert: true })
       )
 
-      // 2. The seam's getPublicStorageUrl() was NOT called (gap: manual URL construction)
-      expect(getPublicStorageUrlSpy).not.toHaveBeenCalled()
+      // Verify getPublicStorageUrl() WAS called (F3 cutover completed)
+      expect(getUrlSpy).toHaveBeenCalledWith('table-qr-codes', `${tableId}.png`)
 
-      // 3. The returned URL matches the manual construction pattern
-      expect(result).toMatch(/^https:\/\/example\.supabase\.co\/storage\/v1\/object\/public\/table-qr-codes\/a1b2c3d4-e5f6-7890-abcd-ef1234567890\.png$/)
+      // Verify the returned URL is from the seam, not manually constructed
+      expect(result).toBe('https://example.public.blob.vercel-storage.com/table-qr-codes/a1b2c3d4-e5f6-7890-abcd-ef1234567890.png')
     } finally {
-      getPublicStorageUrlSpy.mockRestore()
-      process.env.NEXT_PUBLIC_SUPABASE_URL = originalSupabaseUrl
+      uploadSpy.mockRestore()
+      getUrlSpy.mockRestore()
+      process.env.BLOB_PUBLIC_BASE_URL = originalBlobBaseUrl
       process.env.NEXT_PUBLIC_APP_URL = originalAppUrl
     }
   })
 })
-
