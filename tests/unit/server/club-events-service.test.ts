@@ -1211,13 +1211,100 @@ describe('club-events-service', () => {
     })
 
     it('rejects malformed schedules with 400 and no insert on events table (Finding 2)', async () => {
-      // TODO: Requires schedule validation mocking
-      expect(true).toBe(true)
+      const adminSession = createAdminSession()
+
+      const { createClubEvent } = await loadClubEventsService()
+
+      // Empty array fails validation before any insert
+      await expect(
+        createClubEvent(adminSession, {
+          titleEs: 'Event',
+          titleEn: 'Event',
+          date: '2026-05-01',
+          dateKind: 'single',
+          blocksRooms: true,
+          schedules: [],  // Empty — should reject
+        })
+      ).rejects.toMatchObject({ statusCode: 400 })
+
+      // Non-array fails validation before any insert
+      await expect(
+        createClubEvent(adminSession, {
+          titleEs: 'Event',
+          titleEn: 'Event',
+          date: '2026-05-01',
+          dateKind: 'single',
+          blocksRooms: true,
+          schedules: 'not an array',
+        })
+      ).rejects.toMatchObject({ statusCode: 400 })
     })
 
     it('updates club event: auto-copied titleEn follows new titleEs when ES changes (OIR-206)', async () => {
-      // TODO: Bilingual fallback logic test - requires update fixture setup
-      expect(true).toBe(true)
+      const adminSession = createAdminSession()
+
+      // Current event has auto-copied titleEn (same as titleEs)
+      setFixture('events', [
+        {
+          id: 'evt-1',
+          title: 'Viejo',
+          titleEs: 'Viejo',
+          titleEn: 'Viejo',  // Auto-copied (was same as ES)
+          blurbEs: null,
+          blurbEn: null,
+          descriptionEs: null,
+          descriptionEn: null,
+          categoryEs: null,
+          categoryEn: null,
+          dateKind: 'single',
+          date: '2026-04-20',
+          endDate: null,
+          recurrenceLabelEs: null,
+          recurrenceLabelEn: null,
+          imageUrl: null,
+          linkUrl: null,
+          createdBy: 'user-1',
+          createdAt: new Date('2026-04-01T00:00:00Z'),
+          startTime: '00:00:00',
+          endTime: '23:59:59',
+        },
+      ])
+
+      setUpdateFixture('events', [
+        {
+          id: 'evt-1',
+          title: 'Nuevo',
+          titleEs: 'Nuevo',
+          titleEn: 'Nuevo',  // Should auto-copy to new ES
+          blurbEs: null,
+          blurbEn: null,
+          descriptionEs: null,
+          descriptionEn: null,
+          categoryEs: null,
+          categoryEn: null,
+          dateKind: 'single',
+          date: '2026-04-20',
+          endDate: null,
+          recurrenceLabelEs: null,
+          recurrenceLabelEn: null,
+          imageUrl: null,
+          linkUrl: null,
+          createdBy: 'user-1',
+          createdAt: new Date('2026-04-01T00:00:00Z'),
+          startTime: '00:00:00',
+          endTime: '23:59:59',
+        },
+      ])
+      setInsertFixture('event_room_blocks', [])
+
+      const { updateClubEvent } = await loadClubEventsService()
+
+      const result = await updateClubEvent(adminSession, 'evt-1', {
+        titleEs: 'Nuevo',  // Change ES
+        // titleEn not provided → should auto-copy to new ES
+      })
+
+      expect(result.titleEn).toBe('Nuevo')
     })
 
     it('updates club event: explicitly different titleEn is preserved when ES changes (OIR-206)', async () => {
