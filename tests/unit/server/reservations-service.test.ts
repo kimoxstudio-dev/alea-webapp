@@ -620,6 +620,7 @@ describe('reservations service', () => {
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
       selectMock.mockResolvedValueOnce([])
+      deleteMock.mockResolvedValueOnce([])
 
       insertMock.mockResolvedValueOnce([makeReservation()])
 
