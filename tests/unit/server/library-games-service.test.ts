@@ -3,14 +3,13 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { readFileSync } from 'fs'
 import { join } from 'path'
 import {
-  createDrizzleQueryBuilderWithDispatching,
-  resetFixtures,
-  setFixture,
+  createStatefulDrizzleDb,
+  resetDb,
+  seedTable,
+  getRows,
+  getQueryLog,
   createMockServiceError,
   MockServiceError,
-  insertMock,
-  updateMock,
-  deleteMock,
 } from '@/tests/unit/mocks/drizzle-mock'
 
 /**
@@ -35,8 +34,8 @@ import {
 vi.mock('server-only', () => ({}))
 
 vi.mock('@/lib/db', () => ({
-  getDrizzleDb: vi.fn(() => createDrizzleQueryBuilderWithDispatching()),
-  getDrizzleAdminDb: vi.fn(() => createDrizzleQueryBuilderWithDispatching()),
+  getDrizzleDb: vi.fn(() => createStatefulDrizzleDb()),
+  getDrizzleAdminDb: vi.fn(() => createStatefulDrizzleDb()),
 }))
 
 vi.mock('@/lib/server/shared/service-error', () => ({
@@ -103,7 +102,7 @@ async function loadLibraryGamesService() {
 
 describe('library-games-service', () => {
   beforeEach(() => {
-    resetFixtures()
+    resetDb()
     vi.clearAllMocks()
   })
 
@@ -113,7 +112,7 @@ describe('library-games-service', () => {
         createGameRow({ id: 'game-1', title: 'Bolt Action', sortOrder: 0, active: true }),
         createGameRow({ id: 'game-2', title: 'Pathfinder 2e', sortOrder: 1, active: true }),
       ]
-      setFixture('library_games', mockGames)
+      seedTable('library_games', mockGames)
 
       const { listLibraryGames } = await loadLibraryGamesService()
       const result = await listLibraryGames()
@@ -130,7 +129,7 @@ describe('library-games-service', () => {
       const mockGames = [
         createGameRow({ id: 'game-1', title: 'Bolt Action', sortOrder: 0, active: true }),
       ]
-      setFixture('library_games', mockGames)
+      seedTable('library_games', mockGames)
 
       const { listLibraryGames } = await loadLibraryGamesService()
       const result = await listLibraryGames()
@@ -140,7 +139,7 @@ describe('library-games-service', () => {
     })
 
     it('uses regular Drizzle client (user-scoped) for public listing', async () => {
-      setFixture('library_games', [createGameRow({ active: true })])
+      seedTable('library_games', [createGameRow({ active: true })])
 
       const { listLibraryGames } = await loadLibraryGamesService()
       await listLibraryGames()
@@ -149,7 +148,7 @@ describe('library-games-service', () => {
     })
 
     it('maps database columns to public LibraryGame type', async () => {
-      setFixture('library_games', [
+      seedTable('library_games', [
         createGameRow({
           id: 'game-1',
           title: 'Test Game',
@@ -181,7 +180,7 @@ describe('library-games-service', () => {
     })
 
     it('converts weight to number type', async () => {
-      setFixture('library_games', [
+      seedTable('library_games', [
         createGameRow({ id: 'game-1', weight: '3.2', active: true }),
         createGameRow({ id: 'game-2', weight: '4.1', active: true }),
       ])
@@ -197,7 +196,7 @@ describe('library-games-service', () => {
   describe('listAdminLibraryGames', () => {
     it('admin can list all games including inactive', async () => {
       const adminSession = createAdminSession()
-      setFixture('library_games', [
+      seedTable('library_games', [
         createGameRow({ id: 'game-1', active: true }),
         createGameRow({ id: 'game-2', active: false }),
       ])
@@ -213,7 +212,7 @@ describe('library-games-service', () => {
 
     it('chains orderBy calls without error (sort_order primary, title secondary)', async () => {
       const adminSession = createAdminSession()
-      setFixture('library_games', [createGameRow({ active: true })])
+      seedTable('library_games', [createGameRow({ active: true })])
 
       const { listAdminLibraryGames } = await loadLibraryGamesService()
       const result = await listAdminLibraryGames(adminSession)
@@ -233,8 +232,6 @@ describe('library-games-service', () => {
   describe('createLibraryGame', () => {
     it('admin can create a game with required fields', async () => {
       const adminSession = createAdminSession()
-      const newGame = createGameRow({ id: 'game-new-1', title: 'New Game' })
-      insertMock.mockResolvedValue([newGame])
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -247,19 +244,15 @@ describe('library-games-service', () => {
         weight: 3.0,
       })
 
-      expect(result.id).toBe('game-new-1')
+      // The mock materialises a real generated id now, rather than the
+      // canned string the old fixture returned.
+      expect(typeof result.id).toBe('string')
       expect(result.title).toBe('New Game')
       expect(result.categoryEs).toBe('Estrategia')
     })
 
     it('admin can create a game with all fields', async () => {
       const adminSession = createAdminSession()
-      const newGame = createGameRow({
-        id: 'game-new-1',
-        title: 'Complete Game',
-        active: true,
-      })
-      insertMock.mockResolvedValue([newGame])
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -297,7 +290,6 @@ describe('library-games-service', () => {
 
     it('accepts weight 0 (falsy-zero)', async () => {
       const adminSession = createAdminSession()
-      insertMock.mockResolvedValue([createGameRow({ id: 'game-new-1' })])
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -310,12 +302,12 @@ describe('library-games-service', () => {
         weight: 0,
       })
 
-      expect(result.id).toBe('game-new-1')
+      expect(typeof result.id).toBe('string')
+      expect(result.weight).toBe(0)
     })
 
     it('accepts weight 5 (upper bound inclusive)', async () => {
       const adminSession = createAdminSession()
-      insertMock.mockResolvedValue([createGameRow({ id: 'game-new-1' })])
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -328,7 +320,8 @@ describe('library-games-service', () => {
         weight: 5,
       })
 
-      expect(result.id).toBe('game-new-1')
+      expect(typeof result.id).toBe('string')
+      expect(result.weight).toBe(5)
     })
 
     it('rejects weight 5.1 (above upper bound)', async () => {
@@ -516,15 +509,14 @@ describe('library-games-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(insertMock).not.toHaveBeenCalled()
+      expect(getQueryLog().filter((entry) => entry.op === 'insert')).toHaveLength(0)
     })
   })
 
   describe('updateLibraryGame', () => {
     it('admin can update a game', async () => {
       const adminSession = createAdminSession()
-      setFixture('library_games', [createGameRow({ id: 'game-1', title: 'Old Title' })])
-      updateMock.mockResolvedValue([createGameRow({ id: 'game-1', title: 'Updated Game' })])
+      seedTable('library_games', [createGameRow({ id: 'game-1', title: 'Old Title' })])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -548,7 +540,7 @@ describe('library-games-service', () => {
 
     it('returns 404 for non-existent game', async () => {
       const adminSession = createAdminSession()
-      setFixture('library_games', []) // Empty fixture
+      seedTable('library_games', []) // Empty fixture
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -559,7 +551,7 @@ describe('library-games-service', () => {
 
     it('rejects weight 5.1 on update', async () => {
       const adminSession = createAdminSession()
-      setFixture('library_games', [createGameRow({ id: 'game-1' })])
+      seedTable('library_games', [createGameRow({ id: 'game-1' })])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -572,7 +564,7 @@ describe('library-games-service', () => {
 
     it('validates before any DB update', async () => {
       const adminSession = createAdminSession()
-      setFixture('library_games', [createGameRow({ id: 'game-1' })])
+      seedTable('library_games', [createGameRow({ id: 'game-1' })])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -582,13 +574,12 @@ describe('library-games-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(updateMock).not.toHaveBeenCalled()
+      expect(getQueryLog().filter((entry) => entry.op === 'update')).toHaveLength(0)
     })
 
     it('preserves current values for omitted fields', async () => {
       const adminSession = createAdminSession()
-      setFixture('library_games', [createGameRow({ id: 'game-1', title: 'Old Title' })])
-      updateMock.mockResolvedValue([createGameRow({ id: 'game-1' })])
+      seedTable('library_games', [createGameRow({ id: 'game-1', title: 'Old Title' })])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -597,17 +588,21 @@ describe('library-games-service', () => {
       })
 
       expect(result.id).toBe('game-1')
+      // Fields not in the body fall back to the current row's real values.
+      expect(result.categoryEs).toBe('Estrategia')
+      expect(result.players).toBe('2-4')
     })
   })
 
   describe('deleteLibraryGame', () => {
     it('admin can delete a game', async () => {
       const adminSession = createAdminSession()
-      deleteMock.mockResolvedValue([{ id: 'game-1' }])
+      seedTable('library_games', [createGameRow({ id: 'game-1' })])
 
       const { deleteLibraryGame } = await loadLibraryGamesService()
 
       await expect(deleteLibraryGame(adminSession, 'game-1')).resolves.toBeUndefined()
+      expect(getRows('library_games')).toHaveLength(0)
     })
 
     it('non-admin member gets 403 Forbidden on delete', async () => {
@@ -620,7 +615,6 @@ describe('library-games-service', () => {
 
     it('returns 404 for non-existent game', async () => {
       const adminSession = createAdminSession()
-      deleteMock.mockResolvedValue([]) // Empty result
 
       const { deleteLibraryGame } = await loadLibraryGamesService()
 
@@ -692,14 +686,6 @@ describe('library-games-service', () => {
   describe('createLibraryGame with optional English (OIR-206)', () => {
     it('admin can create a game with categoryEn absent, falls back to categoryEs', async () => {
       const adminSession = createAdminSession()
-      insertMock.mockResolvedValue([
-        createGameRow({
-          id: 'game-new-1',
-          title: 'Juego de Estrategia',
-          categoryEs: 'Estrategia',
-          categoryEn: 'Estrategia',
-        }),
-      ])
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -718,14 +704,6 @@ describe('library-games-service', () => {
 
     it('admin can create a game with categoryEn empty string, falls back to categoryEs', async () => {
       const adminSession = createAdminSession()
-      insertMock.mockResolvedValue([
-        createGameRow({
-          id: 'game-new-1',
-          title: 'RPG de Fantasía',
-          categoryEs: 'Rol',
-          categoryEn: 'Rol',
-        }),
-      ])
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -743,14 +721,6 @@ describe('library-games-service', () => {
 
     it('admin can create a game with explicit categoryEn, preserves EN value', async () => {
       const adminSession = createAdminSession()
-      insertMock.mockResolvedValue([
-        createGameRow({
-          id: 'game-new-1',
-          title: 'Modern Warfare Board Game',
-          categoryEs: 'Wargame',
-          categoryEn: 'War',
-        }),
-      ])
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -776,14 +746,7 @@ describe('library-games-service', () => {
         categoryEs: 'Vieja Categoría',
         categoryEn: 'Vieja Categoría',
       })
-      setFixture('library_games', [currentRow])
-      updateMock.mockResolvedValue([
-        createGameRow({
-          id: 'game-1',
-          categoryEs: 'Nueva Categoría',
-          categoryEn: 'Nueva Categoría',
-        }),
-      ])
+      seedTable('library_games', [currentRow])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -801,14 +764,7 @@ describe('library-games-service', () => {
         categoryEs: 'Vieja Categoría',
         categoryEn: 'Explicitly Set Category',
       })
-      setFixture('library_games', [currentRow])
-      updateMock.mockResolvedValue([
-        createGameRow({
-          id: 'game-1',
-          categoryEs: 'Nueva Categoría',
-          categoryEn: 'Explicitly Set Category',
-        }),
-      ])
+      seedTable('library_games', [currentRow])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -828,14 +784,7 @@ describe('library-games-service', () => {
         categoryEs: 'Vieja Categoría',
         categoryEn: 'Old Explicit Category',
       })
-      setFixture('library_games', [currentRow])
-      updateMock.mockResolvedValue([
-        createGameRow({
-          id: 'game-1',
-          categoryEs: 'Nueva Categoría',
-          categoryEn: 'Nueva Categoría',
-        }),
-      ])
+      seedTable('library_games', [currentRow])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -854,14 +803,7 @@ describe('library-games-service', () => {
         categoryEs: 'Vieja Categoría',
         categoryEn: 'Vieja Categoría',
       })
-      setFixture('library_games', [currentRow])
-      updateMock.mockResolvedValue([
-        createGameRow({
-          id: 'game-1',
-          categoryEs: 'Nueva Categoría',
-          categoryEn: 'Vieja Categoría',
-        }),
-      ])
+      seedTable('library_games', [currentRow])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -880,14 +822,7 @@ describe('library-games-service', () => {
         categoryEs: 'Vieja Categoría',
         categoryEn: 'Old Explicit Category',
       })
-      setFixture('library_games', [currentRow])
-      updateMock.mockResolvedValue([
-        createGameRow({
-          id: 'game-1',
-          categoryEs: 'Nueva Categoría',
-          categoryEn: 'Nueva Categoría',
-        }),
-      ])
+      seedTable('library_games', [currentRow])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -903,12 +838,6 @@ describe('library-games-service', () => {
   describe('imageUrl validation (OIR-207)', () => {
     it('admin can create a game with optional imageUrl using valid https URL', async () => {
       const adminSession = createAdminSession()
-      insertMock.mockResolvedValue([
-        createGameRow({
-          id: 'game-new-1',
-          imgUrl: 'https://example.com/landing-media/library-games/abc123.png',
-        }),
-      ])
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -922,13 +851,12 @@ describe('library-games-service', () => {
         imageUrl: 'https://example.com/landing-media/library-games/abc123.png',
       })
 
-      expect(result.id).toBe('game-new-1')
+      expect(typeof result.id).toBe('string')
       expect(result.imgUrl).toBe('https://example.com/landing-media/library-games/abc123.png')
     })
 
     it('admin can create a game with imageUrl absent (optional field)', async () => {
       const adminSession = createAdminSession()
-      insertMock.mockResolvedValue([createGameRow({ id: 'game-new-1', imgUrl: null })])
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -941,13 +869,12 @@ describe('library-games-service', () => {
         weight: 3.5,
       })
 
-      expect(result.id).toBe('game-new-1')
+      expect(typeof result.id).toBe('string')
       expect(result.imgUrl).toBeNull()
     })
 
     it('admin can create a game with imageUrl null (optional field)', async () => {
       const adminSession = createAdminSession()
-      insertMock.mockResolvedValue([createGameRow({ id: 'game-new-1', imgUrl: null })])
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -961,13 +888,12 @@ describe('library-games-service', () => {
         imageUrl: null,
       })
 
-      expect(result.id).toBe('game-new-1')
+      expect(typeof result.id).toBe('string')
       expect(result.imgUrl).toBeNull()
     })
 
     it('admin can create a game with imageUrl empty string (optional field)', async () => {
       const adminSession = createAdminSession()
-      insertMock.mockResolvedValue([createGameRow({ id: 'game-new-1', imgUrl: null })])
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -981,7 +907,7 @@ describe('library-games-service', () => {
         imageUrl: '',
       })
 
-      expect(result.id).toBe('game-new-1')
+      expect(typeof result.id).toBe('string')
       expect(result.imgUrl).toBeNull()
     })
 
@@ -1002,7 +928,7 @@ describe('library-games-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(insertMock).not.toHaveBeenCalled()
+      expect(getQueryLog().filter((entry) => entry.op === 'insert')).toHaveLength(0)
     })
 
     it('admin rejects imageUrl with data: protocol', async () => {
@@ -1022,7 +948,7 @@ describe('library-games-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(insertMock).not.toHaveBeenCalled()
+      expect(getQueryLog().filter((entry) => entry.op === 'insert')).toHaveLength(0)
     })
 
     it('admin rejects imageUrl with relative path', async () => {
@@ -1042,12 +968,11 @@ describe('library-games-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(insertMock).not.toHaveBeenCalled()
+      expect(getQueryLog().filter((entry) => entry.op === 'insert')).toHaveLength(0)
     })
 
     it('admin accepts imageUrl with valid http:// URL', async () => {
       const adminSession = createAdminSession()
-      insertMock.mockResolvedValue([createGameRow({ id: 'game-new-1' })])
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -1061,18 +986,12 @@ describe('library-games-service', () => {
         imageUrl: 'http://example.com/game.png',
       })
 
-      expect(result.id).toBe('game-new-1')
+      expect(typeof result.id).toBe('string')
     })
 
     it('admin can update game with imageUrl added', async () => {
       const adminSession = createAdminSession()
-      setFixture('library_games', [createGameRow({ id: 'game-1' })])
-      updateMock.mockResolvedValue([
-        createGameRow({
-          id: 'game-1',
-          imgUrl: 'https://example.com/landing-media/library-games/updated.png',
-        }),
-      ])
+      seedTable('library_games', [createGameRow({ id: 'game-1' })])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -1081,11 +1000,12 @@ describe('library-games-service', () => {
       })
 
       expect(result.id).toBe('game-1')
+      expect(result.imgUrl).toBe('https://example.com/landing-media/library-games/updated.png')
     })
 
     it('admin rejects imageUrl update with javascript: protocol', async () => {
       const adminSession = createAdminSession()
-      setFixture('library_games', [createGameRow({ id: 'game-1' })])
+      seedTable('library_games', [createGameRow({ id: 'game-1' })])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -1095,13 +1015,12 @@ describe('library-games-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(updateMock).not.toHaveBeenCalled()
+      expect(getQueryLog().filter((entry) => entry.op === 'update')).toHaveLength(0)
     })
 
     it('admin can clear imageUrl by setting to empty string', async () => {
       const adminSession = createAdminSession()
-      setFixture('library_games', [createGameRow({ id: 'game-1' })])
-      updateMock.mockResolvedValue([createGameRow({ id: 'game-1', imgUrl: null })])
+      seedTable('library_games', [createGameRow({ id: 'game-1', imgUrl: 'https://example.com/old.png' })])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -1110,6 +1029,7 @@ describe('library-games-service', () => {
       })
 
       expect(result.id).toBe('game-1')
+      expect(result.imgUrl).toBeNull()
     })
 
     it('migration adds img_url column to library_games', () => {
