@@ -1,23 +1,21 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  createTransactionAwareMockBuilder,
+  createStatefulDrizzleDb,
   createAdminSession,
   createMemberSession,
-  selectMock,
-  insertMock,
-  updateMock,
-  deleteMock,
-  resetFixtures,
-  setFixture,
-  getFixtureState,
+  resetDb,
+  seed,
+  seedTable,
+  getRows,
+  failNextQuery,
   createMockServiceError,
   MockServiceError,
 } from '@/tests/unit/mocks/drizzle-mock'
 
 vi.mock('@/lib/db', () => ({
-  getDrizzleDb: vi.fn(() => createTransactionAwareMockBuilder()),
-  getDrizzleAdminDb: vi.fn(() => createTransactionAwareMockBuilder()),
+  getDrizzleDb: vi.fn(() => createStatefulDrizzleDb()),
+  getDrizzleAdminDb: vi.fn(() => createStatefulDrizzleDb()),
 }))
 
 vi.mock('@/lib/server/shared/service-error', () => ({
@@ -42,12 +40,12 @@ const equipmentRow = {
 // ── listEquipment ─────────────────────────────────────────────────────────────
 describe('listEquipment', () => {
   beforeEach(() => {
-    resetFixtures()
+    resetDb()
     vi.clearAllMocks()
   })
 
   it('returns all equipment rows', async () => {
-    setFixture('equipment', [equipmentRow])
+    seedTable('equipment', [equipmentRow])
     const { listEquipment } = await loadModule()
     const result = await listEquipment()
     expect(result).toHaveLength(1)
@@ -55,14 +53,14 @@ describe('listEquipment', () => {
   })
 
   it('returns an empty array when no equipment exists', async () => {
-    setFixture('equipment', [])
+    seedTable('equipment', [])
     const { listEquipment } = await loadModule()
     const result = await listEquipment()
     expect(result).toEqual([])
   })
 
   it('throws 500 when the database query fails', async () => {
-    selectMock.mockRejectedValueOnce(new Error('DB error'))
+    failNextQuery({ op: 'select', table: 'equipment' })
     const { listEquipment } = await loadModule()
     await expect(listEquipment()).rejects.toMatchObject({ statusCode: 500 })
   })
@@ -71,17 +69,16 @@ describe('listEquipment', () => {
 // ── createEquipment ───────────────────────────────────────────────────────────
 describe('createEquipment', () => {
   beforeEach(() => {
-    resetFixtures()
+    resetDb()
     vi.clearAllMocks()
   })
 
   it('inserts and returns the new equipment', async () => {
-    const newEquipment = { id: 'eq-new-1', name: 'Projector', createdAt: new Date() }
-    insertMock.mockResolvedValueOnce([newEquipment])
     const { createEquipment } = await loadModule()
     const adminSession = createAdminSession()
     const result = await createEquipment(adminSession, { name: 'Projector' })
     expect(result).toMatchObject({ name: 'Projector' })
+    expect(getRows('equipment')).toHaveLength(1)
   })
 
   it('throws 403 when session role is not admin', async () => {
@@ -93,7 +90,7 @@ describe('createEquipment', () => {
   })
 
   it('throws 500 when the database insert fails', async () => {
-    insertMock.mockRejectedValueOnce(new Error('insert failed'))
+    failNextQuery({ op: 'insert', table: 'equipment' })
     const { createEquipment } = await loadModule()
     const adminSession = createAdminSession()
     await expect(createEquipment(adminSession, { name: 'Projector' })).rejects.toMatchObject({
@@ -105,13 +102,12 @@ describe('createEquipment', () => {
 // ── updateEquipment ───────────────────────────────────────────────────────────
 describe('updateEquipment', () => {
   beforeEach(() => {
-    resetFixtures()
+    resetDb()
     vi.clearAllMocks()
   })
 
   it('updates and returns the equipment', async () => {
-    const updatedEquipment = { id: 'eq-1', name: 'Updated Projector', createdAt: new Date() }
-    updateMock.mockResolvedValueOnce([updatedEquipment])
+    seedTable('equipment', [equipmentRow])
     const { updateEquipment } = await loadModule()
     const adminSession = createAdminSession()
     const result = await updateEquipment(adminSession, 'eq-1', { name: 'Updated Projector' })
@@ -127,7 +123,8 @@ describe('updateEquipment', () => {
   })
 
   it('throws 500 when the database update fails', async () => {
-    updateMock.mockRejectedValueOnce(new Error('update failed'))
+    seedTable('equipment', [equipmentRow])
+    failNextQuery({ op: 'update', table: 'equipment' })
     const { updateEquipment } = await loadModule()
     const adminSession = createAdminSession()
     await expect(updateEquipment(adminSession, 'eq-1', { name: 'Updated' })).rejects.toMatchObject({
@@ -139,15 +136,16 @@ describe('updateEquipment', () => {
 // ── deleteEquipment ───────────────────────────────────────────────────────────
 describe('deleteEquipment', () => {
   beforeEach(() => {
-    resetFixtures()
+    resetDb()
     vi.clearAllMocks()
   })
 
   it('deletes equipment and returns void', async () => {
-    deleteMock.mockResolvedValueOnce([equipmentRow])
+    seedTable('equipment', [equipmentRow])
     const { deleteEquipment } = await loadModule()
     const adminSession = createAdminSession()
     await expect(deleteEquipment(adminSession, 'eq-1')).resolves.toBeUndefined()
+    expect(getRows('equipment')).toHaveLength(0)
   })
 
   it('throws 403 when session role is not admin', async () => {
@@ -159,7 +157,8 @@ describe('deleteEquipment', () => {
   })
 
   it('throws 500 when the database delete fails', async () => {
-    deleteMock.mockRejectedValueOnce(new Error('delete failed'))
+    seedTable('equipment', [equipmentRow])
+    failNextQuery({ op: 'delete', table: 'equipment' })
     const { deleteEquipment } = await loadModule()
     const adminSession = createAdminSession()
     await expect(deleteEquipment(adminSession, 'eq-1')).rejects.toMatchObject({
@@ -171,33 +170,40 @@ describe('deleteEquipment', () => {
 // ── getRoomDefaultEquipment ───────────────────────────────────────────────────
 describe('getRoomDefaultEquipment', () => {
   beforeEach(() => {
-    resetFixtures()
+    resetDb()
     vi.clearAllMocks()
   })
 
   it('returns equipment for a room', async () => {
-    // The query does an innerJoin between room_default_equipment and equipment,
-    // so the fixture should return the joined result with equipment fields
-    const roomEquipment = [
-      { id: 'eq-1', name: 'Dice Set', description: 'Standard dice', createdAt: new Date('2025-01-01') },
-      { id: 'eq-2', name: 'Cards', description: 'Playing cards', createdAt: new Date('2025-01-02') },
-    ]
-    setFixture('room_default_equipment', roomEquipment)
+    // Real innerJoin between room_default_equipment and equipment now, so
+    // both sides of the relation must be seeded (the old sequence-driven
+    // mock let the fixture stand in directly for the joined result — the
+    // new state-driven mock evaluates the join for real).
+    seed({
+      equipment: [
+        { id: 'eq-1', name: 'Dice Set', description: 'Standard dice', createdAt: new Date('2025-01-01') },
+        { id: 'eq-2', name: 'Cards', description: 'Playing cards', createdAt: new Date('2025-01-02') },
+      ],
+      room_default_equipment: [
+        { roomId: 'room-1', equipmentId: 'eq-1' },
+        { roomId: 'room-1', equipmentId: 'eq-2' },
+      ],
+    })
     const { getRoomDefaultEquipment } = await loadModule()
     const result = await getRoomDefaultEquipment('room-1')
     expect(result).toHaveLength(2)
-    expect(result[0].name).toBe('Dice Set')
+    expect(result.map((row) => row.name).sort()).toEqual(['Cards', 'Dice Set'])
   })
 
   it('returns an empty array when room has no defaults', async () => {
-    setFixture('room_default_equipment', [])
+    seed({ equipment: [], room_default_equipment: [] })
     const { getRoomDefaultEquipment } = await loadModule()
     const result = await getRoomDefaultEquipment('room-1')
     expect(result).toEqual([])
   })
 
   it('throws 500 when the database query fails', async () => {
-    selectMock.mockRejectedValueOnce(new Error('DB error'))
+    failNextQuery({ op: 'select', table: 'room_default_equipment' })
     const { getRoomDefaultEquipment } = await loadModule()
     await expect(getRoomDefaultEquipment('room-1')).rejects.toMatchObject({ statusCode: 500 })
   })
@@ -206,11 +212,9 @@ describe('getRoomDefaultEquipment', () => {
 // ── setRoomDefaultEquipment ───────────────────────────────────────────────────
 describe('setRoomDefaultEquipment', () => {
   beforeEach(() => {
-    resetFixtures()
+    resetDb()
     vi.clearAllMocks()
-    selectMock.mockReturnValue(Promise.resolve([]))
-    deleteMock.mockReturnValue(Promise.resolve([]))
-    insertMock.mockReturnValue(Promise.resolve([]))
+    seed({ equipment: [{ id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() }] })
   })
 
   it('clears defaults when equipmentIds is empty', async () => {
@@ -221,21 +225,18 @@ describe('setRoomDefaultEquipment', () => {
   })
 
   it('inserts new defaults when no conflicts exist', async () => {
-    setFixture('room_default_equipment', [])
+    seedTable('room_default_equipment', [])
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
     await expect(setRoomDefaultEquipment(adminSession, 'room-1', ['eq-1', 'eq-2'])).resolves.toBeUndefined()
-    expect(insertMock).toHaveBeenCalled()
+    expect(getRows('room_default_equipment')).toHaveLength(2)
   })
 
   it('throws 400 EQUIPMENT_LOCKED_TO_ANOTHER_ROOM when equipment belongs to another room', async () => {
     // Setup: equipment eq-1 is locked to room-99
-    setFixture('room_default_equipment', [{ id: 'rde-conflict', equipmentId: 'eq-1', roomId: 'room-99' }])
-    // Clear the global selectMock so fixture is used instead
-    selectMock.mockClear()
-    selectMock.mockReturnValue(Promise.resolve([{ equipmentId: 'eq-1', roomId: 'room-99' }]))
-    
+    seedTable('room_default_equipment', [{ roomId: 'room-99', equipmentId: 'eq-1' }])
+
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -248,8 +249,8 @@ describe('setRoomDefaultEquipment', () => {
 
   it('allows re-assigning equipment already locked to the same room', async () => {
     // Setup: equipment eq-1 is already assigned to room-1
-    setFixture('room_default_equipment', [{ id: 'rde-same-room', equipmentId: 'eq-1', roomId: 'room-1' }])
-    
+    seedTable('room_default_equipment', [{ roomId: 'room-1', equipmentId: 'eq-1' }])
+
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -258,8 +259,8 @@ describe('setRoomDefaultEquipment', () => {
   })
 
   it('throws 500 when the conflict-check query fails', async () => {
-    setFixture('room_default_equipment', [])
-    selectMock.mockImplementation(() => Promise.reject(new Error('DB failure')))
+    seedTable('room_default_equipment', [])
+    failNextQuery({ op: 'select', table: 'room_default_equipment' })
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -267,8 +268,8 @@ describe('setRoomDefaultEquipment', () => {
   })
 
   it('throws 500 when the delete step fails', async () => {
-    setFixture('room_default_equipment', [])
-    deleteMock.mockImplementation(() => Promise.reject(new Error('delete failed')))
+    seedTable('room_default_equipment', [])
+    failNextQuery({ op: 'delete', table: 'room_default_equipment' })
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -276,8 +277,8 @@ describe('setRoomDefaultEquipment', () => {
   })
 
   it('throws 500 when the insert step fails', async () => {
-    setFixture('room_default_equipment', [])
-    insertMock.mockImplementation(() => Promise.reject(new Error('insert failed')))
+    seedTable('room_default_equipment', [])
+    failNextQuery({ op: 'insert', table: 'room_default_equipment' })
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -291,13 +292,18 @@ describe('setRoomDefaultEquipment', () => {
     // Setup: room-1 already has equipment 'eq-original' assigned
     // Action: try to replace with 'eq-1' (INSERT fails)
     // Verification: the original equipment is still there after rollback
-    
+
     const roomEquipmentTable = 'room_default_equipment'
-    setFixture(roomEquipmentTable, [{ id: 'rde-existing', roomId: 'room-1', equipmentId: 'eq-original' }])
-    
-    selectMock.mockReturnValue(Promise.resolve([])) // no conflicts
-    insertMock.mockImplementation(() => Promise.reject(new Error('insert failed for test')))
-    
+    seed({
+      equipment: [
+        { id: 'eq-1', name: 'Projector', description: null, createdAt: new Date() },
+        { id: 'eq-original', name: 'Original', description: null, createdAt: new Date() },
+      ],
+      room_default_equipment: [{ roomId: 'room-1', equipmentId: 'eq-original' }],
+    })
+
+    failNextQuery({ op: 'insert', table: roomEquipmentTable, error: new Error('insert failed for test') })
+
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -305,11 +311,11 @@ describe('setRoomDefaultEquipment', () => {
     await expect(setRoomDefaultEquipment(adminSession, 'room-1', ['eq-1'])).rejects.toMatchObject({
       statusCode: 500,
     })
-    
+
     // Verify rollback: the original equipment is still there
     // The DELETE inside the failed transaction did not commit
-    const stateAfterRollback = getFixtureState(roomEquipmentTable)
-    expect(stateAfterRollback).toEqual([{ id: 'rde-existing', roomId: 'room-1', equipmentId: 'eq-original' }])
+    const stateAfterRollback = getRows(roomEquipmentTable)
+    expect(stateAfterRollback).toEqual([{ roomId: 'room-1', equipmentId: 'eq-original' }])
   })
 
   it('translates unique-constraint violation (concurrent race) to 400 EQUIPMENT_LOCKED_TO_ANOTHER_ROOM', async () => {
@@ -318,15 +324,19 @@ describe('setRoomDefaultEquipment', () => {
     // equipment. One succeeds, the other's INSERT throws a 23505
     // unique-constraint violation. The service should translate this into
     // the existing business error instead of surfacing a raw 500.
-    setFixture('room_default_equipment', [])
-    deleteMock.mockReturnValue(Promise.resolve([])) // delete succeeds
-    // Simulate the unique-constraint violation from Postgres/node-postgres
-    insertMock.mockImplementation(() =>
-      Promise.reject({
+    seedTable('room_default_equipment', [])
+    // failNextQuery only preserves Error instances verbatim (a plain object
+    // spec is stringified into a generic mock error), so the injected error
+    // must itself be an Error carrying the pg-style `code`/`constraint` shape
+    // isEquipmentExclusivityViolation() duck-types against.
+    failNextQuery({
+      op: 'insert',
+      table: 'room_default_equipment',
+      error: Object.assign(new Error('unique violation'), {
         code: '23505',
         constraint: 'room_default_equipment_equipment_id_unique',
       }),
-    )
+    })
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
@@ -341,15 +351,16 @@ describe('setRoomDefaultEquipment', () => {
     // Negative test: isEquipmentExclusivityViolation should only match the
     // specific constraint, not all unique violations. A different constraint
     // name should fall through to the generic 500 path.
-    setFixture('room_default_equipment', [])
-    deleteMock.mockReturnValue(Promise.resolve([]))
+    seedTable('room_default_equipment', [])
     // Simulate a different unique-constraint violation (e.g., some other table)
-    insertMock.mockImplementation(() =>
-      Promise.reject({
+    failNextQuery({
+      op: 'insert',
+      table: 'room_default_equipment',
+      error: Object.assign(new Error('unique violation'), {
         code: '23505',
         constraint: 'some_other_unique_constraint',
       }),
-    )
+    })
     const { setRoomDefaultEquipment } = await loadModule()
     const adminSession = createAdminSession()
 
