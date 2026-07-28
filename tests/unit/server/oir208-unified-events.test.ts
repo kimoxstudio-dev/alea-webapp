@@ -1077,13 +1077,15 @@ describe('OIR-208: Unified Events', () => {
 
       const { createSavedGameForSession } = await import('@/lib/server/games/saved-games-service')
 
-      // Configure Drizzle mock for table read (first call - conflicts on sg-table-1)
-      selectMock.mockResolvedValueOnce([
-        {
-          id: 'sg-table-1',
-          roomId: RESERVATION_ROOM,
-          type: 'removable_top',
-        },
+      // Seed Drizzle tables and saved_games for the state-driven mock (KIM-443).
+      // The service uses getDrizzleAdminDb() to look up tables and rooms; seedTable
+      // accepts both Drizzle table objects and plain data objects.
+      seedTable('rooms', [
+        { id: RESERVATION_ROOM, name: 'Reservation Room' },
+      ])
+      seedTable('tables', [
+        { id: 'sg-table-1', roomId: RESERVATION_ROOM, name: 'Table SG-1', type: 'removable_top' },
+        { id: 'sg-table-2', roomId: RESERVATION_ROOM, name: 'Table SG-2', type: 'removable_top' },
       ])
 
       // The blocked table itself must conflict.
@@ -1093,35 +1095,8 @@ describe('OIR-208: Unified Events', () => {
         endDate: '2026-05-20',
       })).rejects.toMatchObject({ message: 'SAVED_GAME_EVENT_CONFLICT', statusCode: 409 })
 
-      // Configure Drizzle mock for table read (second call - succeeds on sg-table-2)
-      selectMock.mockResolvedValueOnce([
-        {
-          id: 'sg-table-2',
-          roomId: RESERVATION_ROOM,
-          type: 'removable_top',
-        },
-      ])
-
-      // Configure Drizzle mocks for insert and joined query fetch
-      insertMock.mockResolvedValueOnce([{ id: 'sg-1' }])
-      selectMock.mockResolvedValueOnce([
-        {
-          id: 'sg-1',
-          tableId: 'sg-table-2',
-          userId: 'user-1',
-          startDate: '2026-04-20',
-          endDate: '2026-05-20',
-          status: 'active',
-          attendanceCount: 0,
-          renewedFromId: null,
-          createdAt: new Date('2026-04-01T00:00:00.000Z'),
-          updatedAt: new Date('2026-04-01T00:00:00.000Z'),
-          tableName: 'Saved Game Table',
-          roomName: RESERVATION_ROOM,
-        },
-      ])
-
       // A sibling table not referenced by the block must NOT conflict.
+      // Seed the newly-created row so the joined read finds it.
       const result = await createSavedGameForSession({ id: 'user-1', role: 'member' }, {
         tableId: 'sg-table-2',
         startDate: '2026-04-20',
