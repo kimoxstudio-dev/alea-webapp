@@ -5,7 +5,6 @@ import { NextRequest, NextResponse } from 'next/server'
 const recoverAccountMock = vi.fn()
 const enforceMutationSecurityMock = vi.fn()
 const enforceRateLimitMock = vi.fn()
-const routeSignInWithPasswordMock = vi.fn()
 
 vi.mock('@/lib/server/auth/auth-service', () => ({
   recoverAccount: recoverAccountMock,
@@ -22,20 +21,6 @@ vi.mock('@/lib/server/shared/security', async (importOriginal) => {
     },
   }
 })
-
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseRouteHandlerClient: vi.fn(() => ({
-    supabase: {
-      auth: {
-        signInWithPassword: routeSignInWithPasswordMock,
-      },
-    },
-    applyCookies: (response: NextResponse) => {
-      response.cookies.set('sb-access-token', 'test-session')
-      return response
-    },
-  })),
-}))
 
 function createJsonRequest(body?: unknown) {
   return new NextRequest('http://localhost:3000/api/auth/recover', {
@@ -60,7 +45,7 @@ describe('POST /api/auth/recover', () => {
     enforceMutationSecurityMock.mockReturnValue(null)
     enforceRateLimitMock.mockReturnValue(null)
     recoverAccountMock.mockResolvedValue({
-      authEmail: '100020@members.alea.internal',
+      signInFailed: false,
       user: {
         id: 'user-20',
         memberNumber: '100020',
@@ -69,10 +54,6 @@ describe('POST /api/auth/recover', () => {
         createdAt: '2024-01-01T00:00:00.000Z',
         updatedAt: '2024-01-01T00:00:00.000Z',
       },
-    })
-    routeSignInWithPasswordMock.mockResolvedValue({
-      data: { user: { id: 'user-20' } },
-      error: null,
     })
   })
 
@@ -88,11 +69,10 @@ describe('POST /api/auth/recover', () => {
       memberNumber: '100020',
       isActive: true,
     })
-    expect(routeSignInWithPasswordMock).toHaveBeenCalledWith({
-      email: '100020@members.alea.internal',
+    expect(recoverAccountMock).toHaveBeenCalledWith({
+      token: 'plain-token',
       password: 'Password123',
     })
-    expect(response.cookies.get('sb-access-token')?.value).toBe('test-session')
   })
 
   it('maps recovery failures to service error responses', async () => {
@@ -137,9 +117,16 @@ describe('POST /api/auth/recover', () => {
   })
 
   it('returns 500 when recovery succeeds but automatic sign-in fails', async () => {
-    routeSignInWithPasswordMock.mockResolvedValueOnce({
-      data: { user: null },
-      error: { message: 'sign-in failed' },
+    recoverAccountMock.mockResolvedValueOnce({
+      signInFailed: true,
+      user: {
+        id: 'user-20',
+        memberNumber: '100020',
+        role: 'member',
+        isActive: true,
+        createdAt: '2024-01-01T00:00:00.000Z',
+        updatedAt: '2024-01-01T00:00:00.000Z',
+      },
     })
 
     const { POST } = await import('@/app/api/auth/recover/route')

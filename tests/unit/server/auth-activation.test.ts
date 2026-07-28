@@ -1,5 +1,46 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+// Mock Auth.js early to prevent loading next-auth
+vi.mock('@/lib/authjs/auth', () => ({
+  auth: vi.fn(),
+  signIn: vi.fn(),
+  signOut: vi.fn(),
+  handlers: { GET: vi.fn(), POST: vi.fn() },
+}))
+
+vi.mock('next-auth', () => ({
+  AuthError: class AuthError extends Error {
+    constructor(message: string) {
+      super(message)
+      this.name = 'AuthError'
+    }
+  },
+}))
+
+vi.mock('next-auth/jwt', () => ({
+  getToken: vi.fn(),
+}))
+
+// State for controlling getDrizzleAdminDb behavior
+const drizzleHashWriteState = { zeroRows: false }
+
+vi.mock('@/lib/db', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/db')>('@/lib/db')
+  return {
+    ...actual,
+    getDrizzleAdminDb: vi.fn(() => ({
+      update: vi.fn(() => ({
+        set: vi.fn(() => ({
+          where: vi.fn(() => ({
+            returning: vi.fn(async () => (drizzleHashWriteState.zeroRows ? [] : [{ id: 'member-1' }])),
+          })),
+        })),
+      })),
+    })),
+  }
+})
+
 import { createHash } from 'node:crypto'
 
 
@@ -252,6 +293,7 @@ describe('auth activation helpers', () => {
     claimTokenErrorState.value = null
     claimMissMutatorState.value = null
     databaseTimeRpcMock.mockClear()
+    drizzleHashWriteState.zeroRows = false
 
     const profile = seedProfile()
     profilesById.set(profile.id, profile)
@@ -430,6 +472,45 @@ describe('auth activation helpers', () => {
     })
 
     expect(activationTokensByProfileId.get('member-1')?.used_at).toBeTruthy()
+  })
+
+  it('treats zero-row Drizzle password hash update as a failed write and rolls back token', async () => {
+    seedActivationToken()
+    drizzleHashWriteState.zeroRows = true
+    const { activateAccount } = await loadService()
+
+    await expect(activateAccount({
+      token: 'plain-token',
+      password: 'Password123',
+    })).rejects.toMatchObject({
+      message: 'Failed to activate account',
+      statusCode: 500,
+    })
+
+    expect(activationTokensByProfileId.get('member-1')?.used_at).toBeNull()
+  })
+
+  it('activation succeeds and writes password hash to Drizzle seam', async () => {
+    seedActivationToken()
+    const { activateAccount } = await loadService()
+    const { getDrizzleAdminDb } = await import('@/lib/db')
+
+    const result = await activateAccount({
+      token: 'plain-token',
+      password: 'Password123',
+    })
+
+    expect(result).toMatchObject({
+      authEmail: '100020@members.alea.internal',
+      user: {
+        memberNumber: '100020',
+        isActive: true,
+      },
+    })
+
+    expect(vi.mocked(getDrizzleAdminDb)).toHaveBeenCalled()
+    const mockDb = vi.mocked(getDrizzleAdminDb).mock.results[0].value
+    expect(mockDb.update).toHaveBeenCalled()
   })
 
 

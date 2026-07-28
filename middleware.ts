@@ -1,9 +1,7 @@
 import createMiddleware from 'next-intl/middleware'
-import { createServerClient, type CookieOptions } from '@supabase/ssr'
-import { type NextRequest, type NextResponse } from 'next/server'
-import { ensureCsrfCookie, getSupabaseCookieOptions } from './lib/server/shared/security-edge'
+import { type NextRequest } from 'next/server'
+import { ensureCsrfCookie } from './lib/server/shared/security-edge'
 import { locales, defaultLocale } from './lib/i18n/config'
-import { getSupabaseUrl, getSupabasePublishableKey } from './lib/supabase/config.client'
 
 const handleI18nRouting = createMiddleware({
   locales,
@@ -11,35 +9,14 @@ const handleI18nRouting = createMiddleware({
   localePrefix: 'always',
 })
 
-function createMiddlewareSupabaseClient(request: NextRequest, response: NextResponse) {
-  return createServerClient(
-    getSupabaseUrl(),
-    getSupabasePublishableKey(),
-    {
-      cookieOptions: getSupabaseCookieOptions(),
-      cookies: {
-        getAll() {
-          return request.cookies.getAll()
-        },
-        setAll(cookiesToSet: { name: string; value: string; options: CookieOptions }[]) {
-          cookiesToSet.forEach(({ name, value }) => {
-            request.cookies.set(name, value)
-          })
-
-          cookiesToSet.forEach(({ name, value, options }) => {
-            response.cookies.set(name, value, options)
-          })
-        },
-      },
-    },
-  )
-}
-
 export default async function middleware(request: NextRequest) {
   const response = handleI18nRouting(request)
-  const supabase = createMiddlewareSupabaseClient(request, response)
 
-  await supabase.auth.getUser()
+  // No Auth.js session read happens here (KIM-433 follow-up): a prior
+  // `getToken()` call was added for the F3b cutover but its result was
+  // never used for anything (no redirect, no gating), so it was dead code
+  // — actual route protection happens per-request in route handlers via
+  // `requireAuth`/`requireAdmin` (`lib/server/auth/auth.ts`), not here.
 
   return ensureCsrfCookie(request, response)
 }

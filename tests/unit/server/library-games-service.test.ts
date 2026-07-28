@@ -2,7 +2,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { readFileSync } from 'fs'
 import { join } from 'path'
-import type { ServiceError } from '@/lib/server/shared/service-error'
+import {
+  createStatefulDrizzleDb,
+  resetDb,
+  seedTable,
+  getRows,
+  getQueryLog,
+  createMockServiceError,
+  MockServiceError,
+} from '@/tests/unit/mocks/drizzle-mock'
 
 /**
  * LIBRARY GAMES SERVICE TEST COVERAGE (OIR-205)
@@ -11,7 +19,7 @@ import type { ServiceError } from '@/lib/server/shared/service-error'
  * Implementation: lib/server/games/library-games-service.ts
  *
  * Key scenarios tested:
- * - listLibraryGames returns active games ordered by sort_order then title (public, via RLS)
+ * - listLibraryGames returns active games ordered by sort_order then title (public, explicit filter)
  * - listAdminLibraryGames returns all games (active + inactive) for admin dashboard
  * - createLibraryGame/updateLibraryGame/deleteLibraryGame admin-only operations
  * - Non-admin users get 403 Forbidden from every admin endpoint
@@ -19,247 +27,57 @@ import type { ServiceError } from '@/lib/server/shared/service-error'
  * - Type guards: title as object/array rejected with 400
  * - Validate-before-write: invalid input prevents DB calls
  * - Migration enables RLS, creates SELECT-only policy for active=true, seeds exactly 8 games with category_es AND category_en
- * - Chained .order() calls: secondary order('title') tie-break for consistent results
+ * - Bilingual category fallback (OIR-206): categoryEn optional, falls back to categoryEs
+ * - Image URL validation (OIR-207): optional https/http URLs only, no javascript:/data: or relative paths
  */
 
 vi.mock('server-only', () => ({}))
 
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseServerAdminClient: vi.fn(),
-  createSupabaseServerClient: vi.fn(),
+vi.mock('@/lib/db', () => ({
+  getDrizzleDb: vi.fn(() => createStatefulDrizzleDb()),
+  getDrizzleAdminDb: vi.fn(() => createStatefulDrizzleDb()),
 }))
 
 vi.mock('@/lib/server/shared/service-error', () => ({
-  serviceError: vi.fn((message: string, statusCode: number) => {
-    const err = new Error(message) as ServiceError
-    err.name = 'ServiceError'
-    err.statusCode = statusCode
-    throw err
-  }),
+  ServiceError: MockServiceError,
+  serviceError: createMockServiceError(),
 }))
 
-type LibraryGameRow = {
+// Test data factory for library games
+function createGameRow(overrides?: Partial<{
   id: string
   title: string
-  category_es: string
-  category_en: string
+  categoryEs: string
+  categoryEn: string
   players: string
-  play_time: string
-  weight: number | string
-  sort_order: number
+  playTime: string
+  weight: string
+  sortOrder: number
   active: boolean
-  created_at: string
-  updated_at: string
+  createdAt: string
+  updatedAt: string
+  imgUrl: string | null
+}>): any {
+  return {
+    id: overrides?.id ?? 'game-1',
+    title: overrides?.title ?? 'Test Game',
+    categoryEs: overrides?.categoryEs ?? 'Estrategia',
+    categoryEn: overrides?.categoryEn ?? 'Strategy',
+    players: overrides?.players ?? '2-4',
+    playTime: overrides?.playTime ?? '60m',
+    weight: overrides?.weight ?? '3.0',
+    sortOrder: overrides?.sortOrder ?? 0,
+    active: overrides?.active ?? true,
+    createdAt: overrides?.createdAt ?? '2026-07-04T00:00:00Z',
+    updatedAt: overrides?.updatedAt ?? '2026-07-04T00:00:00Z',
+    imgUrl: overrides?.imgUrl ?? null,
+  }
 }
 
 type SessionUser = {
   id: string
   role: 'admin' | 'member'
   email?: string
-}
-
-function buildSupabaseMock() {
-  return {
-    from: vi.fn(function (table: string) {
-      const state = {
-        table,
-        filters: {} as any,
-        updateData: {} as any,
-        data: null as any,
-        insertData: null as any,
-        orders: [] as any[],
-      }
-
-      // Helper: Create a chainable query builder with .order() and .eq() support
-      function createOrderableBuilder() {
-        return {
-          eq: vi.fn(function (col: string, val: any) {
-            state.filters[col] = val
-            return {
-              maybeSingle: vi.fn(async () => {
-                if (table === 'library_games' && state.filters.id === 'game-1') {
-                  return {
-                    data: {
-                      id: 'game-1',
-                      title: 'Existing Game',
-                      category_es: 'Estrategia',
-                      category_en: 'Strategy',
-                      players: '2-4',
-                      play_time: '90m',
-                      weight: 3.0,
-                      sort_order: 0,
-                      active: true,
-                      created_at: '2026-07-04T00:00:00Z',
-                      updated_at: '2026-07-04T00:00:00Z',
-                    },
-                    error: null,
-                  }
-                }
-                return { data: null, error: null }
-              }),
-              select: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => {
-                  if (table === 'library_games' && state.filters.id === 'game-1') {
-                    return {
-                      data: {
-                        id: 'game-1',
-                        title: 'Existing Game',
-                        category_es: 'Estrategia',
-                        category_en: 'Strategy',
-                        players: '2-4',
-                        play_time: '90m',
-                        weight: 3.0,
-                        sort_order: 0,
-                        active: true,
-                        created_at: '2026-07-04T00:00:00Z',
-                        updated_at: '2026-07-04T00:00:00Z',
-                      },
-                      error: null,
-                    }
-                  }
-                  return { data: null, error: null }
-                }),
-              })),
-            }
-          }),
-          order: vi.fn(function (col: string, opts: any) {
-            state.orders.push({ col, opts })
-            return createChainableQuery()
-          }),
-          select: vi.fn(() => ({
-            eq: vi.fn(function (col: string, val: any) {
-              state.filters[col] = val
-              return {
-                maybeSingle: vi.fn(async () => {
-                  if (table === 'library_games' && state.filters.id === 'game-1') {
-                    return {
-                      data: {
-                        id: 'game-1',
-                        title: 'Existing Game',
-                        category_es: 'Estrategia',
-                        category_en: 'Strategy',
-                        players: '2-4',
-                        play_time: '90m',
-                        weight: 3.0,
-                        sort_order: 0,
-                        active: true,
-                        created_at: '2026-07-04T00:00:00Z',
-                        updated_at: '2026-07-04T00:00:00Z',
-                      },
-                      error: null,
-                    }
-                  }
-                  return { data: null, error: null }
-                }),
-              }
-            }),
-          })),
-        }
-      }
-
-      // Helper: Create a thenable that is also chainable (supports multiple .order() calls)
-      function createChainableQuery() {
-        return {
-          [Symbol.toStringTag]: 'Promise',
-          order: vi.fn(function (col: string, opts: any) {
-            state.orders.push({ col, opts })
-            // Return another chainable query for further chaining
-            return createChainableQuery()
-          }),
-          then: async (onFulfilled?: any, onRejected?: any) => {
-            try {
-              if (table === 'library_games') {
-                const mockData = [
-                  {
-                    id: 'game-1',
-                    title: 'Bolt Action',
-                    category_es: 'Wargame',
-                    category_en: 'Wargame',
-                    players: '2',
-                    play_time: '120m',
-                    weight: 3.2,
-                    sort_order: 0,
-                    active: true,
-                    created_at: '2026-07-04T00:00:00Z',
-                    updated_at: '2026-07-04T00:00:00Z',
-                  },
-                  {
-                    id: 'game-2',
-                    title: 'Pathfinder 2e',
-                    category_es: 'Rol',
-                    category_en: 'RPG',
-                    players: '3–6',
-                    play_time: '∞',
-                    weight: 4.1,
-                    sort_order: 1,
-                    active: true,
-                    created_at: '2026-07-04T00:00:00Z',
-                    updated_at: '2026-07-04T00:00:00Z',
-                  },
-                ]
-                return onFulfilled?.({ data: mockData, error: null })
-              }
-              return onFulfilled?.({ data: [], error: null })
-            } catch (err) {
-              return onRejected?.(err)
-            }
-          },
-        }
-      }
-
-      return {
-        select: vi.fn(function (cols?: string) {
-          return createOrderableBuilder()
-        }),
-        insert: vi.fn(function (data: any) {
-          state.insertData = data
-          return {
-            select: vi.fn(() => ({
-              maybeSingle: vi.fn(async () => ({
-                data: {
-                  id: 'game-new-1',
-                  ...data,
-                  created_at: '2026-07-04T00:00:00Z',
-                  updated_at: '2026-07-04T00:00:00Z',
-                } as LibraryGameRow,
-                error: null,
-              })),
-            })),
-          }
-        }),
-        update: vi.fn(function (data: any) {
-          state.updateData = data
-          return {
-            eq: vi.fn(function (col: string, val: any) {
-              state.filters[col] = val
-              return {
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      id: state.filters.id,
-                      ...state.updateData,
-                      created_at: '2026-07-04T00:00:00Z',
-                      updated_at: '2026-07-04T00:00:00Z',
-                    } as LibraryGameRow,
-                    error: null,
-                  })),
-                })),
-              }
-            }),
-          }
-        }),
-        delete: vi.fn(function () {
-          return {
-            eq: vi.fn(async () => ({
-              data: null,
-              error: null,
-            })),
-          }
-        }),
-      }
-    }),
-    rpc: vi.fn(),
-  }
 }
 
 function createAdminSession(): SessionUser {
@@ -284,19 +102,19 @@ async function loadLibraryGamesService() {
 
 describe('library-games-service', () => {
   beforeEach(() => {
+    resetDb()
     vi.clearAllMocks()
   })
 
   describe('listLibraryGames', () => {
     it('returns active games ordered by sort_order', async () => {
-      const mockSupabaseClient = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        mockSupabaseClient as any
-      )
+      const mockGames = [
+        createGameRow({ id: 'game-1', title: 'Bolt Action', sortOrder: 0, active: true }),
+        createGameRow({ id: 'game-2', title: 'Pathfinder 2e', sortOrder: 1, active: true }),
+      ]
+      seedTable('library_games', mockGames)
 
       const { listLibraryGames } = await loadLibraryGamesService()
-
       const result = await listLibraryGames()
 
       expect(Array.isArray(result)).toBe(true)
@@ -307,54 +125,54 @@ describe('library-games-service', () => {
       expect(result[1].sortOrder).toBe(1)
     })
 
-    it('chains multiple order() calls without error (sort_order primary, title secondary)', async () => {
-      const mockSupabaseClient = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        mockSupabaseClient as any
-      )
+    it('chains orderBy calls without error (sort_order primary, title secondary)', async () => {
+      const mockGames = [
+        createGameRow({ id: 'game-1', title: 'Bolt Action', sortOrder: 0, active: true }),
+      ]
+      seedTable('library_games', mockGames)
 
       const { listLibraryGames } = await loadLibraryGamesService()
-
-      // This test verifies that the chainable .order() mock works correctly
-      // The service calls .order('sort_order').order('title'), which would fail
-      // without the fix (chainable mock). If it doesn't throw, chaining works.
       const result = await listLibraryGames()
+
       expect(Array.isArray(result)).toBe(true)
+      expect(result.length).toBe(1)
     })
 
-    it('uses user-scoped client (RLS-respecting) for public listing', async () => {
-      const mockSupabaseClient = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        mockSupabaseClient as any
-      )
+    it('uses regular Drizzle client (user-scoped) for public listing', async () => {
+      seedTable('library_games', [createGameRow({ active: true })])
 
       const { listLibraryGames } = await loadLibraryGamesService()
-
       await listLibraryGames()
 
-      expect(vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient).toHaveBeenCalled()
+      expect(vi.mocked(await import('@/lib/db')).getDrizzleDb).toHaveBeenCalled()
     })
 
     it('maps database columns to public LibraryGame type', async () => {
-      const mockSupabaseClient = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        mockSupabaseClient as any
-      )
+      seedTable('library_games', [
+        createGameRow({
+          id: 'game-1',
+          title: 'Test Game',
+          categoryEs: 'Estrategia',
+          categoryEn: 'Strategy',
+          players: '2-4',
+          playTime: '60m',
+          weight: '3.2',
+          sortOrder: 0,
+          active: true,
+          imgUrl: null,
+        }),
+      ])
 
       const { listLibraryGames } = await loadLibraryGamesService()
-
       const result = await listLibraryGames()
 
       expect(result[0]).toMatchObject({
         id: 'game-1',
-        title: 'Bolt Action',
-        categoryEs: 'Wargame',
-        categoryEn: 'Wargame',
-        players: '2',
-        playTime: '120m',
+        title: 'Test Game',
+        categoryEs: 'Estrategia',
+        categoryEn: 'Strategy',
+        players: '2-4',
+        playTime: '60m',
         weight: 3.2,
         sortOrder: 0,
       })
@@ -362,14 +180,12 @@ describe('library-games-service', () => {
     })
 
     it('converts weight to number type', async () => {
-      const mockSupabaseClient = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        mockSupabaseClient as any
-      )
+      seedTable('library_games', [
+        createGameRow({ id: 'game-1', weight: '3.2', active: true }),
+        createGameRow({ id: 'game-2', weight: '4.1', active: true }),
+      ])
 
       const { listLibraryGames } = await loadLibraryGamesService()
-
       const result = await listLibraryGames()
 
       expect(typeof result[0].weight).toBe('number')
@@ -380,49 +196,32 @@ describe('library-games-service', () => {
   describe('listAdminLibraryGames', () => {
     it('admin can list all games including inactive', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
+      seedTable('library_games', [
+        createGameRow({ id: 'game-1', active: true }),
+        createGameRow({ id: 'game-2', active: false }),
+      ])
 
       const { listAdminLibraryGames } = await loadLibraryGamesService()
-
       const result = await listAdminLibraryGames(adminSession)
 
       expect(Array.isArray(result)).toBe(true)
+      expect(result.length).toBe(2)
       expect(result[0]).toHaveProperty('active')
+      expect(result[1]).toHaveProperty('active')
     })
 
-    it('chains multiple order() calls without error (sort_order primary, title secondary)', async () => {
+    it('chains orderBy calls without error (sort_order primary, title secondary)', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
+      seedTable('library_games', [createGameRow({ active: true })])
 
       const { listAdminLibraryGames } = await loadLibraryGamesService()
-
-      // This test verifies that the chainable .order() mock works correctly.
-      // The service calls .order('sort_order').order('title'). If it doesn't throw,
-      // the mock fidelity fix (chainable .order()) is working.
       const result = await listAdminLibraryGames(adminSession)
+
       expect(Array.isArray(result)).toBe(true)
     })
 
     it('non-admin member gets 403 Forbidden', async () => {
       const memberSession = createMemberSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { listAdminLibraryGames } = await loadLibraryGamesService()
 
@@ -433,11 +232,6 @@ describe('library-games-service', () => {
   describe('createLibraryGame', () => {
     it('admin can create a game with required fields', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -450,18 +244,15 @@ describe('library-games-service', () => {
         weight: 3.0,
       })
 
-      expect(result.id).toBe('game-new-1')
+      // The mock materialises a real generated id now, rather than the
+      // canned string the old fixture returned.
+      expect(typeof result.id).toBe('string')
       expect(result.title).toBe('New Game')
       expect(result.categoryEs).toBe('Estrategia')
     })
 
     it('admin can create a game with all fields', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -482,16 +273,6 @@ describe('library-games-service', () => {
 
     it('non-admin member gets 403 Forbidden', async () => {
       const memberSession = createMemberSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -509,11 +290,6 @@ describe('library-games-service', () => {
 
     it('accepts weight 0 (falsy-zero)', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -526,16 +302,12 @@ describe('library-games-service', () => {
         weight: 0,
       })
 
-      expect(result.id).toBe('game-new-1')
+      expect(typeof result.id).toBe('string')
+      expect(result.weight).toBe(0)
     })
 
     it('accepts weight 5 (upper bound inclusive)', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -548,21 +320,12 @@ describe('library-games-service', () => {
         weight: 5,
       })
 
-      expect(result.id).toBe('game-new-1')
+      expect(typeof result.id).toBe('string')
+      expect(result.weight).toBe(5)
     })
 
     it('rejects weight 5.1 (above upper bound)', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -580,16 +343,6 @@ describe('library-games-service', () => {
 
     it('rejects weight -1 (negative)', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -607,16 +360,6 @@ describe('library-games-service', () => {
 
     it('rejects weight as NaN', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -634,16 +377,6 @@ describe('library-games-service', () => {
 
     it('rejects weight as string', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -661,16 +394,6 @@ describe('library-games-service', () => {
 
     it('rejects weight null when required', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -688,16 +411,6 @@ describe('library-games-service', () => {
 
     it('rejects title as object with 400', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -715,16 +428,6 @@ describe('library-games-service', () => {
 
     it('rejects title as array with 400', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -742,16 +445,6 @@ describe('library-games-service', () => {
 
     it('rejects categoryEs as array with 400', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -769,16 +462,6 @@ describe('library-games-service', () => {
 
     it('rejects missing/empty title', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -796,16 +479,6 @@ describe('library-games-service', () => {
 
     it('rejects missing categoryEs', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -822,16 +495,6 @@ describe('library-games-service', () => {
 
     it('validates before any DB insert', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -846,18 +509,14 @@ describe('library-games-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin.from('library_games').insert).not.toHaveBeenCalled()
+      expect(getQueryLog().filter((entry) => entry.op === 'insert')).toHaveLength(0)
     })
   })
 
   describe('updateLibraryGame', () => {
     it('admin can update a game', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
+      seedTable('library_games', [createGameRow({ id: 'game-1', title: 'Old Title' })])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -871,16 +530,6 @@ describe('library-games-service', () => {
 
     it('non-admin member gets 403 Forbidden on update', async () => {
       const memberSession = createMemberSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -891,26 +540,9 @@ describe('library-games-service', () => {
 
     it('returns 404 for non-existent game', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
+      seedTable('library_games', []) // Empty fixture
 
       const { updateLibraryGame } = await loadLibraryGamesService()
-
-      mockSupabaseAdmin.from = vi.fn(() => ({
-        select: vi.fn(() => ({
-          eq: vi.fn(() => ({
-            maybeSingle: vi.fn(async () => ({ data: null, error: null })),
-          })),
-        })),
-      })) as any
 
       await expect(
         updateLibraryGame(adminSession, 'nonexistent-game', { title: 'Updated' })
@@ -919,16 +551,7 @@ describe('library-games-service', () => {
 
     it('rejects weight 5.1 on update', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
+      seedTable('library_games', [createGameRow({ id: 'game-1' })])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -941,16 +564,7 @@ describe('library-games-service', () => {
 
     it('validates before any DB update', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
+      seedTable('library_games', [createGameRow({ id: 'game-1' })])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -960,16 +574,12 @@ describe('library-games-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin.from('library_games').update).not.toHaveBeenCalled()
+      expect(getQueryLog().filter((entry) => entry.op === 'update')).toHaveLength(0)
     })
 
     it('preserves current values for omitted fields', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
+      seedTable('library_games', [createGameRow({ id: 'game-1', title: 'Old Title' })])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -978,35 +588,25 @@ describe('library-games-service', () => {
       })
 
       expect(result.id).toBe('game-1')
+      // Fields not in the body fall back to the current row's real values.
+      expect(result.categoryEs).toBe('Estrategia')
+      expect(result.players).toBe('2-4')
     })
   })
 
   describe('deleteLibraryGame', () => {
     it('admin can delete a game', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
+      seedTable('library_games', [createGameRow({ id: 'game-1' })])
 
       const { deleteLibraryGame } = await loadLibraryGamesService()
 
       await expect(deleteLibraryGame(adminSession, 'game-1')).resolves.toBeUndefined()
+      expect(getRows('library_games')).toHaveLength(0)
     })
 
     it('non-admin member gets 403 Forbidden on delete', async () => {
       const memberSession = createMemberSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { deleteLibraryGame } = await loadLibraryGamesService()
 
@@ -1015,26 +615,8 @@ describe('library-games-service', () => {
 
     it('returns 404 for non-existent game', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabaseAdmin as any
-      )
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { deleteLibraryGame } = await loadLibraryGamesService()
-
-      mockSupabaseAdmin.from = vi.fn(() => ({
-        select: vi.fn(() => ({
-          eq: vi.fn(() => ({
-            maybeSingle: vi.fn(async () => ({ data: null, error: null })),
-          })),
-        })),
-      })) as any
 
       await expect(deleteLibraryGame(adminSession, 'nonexistent-game')).rejects.toMatchObject({
         statusCode: 404,
@@ -1077,14 +659,13 @@ describe('library-games-service', () => {
     })
 
     it('migration seeds have category_es AND category_en populated for all games', () => {
-      // Verify seeded games have bilingual categories
       expect(migrationContent).toContain("'Bolt Action'")
-      expect(migrationContent).toContain("'Wargame'") // appears in Bolt Action and Warhammer
+      expect(migrationContent).toContain("'Wargame'")
       expect(migrationContent).toContain("'Pathfinder 2e'")
-      expect(migrationContent).toContain("'Rol'") // Spanish category
-      expect(migrationContent).toContain("'RPG'") // English category for Pathfinder
-      expect(migrationContent).toContain("'Deducción'") // Spanish for Blood on the Clocktower
-      expect(migrationContent).toContain("'Deduction'") // English
+      expect(migrationContent).toContain("'Rol'")
+      expect(migrationContent).toContain("'RPG'")
+      expect(migrationContent).toContain("'Deducción'")
+      expect(migrationContent).toContain("'Deduction'")
     })
 
     it('migration creates required columns with correct types', () => {
@@ -1105,17 +686,12 @@ describe('library-games-service', () => {
   describe('createLibraryGame with optional English (OIR-206)', () => {
     it('admin can create a game with categoryEn absent, falls back to categoryEs', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
       const result = await createLibraryGame(adminSession, {
         title: 'Juego de Estrategia',
         categoryEs: 'Estrategia',
-        // categoryEn absent — should fallback
         players: '2-4',
         playTime: '45 min',
         weight: 3.0,
@@ -1123,22 +699,18 @@ describe('library-games-service', () => {
 
       expect(result.title).toBe('Juego de Estrategia')
       expect(result.categoryEs).toBe('Estrategia')
-      expect(result.categoryEn).toBe('Estrategia') // Fallback to ES
+      expect(result.categoryEn).toBe('Estrategia')
     })
 
     it('admin can create a game with categoryEn empty string, falls back to categoryEs', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
       const result = await createLibraryGame(adminSession, {
         title: 'RPG de Fantasía',
         categoryEs: 'Rol',
-        categoryEn: '', // Empty string — should fallback
+        categoryEn: '',
         players: '2-8',
         playTime: '120 min',
         weight: 2.5,
@@ -1149,10 +721,6 @@ describe('library-games-service', () => {
 
     it('admin can create a game with explicit categoryEn, preserves EN value', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -1172,60 +740,18 @@ describe('library-games-service', () => {
   describe('updateLibraryGame with optional English (OIR-206)', () => {
     it('admin can update game with categoryEn absent, follows new categoryEs when ES changes', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      const currentRow = {
+      const currentRow = createGameRow({
         id: 'game-1',
         title: 'Old Game',
-        category_es: 'Vieja Categoría',
-        category_en: 'Vieja Categoría', // Auto-copied
-        players: '2-4',
-        play_time: '45 min',
-        weight: 2.0,
-        sort_order: 0,
-        active: true,
-        created_at: '2026-04-01T00:00:00Z',
-        updated_at: '2026-04-01T00:00:00Z',
-      }
-
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'library_games') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: currentRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      ...currentRow,
-                      category_es: 'Nueva Categoría',
-                      category_en: 'Nueva Categoría', // Should follow ES
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+        categoryEs: 'Vieja Categoría',
+        categoryEn: 'Vieja Categoría',
+      })
+      seedTable('library_games', [currentRow])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
       const result = await updateLibraryGame(adminSession, 'game-1', {
         categoryEs: 'Nueva Categoría',
-        // categoryEn absent — should re-copy from new ES value
       })
 
       expect(result.categoryEn).toBe('Nueva Categoría')
@@ -1233,258 +759,85 @@ describe('library-games-service', () => {
 
     it('admin can update game with explicit categoryEn preserved when ES changes', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      const currentRow = {
+      const currentRow = createGameRow({
         id: 'game-1',
-        title: 'Old Game',
-        category_es: 'Vieja Categoría',
-        category_en: 'Explicitly Set Category', // Different from ES — explicit
-        players: '2-4',
-        play_time: '45 min',
-        weight: 2.0,
-        sort_order: 0,
-        active: true,
-        created_at: '2026-04-01T00:00:00Z',
-        updated_at: '2026-04-01T00:00:00Z',
-      }
-
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'library_games') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: currentRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      ...currentRow,
-                      category_es: 'Nueva Categoría',
-                      category_en: 'Explicitly Set Category', // Preserved (explicitly set)
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+        categoryEs: 'Vieja Categoría',
+        categoryEn: 'Explicitly Set Category',
+      })
+      seedTable('library_games', [currentRow])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
       const result = await updateLibraryGame(adminSession, 'game-1', {
         categoryEs: 'Nueva Categoría',
-        // categoryEn absent — but should preserve the explicit value
       })
 
-      expect(result.categoryEn).toBe('Explicitly Set Category') // Preserved
+      expect(result.categoryEn).toBe('Explicitly Set Category')
     })
   })
 
   describe('updateLibraryGame with fallback semantics edge cases (OIR-206 round 2)', () => {
     it('rule 2: explicit different categoryEn + blank categoryEn payload = re-enable auto-copy to new ES', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      const currentRow = {
+      const currentRow = createGameRow({
         id: 'game-1',
-        title: 'Game Title',
-        category_es: 'Vieja Categoría',
-        category_en: 'Old Explicit Category', // Deliberately different from ES
-        players: '2-4',
-        play_time: '45 min',
-        weight: 2.0,
-        sort_order: 0,
-        active: true,
-        created_at: '2026-04-01T00:00:00Z',
-        updated_at: '2026-04-01T00:00:00Z',
-      }
-
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'library_games') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: currentRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      ...currentRow,
-                      category_es: 'Nueva Categoría',
-                      category_en: 'Nueva Categoría', // Should become new ES (rule 2)
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+        categoryEs: 'Vieja Categoría',
+        categoryEn: 'Old Explicit Category',
+      })
+      seedTable('library_games', [currentRow])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
       const result = await updateLibraryGame(adminSession, 'game-1', {
         categoryEs: 'Nueva Categoría',
-        categoryEn: '', // Blank = re-enable auto-copy
+        categoryEn: '',
       })
 
-      expect(result.categoryEn).toBe('Nueva Categoría') // Follows new ES
+      expect(result.categoryEn).toBe('Nueva Categoría')
     })
 
     it('rule 1: resending identical categoryEn (en === es deliberately) + ES change = EN preserved', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      const currentRow = {
+      const currentRow = createGameRow({
         id: 'game-1',
-        title: 'Game Title',
-        category_es: 'Vieja Categoría',
-        category_en: 'Vieja Categoría', // Same as ES (deliberately or auto-copied)
-        players: '2-4',
-        play_time: '45 min',
-        weight: 2.0,
-        sort_order: 0,
-        active: true,
-        created_at: '2026-04-01T00:00:00Z',
-        updated_at: '2026-04-01T00:00:00Z',
-      }
-
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'library_games') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: currentRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      ...currentRow,
-                      category_es: 'Nueva Categoría',
-                      category_en: 'Vieja Categoría', // Preserved because explicitly resent (rule 1)
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+        categoryEs: 'Vieja Categoría',
+        categoryEn: 'Vieja Categoría',
+      })
+      seedTable('library_games', [currentRow])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
       const result = await updateLibraryGame(adminSession, 'game-1', {
         categoryEs: 'Nueva Categoría',
-        categoryEn: 'Vieja Categoría', // Resend explicit identical value
+        categoryEn: 'Vieja Categoría',
       })
 
-      expect(result.categoryEn).toBe('Vieja Categoría') // Preserved by rule 1
+      expect(result.categoryEn).toBe('Vieja Categoría')
     })
 
     it('rule 2: whitespace-only categoryEn behaves as blank (re-enable auto-copy to new ES)', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      const currentRow = {
+      const currentRow = createGameRow({
         id: 'game-1',
-        title: 'Game Title',
-        category_es: 'Vieja Categoría',
-        category_en: 'Old Explicit Category',
-        players: '2-4',
-        play_time: '45 min',
-        weight: 2.0,
-        sort_order: 0,
-        active: true,
-        created_at: '2026-04-01T00:00:00Z',
-        updated_at: '2026-04-01T00:00:00Z',
-      }
-
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'library_games') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: currentRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      ...currentRow,
-                      category_es: 'Nueva Categoría',
-                      category_en: 'Nueva Categoría', // Should become new ES (whitespace trimmed = empty)
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+        categoryEs: 'Vieja Categoría',
+        categoryEn: 'Old Explicit Category',
+      })
+      seedTable('library_games', [currentRow])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
       const result = await updateLibraryGame(adminSession, 'game-1', {
         categoryEs: 'Nueva Categoría',
-        categoryEn: '   ', // Whitespace-only = treated as empty (rule 2)
+        categoryEn: '   ',
       })
 
-      expect(result.categoryEn).toBe('Nueva Categoría') // Follows new ES
+      expect(result.categoryEn).toBe('Nueva Categoría')
     })
   })
 
   describe('imageUrl validation (OIR-207)', () => {
     it('admin can create a game with optional imageUrl using valid https URL', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -1498,16 +851,12 @@ describe('library-games-service', () => {
         imageUrl: 'https://example.com/landing-media/library-games/abc123.png',
       })
 
-      expect(result.id).toBe('game-new-1')
+      expect(typeof result.id).toBe('string')
       expect(result.imgUrl).toBe('https://example.com/landing-media/library-games/abc123.png')
     })
 
     it('admin can create a game with imageUrl absent (optional field)', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -1520,16 +869,12 @@ describe('library-games-service', () => {
         weight: 3.5,
       })
 
-      expect(result.id).toBe('game-new-1')
+      expect(typeof result.id).toBe('string')
       expect(result.imgUrl).toBeNull()
     })
 
     it('admin can create a game with imageUrl null (optional field)', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -1543,16 +888,12 @@ describe('library-games-service', () => {
         imageUrl: null,
       })
 
-      expect(result.id).toBe('game-new-1')
+      expect(typeof result.id).toBe('string')
       expect(result.imgUrl).toBeNull()
     })
 
     it('admin can create a game with imageUrl empty string (optional field)', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -1566,21 +907,12 @@ describe('library-games-service', () => {
         imageUrl: '',
       })
 
-      expect(result.id).toBe('game-new-1')
+      expect(typeof result.id).toBe('string')
       expect(result.imgUrl).toBeNull()
     })
 
     it('admin rejects imageUrl with javascript: protocol', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -1596,20 +928,11 @@ describe('library-games-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin.from('library_games').insert).not.toHaveBeenCalled()
+      expect(getQueryLog().filter((entry) => entry.op === 'insert')).toHaveLength(0)
     })
 
     it('admin rejects imageUrl with data: protocol', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -1625,20 +948,11 @@ describe('library-games-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin.from('library_games').insert).not.toHaveBeenCalled()
+      expect(getQueryLog().filter((entry) => entry.op === 'insert')).toHaveLength(0)
     })
 
     it('admin rejects imageUrl with relative path', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -1654,15 +968,11 @@ describe('library-games-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin.from('library_games').insert).not.toHaveBeenCalled()
+      expect(getQueryLog().filter((entry) => entry.op === 'insert')).toHaveLength(0)
     })
 
     it('admin accepts imageUrl with valid http:// URL', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
 
       const { createLibraryGame } = await loadLibraryGamesService()
 
@@ -1676,15 +986,12 @@ describe('library-games-service', () => {
         imageUrl: 'http://example.com/game.png',
       })
 
-      expect(result.id).toBe('game-new-1')
+      expect(typeof result.id).toBe('string')
     })
 
     it('admin can update game with imageUrl added', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      seedTable('library_games', [createGameRow({ id: 'game-1' })])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -1693,19 +1000,12 @@ describe('library-games-service', () => {
       })
 
       expect(result.id).toBe('game-1')
+      expect(result.imgUrl).toBe('https://example.com/landing-media/library-games/updated.png')
     })
 
     it('admin rejects imageUrl update with javascript: protocol', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError.mockImplementation((msg, code) => {
-        const err = new Error(msg) as ServiceError
-        err.statusCode = code
-        throw err
-      })
+      seedTable('library_games', [createGameRow({ id: 'game-1' })])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -1715,15 +1015,12 @@ describe('library-games-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(mockSupabaseAdmin.from('library_games').update).not.toHaveBeenCalled()
+      expect(getQueryLog().filter((entry) => entry.op === 'update')).toHaveLength(0)
     })
 
     it('admin can clear imageUrl by setting to empty string', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      seedTable('library_games', [createGameRow({ id: 'game-1', imgUrl: 'https://example.com/old.png' })])
 
       const { updateLibraryGame } = await loadLibraryGamesService()
 
@@ -1732,6 +1029,7 @@ describe('library-games-service', () => {
       })
 
       expect(result.id).toBe('game-1')
+      expect(result.imgUrl).toBeNull()
     })
 
     it('migration adds img_url column to library_games', () => {
