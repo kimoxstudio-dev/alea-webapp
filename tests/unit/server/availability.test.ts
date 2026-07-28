@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import type { GameTable } from '@/lib/types'
 import type { Tables } from '@/lib/supabase/types'
 import { resolveDate, normalizeTime, generateDaySlots, buildAvailability } from '@/lib/server/reservations/availability'
+import { getCurrentClubDate } from '@/lib/club-time'
 
 type ReservationRow = Tables<'reservations'>
 
@@ -35,22 +36,22 @@ function makeGameTable(overrides?: Partial<GameTable>): GameTable {
 
 describe('resolveDate', () => {
   it('returns today when input is null', () => {
-    const today = new Date().toISOString().split('T')[0]
+    const today = getCurrentClubDate()
     expect(resolveDate(null)).toBe(today)
   })
 
   it('returns today when input is undefined', () => {
-    const today = new Date().toISOString().split('T')[0]
+    const today = getCurrentClubDate()
     expect(resolveDate(undefined)).toBe(today)
   })
 
   it('returns today when input is empty string', () => {
-    const today = new Date().toISOString().split('T')[0]
+    const today = getCurrentClubDate()
     expect(resolveDate('')).toBe(today)
   })
 
   it('returns today when input is whitespace only', () => {
-    const today = new Date().toISOString().split('T')[0]
+    const today = getCurrentClubDate()
     expect(resolveDate('   ')).toBe(today)
   })
 
