@@ -148,12 +148,17 @@ describe("F1 Drizzle Migration Static SQL Verification (Zero DB)", () => {
       expect(allSchemaSrc).toContain("clerk_user_id")
       expect(concatenatedSql).toContain("clerk_user_id")
 
-      const profilesSection = allMigrationsSql.substring(
-        allMigrationsSql.indexOf("CREATE TABLE \"profiles\"")
+      const clerkMigration = readFileSync(
+        join(MIGRATION_DIR, "0003_clerk_profile_identity.sql"),
+        "utf-8",
       )
-      expect(extractColumnType(profilesSection, "clerk_user_id")).toBe("text")
-      expect(concatenatedSql).toContain("profiles_clerk_user_id_key")
-      expect(concatenatedSql).toContain("where \"profiles\".\"clerk_user_id\" is not null")
+      expect(clerkMigration).toMatch(
+        /ALTER TABLE "profiles" ADD COLUMN "clerk_user_id" text;/,
+      )
+      expect(clerkMigration).not.toMatch(/"clerk_user_id" text NOT NULL/i)
+      expect(clerkMigration).toMatch(
+        /CREATE UNIQUE INDEX "profiles_clerk_user_id_key" ON "profiles" USING btree \("clerk_user_id"\) WHERE "profiles"\."clerk_user_id" is not null;/,
+      )
     })
   })
 

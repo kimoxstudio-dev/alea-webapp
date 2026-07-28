@@ -28,16 +28,9 @@ export interface AuthJsUser {
  * passed in, closing off the cross-profile identity-drift that querying by
  * the non-unique `email` column previously allowed (KIM-433 follow-up fix).
  *
- * `password_hash` is expected to be bcryptjs-compatible — see the F2
- * cutover note in Linear KIM-393..422 (Supabase→Neon migration), which copies hashes
- * straight from `auth.users.encrypted_password` with no re-hash.
- *
- * NOTE: `profiles.password_hash` exists in the Drizzle schema (KIM-417 —
- * see `lib/db/schema/profiles.ts`), but it is **unpopulated** until the F2
- * cutover migration runs (KIM-419), which copies
- * `auth.users.encrypted_password` into `profiles.password_hash` verbatim.
- * Until that cutover happens, every row's `password_hash` is `null`, so
- * this function still returns `null` for every lookup in practice.
+ * `password_hash` is expected to be bcryptjs-compatible. During the
+ * transitional Auth.js runtime it is populated by the Neon seed/account
+ * lifecycle paths; KIM-451 replaces this runtime with Clerk.
  *
  * This is defensive scaffolding: the schema column exists, but the data
  * behind it does not yet. Any failure — connection error, no matching row,
@@ -51,10 +44,8 @@ export interface AuthJsUser {
  * first place.
  *
  * This route is also gated 404-by-default behind `AUTH_JS_ENABLED` (see
- * app/api/authjs/[...nextauth]/route.ts) so this code path cannot be
- * reached in any deployed environment before the F2 cutover intentionally
- * enables it, even though KIM-433 wires it into the live session path
- * (`lib/server/auth/auth-service.ts`).
+ * app/api/authjs/[...nextauth]/route.ts). KIM-451 removes this transitional
+ * runtime in favor of Clerk.
  */
 export async function verifyCredentials(
   authEmail: string,

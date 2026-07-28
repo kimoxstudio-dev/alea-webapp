@@ -4,16 +4,15 @@
  * (KIM-434, F3c Drizzle/Neon seam).
  *
  * Context: the user is rebuilding their Neon DB from scratch via
- * `lib/db/migrations/0000_fine_magma.sql` + `0001_exclusion_constraints.sql`,
- * then running `pnpm db:seed` (KIM-432). After that rebuild, the live DB is
+ * the complete migration set in `lib/db/migrations/`, then running
+ * `pnpm db:seed` (KIM-432). After that rebuild, the live DB is
  * expected to match `lib/db/schema/*.ts` exactly by construction — this
  * script is NOT an exhaustive audit, just a quick "did the rebuild actually
  * produce what the Drizzle schema declares" smoke test the user can run
  * themselves.
  *
  * This is plain Node ESM (not TypeScript) so it needs no extra dev
- * dependency (no `tsx`/`ts-node`) — same convention as
- * `scripts/cutover-rehearsal-runner.mjs`. It intentionally does NOT import
+ * dependency (no `tsx`/`ts-node`). It intentionally does NOT import
  * `lib/db/schema/*.ts` directly (that would require a TS loader); instead
  * the expected shape is a small manifest below, hand-derived from those
  * files. Keep the manifest in sync when schema files change.
@@ -66,6 +65,7 @@ const EXPECTED_SCHEMA = {
     psw_changed: 'timestamp with time zone',
     phone: 'text',
     password_hash: 'text',
+    clerk_user_id: 'text',
   },
   rooms: {
     id: 'uuid',

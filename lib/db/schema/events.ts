@@ -114,7 +114,7 @@ export const eventRoomBlocks = pgTable(
  * Internal-only join table; never exposed to the public landing (see
  * 20260704000006_oir208_table_blocks_and_materials.sql). No RLS policies were
  * ever defined for this table in Supabase (service_role-only via GRANT) — see
- * coverage doc.
+ * Linear KIM-418.
  */
 export const eventEquipment = pgTable(
   'event_equipment',

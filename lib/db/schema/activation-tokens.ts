@@ -12,7 +12,7 @@ import { profiles } from './profiles'
  * only. See Linear KIM-417 for the full RLS history.
  *
  * Trigger `activation_tokens_updated_at` (BEFORE UPDATE -> handle_updated_at())
- * has no Drizzle schema-builder equivalent — see coverage doc.
+ * has no Drizzle schema-builder equivalent — see Linear KIM-417.
  */
 export const activationTokens = pgTable(
   'activation_tokens',

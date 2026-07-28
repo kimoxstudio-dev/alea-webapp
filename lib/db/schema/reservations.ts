@@ -18,7 +18,7 @@ import { tables } from './tables'
  *
  * `user_id` originally carried TWO foreign keys in Supabase: one to
  * `auth.users(id)` (Supabase Auth-managed, no Neon equivalent — dropped, see
- * coverage doc) and one to `public.profiles(id)` (kept below, mirrors
+ * Linear KIM-417) and one to `public.profiles(id)` (kept below, mirrors
  * `reservations_user_id_fkey_profiles`).
  */
 export const reservations = pgTable(

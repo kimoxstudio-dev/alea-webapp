@@ -14,15 +14,13 @@ import { roleEnum } from './enums'
  * identity to Clerk without making Clerk's string ID the application PK.
  *
  * Trigger `profiles_updated_at` (BEFORE UPDATE -> handle_updated_at()) has no
- * Drizzle schema-builder equivalent (no trigger support) — see coverage doc.
+ * Drizzle schema-builder equivalent (no trigger support) — see Linear KIM-417.
  *
  * `passwordHash` has NO Supabase-era equivalent (Supabase Auth stored
  * `auth.users.encrypted_password` in its own managed table, not on
- * `profiles`). It is added here, nullable, as forward schema for the target
- * Auth.js stack: PR #170 (KIM-416)'s credentials provider already selects
- * `profiles.password_hash`, and the F2 cutover runbook (KIM-419) copies
- * `auth.users.encrypted_password` verbatim into this column. Nullable so
- * existing rows (pre-cutover) don't need a value; see Linear KIM-417.
+ * `profiles`). It remains nullable for the transitional Auth.js runtime
+ * until Clerk replaces that runtime in KIM-451. Existing rows therefore
+ * do not need a value; see Linear KIM-417.
  */
 export const profiles = pgTable(
   'profiles',

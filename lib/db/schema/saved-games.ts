@@ -16,7 +16,7 @@ import { reservations } from './reservations'
  *
  * Business-rule triggers (validate_saved_game, increment_saved_game_attendance,
  * cancel_saved_games_for_event_block, etc. — 20260619000006..19) are plpgsql
- * and likewise have no Drizzle schema-builder equivalent; see coverage doc.
+ * and likewise have no Drizzle schema-builder equivalent; see Linear KIM-417.
  */
 export const savedGames = pgTable(
   'saved_games',

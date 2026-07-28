@@ -6,7 +6,7 @@
  * table-by-table status, all RLS policies (deferred to KIM-418), Supabase-
  * specific constructs skipped, and judgment calls made during translation.
  *
- * NOT included here (see coverage doc + lib/db/schema/manual-sql/):
+ * NOT included here (see Linear KIM-417/KIM-418 + lib/db/schema/manual-sql/):
  *   - RLS policies (KIM-418 replaces these with service-layer checks)
  *   - Exclusion constraints (no Drizzle pg-core builder) — raw SQL
  *   - Triggers / plpgsql functions (no Drizzle builder) — raw SQL / deferred

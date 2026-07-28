@@ -6,7 +6,7 @@ import { boolean, integer, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg
  *
  * Public SELECT is restricted to active=true rows; writes go exclusively
  * through the admin/service-role client (lib/server/partners-service.ts) —
- * no INSERT/UPDATE/DELETE RLS policies were ever defined. See coverage doc.
+ * no INSERT/UPDATE/DELETE RLS policies were ever defined. See Linear KIM-418.
  */
 export const partners = pgTable('partners', {
   id: uuid('id').primaryKey().defaultRandom(),
