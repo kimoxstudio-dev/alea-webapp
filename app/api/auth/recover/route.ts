@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { createSupabaseRouteHandlerClient } from '@/lib/supabase/server'
 import { recoverAccount } from '@/lib/server/auth/auth-service'
 import { toServiceErrorResponse } from '@/lib/server/shared/http-error'
 import { enforceMutationSecurity, enforceRateLimit, RATE_LIMIT_POLICIES } from '@/lib/server/shared/security'
@@ -12,7 +11,6 @@ export async function POST(request: NextRequest) {
   if (rateLimitError) return rateLimitError
 
   try {
-    const { supabase, applyCookies } = createSupabaseRouteHandlerClient(request)
     let body: unknown
 
     try {
@@ -27,24 +25,22 @@ export async function POST(request: NextRequest) {
     const requestBody = typeof body === 'object' && body !== null
       ? body as Record<string, unknown>
       : {}
+    // recoverAccount() now establishes the post-recovery Auth.js session
+    // itself (see lib/server/auth/auth-service.ts) — no client/cookie
+    // plumbing needed here.
     const result = await recoverAccount({
       token: requestBody.token,
       password: requestBody.password,
     })
-    const password = String(requestBody.password ?? '')
-    const { error: signInError } = await supabase.auth.signInWithPassword({
-      email: result.authEmail,
-      password,
-    })
 
-    if (signInError) {
-      return applyCookies(NextResponse.json({
+    if (result.signInFailed) {
+      return NextResponse.json({
         message: 'Password updated, but automatic sign-in failed. Please sign in with your member number and new password.',
         statusCode: 500,
-      }, { status: 500 }))
+      }, { status: 500 })
     }
 
-    return applyCookies(NextResponse.json(result.user))
+    return NextResponse.json(result.user)
   } catch (error) {
     return toServiceErrorResponse(error)
   }

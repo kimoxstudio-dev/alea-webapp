@@ -126,11 +126,12 @@ interface SeedProfileInput {
 
 /**
  * Upserts a dev profile keyed on `authEmail`. `email` is set to the same
- * value as `authEmail` — required so `lib/authjs/credentials-user.ts`'s
- * `verifyCredentials()` (which looks up rows by the nullable `email`
- * column, not `authEmail`) can find these seeded rows too. This mirrors a
- * documented discrepancy between the legacy Supabase-session auth path and
- * the Auth.js scaffolding; not something this script can or should "fix".
+ * value as `authEmail` for consistency with real profile rows (which also
+ * carry both columns set to the same value in practice) — not because it's
+ * required for lookup. `lib/authjs/credentials-user.ts`'s
+ * `verifyCredentials()` looks up rows by the uniquely-indexed `authEmail`
+ * column (KIM-433), so these seeded rows are found via `authEmail`
+ * regardless of what `email` is set to.
  */
 async function upsertDevProfile(db: SeedDb, input: SeedProfileInput): Promise<void> {
   const passwordHash = await bcrypt.hash(DEV_SEED_PASSWORD, 10)

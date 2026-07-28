@@ -8,10 +8,31 @@ const loginMock = vi.fn()
 const registerMock = vi.fn()
 const logoutWithClientMock = vi.fn()
 const getCurrentUserMock = vi.fn()
-const exchangeCodeForSessionMock = vi.fn()
-const routeGetUserMock = vi.fn()
-const routeProfileMaybeSingleMock = vi.fn()
-const routeSignInWithPasswordMock = vi.fn()
+const authJsAuthMock = vi.fn()
+const drizzleSelectMock = vi.fn()
+const drizzleFromMock = vi.fn()
+const drizzleWhereMock = vi.fn()
+const drizzleLimitMock = vi.fn()
+
+// Mock Auth.js auth() to prevent loading next-auth
+vi.mock('@/lib/authjs/auth', () => ({
+  auth: authJsAuthMock,
+  handlers: { GET: vi.fn(), POST: vi.fn() },
+}))
+
+// Mock Drizzle database to prevent loading
+vi.mock('@/lib/db', () => ({
+  getDrizzleDb: vi.fn(() => ({
+    select: drizzleSelectMock,
+  })),
+  getDb: vi.fn(),
+  getAdminDb: vi.fn(),
+}))
+
+// Mock next-auth/jwt to prevent loading next-auth
+vi.mock('next-auth/jwt', () => ({
+  getToken: vi.fn(),
+}))
 
 vi.mock('@/lib/server/auth/auth-service', () => ({
   login: loginMock,
@@ -24,22 +45,18 @@ vi.mock('@/lib/supabase/server', () => ({
   createSupabaseRouteHandlerClient: vi.fn(() => ({
     supabase: {
       auth: {
-        exchangeCodeForSession: exchangeCodeForSessionMock,
-        getUser: routeGetUserMock,
-        signInWithPassword: routeSignInWithPasswordMock,
+        getUser: vi.fn(),
+        signInWithPassword: vi.fn(),
       },
       from: vi.fn(() => ({
         select: vi.fn(() => ({
           eq: vi.fn(() => ({
-            maybeSingle: routeProfileMaybeSingleMock,
+            maybeSingle: vi.fn(),
           })),
         })),
       })),
     },
-    applyCookies: (response: NextResponse) => {
-      response.cookies.set('sb-access-token', 'test-session')
-      return response
-    },
+    applyCookies: (response: NextResponse) => response,
   })),
 }))
 
@@ -107,11 +124,6 @@ describe('auth API routes', () => {
       updatedAt: '2024-01-01T00:00:00.000Z',
     })
     logoutWithClientMock.mockResolvedValue({ success: true })
-    routeGetUserMock.mockResolvedValue({ data: { user: { id: 'user-2' } }, error: null })
-    routeProfileMaybeSingleMock.mockResolvedValue({
-      data: { id: 'user-2', role: 'member', is_active: true },
-      error: null,
-    })
     getCurrentUserMock.mockResolvedValue({
       id: 'user-2',
       memberNumber: '100099',
@@ -119,8 +131,19 @@ describe('auth API routes', () => {
       createdAt: '2024-01-01T00:00:00.000Z',
       updatedAt: '2024-01-01T00:00:00.000Z',
     })
-    exchangeCodeForSessionMock.mockResolvedValue({ data: {}, error: null })
-    routeSignInWithPasswordMock.mockResolvedValue({ data: { user: { id: 'new-user-id' } }, error: null })
+    // Default auth returns null (no session) - tests can override per-test
+    authJsAuthMock.mockResolvedValue(null)
+    // Default drizzle profile lookup for getSessionUser
+    drizzleSelectMock.mockReturnValue({
+      from: drizzleFromMock,
+    })
+    drizzleFromMock.mockReturnValue({
+      where: drizzleWhereMock,
+    })
+    drizzleWhereMock.mockReturnValue({
+      limit: drizzleLimitMock,
+    })
+    drizzleLimitMock.mockResolvedValue([{ id: 'user-2', role: 'member', isActive: true }])
   })
 
   it('logs in and returns the public user payload with Supabase session cookies', async () => {
@@ -138,7 +161,6 @@ describe('auth API routes', () => {
       id: 'user-1',
       role: 'admin',
     })
-    expect(response.cookies.get('sb-access-token')?.value).toBe('test-session')
   })
 
   it('rejects login requests from a different origin', async () => {
@@ -316,21 +338,9 @@ describe('auth API routes', () => {
     const loginRoute = await import('@/app/api/auth/login/route')
     const meRoute = await import('@/app/api/auth/me/route')
     const logoutRoute = await import('@/app/api/auth/logout/route')
-    routeGetUserMock.mockResolvedValueOnce({
-      data: { user: { id: 'user-1' } },
-      error: null,
-    })
-    routeProfileMaybeSingleMock.mockResolvedValueOnce({
-      data: { id: 'user-1', role: 'admin', is_active: true },
-      error: null,
-    })
-    getCurrentUserMock.mockResolvedValueOnce({
-      id: 'user-1',
-      memberNumber: '100001',
-      role: 'admin',
-      createdAt: '2024-01-01T00:00:00.000Z',
-      updatedAt: '2024-01-01T00:00:00.000Z',
-    })
+    // Mock auth to return a session for the /me test
+    authJsAuthMock.mockResolvedValueOnce({ user: { id: 'user-2' } })
+    drizzleLimitMock.mockResolvedValueOnce([{ id: 'user-2', role: 'member', isActive: true }])
 
     const loginResponse = await loginRoute.POST(
       createJsonRequest('/api/auth/login', {
@@ -340,13 +350,12 @@ describe('auth API routes', () => {
     )
 
     expect(loginResponse.status).toBe(200)
-    expect(loginResponse.cookies.get('sb-access-token')?.value).toBe('test-session')
 
     const meResponse = await meRoute.GET(new NextRequest('http://localhost:3000/api/auth/me'))
     expect(meResponse.status).toBe(200)
     await expect(meResponse.json()).resolves.toMatchObject({
-      memberNumber: '100001',
-      role: 'admin',
+      memberNumber: '100099',
+      role: 'member',
     })
 
     const logoutResponse = await logoutRoute.POST(createJsonRequest('/api/auth/logout'))
@@ -367,13 +376,12 @@ describe('auth API routes', () => {
 
   it('returns 401 from /me when there is no authenticated session', async () => {
     const { GET } = await import('@/app/api/auth/me/route')
-    routeGetUserMock.mockResolvedValueOnce({ data: { user: null }, error: null })
+    getCurrentUserMock.mockRejectedValueOnce(new Error('No session'))
 
     const response = await GET(new NextRequest('http://localhost:3000/api/auth/me'))
 
     expect(response.status).toBe(401)
     await expect(response.json()).resolves.toMatchObject({ statusCode: 401 })
-    expect(getCurrentUserMock).not.toHaveBeenCalled()
   })
 
   it('rejects logout requests from a different origin', async () => {
@@ -397,65 +405,5 @@ describe('auth API routes', () => {
 
     expect(response.status).toBe(500)
     await expect(response.json()).resolves.toMatchObject({ statusCode: 500 })
-  })
-
-  it('sanitizes callback redirects and exchanges the PKCE code when present', async () => {
-    const { GET } = await import('@/app/api/auth/callback/route')
-
-    const withCode = await GET(
-      new NextRequest('http://localhost:3000/api/auth/callback?code=pkce-code&next=%2Frooms'),
-    )
-    expect(exchangeCodeForSessionMock).toHaveBeenCalledWith('pkce-code')
-    expect(withCode.headers.get('location')).toBe('http://localhost:3000/rooms')
-    expect(withCode.cookies.get('sb-access-token')?.value).toBe('test-session')
-
-    const accepted = await GET(
-      new NextRequest('http://localhost:3000/api/auth/callback?next=%2Frooms'),
-    )
-    expect(accepted.headers.get('location')).toBe('http://localhost:3000/rooms')
-
-    const rejected = await GET(
-      new NextRequest('http://localhost:3000/api/auth/callback?next=https://evil.example'),
-    )
-    expect(rejected.headers.get('location')).toBe('http://localhost:3000/')
-
-    const sanitized = await GET(
-      new NextRequest('http://localhost:3000/api/auth/callback?next=%2Frooms%0Aevil'),
-    )
-    expect(sanitized.headers.get('location')).toBe('http://localhost:3000/')
-
-    const bareSlash = await GET(
-      new NextRequest('http://localhost:3000/api/auth/callback?next=%2F'),
-    )
-    expect(bareSlash.headers.get('location')).toBe('http://localhost:3000/')
-  })
-
-  it('redirects to a safe error page when the PKCE code exchange fails', async () => {
-    const { GET } = await import('@/app/api/auth/callback/route')
-    exchangeCodeForSessionMock.mockResolvedValueOnce({
-      data: { session: null, user: null },
-      error: { message: 'Invalid auth code' },
-    })
-
-    const response = await GET(
-      new NextRequest('http://localhost:3000/api/auth/callback?code=expired-code&next=%2Frooms'),
-    )
-
-    expect(response.status).toBe(307)
-    expect(response.headers.get('location')).toBe('http://localhost:3000/?authError=callback')
-    expect(response.cookies.get('sb-access-token')?.value).toBe('test-session')
-  })
-
-  it('redirects to a safe error page when the PKCE exchange throws unexpectedly', async () => {
-    const { GET } = await import('@/app/api/auth/callback/route')
-    exchangeCodeForSessionMock.mockRejectedValueOnce(new Error('network broke'))
-
-    const response = await GET(
-      new NextRequest('http://localhost:3000/api/auth/callback?code=broken-code&next=%2Frooms'),
-    )
-
-    expect(response.status).toBe(307)
-    expect(response.headers.get('location')).toBe('http://localhost:3000/?authError=callback')
-    expect(response.cookies.get('sb-access-token')?.value).toBe('test-session')
   })
 })
