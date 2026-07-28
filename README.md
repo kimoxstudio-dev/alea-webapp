@@ -245,9 +245,7 @@ Before pushing:
 
 Session hygiene:
 
-1. Read `docs/HANDOFF.md` before starting work.
-2. Update `docs/HANDOFF.md` before ending the session.
-3. Keep handoff notes only in `docs/HANDOFF.md`; do not use GitHub PR comments or `CLAUDE.md` for repository handoff state.
+1. Keep task and handoff state in Linear; use pull-request comments only for code review.
 
 If you touched SQL schema or generated DB types:
 
