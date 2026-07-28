@@ -12,8 +12,7 @@ import { reservations } from './reservations'
  *
  * `saved_games_no_active_overlap` (EXCLUDE USING gist on table_id +
  * daterange(start_date, end_date) WHERE status = 'active') has no Drizzle
- * pg-core builder — preserved as raw SQL. See lib/db/schema/manual-sql/ and
- * docs/MIGRATION-F1-DRIZZLE-COVERAGE.md.
+ * pg-core builder — preserved as raw SQL. See lib/db/schema/manual-sql/ and Linear KIM-417.
  *
  * Business-rule triggers (validate_saved_game, increment_saved_game_attendance,
  * cancel_saved_games_for_event_block, etc. — 20260619000006..19) are plpgsql

@@ -3,7 +3,7 @@
  * scripts/cutover-rehearsal-runner.mjs — F2 cutover rehearsal (KIM-419).
  *
  * Invoked by scripts/cutover-rehearsal.sh. Exercises the mechanical steps
- * of docs/CUTOVER-RUNBOOK-F2.md against synthetic, in-memory fixture data
+ * tracked in Linear KIM-420 against synthetic, in-memory fixture data
  * only:
  *
  *   1. dump format validation      (lib/cutover/dump-integrity.mjs)

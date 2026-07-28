@@ -2,7 +2,7 @@
 #
 # scripts/cutover-rehearsal.sh — F2 cutover rehearsal (KIM-419)
 #
-# Rehearses the MECHANICAL steps of docs/CUTOVER-RUNBOOK-F2.md — dump
+# Rehearses the MECHANICAL cutover steps tracked in Linear KIM-420 — dump
 # format validation, the bcrypt hash-copy logic, and the session
 # invalidation logic — against synthetic, in-memory fixture data only.
 #
@@ -14,7 +14,7 @@
 #     project.
 #
 # Executing the REAL cutover is a separate, USER-ONLY issue (KIM-420,
-# "F2 execute cutover") — this script and docs/CUTOVER-RUNBOOK-F2.md are
+# "F2 execute cutover") — this script and its tests are
 # prep/rehearsal artifacts only, prepared by agents for the human operator
 # to review and run manually when the real cutover happens.
 #
@@ -30,7 +30,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 echo -e "${YELLOW}━━━ F2 cutover rehearsal — synthetic fixtures only, no real infra ━━━${NC}"
-echo "See docs/CUTOVER-RUNBOOK-F2.md for the full runbook this rehearses."
+echo "See Linear KIM-420 for the current cutover procedure."
 echo "Real cutover execution is a separate, user-only step (KIM-420)."
 echo ""
 

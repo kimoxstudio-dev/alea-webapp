@@ -30,7 +30,7 @@ import { equipment } from './equipment'
  * (Supabase Auth-managed, no Neon equivalent). Adapted here to reference
  * `public.profiles(id) ON DELETE SET NULL` instead — profiles is the durable
  * identity table in the target schema. This is a judgment call; see
- * docs/MIGRATION-F1-DRIZZLE-COVERAGE.md.
+ * Linear KIM-417.
  */
 export const events = pgTable(
   'events',

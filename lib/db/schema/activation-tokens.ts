@@ -9,7 +9,7 @@ import { profiles } from './profiles'
  * anon SELECT-by-hash policy and the authenticated UPDATE-own policy were
  * both created then later dropped, and table-level GRANTs to anon/
  * authenticated were revoked — this table ends up service_role/admin-client
- * only. See docs/MIGRATION-F1-DRIZZLE-COVERAGE.md for the full RLS history.
+ * only. See Linear KIM-417 for the full RLS history.
  *
  * Trigger `activation_tokens_updated_at` (BEFORE UPDATE -> handle_updated_at())
  * has no Drizzle schema-builder equivalent — see coverage doc.

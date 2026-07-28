@@ -7,7 +7,7 @@ import { roleEnum } from './enums'
  *
  * Supabase-era `id` referenced `auth.users(id) ON DELETE CASCADE` (a Supabase
  * Auth-managed table with no Drizzle/Neon equivalent). That FK is intentionally
- * NOT translated here — see docs/MIGRATION-F1-DRIZZLE-COVERAGE.md, "Supabase
+ * NOT translated here — see Linear KIM-417, "Supabase
  * Auth linkage" ambiguity. Under the target Clerk stack, `profiles` remains
  * the root domain identity table and keeps its UUID primary key so existing
  * foreign keys do not need to be rewritten. `clerk_user_id` links that domain
@@ -22,8 +22,7 @@ import { roleEnum } from './enums'
  * Auth.js stack: PR #170 (KIM-416)'s credentials provider already selects
  * `profiles.password_hash`, and the F2 cutover runbook (KIM-419) copies
  * `auth.users.encrypted_password` verbatim into this column. Nullable so
- * existing rows (pre-cutover) don't need a value; see
- * docs/MIGRATION-F1-DRIZZLE-COVERAGE.md §7.1/§8.
+ * existing rows (pre-cutover) don't need a value; see Linear KIM-417.
  */
 export const profiles = pgTable(
   'profiles',

@@ -252,7 +252,7 @@ function getActivationTokenTable(client: { from: (table: 'activation_tokens') =>
 // Privilege check (role === 'admin') lives here in the service layer, not in
 // route handlers (repo convention). activation_tokens is now locked down to
 // service_role only at the RLS layer (no anon/authenticated policies remain —
-// see docs/RLS-SERVICE-LAYER-AUDIT.md), so this in-function check is the only
+// see Linear KIM-418), so this in-function check is the only
 // authorization guard for admin-triggered activation/recovery link
 // generation once RLS is removed as part of the Vercel/Postgres migration.
 function requireAdminSession(session: SessionUser): void {

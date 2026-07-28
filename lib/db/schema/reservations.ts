@@ -14,8 +14,7 @@ import { tables } from './tables'
  * drizzle-orm 0.45):
  *   - EXCLUDE USING gist reservations_no_pending_active_overlap_top
  *   - EXCLUDE USING gist reservations_no_pending_active_overlap_bottom
- * Both are preserved as raw SQL — see lib/db/schema/manual-sql/ and
- * docs/MIGRATION-F1-DRIZZLE-COVERAGE.md.
+ * Both are preserved as raw SQL — see lib/db/schema/manual-sql/ and Linear KIM-417.
  *
  * `user_id` originally carried TWO foreign keys in Supabase: one to
  * `auth.users(id)` (Supabase Auth-managed, no Neon equivalent — dropped, see

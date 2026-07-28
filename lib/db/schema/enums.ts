@@ -2,7 +2,7 @@ import { pgEnum } from 'drizzle-orm/pg-core'
 
 /**
  * lib/db/schema — F1 Drizzle schema, translated from the 85 Supabase SQL
- * migrations in supabase/migrations/. See docs/MIGRATION-F1-DRIZZLE-COVERAGE.md
+ * migrations in supabase/migrations/. See Linear KIM-417
  * for the full coverage report (tables, RLS policies deferred to KIM-418,
  * Supabase-specific constructs skipped, and judgment calls made).
  *

@@ -2,7 +2,7 @@
  * lib/db/schema — F1 Drizzle schema barrel export.
  *
  * Translated from the 85 Supabase SQL migrations in supabase/migrations/.
- * See docs/MIGRATION-F1-DRIZZLE-COVERAGE.md for the full coverage report:
+ * See Linear KIM-417 for the full coverage report:
  * table-by-table status, all RLS policies (deferred to KIM-418), Supabase-
  * specific constructs skipped, and judgment calls made during translation.
  *

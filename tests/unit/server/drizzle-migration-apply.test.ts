@@ -267,11 +267,11 @@ describe("F1 Drizzle Migration Static SQL Verification (Zero DB)", () => {
     // PL/pgSQL triggers (like profiles_updated_at) are hand-written SQL that Drizzle ORM
     // does not support in schema definitions. They exist in the database but cannot be
     // verified via schema parsing alone. This is an intentional, documented gap.
-    // See docs/MIGRATION-F1-DRIZZLE-COVERAGE.md for details.
+    // See Linear KIM-417 for details.
 
     // Supabase Auth's auth.users table (with its FK to profiles.id) was intentionally
     // dropped when migrating to Clerk on Neon. profiles remains the domain identity;
     // profiles.clerk_user_id provides the external auth mapping.
-    // See docs/MIGRATION-F1-DRIZZLE-COVERAGE.md "Supabase Auth linkage" section.
+    // See Linear KIM-417 ("Supabase Auth linkage").
   })
 })
