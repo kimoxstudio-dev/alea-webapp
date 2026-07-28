@@ -159,10 +159,17 @@ describe('AuthProvider', () => {
     )
     const { result } = renderHook(() => useAuth(), { wrapper })
 
-    await expect(
-      act(async () => result.current.login('100099', 'Password123')),
-    ).rejects.toThrow('Invalid credentials')
-    expect(clerkSignOutMock).toHaveBeenCalledOnce()
-    expect(result.current.user).toBeNull()
+    let loginError: unknown
+    await act(async () => {
+      try {
+        await result.current.login('100099', 'Password123')
+      } catch (error) {
+        loginError = error
+      }
+    })
+
+    expect(loginError).toEqual(new Error('Invalid credentials'))
+    await waitFor(() => expect(clerkSignOutMock).toHaveBeenCalledOnce())
+    await waitFor(() => expect(result.current.user).toBeNull())
   })
 })
