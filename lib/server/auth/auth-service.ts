@@ -18,7 +18,6 @@ import {
 } from '@/lib/auth/session'
 import type { Tables, TablesInsert } from '@/lib/supabase/types'
 import { activationServerSchema, recoveryServerSchema, registerServerSchema } from '@/lib/validations/auth'
-import { type PublicProfileRow, toPublicUser } from '@/lib/server/users/profile-mappers'
 
 /**
  * bcryptjs cost factor — matches `scripts/seed.ts`'s `bcrypt.hash(password, 10)`
@@ -90,6 +89,15 @@ async function persistDrizzlePasswordHash(
 
 type ActivationTokenRow = Tables<'activation_tokens'>
 type AuthCredentialRow = Pick<Tables<'profiles'>, 'id' | 'member_number' | 'auth_email' | 'email' | 'full_name' | 'phone' | 'role' | 'is_active' | 'active_from' | 'no_show_count' | 'blocked_until' | 'created_at' | 'updated_at'>
+/**
+ * Local alias for the snake_case Supabase profile row shape this file still
+ * reads (`lib/server/auth/*` is not part of the KIM-440 profiles migration —
+ * see `lib/server/users/profile-mappers.ts`, which now maps the Drizzle
+ * (camelCase) row shape used by the migrated `users-service.ts`). Same field
+ * set as `AuthCredentialRow` above; kept as a distinct alias so call sites
+ * below read by intent (public profile vs. auth-credential lookup).
+ */
+type PublicProfileRow = AuthCredentialRow
 const PUBLIC_PROFILE_COLUMNS = 'id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at' as const
 const ACTIVATION_TOKEN_COLUMNS = 'id, profile_id, token_hash, expires_at, used_at, created_by, created_at, updated_at' as const
 const ACTIVATION_WINDOW_MS = 24 * 60 * 60 * 1000
@@ -288,6 +296,30 @@ async function getAuthCredentialProfileBy(
 async function getAuthCredentialByMemberNumber(memberNumber: string) {
   const admin = getAdminDb()
   return getAuthCredentialProfileBy(admin, 'member_number', memberNumber)
+}
+
+/**
+ * Local replacement for `lib/server/users/profile-mappers.ts`'s
+ * `toPublicUser()`, which now maps the Drizzle (camelCase) `profiles` row
+ * shape used by the migrated `users-service.ts`. This file still queries
+ * `profiles` through the legacy Supabase seam (snake_case rows), so it maps
+ * from that shape locally instead.
+ */
+function toUser(profile: PublicProfileRow): User {
+  return {
+    id: profile.id,
+    memberNumber: profile.member_number,
+    fullName: profile.full_name ?? null,
+    email: profile.email ?? null,
+    phone: profile.phone ?? null,
+    role: profile.role,
+    isActive: profile.is_active,
+    activeFrom: profile.active_from ?? null,
+    noShowCount: profile.no_show_count,
+    blockedUntil: profile.blocked_until ?? null,
+    createdAt: profile.created_at,
+    updatedAt: profile.updated_at,
+  }
 }
 
 function hashActivationToken(token: string) {
@@ -612,7 +644,7 @@ export async function activateAccount(input: { token: unknown; password: unknown
 
   return {
     authEmail,
-    user: toPublicUser(updatedProfile),
+    user: toUser(updatedProfile),
     signInFailed,
   }
 }
@@ -734,7 +766,7 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
 
   return {
     authEmail,
-    user: toPublicUser(updatedProfile),
+    user: toUser(updatedProfile),
     signInFailed,
   }
 }
@@ -800,7 +832,7 @@ export async function login(
     serviceError('Invalid credentials', 401)
   }
 
-  return toPublicUser(credentialProfile)
+  return toUser(credentialProfile)
 }
 
 export async function register(
@@ -877,7 +909,7 @@ export async function register(
     // Non-fatal: profile was created successfully. User can log in separately.
   }
 
-  return toPublicUser(profileData)
+  return toUser(profileData)
 }
 
 async function getSessionScopedProfile(id: string, client?: ProfileLookupClient) {
@@ -898,7 +930,7 @@ export async function getCurrentUser(
     serviceError('Unauthorized', 401)
   }
 
-  return toPublicUser(profile)
+  return toUser(profile)
 }
 
 export async function logout() {
