@@ -117,6 +117,67 @@ describe('verifyCredentials', () => {
     })
   })
 
+  describe('when isActive is false (suspended profile)', () => {
+    it('returns null when profile is inactive (isActive: false)', async () => {
+      const bcryptHash = '$2a$10$xyzhashedpassword'
+      drizzleLimitMock.mockResolvedValueOnce([
+        {
+          id: 'user-5',
+          email: 'suspended@example.com',
+          passwordHash: bcryptHash,
+          fullName: 'Suspended User',
+          role: 'member',
+          isActive: false,
+        },
+      ])
+
+      const result = await verifyCredentials('suspended@example.com', 'correctpassword')
+
+      expect(result).toBeNull()
+      expect(vi.mocked(bcrypt.compare)).not.toHaveBeenCalled()
+    })
+
+    it('returns null uniformly for inactive profile, matching "no user found" and "wrong password" signals', async () => {
+      const bcryptHash = '$2a$10$xyzhashedpassword'
+
+      // Case 1: No user found
+      drizzleLimitMock.mockResolvedValueOnce([])
+      const noUserResult = await verifyCredentials('nonexistent@example.com', 'anypassword')
+
+      // Case 2: User found, inactive
+      drizzleLimitMock.mockResolvedValueOnce([
+        {
+          id: 'user-5',
+          email: 'suspended@example.com',
+          passwordHash: bcryptHash,
+          fullName: 'Suspended User',
+          role: 'member',
+          isActive: false,
+        },
+      ])
+      const inactiveUserResult = await verifyCredentials('suspended@example.com', 'correctpassword')
+
+      // Case 3: User found, wrong password
+      drizzleLimitMock.mockResolvedValueOnce([
+        {
+          id: 'user-6',
+          email: 'active@example.com',
+          passwordHash: bcryptHash,
+          fullName: 'Active User',
+          role: 'member',
+          isActive: true,
+        },
+      ])
+      vi.mocked(bcrypt.compare).mockResolvedValue(false as any)
+      const wrongPasswordResult = await verifyCredentials('active@example.com', 'wrongpassword')
+
+      // All three cases return null uniformly
+      expect(noUserResult).toBeNull()
+      expect(inactiveUserResult).toBeNull()
+      expect(wrongPasswordResult).toBeNull()
+    })
+  })
+
   describe('when password does not match', () => {
     it('returns null when password is incorrect', async () => {
       const bcryptHash = '$2a$10$xyzhashedpassword'

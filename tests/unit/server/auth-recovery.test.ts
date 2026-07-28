@@ -22,15 +22,18 @@ vi.mock('next-auth/jwt', () => ({
   getToken: vi.fn(),
 }))
 
+// State for controlling getDrizzleAdminDb behavior
+const drizzleHashWriteState = { zeroRows: false }
+
 vi.mock('@/lib/db', async () => {
   const actual = await vi.importActual<typeof import('@/lib/db')>('@/lib/db')
   return {
     ...actual,
-    getDrizzleAdminDb: vi.fn(async () => ({
+    getDrizzleAdminDb: vi.fn(() => ({
       update: vi.fn(() => ({
         set: vi.fn(() => ({
           where: vi.fn(() => ({
-            returning: vi.fn(async () => [{ id: 'member-1' }]),
+            returning: vi.fn(async () => (drizzleHashWriteState.zeroRows ? [] : [{ id: 'member-1' }])),
           })),
         })),
       })),
@@ -290,6 +293,7 @@ describe('auth recovery helpers', () => {
     claimTokenErrorState.value = null
     claimMissMutatorState.value = null
     databaseTimeRpcMock.mockClear()
+    drizzleHashWriteState.zeroRows = false
 
     const profile = seedProfile()
     profilesById.set(profile.id, profile)
@@ -447,6 +451,45 @@ describe('auth recovery helpers', () => {
     })
 
     expect(activationTokensByProfileId.get('member-1')?.used_at).toBeTruthy()
+  })
+
+  it('treats zero-row Drizzle password hash update as a failed write and rolls back token', async () => {
+    seedRecoveryToken()
+    drizzleHashWriteState.zeroRows = true
+    const { recoverAccount } = await loadService()
+
+    await expect(recoverAccount({
+      token: 'plain-token',
+      password: 'Password123',
+    })).rejects.toMatchObject({
+      message: 'Failed to recover account',
+      statusCode: 500,
+    })
+
+    expect(activationTokensByProfileId.get('member-1')?.used_at).toBeNull()
+  })
+
+  it('recovery succeeds and writes password hash to Drizzle seam', async () => {
+    seedRecoveryToken()
+    const { recoverAccount } = await loadService()
+    const { getDrizzleAdminDb } = await import('@/lib/db')
+
+    const result = await recoverAccount({
+      token: 'plain-token',
+      password: 'Password123',
+    })
+
+    expect(result).toMatchObject({
+      authEmail: '100020@members.alea.internal',
+      user: {
+        memberNumber: '100020',
+        isActive: true,
+      },
+    })
+
+    expect(vi.mocked(getDrizzleAdminDb)).toHaveBeenCalled()
+    const mockDb = vi.mocked(getDrizzleAdminDb).mock.results[0].value
+    expect(mockDb.update).toHaveBeenCalled()
   })
 
 
