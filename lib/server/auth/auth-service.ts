@@ -2,21 +2,19 @@ import type { User } from '@/lib/types'
 import type { SessionUser } from '@/lib/server/auth/auth'
 import { createHash, randomBytes } from 'node:crypto'
 import bcrypt from 'bcryptjs'
-import { eq } from 'drizzle-orm'
+import { and, eq, gt, isNull } from 'drizzle-orm'
 import { AuthError } from 'next-auth'
 import { signIn as authJsSignIn, signOut as authJsSignOut } from '@/lib/authjs/auth'
 import { verifyCredentials } from '@/lib/authjs/credentials-user'
 import { getDatabaseNow } from '@/lib/server/shared/database-time'
 import { serviceError } from '@/lib/server/shared/service-error'
-import { getAdminDb, getDb, getDrizzleAdminDb } from '@/lib/db'
-import { profiles } from '@/lib/db/schema'
+import { getAdminDb, getDrizzleAdminDb, getDrizzleDb } from '@/lib/db'
+import { activationTokens, profiles } from '@/lib/db/schema'
 import {
   createAuthUser,
   deleteAuthUser,
-  signInWithPassword as authSignInWithPassword,
   updateAuthUserById,
 } from '@/lib/auth/session'
-import type { Tables, TablesInsert } from '@/lib/supabase/types'
 import { activationServerSchema, recoveryServerSchema, registerServerSchema } from '@/lib/validations/auth'
 
 /**
@@ -52,12 +50,10 @@ const PASSWORD_HASH_COST = 10
  * success would silently leave the account "activated" with no usable
  * credential — exactly the class of bug this fix exists to close.
  *
- * Must be called, and succeed, BEFORE the Supabase-side `profiles` row is
- * marked `is_active: true` (activation) — so that if this write fails, the
- * account is never left "marked active, token already consumed, but
- * unusable" (no valid credential on the seam `verifyCredentials()` reads).
- * Callers roll back the single-use activation/recovery token on failure,
- * the same way they already do for `updateAuthUserById()` failures.
+ * For activation, this single Drizzle update persists both the password hash
+ * and active-status fields. Callers roll back the single-use token when it
+ * fails, so Neon never exposes an active profile without the credential
+ * `verifyCredentials()` reads.
  */
 async function persistDrizzlePasswordHash(
   profileId: string,
@@ -86,85 +82,38 @@ async function persistDrizzlePasswordHash(
   }
 }
 
-type ActivationTokenRow = Tables<'activation_tokens'>
-type AuthCredentialRow = Pick<Tables<'profiles'>, 'id' | 'member_number' | 'auth_email' | 'email' | 'full_name' | 'phone' | 'role' | 'is_active' | 'active_from' | 'no_show_count' | 'blocked_until' | 'created_at' | 'updated_at'>
-/**
- * Local alias for the snake_case Supabase profile row shape this file still
- * reads (`lib/server/auth/*` is not part of the KIM-440 profiles migration —
- * see `lib/server/users/profile-mappers.ts`, which now maps the Drizzle
- * (camelCase) row shape used by the migrated `users-service.ts`). Same field
- * set as `AuthCredentialRow` above; kept as a distinct alias so call sites
- * below read by intent (public profile vs. auth-credential lookup).
- */
-type PublicProfileRow = AuthCredentialRow
-const PUBLIC_PROFILE_COLUMNS = 'id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at' as const
-const ACTIVATION_TOKEN_COLUMNS = 'id, profile_id, token_hash, expires_at, used_at, created_by, created_at, updated_at' as const
 const ACTIVATION_WINDOW_MS = 24 * 60 * 60 * 1000
 
-// Auth-only columns: auth_email is used to resolve Supabase Auth credentials for sign-in/activation.
-// email is optional contact email; it is not part of the public user model (issue #39) but IS included for admin-facing user data.
-const AUTH_CREDENTIAL_COLUMNS = 'id, member_number, auth_email, email, full_name, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at' as const
+const DRIZZLE_PROFILE_COLUMNS = {
+  id: profiles.id,
+  memberNumber: profiles.memberNumber,
+  fullName: profiles.fullName,
+  authEmail: profiles.authEmail,
+  email: profiles.email,
+  phone: profiles.phone,
+  role: profiles.role,
+  isActive: profiles.isActive,
+  activeFrom: profiles.activeFrom,
+  noShowCount: profiles.noShowCount,
+  blockedUntil: profiles.blockedUntil,
+  createdAt: profiles.createdAt,
+  updatedAt: profiles.updatedAt,
+} as const
 
-type PublicProfileLookupColumn = 'id' | 'member_number'
-type AuthCredentialLookupColumn = 'id' | 'member_number' | 'email'
-type PublicProfileMaybeSingleResult = Promise<{
-  data: PublicProfileRow | null
-  error: unknown
-}>
-type AuthCredentialMaybeSingleResult = Promise<{
-  data: AuthCredentialRow | null
-  error: unknown
-}>
-type ActivationTokenMaybeSingleResult = Promise<{
-  data: ActivationTokenRow | null
-  error: unknown
-}>
-type PublicProfilesTableClient = {
-  select: (columns: typeof PUBLIC_PROFILE_COLUMNS) => {
-    eq: (column: PublicProfileLookupColumn, value: string) => {
-      maybeSingle: () => PublicProfileMaybeSingleResult
-    }
-  }
-}
-type AuthCredentialTableClient = {
-  select: (columns: typeof AUTH_CREDENTIAL_COLUMNS) => {
-    eq: (column: AuthCredentialLookupColumn, value: string) => {
-      maybeSingle: () => AuthCredentialMaybeSingleResult
-    }
-  }
-}
-type ActivationTokenTableClient = {
-  select: (columns: typeof ACTIVATION_TOKEN_COLUMNS) => {
-    eq: (column: 'profile_id' | 'token_hash', value: string) => {
-      maybeSingle: () => ActivationTokenMaybeSingleResult
-    }
-  }
-  insert: (values: TablesInsert<'activation_tokens'>) => Promise<{ error: unknown }>
-  upsert: (
-    values: TablesInsert<'activation_tokens'>,
-    options: { onConflict: 'profile_id' },
-  ) => Promise<{ error: unknown }>
-  update: (values: Partial<Tables<'activation_tokens'>>) => {
-    eq: (column: 'id' | 'token_hash', value: string) => {
-      eq: (column: 'id', value: string) => Promise<{ error: unknown }>
-      gt: (
-        column: 'expires_at',
-        value: string,
-      ) => {
-        is: (
-          column: 'used_at',
-          value: null,
-        ) => {
-          select: (columns: typeof ACTIVATION_TOKEN_COLUMNS) => {
-            maybeSingle: () => ActivationTokenMaybeSingleResult
-          }
-        }
-      }
-    }
-  }
-}
-type ProfileLookupClient = {
-  from: (table: 'profiles') => unknown
+type DrizzleProfileRow = {
+  id: string
+  memberNumber: string
+  fullName: string | null
+  authEmail: string
+  email: string | null
+  phone: string | null
+  role: 'member' | 'admin'
+  isActive: boolean
+  activeFrom: Date | null
+  noShowCount: number
+  blockedUntil: Date | null
+  createdAt: Date
+  updatedAt: Date
 }
 
 type AuthClient = {
@@ -236,18 +185,6 @@ async function signOutWithAuthJs(): Promise<void> {
   }
 }
 
-function getProfilesTable(client: ProfileLookupClient) {
-  return client.from('profiles') as PublicProfilesTableClient
-}
-
-function getAuthCredentialTable(client: ProfileLookupClient) {
-  return client.from('profiles') as AuthCredentialTableClient
-}
-
-function getActivationTokenTable(client: { from: (table: 'activation_tokens') => unknown }) {
-  return client.from('activation_tokens') as ActivationTokenTableClient
-}
-
 // Privilege check (role === 'admin') lives here in the service layer, not in
 // route handlers (repo convention). activation_tokens is now locked down to
 // service_role only at the RLS layer (no anon/authenticated policies remain —
@@ -258,66 +195,62 @@ function requireAdminSession(session: SessionUser): void {
   if (session.role !== 'admin') serviceError('Forbidden', 403)
 }
 
-async function getPublicProfileBy(
-  client: ProfileLookupClient,
-  column: PublicProfileLookupColumn,
-  value: string,
-) {
-  const { data, error } = await getProfilesTable(client)
-    .select(PUBLIC_PROFILE_COLUMNS)
-    .eq(column, value)
-    .maybeSingle()
-
-  if (error) {
+async function getPublicProfileById(id: string) {
+  try {
+    const db = getDrizzleDb()
+    const [row] = await db
+      .select(DRIZZLE_PROFILE_COLUMNS)
+      .from(profiles)
+      .where(eq(profiles.id, id))
+      .limit(1)
+    return row ?? null
+  } catch {
     serviceError('Internal server error', 500)
   }
-
-  return data
 }
 
-async function getAuthCredentialProfileBy(
-  client: ProfileLookupClient,
-  column: AuthCredentialLookupColumn,
-  value: string,
-) {
-  const { data, error } = await getAuthCredentialTable(client)
-    .select(AUTH_CREDENTIAL_COLUMNS)
-    .eq(column, value)
-    .maybeSingle()
-
-  if (error) {
+async function getAuthCredentialProfileById(id: string) {
+  try {
+    const db = getDrizzleAdminDb()
+    const [row] = await db
+      .select(DRIZZLE_PROFILE_COLUMNS)
+      .from(profiles)
+      .where(eq(profiles.id, id))
+      .limit(1)
+    return row ?? null
+  } catch {
     serviceError('Internal server error', 500)
   }
-
-  return data
 }
 
 async function getAuthCredentialByMemberNumber(memberNumber: string) {
-  const admin = getAdminDb()
-  return getAuthCredentialProfileBy(admin, 'member_number', memberNumber)
+  try {
+    const db = getDrizzleAdminDb()
+    const [row] = await db
+      .select(DRIZZLE_PROFILE_COLUMNS)
+      .from(profiles)
+      .where(eq(profiles.memberNumber, memberNumber))
+      .limit(1)
+    return row ?? null
+  } catch {
+    serviceError('Internal server error', 500)
+  }
 }
 
-/**
- * Local replacement for `lib/server/users/profile-mappers.ts`'s
- * `toPublicUser()`, which now maps the Drizzle (camelCase) `profiles` row
- * shape used by the migrated `users-service.ts`. This file still queries
- * `profiles` through the legacy Supabase seam (snake_case rows), so it maps
- * from that shape locally instead.
- */
-function toUser(profile: PublicProfileRow): User {
+function toUser(profile: DrizzleProfileRow): User {
   return {
     id: profile.id,
-    memberNumber: profile.member_number,
-    fullName: profile.full_name ?? null,
+    memberNumber: profile.memberNumber,
+    fullName: profile.fullName ?? null,
     email: profile.email ?? null,
     phone: profile.phone ?? null,
     role: profile.role,
-    isActive: profile.is_active,
-    activeFrom: profile.active_from ?? null,
-    noShowCount: profile.no_show_count,
-    blockedUntil: profile.blocked_until ?? null,
-    createdAt: profile.created_at,
-    updatedAt: profile.updated_at,
+    isActive: profile.isActive,
+    activeFrom: profile.activeFrom?.toISOString() ?? null,
+    noShowCount: profile.noShowCount,
+    blockedUntil: profile.blockedUntil?.toISOString() ?? null,
+    createdAt: profile.createdAt.toISOString(),
+    updatedAt: profile.updatedAt.toISOString(),
   }
 }
 
@@ -329,12 +262,86 @@ function createActivationToken() {
   return randomBytes(32).toString('hex')
 }
 
-function isActivationExpired(expiresAt: string, currentTime: Date) {
+function isActivationExpired(expiresAt: string | Date, currentTime: Date) {
   return new Date(expiresAt).getTime() <= currentTime.getTime()
 }
 
-async function getDatabaseNowIso(admin: unknown) {
-  return (await getDatabaseNow(admin)).toISOString()
+async function getActivationTokenByHash(tokenHash: string) {
+  try {
+    const db = getDrizzleAdminDb()
+    const [row] = await db
+      .select()
+      .from(activationTokens)
+      .where(eq(activationTokens.tokenHash, tokenHash))
+      .limit(1)
+    return row ?? null
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+}
+
+async function rollbackActivationTokenClaim(id: string, claimedAt: Date): Promise<void> {
+  try {
+    const db = getDrizzleAdminDb()
+    await db
+      .update(activationTokens)
+      .set({ usedAt: null })
+      .where(and(
+        eq(activationTokens.id, id),
+        eq(activationTokens.usedAt, claimedAt),
+      ))
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+}
+
+async function claimActivationToken(
+  tokenHash: string,
+  claimedAt: Date,
+  errorMessage: string,
+) {
+  try {
+    const db = getDrizzleAdminDb()
+    const [row] = await db
+      .update(activationTokens)
+      .set({ usedAt: claimedAt })
+      .where(and(
+        eq(activationTokens.tokenHash, tokenHash),
+        gt(activationTokens.expiresAt, claimedAt),
+        isNull(activationTokens.usedAt),
+      ))
+      .returning()
+    return row ?? null
+  } catch {
+    serviceError(errorMessage, 500)
+  }
+}
+
+async function upsertActivationToken(values: {
+  profileId: string
+  tokenHash: string
+  expiresAt: Date
+  createdBy: string
+  updatedAt: Date
+}, errorMessage: string): Promise<void> {
+  try {
+    const db = getDrizzleAdminDb()
+    await db
+      .insert(activationTokens)
+      .values({ ...values, usedAt: null })
+      .onConflictDoUpdate({
+        target: activationTokens.profileId,
+        set: {
+          tokenHash: values.tokenHash,
+          expiresAt: values.expiresAt,
+          createdBy: values.createdBy,
+          usedAt: null,
+          updatedAt: values.updatedAt,
+        },
+      })
+  } catch {
+    serviceError(errorMessage, 500)
+  }
 }
 
 export type ActivationLinkState =
@@ -350,37 +357,28 @@ export async function getActivationLinkState(token: string): Promise<ActivationL
     return { status: 'invalid', memberNumber: null, fullName: null }
   }
 
-  const admin = getAdminDb()
-  const activationTokens = getActivationTokenTable(admin)
   const tokenHash = hashActivationToken(token)
-  const { data: activationToken, error: activationTokenError } = await activationTokens
-    .select(ACTIVATION_TOKEN_COLUMNS)
-    .eq('token_hash', tokenHash)
-    .maybeSingle()
-
-  if (activationTokenError) {
-    serviceError('Internal server error', 500)
-  }
+  const activationToken = await getActivationTokenByHash(tokenHash)
   if (!activationToken) {
     return { status: 'invalid', memberNumber: null, fullName: null }
   }
-  if (activationToken.used_at) {
+  if (activationToken.usedAt) {
     return { status: 'used', memberNumber: null, fullName: null }
   }
-  const databaseNow = await getDatabaseNow(admin)
-  if (isActivationExpired(activationToken.expires_at, databaseNow)) {
+  const databaseNow = await getDatabaseNow(getDrizzleAdminDb())
+  if (isActivationExpired(activationToken.expiresAt, databaseNow)) {
     return { status: 'expired', memberNumber: null, fullName: null }
   }
 
-  const profile = await getAuthCredentialProfileBy(admin, 'id', activationToken.profile_id)
-  if (!profile || profile.is_active) {
+  const profile = await getAuthCredentialProfileById(activationToken.profileId)
+  if (!profile || profile.isActive) {
     return { status: 'used', memberNumber: null, fullName: null }
   }
 
   return {
     status: 'valid',
-    memberNumber: profile.member_number,
-    fullName: profile.full_name ?? null,
+    memberNumber: profile.memberNumber,
+    fullName: profile.fullName ?? null,
   }
 }
 
@@ -392,8 +390,7 @@ export async function generateActivationLink(input: {
   createdBy: string
 }) {
   requireAdminSession(input.session)
-  const admin = getAdminDb()
-  const profile = await getAuthCredentialProfileBy(admin, 'id', input.userId)
+  const profile = await getAuthCredentialProfileById(input.userId)
 
   if (!profile) {
     serviceError('User not found', 404)
@@ -401,25 +398,20 @@ export async function generateActivationLink(input: {
   if (profile.role !== 'member') {
     serviceError('Only member accounts can be activated', 400)
   }
-  if (profile.is_active) {
+  if (profile.isActive) {
     serviceError('This member is already active', 400)
   }
 
-  const activationTokens = getActivationTokenTable(admin)
   const token = createActivationToken()
-  const databaseNow = await getDatabaseNow(admin)
+  const databaseNow = await getDatabaseNow(getDrizzleAdminDb())
   const expiresAt = new Date(databaseNow.getTime() + ACTIVATION_WINDOW_MS)
-  const upsertResult = await activationTokens.upsert({
-    profile_id: profile.id,
-    token_hash: hashActivationToken(token),
-    expires_at: expiresAt.toISOString(),
-    created_by: input.createdBy,
-    used_at: null,
-  }, { onConflict: 'profile_id' })
-
-  if (upsertResult.error) {
-    serviceError('Failed to create activation link', 500)
-  }
+  await upsertActivationToken({
+    profileId: profile.id,
+    tokenHash: hashActivationToken(token),
+    expiresAt,
+    createdBy: input.createdBy,
+    updatedAt: databaseNow,
+  }, 'Failed to create activation link')
 
   return {
     activationLink: `${input.baseUrl}/${input.locale}/activate?token=${token}`,
@@ -432,37 +424,28 @@ export async function getRecoveryLinkState(token: string): Promise<RecoveryLinkS
     return { status: 'invalid', memberNumber: null, fullName: null }
   }
 
-  const admin = getAdminDb()
-  const activationTokens = getActivationTokenTable(admin)
   const tokenHash = hashActivationToken(token)
-  const { data: recoveryToken, error: recoveryTokenError } = await activationTokens
-    .select(ACTIVATION_TOKEN_COLUMNS)
-    .eq('token_hash', tokenHash)
-    .maybeSingle()
-
-  if (recoveryTokenError) {
-    serviceError('Internal server error', 500)
-  }
+  const recoveryToken = await getActivationTokenByHash(tokenHash)
   if (!recoveryToken) {
     return { status: 'invalid', memberNumber: null, fullName: null }
   }
-  if (recoveryToken.used_at) {
+  if (recoveryToken.usedAt) {
     return { status: 'used', memberNumber: null, fullName: null }
   }
-  const databaseNow = await getDatabaseNow(admin)
-  if (isActivationExpired(recoveryToken.expires_at, databaseNow)) {
+  const databaseNow = await getDatabaseNow(getDrizzleAdminDb())
+  if (isActivationExpired(recoveryToken.expiresAt, databaseNow)) {
     return { status: 'expired', memberNumber: null, fullName: null }
   }
 
-  const profile = await getAuthCredentialProfileBy(admin, 'id', recoveryToken.profile_id)
-  if (!profile || !profile.is_active) {
+  const profile = await getAuthCredentialProfileById(recoveryToken.profileId)
+  if (!profile || !profile.isActive) {
     return { status: 'invalid', memberNumber: null, fullName: null }
   }
 
   return {
     status: 'valid',
-    memberNumber: profile.member_number,
-    fullName: profile.full_name ?? null,
+    memberNumber: profile.memberNumber,
+    fullName: profile.fullName ?? null,
   }
 }
 
@@ -474,8 +457,7 @@ export async function generateRecoveryLink(input: {
   createdBy: string
 }) {
   requireAdminSession(input.session)
-  const admin = getAdminDb()
-  const profile = await getAuthCredentialProfileBy(admin, 'id', input.userId)
+  const profile = await getAuthCredentialProfileById(input.userId)
 
   if (!profile) {
     serviceError('User not found', 404)
@@ -483,25 +465,20 @@ export async function generateRecoveryLink(input: {
   if (profile.role !== 'member') {
     serviceError('Only member accounts can receive recovery links', 400)
   }
-  if (!profile.is_active) {
+  if (!profile.isActive) {
     serviceError('This member must activate the account before using recovery', 400)
   }
 
-  const activationTokens = getActivationTokenTable(admin)
   const token = createActivationToken()
-  const databaseNow = await getDatabaseNow(admin)
+  const databaseNow = await getDatabaseNow(getDrizzleAdminDb())
   const expiresAt = new Date(databaseNow.getTime() + ACTIVATION_WINDOW_MS)
-  const upsertResult = await activationTokens.upsert({
-    profile_id: profile.id,
-    token_hash: hashActivationToken(token),
-    expires_at: expiresAt.toISOString(),
-    created_by: input.createdBy,
-    used_at: null,
-  }, { onConflict: 'profile_id' })
-
-  if (upsertResult.error) {
-    serviceError('Failed to create recovery link', 500)
-  }
+  await upsertActivationToken({
+    profileId: profile.id,
+    tokenHash: hashActivationToken(token),
+    expiresAt,
+    createdBy: input.createdBy,
+    updatedAt: databaseNow,
+  }, 'Failed to create recovery link')
 
   return {
     recoveryLink: `${input.baseUrl}/${input.locale}/recover?token=${token}`,
@@ -516,59 +493,38 @@ export async function activateAccount(input: { token: unknown; password: unknown
   }
 
   const admin = getAdminDb()
-  const activationTokens = getActivationTokenTable(admin)
   const tokenHash = hashActivationToken(parsed.data.token)
-  const { data: existingToken, error: activationTokenError } = await activationTokens
-    .select(ACTIVATION_TOKEN_COLUMNS)
-    .eq('token_hash', tokenHash)
-    .maybeSingle()
-
-  if (activationTokenError) {
-    serviceError('Internal server error', 500)
-  }
-  const databaseNow = existingToken ? await getDatabaseNow(admin) : null
-  if (!existingToken || !databaseNow || isActivationExpired(existingToken.expires_at, databaseNow)) {
+  const existingToken = await getActivationTokenByHash(tokenHash)
+  const databaseNow = existingToken ? await getDatabaseNow(getDrizzleAdminDb()) : null
+  if (!existingToken || !databaseNow || isActivationExpired(existingToken.expiresAt, databaseNow)) {
     serviceError('Activation link is invalid or has expired', 400)
   }
-  if (existingToken.used_at) {
+  if (existingToken.usedAt) {
     serviceError('Activation link has already been used', 400)
   }
 
-  const profile = await getAuthCredentialProfileBy(admin, 'id', existingToken.profile_id)
+  const profile = await getAuthCredentialProfileById(existingToken.profileId)
   if (!profile) {
     serviceError('Activation link is invalid or has expired', 400)
   }
-  if (profile.is_active) {
+  if (profile.isActive) {
     serviceError('Activation link has already been used', 400)
   }
 
-  const activatedAt = await getDatabaseNowIso(admin)
-  const { data: claimedToken, error: claimTokenError } = await activationTokens
-    .update({ used_at: activatedAt })
-    .eq('token_hash', tokenHash)
-    .gt('expires_at', activatedAt)
-    .is('used_at', null)
-    .select(ACTIVATION_TOKEN_COLUMNS)
-    .maybeSingle()
-
-  if (claimTokenError) {
-    serviceError('Failed to activate account', 500)
-  }
+  const activatedAt = await getDatabaseNow(getDrizzleAdminDb())
+  const claimedToken = await claimActivationToken(
+    tokenHash,
+    activatedAt,
+    'Failed to activate account',
+  )
 
   if (!claimedToken) {
-    const { data: latestToken, error: latestTokenError } = await activationTokens
-      .select(ACTIVATION_TOKEN_COLUMNS)
-      .eq('token_hash', tokenHash)
-      .maybeSingle()
-
-    if (latestTokenError) {
-      serviceError('Internal server error', 500)
-    }
-    const latestDatabaseNow = latestToken ? await getDatabaseNow(admin) : null
-    if (!latestToken || !latestDatabaseNow || isActivationExpired(latestToken.expires_at, latestDatabaseNow)) {
+    const latestToken = await getActivationTokenByHash(tokenHash)
+    const latestDatabaseNow = latestToken ? await getDatabaseNow(getDrizzleAdminDb()) : null
+    if (!latestToken || !latestDatabaseNow || isActivationExpired(latestToken.expiresAt, latestDatabaseNow)) {
       serviceError('Activation link is invalid or has expired', 400)
     }
-    if (latestToken.used_at) {
+    if (latestToken.usedAt) {
       serviceError('Activation link has already been used', 400)
     }
 
@@ -582,36 +538,25 @@ export async function activateAccount(input: { token: unknown; password: unknown
     email_confirm: true,
   })
   if (updateAuthError) {
-    await activationTokens.update({ used_at: null }).eq('id', claimedToken.id)
+    await rollbackActivationTokenClaim(claimedToken.id, activatedAt)
     serviceError('Failed to activate account', 500)
   }
 
   // KIM-433 Codex-review fix — see `persistDrizzlePasswordHash()` doc comment.
-  // Must succeed, and must land, before the Supabase `is_active: true` flip
-  // below so a failure here never leaves the account marked active with the
-  // token already consumed but no usable credential.
+  // This single Neon write persists both active state and credential. Failure
+  // rolls back the token claim, avoiding an active account with no usable hash.
   const drizzleWriteOk = await persistDrizzlePasswordHash(profile.id, passwordHash, {
     isActive: true,
-    activeFrom: new Date(activatedAt),
-    pswChanged: new Date(activatedAt),
+    activeFrom: activatedAt,
+    pswChanged: activatedAt,
   })
   if (!drizzleWriteOk) {
-    await activationTokens.update({ used_at: null }).eq('id', claimedToken.id)
+    await rollbackActivationTokenClaim(claimedToken.id, activatedAt)
     serviceError('Failed to activate account', 500)
   }
 
-  const { data: updatedProfile, error: updatedProfileError } = await admin
-    .from('profiles')
-    .update({
-      is_active: true,
-      active_from: activatedAt,
-      psw_changed: activatedAt,
-    })
-    .eq('id', profile.id)
-    .select(PUBLIC_PROFILE_COLUMNS)
-    .maybeSingle()
-
-  if (updatedProfileError || !updatedProfile) {
+  const updatedProfile = await getPublicProfileById(profile.id)
+  if (!updatedProfile) {
     serviceError('Failed to activate account', 500)
   }
 
@@ -625,7 +570,7 @@ export async function activateAccount(input: { token: unknown; password: unknown
   // Identity is resolved and compared BEFORE any session is established —
   // see `establishAuthJsSession()`'s doc comment (KIM-433) for why a
   // same-request signIn()-then-auth() readback cannot be relied on instead.
-  const authEmail = profile.auth_email ?? profile.email ?? ''
+  const authEmail = profile.authEmail
   const verifiedUser = await verifyCredentials(authEmail, parsed.data.password)
 
   // Defense-in-depth, mirroring login()'s identity-drift guard: `profile`
@@ -655,56 +600,35 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
   }
 
   const admin = getAdminDb()
-  const activationTokens = getActivationTokenTable(admin)
   const tokenHash = hashActivationToken(parsed.data.token)
-  const { data: existingToken, error: recoveryTokenError } = await activationTokens
-    .select(ACTIVATION_TOKEN_COLUMNS)
-    .eq('token_hash', tokenHash)
-    .maybeSingle()
-
-  if (recoveryTokenError) {
-    serviceError('Internal server error', 500)
-  }
-  const databaseNow = existingToken ? await getDatabaseNow(admin) : null
-  if (!existingToken || !databaseNow || isActivationExpired(existingToken.expires_at, databaseNow)) {
+  const existingToken = await getActivationTokenByHash(tokenHash)
+  const databaseNow = existingToken ? await getDatabaseNow(getDrizzleAdminDb()) : null
+  if (!existingToken || !databaseNow || isActivationExpired(existingToken.expiresAt, databaseNow)) {
     serviceError('Recovery link is invalid or has expired', 400)
   }
-  if (existingToken.used_at) {
+  if (existingToken.usedAt) {
     serviceError('Recovery link has already been used', 400)
   }
 
-  const profile = await getAuthCredentialProfileBy(admin, 'id', existingToken.profile_id)
-  if (!profile || !profile.is_active) {
+  const profile = await getAuthCredentialProfileById(existingToken.profileId)
+  if (!profile || !profile.isActive) {
     serviceError('Recovery link is invalid or has expired', 400)
   }
 
-  const recoveredAt = await getDatabaseNowIso(admin)
-  const { data: claimedToken, error: claimTokenError } = await activationTokens
-    .update({ used_at: recoveredAt })
-    .eq('token_hash', tokenHash)
-    .gt('expires_at', recoveredAt)
-    .is('used_at', null)
-    .select(ACTIVATION_TOKEN_COLUMNS)
-    .maybeSingle()
-
-  if (claimTokenError) {
-    serviceError('Failed to recover account', 500)
-  }
+  const recoveredAt = await getDatabaseNow(getDrizzleAdminDb())
+  const claimedToken = await claimActivationToken(
+    tokenHash,
+    recoveredAt,
+    'Failed to recover account',
+  )
 
   if (!claimedToken) {
-    const { data: latestToken, error: latestTokenError } = await activationTokens
-      .select(ACTIVATION_TOKEN_COLUMNS)
-      .eq('token_hash', tokenHash)
-      .maybeSingle()
-
-    if (latestTokenError) {
-      serviceError('Internal server error', 500)
-    }
-    const latestDatabaseNow = latestToken ? await getDatabaseNow(admin) : null
-    if (!latestToken || !latestDatabaseNow || isActivationExpired(latestToken.expires_at, latestDatabaseNow)) {
+    const latestToken = await getActivationTokenByHash(tokenHash)
+    const latestDatabaseNow = latestToken ? await getDatabaseNow(getDrizzleAdminDb()) : null
+    if (!latestToken || !latestDatabaseNow || isActivationExpired(latestToken.expiresAt, latestDatabaseNow)) {
       serviceError('Recovery link is invalid or has expired', 400)
     }
-    if (latestToken.used_at) {
+    if (latestToken.usedAt) {
       serviceError('Recovery link has already been used', 400)
     }
 
@@ -718,33 +642,24 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
     email_confirm: true,
   })
   if (updateAuthError) {
-    await activationTokens.update({ used_at: null }).eq('id', claimedToken.id)
+    await rollbackActivationTokenClaim(claimedToken.id, recoveredAt)
     serviceError('Failed to recover account', 500)
   }
 
   // KIM-433 Codex-review fix — see `persistDrizzlePasswordHash()` doc comment.
-  // `isActive: true` is reasserted (not flipped — `profile.is_active` was
-  // already required to be true above) as defense-in-depth self-healing in
-  // case the Drizzle/Neon row ever lagged the Supabase one.
+  // `isActive: true` is reasserted (not flipped — `profile.isActive` was
+  // already required above) as defense-in-depth against profile-state drift.
   const drizzleWriteOk = await persistDrizzlePasswordHash(profile.id, passwordHash, {
     isActive: true,
-    pswChanged: new Date(recoveredAt),
+    pswChanged: recoveredAt,
   })
   if (!drizzleWriteOk) {
-    await activationTokens.update({ used_at: null }).eq('id', claimedToken.id)
+    await rollbackActivationTokenClaim(claimedToken.id, recoveredAt)
     serviceError('Failed to recover account', 500)
   }
 
-  const { data: updatedProfile, error: updatedProfileError } = await admin
-    .from('profiles')
-    .update({
-      psw_changed: recoveredAt,
-    })
-    .eq('id', profile.id)
-    .select(PUBLIC_PROFILE_COLUMNS)
-    .maybeSingle()
-
-  if (updatedProfileError || !updatedProfile) {
+  const updatedProfile = await getPublicProfileById(profile.id)
+  if (!updatedProfile) {
     serviceError('Failed to recover account', 500)
   }
 
@@ -752,7 +667,7 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
   // `activateAccount()` above for why this moved here from the route
   // handler, and for why identity is resolved/compared before any session
   // is established (KIM-433).
-  const authEmail = profile.auth_email ?? profile.email ?? ''
+  const authEmail = profile.authEmail
   const verifiedUser = await verifyCredentials(authEmail, parsed.data.password)
 
   // Defense-in-depth identity-drift guard — see the matching comment in
@@ -787,14 +702,13 @@ export async function login(
     serviceError('Invalid credentials', 401)
   }
 
-  const authEmail = credentialProfile.auth_email ?? credentialProfile.email
+  const authEmail = credentialProfile.authEmail
 
   if (!authEmail) {
-    // Profile has no email set — cannot authenticate.
     serviceError('Invalid credentials', 401)
   }
 
-  if (credentialProfile.is_active === false) {
+  if (credentialProfile.isActive === false) {
     // Suspended users cannot sign in.
     serviceError('Invalid credentials', 401)
   }
@@ -836,7 +750,7 @@ export async function login(
 
 export async function register(
   input: unknown,
-  sessionClient?: AuthClient,
+  _sessionClient?: AuthClient,
 ): Promise<User> {
   const parsed = registerServerSchema.safeParse(input)
   if (!parsed.success) {
@@ -845,13 +759,14 @@ export async function register(
 
   const { memberNumber, password } = parsed.data
 
-  // Use the full admin client (ReturnType<typeof getAdminDb>) so
-  // both auth.admin and .from('profiles') are available without unsafe casts.
+  // Supabase Auth remains transitional until Clerk cutover. Domain profile
+  // persistence below is Drizzle/Neon-only.
   const adminClient = getAdminDb()
+  const drizzleAdmin = getDrizzleAdminDb()
 
   // Check whether the member number is already taken by an existing profile.
   // Generic message to avoid user enumeration (do not confirm whether the number exists).
-  const existing = await getAuthCredentialProfileBy(adminClient, 'member_number', memberNumber)
+  const existing = await getAuthCredentialByMemberNumber(memberNumber)
   if (existing) {
     serviceError('Invalid registration details', 400)
   }
@@ -860,8 +775,11 @@ export async function register(
   // can work with email/password credentials without exposing real emails.
   const email = `${memberNumber}@members.alea.internal`
 
-  // Create the Supabase Auth user. The on_auth_user_created trigger will immediately
-  // INSERT a profiles row with a placeholder member_number.
+  const registeredAt = await getDatabaseNow(drizzleAdmin)
+  const passwordHash = await bcrypt.hash(password, PASSWORD_HASH_COST)
+
+  // Create the Supabase Auth user. Neon has no Auth trigger-backed profile row,
+  // so the Drizzle insert below is the first persistence of domain identity.
   const { data: authData, error: authError } = await createAuthUser(adminClient, {
     email,
     password,
@@ -874,17 +792,23 @@ export async function register(
 
   const userId = authData.user.id
 
-  // UPDATE the trigger-created profile row with the real values.
-  // We use update() instead of insert() because the on_auth_user_created trigger
-  // already inserted a row for this user id with a placeholder member_number.
-  const { data: profileData, error: profileError } = await adminClient
-    .from('profiles')
-    .update({ member_number: memberNumber, auth_email: email, role: 'member', is_active: true })
-    .eq('id', userId)
-    .select(PUBLIC_PROFILE_COLUMNS)
-    .maybeSingle()
-
-  if (profileError) {
+  let profileData: DrizzleProfileRow | undefined
+  try {
+    ;[profileData] = await drizzleAdmin
+      .insert(profiles)
+      .values({
+        id: userId,
+        memberNumber,
+        authEmail: email,
+        email,
+        role: 'member',
+        isActive: true,
+        activeFrom: registeredAt,
+        pswChanged: registeredAt,
+        passwordHash,
+      })
+      .returning(DRIZZLE_PROFILE_COLUMNS)
+  } catch (profileError) {
     // Unique constraint violation on member_number — concurrent registration with the
     // same member number; clean up the orphaned auth user.
     if ((profileError as { code?: string }).code === '23505') {
@@ -900,31 +824,29 @@ export async function register(
     serviceError('Failed to create user profile', 500)
   }
 
-  // Sign the user in to establish a session. Registration succeeded regardless of
-  // whether auto-login works — the user can always log in manually.
-  const supabase = sessionClient ?? await getDb()
-  const { error: signInError } = await authSignInWithPassword(supabase, { email, password })
-  if (signInError) {
-    // Non-fatal: profile was created successfully. User can log in separately.
+  // Registration succeeded regardless of whether auto-login works — the user can
+  // always log in manually. Verify identity first so no session is ever issued
+  // for the wrong profile if profile/auth state drifted unexpectedly.
+  const verifiedUser = await verifyCredentials(email, password)
+  if (verifiedUser && verifiedUser.id === userId) {
+    try {
+      await establishAuthJsSession(email, password)
+    } catch {
+      // Non-fatal: profile was created successfully. User can log in separately.
+    }
   }
 
   return toUser(profileData)
 }
 
-async function getSessionScopedProfile(id: string, client?: ProfileLookupClient) {
-  const supabase = client ?? await getDb()
-  return getPublicProfileBy(supabase, 'id', id)
-}
-
 export async function getCurrentUser(
   session: SessionUser | null,
-  client?: ProfileLookupClient,
 ): Promise<User> {
   if (!session) {
     serviceError('Unauthorized', 401)
   }
 
-  const profile = await getSessionScopedProfile(session.id, client)
+  const profile = await getPublicProfileById(session.id)
   if (!profile) {
     serviceError('Unauthorized', 401)
   }
