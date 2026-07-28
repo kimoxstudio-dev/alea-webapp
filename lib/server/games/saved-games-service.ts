@@ -1,35 +1,115 @@
 /**
- * Saved-games service — admin client usage policy
+ * Saved-games service — KIM-441 (F3c PR6): migrated off the legacy Supabase
+ * `getDb()`/`getAdminDb()` seam onto the Drizzle/Neon client
+ * (`getDrizzleDb()`/`getDrizzleAdminDb()`), following the pilot pattern from
+ * `lib/server/equipment/equipment-service.ts` (PR1) and
+ * `lib/server/partners/partners-service.ts`.
  *
- * This service uses getAdminDb() throughout deliberately.
- * RLS is being removed as part of the Vercel/Postgres migration (Phase 2), so
- * the session-scoped client cannot be relied upon for row-level isolation.
- * Member isolation is instead enforced at the application layer via:
- *   - explicit `user_id = session.id` filters on member-scoped reads/writes
- *     (see the non-admin branch of `listSavedGamesForSession` below)
- *   - explicit ownership checks (`current.user_id !== session.id`) before
+ * `saved_games` / `saved_game_attendances` (this service's own domain) and
+ * `tables` / `rooms` (already migrated — `lib/server/tables/tables-service.ts`
+ * PR2, `lib/server/rooms/rooms-service.ts` PR2) are read/written via Drizzle
+ * below.
+ *
+ * `event_room_blocks` is NOT yet migrated — `lib/server/events/events-service.ts`
+ * still owns that domain on the legacy Supabase seam — so
+ * `assertTableAndEventAvailability()` intentionally keeps reading it via
+ * `getAdminDb()`, mirroring the exact "split-brain" disclosure documented in
+ * `tables-service.ts` for the same table: combining a Neon read (tables) with
+ * a Supabase read (event_room_blocks) here is two independent round-trips
+ * joined in application code, not a single SQL join.
+ *
+ * Member isolation policy (unchanged from the pre-migration version):
+ *   - explicit `user_id = session.id` filter on member-scoped reads (see the
+ *     non-admin branch of `listSavedGamesForSession` below)
+ *   - explicit ownership checks (`current.userId !== session.id`) before
  *     mutations such as renew
- * NOTE: a stronger multi-row guard (`assertMemberRowsScoped()`, KIM-397) is
- * planned but not part of this PR — it is not imported or called here today.
+ *   - `assertMemberRowsScoped()` (KIM-397) as defense-in-depth on the
+ *     multi-row read in `listSavedGamesForSession`, run AFTER the DB fetch
+ *     and BEFORE mapping rows to the public `SavedGame` shape
  * Cross-user operations (attendance recording, table/event conflict checks)
  * legitimately need to span users and therefore require the admin client.
  */
+import { and, asc, eq, gte, lte } from 'drizzle-orm'
 import type { SavedGame, SavedGameStatus } from '@/lib/types'
 import { ERROR_CODES } from '@/lib/types/error-codes'
 import type { SessionUser } from '@/lib/server/auth/auth'
 import { getCurrentClubDate, isValidDateOnlyString } from '@/lib/club-time'
-import { getAdminDb } from '@/lib/db'
+import { getAdminDb, getDrizzleAdminDb } from '@/lib/db'
+import { rooms, savedGameAttendances, savedGames, tables } from '@/lib/db/schema'
 import { serviceError } from '@/lib/server/shared/service-error'
 import { assertMemberRowsScoped } from '@/lib/server/shared/data-scoping'
 import type { Tables } from '@/lib/supabase/types'
 
-type SavedGameRow = Tables<'saved_games'>
-type SavedGameJoinedRow = SavedGameRow & {
-  tables?: { name: string; rooms?: { name: string } | null } | null
+const SAVED_GAME_JOIN_SELECTION = {
+  id: savedGames.id,
+  tableId: savedGames.tableId,
+  userId: savedGames.userId,
+  startDate: savedGames.startDate,
+  endDate: savedGames.endDate,
+  status: savedGames.status,
+  attendanceCount: savedGames.attendanceCount,
+  renewedFromId: savedGames.renewedFromId,
+  createdAt: savedGames.createdAt,
+  updatedAt: savedGames.updatedAt,
+  tableName: tables.name,
+  roomName: rooms.name,
+} as const
+
+type SavedGameJoinedRow = {
+  id: string
+  tableId: string
+  userId: string
+  startDate: string
+  endDate: string
+  status: string
+  attendanceCount: number
+  renewedFromId: string | null
+  createdAt: Date
+  updatedAt: Date
+  tableName: string
+  roomName: string
 }
 
-const SAVED_GAME_COLUMNS = 'id, table_id, user_id, start_date, end_date, status, attendance_count, renewed_from_id, created_at, updated_at'
-const SAVED_GAME_JOINED_COLUMNS = `${SAVED_GAME_COLUMNS}, tables(name, rooms(name))`
+/**
+ * Runs a Drizzle query, translating any thrown DB/driver error into a
+ * uniform 500 ServiceError. Business-logic outcomes (e.g. "no row
+ * returned" -> 404, validation -> 400) are handled by callers, outside this
+ * wrapper, so their specific status codes aren't swallowed into a 500.
+ */
+async function runQuery<T>(query: Promise<T>): Promise<T> {
+  try {
+    return await query
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+}
+
+/**
+ * `node-postgres` (the driver behind the Drizzle/Neon seam) throws raw `pg`
+ * `DatabaseError` instances with a `code` shape on constraint violations; it
+ * does not wrap them. Duck-typed here rather than importing `pg`'s error
+ * class to keep this check dependency-light.
+ */
+function getPgErrorCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null) return undefined
+  const { code } = error as { code?: unknown }
+  return typeof code === 'string' ? code : undefined
+}
+
+/** Builds the saved_games -> tables -> rooms join used by every read below. */
+function savedGamesJoinedQuery(db: ReturnType<typeof getDrizzleAdminDb>) {
+  return db
+    .select(SAVED_GAME_JOIN_SELECTION)
+    .from(savedGames)
+    .innerJoin(tables, eq(savedGames.tableId, tables.id))
+    .innerJoin(rooms, eq(tables.roomId, rooms.id))
+}
+
+async function fetchJoinedSavedGame(id: string): Promise<SavedGameJoinedRow | undefined> {
+  const db = getDrizzleAdminDb()
+  const [row] = await runQuery(savedGamesJoinedQuery(db).where(eq(savedGames.id, id)))
+  return row
+}
 
 function parseDate(value: unknown, field: string) {
   const date = String(value ?? '')
@@ -56,44 +136,47 @@ function getMaxEndDate(startDate: string) {
 }
 
 function mapSavedGame(row: SavedGameJoinedRow, today = getCurrentClubDate()): SavedGame {
-  const renewalOpensOn = addDays(row.end_date, -14)
-  const status = row.status === 'active' && row.end_date < today ? 'completed' : row.status
+  const renewalOpensOn = addDays(row.endDate, -14)
+  const status = row.status === 'active' && row.endDate < today ? 'completed' : row.status
   return {
     id: row.id,
-    tableId: row.table_id,
-    userId: row.user_id,
-    startDate: row.start_date,
-    endDate: row.end_date,
+    tableId: row.tableId,
+    userId: row.userId,
+    startDate: row.startDate,
+    endDate: row.endDate,
     status: status as SavedGameStatus,
-    attendanceCount: row.attendance_count,
-    renewedFromId: row.renewed_from_id,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    roomName: row.tables?.rooms?.name ?? null,
-    tableName: row.tables?.name ?? null,
+    attendanceCount: row.attendanceCount,
+    renewedFromId: row.renewedFromId,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+    roomName: row.roomName ?? null,
+    tableName: row.tableName ?? null,
     renewalOpensOn,
-    canRenew: status === 'active' && today >= renewalOpensOn && today <= row.end_date,
+    canRenew: status === 'active' && today >= renewalOpensOn && today <= row.endDate,
   }
 }
 
 async function assertTableAndEventAvailability(tableId: string, startDate: string, endDate: string) {
-  // Admin client required: table and event-block lookups span all users/rooms;
-  // no member isolation needed — these are global availability checks.
-  const admin = getAdminDb()
-  const { data: table, error: tableError } = await admin
-    .from('tables')
-    .select('id, room_id, type')
-    .eq('id', tableId)
-    .maybeSingle()
+  // Drizzle/Neon read: `tables` is already migrated (tables-service.ts PR2),
+  // so its source of truth lives in Neon.
+  const db = getDrizzleAdminDb()
+  const [table] = await runQuery(
+    db
+      .select({ id: tables.id, roomId: tables.roomId, type: tables.type })
+      .from(tables)
+      .where(eq(tables.id, tableId)),
+  )
 
-  if (tableError) serviceError('Internal server error', 500)
   if (!table) serviceError('Table not found', 404)
   if (table.type !== 'removable_top') serviceError(ERROR_CODES.SAVED_GAME_REQUIRES_REMOVABLE_TOP, 400)
 
+  // Legacy Supabase read: `event_room_blocks` is owned by events-service.ts,
+  // which has not migrated yet — see file header "split-brain" disclosure.
+  const admin = getAdminDb()
   const { data: blocks, error: blocksError } = await admin
     .from('event_room_blocks')
     .select('id, table_id')
-    .eq('room_id', table.room_id)
+    .eq('room_id', table.roomId)
     .gte('date', startDate)
     .lte('date', endDate)
 
@@ -116,23 +199,24 @@ function validateDateRange(startDate: string, endDate: string) {
 }
 
 export async function listSavedGamesForSession(session: SessionUser): Promise<SavedGame[]> {
-  // Admin client required: RLS is removed in Phase 2. Member isolation is
-  // enforced by the `user_id = session.id` filter below (non-admin path).
+  // Admin client required: Neon has no RLS. Member isolation is enforced by
+  // the `eq(savedGames.userId, session.id)` filter below (non-admin path).
   // Admins intentionally receive all rows.
-  const admin = getAdminDb()
+  const db = getDrizzleAdminDb()
   const today = getCurrentClubDate()
-  let query = admin
-    .from('saved_games')
-    .select(SAVED_GAME_JOINED_COLUMNS)
-    .order('start_date', { ascending: true })
 
-  if (session.role !== 'admin') query = query.eq('user_id', session.id)
-  const { data, error } = await query
-  if (error) serviceError('Internal server error', 500)
+  const rows = await runQuery(
+    savedGamesJoinedQuery(db)
+      .where(session.role !== 'admin' ? eq(savedGames.userId, session.id) : undefined)
+      .orderBy(asc(savedGames.startDate)),
+  )
 
   // Defense-in-depth: verify the query filter held before mapping rows out.
+  // `assertMemberRowsScoped()` requires a `user_id` (snake_case) field; the
+  // Drizzle row uses `userId` (camelCase), so it's bridged here rather than
+  // changing the shared helper's contract (also used by other services).
   const rawRows = assertMemberRowsScoped(
-    (data ?? []) as unknown as SavedGameJoinedRow[],
+    rows.map((row) => ({ ...row, user_id: row.userId })),
     session,
   )
 
@@ -150,62 +234,83 @@ export async function createSavedGameForSession(
   validateDateRange(startDate, endDate)
   await assertTableAndEventAvailability(tableId, startDate, endDate)
 
-  // Admin client required: RLS is removed in Phase 2. Member isolation is
-  // enforced by writing `user_id: session.id` explicitly into the insert
-  // payload — the authenticated user can only create rows for themselves.
-  const admin = getAdminDb()
-  const { data, error } = await admin
-    .from('saved_games')
-    .insert({ table_id: tableId, user_id: session.id, start_date: startDate, end_date: endDate })
-    .select(SAVED_GAME_JOINED_COLUMNS)
-    .single()
+  // Admin client required: Neon has no RLS. Member isolation is enforced by
+  // writing `userId: session.id` explicitly into the insert payload — the
+  // authenticated user can only create rows for themselves.
+  const db = getDrizzleAdminDb()
+  let row: { id: string } | undefined
+  try {
+    ;[row] = await db
+      .insert(savedGames)
+      .values({ tableId, userId: session.id, startDate, endDate })
+      .returning({ id: savedGames.id })
+  } catch (err) {
+    const code = getPgErrorCode(err)
+    if (code === '23P01') serviceError(ERROR_CODES.SAVED_GAME_CONFLICT, 409)
+    if (code === '23514') serviceError((err as Error).message, 400)
+    serviceError('Internal server error', 500)
+  }
+  if (!row) serviceError('Internal server error', 500)
 
-  if (error?.code === '23P01') serviceError(ERROR_CODES.SAVED_GAME_CONFLICT, 409)
-  if (error?.code === '23514') serviceError(error.message, 400)
-  if (error || !data) serviceError('Internal server error', 500)
-  return mapSavedGame(data as unknown as SavedGameJoinedRow)
+  const joined = await fetchJoinedSavedGame(row.id)
+  if (!joined) serviceError('Internal server error', 500)
+  return mapSavedGame(joined)
 }
 
 export async function renewSavedGameForSession(session: SessionUser, id: string): Promise<SavedGame> {
-  // Admin client required: RLS is removed in Phase 2. Member isolation is
-  // enforced by the ownership check below (`current.user_id !== session.id`)
-  // which throws 403 before any mutation occurs for non-admin users.
-  const admin = getAdminDb()
-  const { data: current, error: currentError } = await admin
-    .from('saved_games')
-    .select(SAVED_GAME_COLUMNS)
-    .eq('id', id)
-    .maybeSingle()
+  // Admin client required: Neon has no RLS. Member isolation is enforced by
+  // the ownership check below (`current.userId !== session.id`) which throws
+  // 403 before any mutation occurs for non-admin users.
+  const db = getDrizzleAdminDb()
+  const [current] = await runQuery(
+    db
+      .select({
+        id: savedGames.id,
+        tableId: savedGames.tableId,
+        userId: savedGames.userId,
+        startDate: savedGames.startDate,
+        endDate: savedGames.endDate,
+        status: savedGames.status,
+      })
+      .from(savedGames)
+      .where(eq(savedGames.id, id)),
+  )
 
-  if (currentError) serviceError('Internal server error', 500)
   if (!current) serviceError('Saved Game not found', 404)
-  if (session.role !== 'admin' && current.user_id !== session.id) serviceError('Forbidden', 403)
+  if (session.role !== 'admin' && current.userId !== session.id) serviceError('Forbidden', 403)
   if (current.status !== 'active') serviceError(ERROR_CODES.SAVED_GAME_NOT_ACTIVE, 409)
 
   const today = getCurrentClubDate()
-  const renewalOpensOn = addDays(current.end_date, -14)
-  if (today < renewalOpensOn || today > current.end_date) serviceError(ERROR_CODES.SAVED_GAME_RENEWAL_NOT_OPEN, 409)
+  const renewalOpensOn = addDays(current.endDate, -14)
+  if (today < renewalOpensOn || today > current.endDate) serviceError(ERROR_CODES.SAVED_GAME_RENEWAL_NOT_OPEN, 409)
 
-  const startDate = addDays(current.end_date, 1)
+  const startDate = addDays(current.endDate, 1)
   const endDate = getMaxEndDate(startDate)
-  await assertTableAndEventAvailability(current.table_id, startDate, endDate)
+  await assertTableAndEventAvailability(current.tableId, startDate, endDate)
 
-  const { data, error } = await admin
-    .from('saved_games')
-    .insert({
-      table_id: current.table_id,
-      user_id: current.user_id,
-      start_date: startDate,
-      end_date: endDate,
-      renewed_from_id: current.id,
-    })
-    .select(SAVED_GAME_JOINED_COLUMNS)
-    .single()
+  let row: { id: string } | undefined
+  try {
+    ;[row] = await db
+      .insert(savedGames)
+      .values({
+        tableId: current.tableId,
+        userId: current.userId,
+        startDate,
+        endDate,
+        renewedFromId: current.id,
+      })
+      .returning({ id: savedGames.id })
+  } catch (err) {
+    const code = getPgErrorCode(err)
+    if (code === '23505') serviceError(ERROR_CODES.SAVED_GAME_ALREADY_RENEWED, 409)
+    if (code === '23P01') serviceError(ERROR_CODES.SAVED_GAME_CONFLICT, 409)
+    serviceError('Internal server error', 500)
+  }
+  if (!row) serviceError('Internal server error', 500)
 
-  if (error?.code === '23505') serviceError(ERROR_CODES.SAVED_GAME_ALREADY_RENEWED, 409)
-  if (error?.code === '23P01') serviceError(ERROR_CODES.SAVED_GAME_CONFLICT, 409)
-  if (error || !data) serviceError('Internal server error', 500)
-  return mapSavedGame(data as unknown as SavedGameJoinedRow, today)
+  const joined = await fetchJoinedSavedGame(row.id)
+  if (!joined) serviceError('Internal server error', 500)
+  return mapSavedGame(joined, today)
 }
 
 export async function recordSavedGameAttendance(playReservation: Tables<'reservations'>): Promise<void> {
@@ -214,25 +319,33 @@ export async function recordSavedGameAttendance(playReservation: Tables<'reserva
   // Admin client required: this function is called from a system/cron context
   // (not a user request) and intentionally reads across all users to match a
   // reservation to its saved game. No per-user scoping is appropriate here.
-  const admin = getAdminDb()
-  const { data: savedGame, error } = await admin
-    .from('saved_games')
-    .select('id')
-    .eq('table_id', playReservation.table_id)
-    .eq('user_id', playReservation.user_id)
-    .eq('status', 'active')
-    .lte('start_date', playReservation.date)
-    .gte('end_date', playReservation.date)
-    .maybeSingle()
+  const db = getDrizzleAdminDb()
+  const [savedGame] = await runQuery(
+    db
+      .select({ id: savedGames.id })
+      .from(savedGames)
+      .where(
+        and(
+          eq(savedGames.tableId, playReservation.table_id),
+          eq(savedGames.userId, playReservation.user_id),
+          eq(savedGames.status, 'active'),
+          lte(savedGames.startDate, playReservation.date),
+          gte(savedGames.endDate, playReservation.date),
+        ),
+      ),
+  )
 
-  if (error) serviceError('Internal server error', 500)
   if (!savedGame) return
 
-  const { error: attendanceError } = await admin.from('saved_game_attendances').insert({
-    saved_game_id: savedGame.id,
-    play_reservation_id: playReservation.id,
-    attended_on: playReservation.date,
-  })
-
-  if (attendanceError?.code !== '23505' && attendanceError) serviceError('Internal server error', 500)
+  try {
+    await db.insert(savedGameAttendances).values({
+      savedGameId: savedGame.id,
+      playReservationId: playReservation.id,
+      attendedOn: playReservation.date,
+    })
+  } catch (err) {
+    // 23505 (unique_violation on play_reservation_id) means this reservation
+    // already recorded attendance — idempotent no-op, matches prior behavior.
+    if (getPgErrorCode(err) !== '23505') serviceError('Internal server error', 500)
+  }
 }

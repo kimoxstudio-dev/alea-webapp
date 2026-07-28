@@ -14,6 +14,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { readFileSync } from 'fs'
 import { join } from 'path'
 import {
+  createDrizzleQueryBuilder,
+  selectMock,
+  insertMock,
   createStatefulDrizzleDb,
   resetDb,
   seedTable,
@@ -1074,6 +1077,17 @@ describe('OIR-208: Unified Events', () => {
 
       const { createSavedGameForSession } = await import('@/lib/server/games/saved-games-service')
 
+      // Seed Drizzle tables and saved_games for the state-driven mock (KIM-443).
+      // The service uses getDrizzleAdminDb() to look up tables and rooms; seedTable
+      // accepts both Drizzle table objects and plain data objects.
+      seedTable('rooms', [
+        { id: RESERVATION_ROOM, name: 'Reservation Room' },
+      ])
+      seedTable('tables', [
+        { id: 'sg-table-1', roomId: RESERVATION_ROOM, name: 'Table SG-1', type: 'removable_top' },
+        { id: 'sg-table-2', roomId: RESERVATION_ROOM, name: 'Table SG-2', type: 'removable_top' },
+      ])
+
       // The blocked table itself must conflict.
       await expect(createSavedGameForSession({ id: 'user-1', role: 'member' }, {
         tableId: 'sg-table-1',
@@ -1082,6 +1096,7 @@ describe('OIR-208: Unified Events', () => {
       })).rejects.toMatchObject({ message: 'SAVED_GAME_EVENT_CONFLICT', statusCode: 409 })
 
       // A sibling table not referenced by the block must NOT conflict.
+      // Seed the newly-created row so the joined read finds it.
       const result = await createSavedGameForSession({ id: 'user-1', role: 'member' }, {
         tableId: 'sg-table-2',
         startDate: '2026-04-20',
