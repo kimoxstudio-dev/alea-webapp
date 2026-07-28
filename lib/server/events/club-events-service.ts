@@ -363,9 +363,14 @@ function resolveClubEventFields(body: ClubEventInput, current: EventRow | null):
   // OFF nulls them (paired constraint holds) and keeps only the legacy
   // `title` column populated — an internal-only event. When omitted on an
   // update, preserve whatever the row currently is.
+  // KIM-434 PR3/PR3b compatibility note: isClubEventRow now expects the
+  // camelCase (Drizzle) shape { titleEs, titleEn } since events-service.ts
+  // was migrated in PR3 (commit 6c6928f). This file remains on the legacy
+  // Supabase seam (snake_case rows), so map the two fields it needs inline
+  // rather than migrating the whole row shape.
   const visibleOnLanding = body.visibleOnLanding !== undefined
     ? parseBooleanFlag(body.visibleOnLanding)
-    : (current ? isClubEventRow(current) : true)
+    : (current ? isClubEventRow({ titleEs: current.title_es, titleEn: current.title_en }) : true)
 
   // OIR-208 review fix: the unified form never edits description/start_time/
   // end_time, so an UPDATE must preserve whatever is already on the row (a
@@ -442,7 +447,9 @@ function toAdminClubEvent(
     roomBlocks,
     // OIR-208: unified events — a row is landing-visible once both bilingual
     // titles are populated (same predicate as isClubEventRow).
-    visibleOnLanding: isClubEventRow(row),
+    // KIM-434 PR3/PR3b compatibility note: see the mapping comment above —
+    // isClubEventRow expects camelCase, this file's rows are snake_case.
+    visibleOnLanding: isClubEventRow({ titleEs: row.title_es, titleEn: row.title_en }),
     materials,
   }
 }
@@ -978,5 +985,14 @@ export async function deleteClubEvent(session: SessionUser, id: string): Promise
   // Calls deleteEventCascade directly (not the guarded deleteEvent) since
   // this surface intentionally operates on any row — the inverse of
   // deleteEvent's own isClubEventRow guard.
-  await deleteEventCascade(admin, id)
+  //
+  // KIM-434 PR3/PR3b compatibility note: deleteEventCascade's signature
+  // changed from (admin, id) to (id) when events-service.ts was migrated to
+  // Drizzle in PR3 (commit 6c6928f). club-events-service.ts itself remains
+  // unmigrated (legacy Supabase seam, deferred to PR3b — see the plan
+  // captured in tests/unit/server/club-events-service.test.ts) but must call
+  // the new signature since it imports deleteEventCascade from the
+  // already-migrated events-service.ts. This is the one adaptation needed to
+  // keep this otherwise-untouched file compiling against its dependency.
+  await deleteEventCascade(id)
 }

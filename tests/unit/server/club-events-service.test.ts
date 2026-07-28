@@ -26,6 +26,46 @@ vi.mock('@/lib/supabase/server', () => ({
   createSupabaseServerClient: vi.fn(),
 }))
 
+/**
+ * KIM-434 PR3/PR3b compatibility note: this file stays on the legacy
+ * Supabase seam (club-events-service.ts itself is unmigrated, deferred to
+ * PR3b — see the plan above), but it calls two functions from
+ * events-service.ts that WERE migrated to Drizzle in PR3 (commit 6c6928f):
+ * `deleteEventCascade` (from deleteClubEvent) and `listEvents` (tested
+ * directly in the "listEvents (from events-service.ts)" describe block
+ * below). Both need a minimal Drizzle mock to resolve without touching a
+ * real database — empty results are sufficient for what these specific
+ * tests assert (no error thrown / result is an array), so this is
+ * deliberately NOT the full shared dispatching mock from
+ * tests/unit/mocks/drizzle-mock.ts — just enough to keep this otherwise-
+ * untouched file passing against its migrated dependency.
+ */
+function createMinimalDrizzleStub() {
+  const resolved = Promise.resolve([]) as Promise<any[]> & { orderBy: () => Promise<any[]> }
+  resolved.orderBy = () => Promise.resolve([])
+  const chain: any = {
+    select: () => chain,
+    from: () => chain,
+    where: () => resolved,
+    delete: () => chain,
+    transaction: async (cb: (tx: typeof chain) => unknown) => cb(chain),
+  }
+  return chain
+}
+
+// Only override the Drizzle-seam exports; getDb/getAdminDb must keep their
+// real (thin-wrapper) implementation, which itself calls the mocked
+// @/lib/supabase/server functions above — every other test in this file
+// depends on that passthrough continuing to work.
+vi.mock('@/lib/db', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/db')>()
+  return {
+    ...actual,
+    getDrizzleDb: vi.fn(() => createMinimalDrizzleStub()),
+    getDrizzleAdminDb: vi.fn(() => createMinimalDrizzleStub()),
+  }
+})
+
 vi.mock('@/lib/server/shared/service-error', () => ({
   serviceError: vi.fn((message: string, statusCode: number) => {
     const err = new Error(message) as ServiceError
