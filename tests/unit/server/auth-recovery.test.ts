@@ -22,22 +22,147 @@ vi.mock('next-auth/jwt', () => ({
   getToken: vi.fn(),
 }))
 
-// State for controlling getDrizzleAdminDb behavior
+// State for controlling Drizzle seam behavior
 const drizzleHashWriteState = { zeroRows: false }
 
 vi.mock('@/lib/db', async () => {
   const actual = await vi.importActual<typeof import('@/lib/db')>('@/lib/db')
-  return {
-    ...actual,
-    getDrizzleAdminDb: vi.fn(() => ({
-      update: vi.fn(() => ({
-        set: vi.fn(() => ({
-          where: vi.fn(() => ({
-            returning: vi.fn(async () => (drizzleHashWriteState.zeroRows ? [] : [{ id: 'member-1' }])),
-          })),
-        })),
+  const { getTableName } = await vi.importActual<typeof import('drizzle-orm')>('drizzle-orm')
+  const buildDrizzleProfile = (profile: ProfileRow) => ({
+    id: profile.id,
+    memberNumber: profile.member_number,
+    authEmail: profile.auth_email,
+    email: profile.email,
+    fullName: profile.full_name,
+    phone: profile.phone,
+    role: profile.role,
+    isActive: profile.is_active,
+    activeFrom: profile.active_from ? new Date(profile.active_from) : null,
+    noShowCount: profile.no_show_count,
+    blockedUntil: profile.blocked_until ? new Date(profile.blocked_until) : null,
+    createdAt: new Date(profile.created_at),
+    updatedAt: new Date(profile.updated_at),
+  })
+  const buildDrizzleToken = (token: ActivationTokenRow) => ({
+    id: token.id,
+    profileId: token.profile_id,
+    tokenHash: token.token_hash,
+    expiresAt: new Date(token.expires_at),
+    usedAt: token.used_at ? new Date(token.used_at) : null,
+    createdBy: token.created_by,
+    createdAt: new Date(token.created_at),
+    updatedAt: new Date(token.updated_at),
+  })
+  const selectMock = vi.fn(() => ({
+    from: vi.fn((table: unknown) => ({
+      where: vi.fn(() => ({
+        limit: vi.fn(async () => {
+          if (getTableName(table as never) === 'activation_tokens') {
+            const token = activationTokensByHash.values().next().value
+            return token ? [buildDrizzleToken(token)] : []
+          }
+          const profile = profilesById.values().next().value
+          return profile ? [buildDrizzleProfile(profile)] : []
+        }),
       })),
     })),
+  }))
+  const drizzleUpdateMock = vi.fn((table: unknown) => ({
+    set: vi.fn((updates: Record<string, unknown>) => ({
+      where: vi.fn(() => {
+        if (getTableName(table as never) === 'activation_tokens') {
+          const execute = async () => {
+            if (claimTokenErrorState.value && updates.usedAt instanceof Date) {
+              throw claimTokenErrorState.value
+            }
+            const existing = activationTokensById.values().next().value
+            if (!existing) return []
+            if (claimMissMutatorState.value && updates.usedAt instanceof Date) {
+              claimMissMutatorState.value(existing.token_hash)
+              return []
+            }
+            if (
+              updates.usedAt instanceof Date &&
+              (existing.used_at !== null || new Date(existing.expires_at) <= updates.usedAt)
+            ) {
+              return []
+            }
+            const next = {
+              ...existing,
+              used_at: updates.usedAt instanceof Date
+                ? updates.usedAt.toISOString()
+                : (updates.usedAt === null ? null : existing.used_at),
+              updated_at: '2026-04-15T11:00:00.000Z',
+            }
+            activationTokensById.set(next.id, next)
+            activationTokensByProfileId.set(next.profile_id, next)
+            activationTokensByHash.set(next.token_hash, next)
+            return [buildDrizzleToken(next)]
+          }
+          return {
+            returning: vi.fn(execute),
+            then: (resolve: (value: unknown) => unknown, reject: (reason: unknown) => unknown) =>
+              execute().then(resolve, reject),
+          }
+        }
+        return {
+          returning: vi.fn(async () => {
+          const existing = profilesById.get('member-1')
+          if (!existing) return []
+          const next = {
+            ...existing,
+            is_active: typeof updates.isActive === 'boolean' ? updates.isActive : existing.is_active,
+            active_from: updates.activeFrom instanceof Date ? updates.activeFrom.toISOString() : existing.active_from,
+            psw_changed: updates.pswChanged instanceof Date ? updates.pswChanged.toISOString() : existing.psw_changed,
+            updated_at: '2026-04-15T11:00:00.000Z',
+          }
+          profilesById.set(next.id, next)
+          profilesByMemberNumber.set(next.member_number, next)
+          return drizzleHashWriteState.zeroRows ? [] : [{ id: next.id }]
+          }),
+        }
+      }),
+    })),
+  }))
+  const insertMock = vi.fn((table: unknown) => ({
+    values: vi.fn((values: Record<string, unknown>) => ({
+      onConflictDoUpdate: vi.fn((config: { set: Record<string, unknown> }) => ({
+        then: (resolve: (value: unknown) => unknown, reject: (reason: unknown) => unknown) => {
+          const execute = async () => {
+            if (getTableName(table as never) !== 'activation_tokens') return []
+            activationTokenUpsertMock(values)
+            const existing = activationTokensByProfileId.get(String(values.profileId))
+            if (existing) activationTokensByHash.delete(existing.token_hash)
+            const next: ActivationTokenRow = {
+              id: existing?.id ?? 'token-new',
+              profile_id: String(values.profileId),
+              token_hash: String(values.tokenHash),
+              expires_at: (values.expiresAt as Date).toISOString(),
+              used_at: null,
+              created_by: String(values.createdBy),
+              created_at: existing?.created_at ?? '2026-04-15T10:00:00.000Z',
+              updated_at: (config.set.updatedAt as Date).toISOString(),
+            }
+            activationTokensById.set(next.id, next)
+            activationTokensByProfileId.set(next.profile_id, next)
+            activationTokensByHash.set(next.token_hash, next)
+            return []
+          }
+          return execute().then(resolve, reject)
+        },
+      })),
+    })),
+  }))
+  const sharedDrizzleDb = {
+    select: selectMock,
+    update: drizzleUpdateMock,
+    insert: insertMock,
+    execute: vi.fn(async () => ({ rows: [{ now: new Date('2026-04-15T10:30:00.000Z') }] })),
+  }
+  return {
+    ...actual,
+    getDrizzleDb: vi.fn(() => sharedDrizzleDb),
+    getDrizzleAdminDb: vi.fn(() => sharedDrizzleDb),
   }
 })
 
@@ -92,12 +217,6 @@ const updateUserByIdMock = vi.fn()
 const activationTokenUpsertMock = vi.fn()
 const claimTokenErrorState = { value: null as { message: string } | null }
 const claimMissMutatorState = { value: null as ((tokenHash: string) => void) | null }
-const databaseTimeRpcMock = vi.fn(async (fn: string) => (
-  fn === 'get_database_time'
-    ? { data: '2026-04-15T10:30:00.000Z', error: null }
-    : { data: null, error: null }
-))
-
 function hashToken(token: string) {
   return createHash('sha256').update(token).digest('hex')
 }
@@ -146,13 +265,9 @@ vi.mock('@/lib/supabase/server', () => ({
       signInWithPassword: vi.fn(),
       signOut: vi.fn(),
     },
-    from: vi.fn(() => ({
-      select: vi.fn(() => ({
-        eq: vi.fn(() => ({
-          maybeSingle: vi.fn(async () => ({ data: null, error: null })),
-        })),
-      })),
-    })),
+    from: vi.fn(() => {
+      throw new Error('Legacy Supabase DB seam must not be used')
+    }),
   })),
   createSupabaseServerAdminClient: vi.fn(() => ({
     auth: {
@@ -160,117 +275,11 @@ vi.mock('@/lib/supabase/server', () => ({
         updateUserById: updateUserByIdMock,
       },
     },
-    rpc: databaseTimeRpcMock,
-    from: vi.fn((table: 'profiles' | 'activation_tokens') => {
-      if (table === 'profiles') {
-        return {
-          select: vi.fn(() => ({
-            eq: vi.fn((column: 'id' | 'member_number', value: string) => ({
-              maybeSingle: vi.fn(async () => {
-                if (column === 'id') return { data: profilesById.get(value) ?? null, error: null }
-                return { data: profilesByMemberNumber.get(value) ?? null, error: null }
-              }),
-            })),
-          })),
-          update: vi.fn((updates: Partial<ProfileRow>) => ({
-            eq: vi.fn((column: 'id', value: string) => ({
-              select: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => {
-                  const existing = profilesById.get(value)
-                  if (!existing) return { data: null, error: null }
-                  const next = { ...existing, ...updates, updated_at: '2026-04-15T11:00:00.000Z' }
-                  profilesById.set(value, next)
-                  profilesByMemberNumber.set(next.member_number, next)
-                  return { data: next, error: null }
-                }),
-              })),
-            })),
-          })),
-        }
-      }
-
-      return {
-        select: vi.fn(() => ({
-          eq: vi.fn((column: 'profile_id' | 'token_hash', value: string) => ({
-            maybeSingle: vi.fn(async () => {
-              if (column === 'profile_id') return { data: activationTokensByProfileId.get(value) ?? null, error: null }
-              return { data: activationTokensByHash.get(value) ?? null, error: null }
-            }),
-          })),
-        })),
-        insert: vi.fn(async (values: ActivationTokenRow) => {
-          const inserted = { ...values, id: 'token-new', created_at: '2026-04-15T10:00:00.000Z', updated_at: '2026-04-15T10:00:00.000Z', used_at: null }
-          activationTokensById.set(inserted.id, inserted)
-          activationTokensByProfileId.set(inserted.profile_id, inserted)
-          activationTokensByHash.set(inserted.token_hash, inserted)
-          return { error: null }
-        }),
-        upsert: activationTokenUpsertMock.mockImplementation(async (values: ActivationTokenRow) => {
-          const existing = activationTokensByProfileId.get(values.profile_id)
-          if (existing) {
-            activationTokensByHash.delete(existing.token_hash)
-            const next = {
-              ...existing,
-              ...values,
-              updated_at: '2026-04-15T10:00:00.000Z',
-              used_at: Object.prototype.hasOwnProperty.call(values, 'used_at') ? values.used_at : existing.used_at,
-            }
-            activationTokensById.set(existing.id, next)
-            activationTokensByProfileId.set(next.profile_id, next)
-            activationTokensByHash.set(next.token_hash, next)
-            return { error: null }
-          }
-
-          const inserted = { ...values, id: 'token-new', created_at: '2026-04-15T10:00:00.000Z', updated_at: '2026-04-15T10:00:00.000Z', used_at: null }
-          activationTokensById.set(inserted.id, inserted)
-          activationTokensByProfileId.set(inserted.profile_id, inserted)
-          activationTokensByHash.set(inserted.token_hash, inserted)
-          return { error: null }
-        }),
-        update: vi.fn((updates: Partial<ActivationTokenRow>) => ({
-          eq: vi.fn((column: 'id' | 'token_hash', value: string) => {
-            if (column === 'id') {
-              return Promise.resolve().then(async () => {
-                const existing = activationTokensById.get(value)
-                if (!existing) return { error: null }
-                const next = { ...existing, ...updates, updated_at: '2026-04-15T11:00:00.000Z' }
-                activationTokensById.set(value, next)
-                activationTokensByProfileId.set(next.profile_id, next)
-                activationTokensByHash.set(next.token_hash, next)
-                return { error: null }
-              })
-            }
-
-            return {
-              gt: vi.fn((_gtColumn: 'expires_at', gtValue: string) => ({
-                is: vi.fn((_isColumn: 'used_at', isValue: null) => ({
-                  select: vi.fn(() => ({
-                    maybeSingle: vi.fn(async () => {
-                      if (claimTokenErrorState.value) {
-                        return { data: null, error: claimTokenErrorState.value }
-                      }
-                      if (claimMissMutatorState.value) {
-                        claimMissMutatorState.value(value)
-                        return { data: null, error: null }
-                      }
-                      const existing = activationTokensByHash.get(value)
-                      if (!existing) return { data: null, error: null }
-                      if (existing.expires_at <= gtValue || existing.used_at !== isValue) {
-                        return { data: null, error: null }
-                      }
-                      const next = { ...existing, ...updates, updated_at: '2026-04-15T11:00:00.000Z' }
-                      activationTokensById.set(existing.id, next)
-                      activationTokensByProfileId.set(next.profile_id, next)
-                      activationTokensByHash.set(next.token_hash, next)
-                      return { data: next, error: null }
-                    }),
-                  })),
-                })),
-              })),
-            }
-          }),
-        })),
-      }
+    rpc: vi.fn(() => {
+      throw new Error('Legacy Supabase DB time seam must not be used')
+    }),
+    from: vi.fn(() => {
+      throw new Error('Legacy Supabase DB seam must not be used')
     }),
   })),
 }))
@@ -292,7 +301,6 @@ describe('auth recovery helpers', () => {
     activationTokenUpsertMock.mockClear()
     claimTokenErrorState.value = null
     claimMissMutatorState.value = null
-    databaseTimeRpcMock.mockClear()
     drizzleHashWriteState.zeroRows = false
 
     const profile = seedProfile()
@@ -433,7 +441,7 @@ describe('auth recovery helpers', () => {
     expect(activationTokensByProfileId.get('member-1')?.used_at).toBeNull()
   })
 
-  it('keeps token consumed when password changes but profile update fails', async () => {
+  it('rolls token usage back when the Drizzle profile row disappears before password persistence', async () => {
     seedRecoveryToken()
     updateUserByIdMock.mockImplementationOnce(async () => {
       profilesById.delete('member-1')
@@ -450,7 +458,7 @@ describe('auth recovery helpers', () => {
       statusCode: 500,
     })
 
-    expect(activationTokensByProfileId.get('member-1')?.used_at).toBeTruthy()
+    expect(activationTokensByProfileId.get('member-1')?.used_at).toBeNull()
   })
 
   it('treats zero-row Drizzle password hash update as a failed write and rolls back token', async () => {

@@ -6,9 +6,13 @@ const authJsSignInMock = vi.fn()
 const authJsSignOutMock = vi.fn()
 const authJsAuthMock = vi.fn()
 const verifyCredentialsMock = vi.fn()
-const authSignInWithPasswordMock = vi.fn()
 const authCreateUserMock = vi.fn()
 const authDeleteUserMock = vi.fn()
+const drizzleSelectMock = vi.fn()
+const drizzleInsertMock = vi.fn()
+const drizzleExecuteMock = vi.fn(async () => ({
+  rows: [{ now: new Date('2026-04-15T10:30:00.000Z') }],
+}))
 
 vi.mock('@/lib/authjs/auth', () => ({
   signIn: authJsSignInMock,
@@ -31,7 +35,6 @@ vi.mock('next-auth/jwt', () => ({
 }))
 
 vi.mock('@/lib/auth/session', () => ({
-  signInWithPassword: authSignInWithPasswordMock,
   createAuthUser: authCreateUserMock,
   deleteAuthUser: authDeleteUserMock,
   updateAuthUserById: vi.fn(),
@@ -42,6 +45,20 @@ vi.mock('@/lib/authjs/credentials-user', () => ({
   createAuthUser: authCreateUserMock,
   deleteAuthUser: authDeleteUserMock,
   updateAuthUserById: vi.fn(),
+}))
+
+vi.mock('@/lib/db', () => ({
+  getDb: vi.fn(),
+  getAdminDb: vi.fn(() => buildAdminClient()),
+  getDrizzleDb: vi.fn(() => ({
+    select: drizzleSelectMock,
+    execute: drizzleExecuteMock,
+  })),
+  getDrizzleAdminDb: vi.fn(() => ({
+    select: drizzleSelectMock,
+    insert: drizzleInsertMock,
+    execute: drizzleExecuteMock,
+  })),
 }))
 
 type ProfileRow = {
@@ -61,12 +78,18 @@ const adminState = {
   byMemberNumber: new Map<string, ProfileRow>(),
   byId: new Map<string, ProfileRow>(),
 }
+const databaseTimeRpcMock = vi.fn(async (fn: string) => (
+  fn === 'get_database_time'
+    ? { data: '2026-04-15T10:30:00.000Z', error: null }
+    : { data: null, error: null }
+))
+
+const drizzleState = {
+  insertError: null as Error | null,
+  insertReturnsRow: true,
+}
 
 const signOut = vi.fn()
-const adminCreateUser = vi.fn()
-const adminDeleteUser = vi.fn()
-const adminUpdateProfile = vi.fn()
-const adminUpdateProfileEq = vi.fn()
 
 function makeProfile(overrides?: Partial<ProfileRow>): ProfileRow {
   return {
@@ -83,6 +106,71 @@ function makeProfile(overrides?: Partial<ProfileRow>): ProfileRow {
   }
 }
 
+function toDrizzleProfile(profile: ProfileRow) {
+  return {
+    id: profile.id,
+    memberNumber: profile.member_number,
+    authEmail: profile.auth_email ?? `${profile.member_number}@members.alea.internal`,
+    email: profile.email ?? null,
+    fullName: profile.full_name ?? null,
+    phone: null,
+    role: profile.role,
+    isActive: profile.is_active,
+    activeFrom: null,
+    noShowCount: 0,
+    blockedUntil: null,
+    createdAt: new Date(profile.created_at),
+    updatedAt: new Date(profile.updated_at),
+  }
+}
+
+function getFirstProfile() {
+  const fromId = adminState.byId.values().next().value
+  if (fromId) return fromId
+  const fromMember = adminState.byMemberNumber.values().next().value
+  if (fromMember) return fromMember
+  const fromEmail = adminState.byEmail.values().next().value
+  return fromEmail ?? null
+}
+
+function buildDrizzleSelectChain() {
+  return {
+    from: vi.fn(() => ({
+      where: vi.fn(() => ({
+        limit: vi.fn(async () => {
+          const profile = getFirstProfile()
+          return profile ? [toDrizzleProfile(profile)] : []
+        }),
+      })),
+    })),
+  }
+}
+
+function buildDrizzleInsertChain() {
+  return {
+    values: vi.fn((values: Record<string, unknown>) => ({
+      returning: vi.fn(async () => {
+        if (drizzleState.insertError) throw drizzleState.insertError
+        if (!drizzleState.insertReturnsRow) return []
+        const row = makeProfile({
+          id: String(values.id),
+          member_number: String(values.memberNumber),
+          auth_email: String(values.authEmail),
+          email: typeof values.email === 'string' ? values.email : String(values.authEmail),
+          role: 'member',
+          is_active: true,
+          created_at: '2024-01-01T00:00:00.000Z',
+          updated_at: '2024-01-01T00:00:00.000Z',
+        })
+        adminState.byId.set(row.id, row)
+        adminState.byMemberNumber.set(row.member_number, row)
+        adminState.byEmail.set(row.auth_email ?? row.email ?? '', row)
+        return [toDrizzleProfile(row)]
+      }),
+    })),
+  }
+}
+
 // Build admin client factory
 function buildAdminClient() {
   return {
@@ -92,34 +180,14 @@ function buildAdminClient() {
         deleteUser: authDeleteUserMock,
       },
     },
+    rpc: databaseTimeRpcMock,
     from: vi.fn((tableName: string) => {
       if (tableName !== 'profiles') {
         return { select: vi.fn(), update: vi.fn() }
       }
       return {
-        select: vi.fn((cols: string) => ({
-          eq: vi.fn((column: string, value: string) => ({
-            maybeSingle: vi.fn(async () => {
-              if (column === 'email') {
-                return { data: adminState.byEmail.get(value) ?? null, error: null }
-              }
-              if (column === 'member_number') {
-                return { data: adminState.byMemberNumber.get(value) ?? null, error: null }
-              }
-              if (column === 'id') {
-                return { data: adminState.byId.get(value) ?? null, error: null }
-              }
-              return { data: null, error: null }
-            }),
-          })),
-        })),
-        update: vi.fn((updates: Record<string, unknown>) => ({
-          eq: vi.fn((column: string, value: string) => ({
-            select: vi.fn((cols: string) => ({
-              maybeSingle: adminUpdateProfileEq,
-            })),
-          })),
-        })),
+        select: vi.fn(),
+        update: vi.fn(),
       }
     }),
   }
@@ -155,6 +223,9 @@ describe('auth service', () => {
     adminState.byEmail.clear()
     adminState.byMemberNumber.clear()
     adminState.byId.clear()
+    drizzleState.insertError = null
+    drizzleState.insertReturnsRow = true
+    databaseTimeRpcMock.mockClear()
     authJsSignInMock.mockResolvedValue({ ok: true })
     authJsAuthMock.mockResolvedValue({ user: { id: 'user-1' } })
     authJsSignOutMock.mockResolvedValue(undefined)
@@ -168,11 +239,11 @@ describe('auth service', () => {
       created_at: '2024-01-01T00:00:00Z',
       updated_at: '2024-01-01T00:00:00Z',
     })
-    authSignInWithPasswordMock.mockResolvedValue({ user: { id: 'auth-user-1' }, session: null })
     authCreateUserMock.mockResolvedValue({ data: { user: { id: 'auth-user-1' } }, error: null })
     authDeleteUserMock.mockResolvedValue({})
     signOut.mockResolvedValue({ error: null })
-    adminUpdateProfileEq.mockResolvedValue([makeProfile()])
+    drizzleSelectMock.mockImplementation(() => buildDrizzleSelectChain())
+    drizzleInsertMock.mockImplementation(() => buildDrizzleInsertChain())
   })
 
   describe('login', () => {
@@ -220,7 +291,7 @@ describe('auth service', () => {
       await expect(login({ identifier: '999999', password: 'password123' })).rejects.toThrow()
     })
 
-    it('rejects invalid credentials when Supabase sign-in fails', async () => {
+    it('rejects invalid credentials when credential verification fails', async () => {
       const profile = makeProfile({ member_number: '100001' })
       adminState.byMemberNumber.set('100001', profile)
       adminState.byId.set('user-1', profile)
@@ -242,13 +313,14 @@ describe('auth service', () => {
       await expect(login({ identifier: '100001', password: 'password123' })).rejects.toThrow()
     })
 
-    it('rejects when the credential profile has no auth email to use for Supabase sign-in', async () => {
-      const profile = makeProfile({ member_number: '100001', auth_email: null, email: null })
+    it('rejects when the credential profile has no auth email', async () => {
+      const profile = makeProfile({ member_number: '100001', auth_email: '', email: undefined })
       adminState.byMemberNumber.set('100001', profile)
 
       const { login } = await loadService()
 
       await expect(login({ identifier: '100001', password: 'password123' })).rejects.toThrow()
+      expect(verifyCredentialsMock).not.toHaveBeenCalled()
     })
 
   })
@@ -315,11 +387,8 @@ describe('auth service', () => {
     })
 
   describe('register', () => {
-    it('creates a Supabase Auth user, updates the trigger-created profile row, and returns the public user', async () => {
+    it('creates a Supabase Auth user, inserts the Drizzle profile row, and returns the public user', async () => {
       authCreateUserMock.mockResolvedValueOnce({ data: { user: { id: 'new-user-id' } }, error: null })
-      const newProfile = makeProfile({ id: 'new-user-id', member_number: '100099', email: 'newuser@alea.club' })
-      adminState.byId.set('new-user-id', newProfile)
-      adminUpdateProfileEq.mockResolvedValueOnce({ data: newProfile, error: null })
 
       const { register } = await loadService()
       const result = await register({
@@ -333,11 +402,15 @@ describe('auth service', () => {
       })
     })
 
-    it('calls signInWithPassword after creating the profile to establish a session', async () => {
+    it('calls Auth.js signIn after creating the profile to establish a session', async () => {
       authCreateUserMock.mockResolvedValueOnce({ data: { user: { id: 'new-user-id' } }, error: null })
-      const newProfile = makeProfile({ id: 'new-user-id', member_number: '100099', email: 'new@alea.club' })
-      adminState.byId.set('new-user-id', newProfile)
-      adminUpdateProfileEq.mockResolvedValueOnce({ data: newProfile, error: null })
+      verifyCredentialsMock.mockResolvedValueOnce({
+        id: 'new-user-id',
+        email: '100099@members.alea.internal',
+        name: null,
+        role: 'member' as const,
+        isActive: true,
+      })
 
       const { register } = await loadService()
       await register({
@@ -345,23 +418,20 @@ describe('auth service', () => {
         password: 'Password123',
       })
 
-      expect(authSignInWithPasswordMock).toHaveBeenCalled()
+      expect(authJsSignInMock).toHaveBeenCalled()
     })
 
-    it('does not overwrite contact email with the internal auth email during registration', async () => {
+    it('persists the internal auth email during registration', async () => {
       authCreateUserMock.mockResolvedValueOnce({ data: { user: { id: 'new-user-id' } }, error: null })
-      const newProfile = makeProfile({ id: 'new-user-id', member_number: '100099', email: 'contact@example.com' })
-      adminState.byId.set('new-user-id', newProfile)
-      adminUpdateProfileEq.mockResolvedValueOnce({ data: newProfile, error: null })
 
       const { register } = await loadService()
       const result = await register({
         memberNumber: '100099',
         password: 'Password123',
-        email: 'contact@example.com',
       })
 
       expect(result.id).toBe('new-user-id')
+      expect(result.email).toBe('100099@members.alea.internal')
     })
 
     it('rejects with 400 when the member number is already taken', async () => {
@@ -405,21 +475,20 @@ describe('auth service', () => {
       await expect(register({ memberNumber: '100099', password: 'Password123' })).rejects.toThrow()
     })
 
-    it('cleans up the auth user and rejects with 400 when profile update hits a unique constraint', async () => {
+    it('cleans up the auth user and rejects with 400 when profile insert hits a unique constraint', async () => {
       authCreateUserMock.mockResolvedValueOnce({ data: { user: { id: 'new-user-id' } }, error: null })
       const profileError = new Error('Unique violation')
       ;(profileError as any).code = '23505'
-      adminUpdateProfileEq.mockResolvedValueOnce({ data: null, error: profileError })
+      drizzleState.insertError = profileError
 
       const { register } = await loadService()
       
       await expect(register({ memberNumber: '100099', password: 'Password123' })).rejects.toThrow('Invalid registration details')
     })
 
-    it('cleans up the auth user and rejects with 500 when the profile update fails', async () => {
+    it('cleans up the auth user and rejects with 500 when the profile insert fails', async () => {
       authCreateUserMock.mockResolvedValueOnce({ data: { user: { id: 'new-user-id' } }, error: null })
-      const profileError = new Error('DB error')
-      adminUpdateProfileEq.mockResolvedValueOnce({ data: null, error: profileError })
+      drizzleState.insertError = new Error('DB error')
 
       const { register } = await loadService()
       
@@ -428,9 +497,13 @@ describe('auth service', () => {
 
     it('succeeds even when auto-login after registration fails', async () => {
       authCreateUserMock.mockResolvedValueOnce({ data: { user: { id: 'new-user-id' } }, error: null })
-      const newProfile = makeProfile({ id: 'new-user-id', member_number: '100099' })
-      adminState.byId.set('new-user-id', newProfile)
-      adminUpdateProfileEq.mockResolvedValueOnce({ data: newProfile, error: null })
+      verifyCredentialsMock.mockResolvedValueOnce({
+        id: 'new-user-id',
+        email: '100099@members.alea.internal',
+        name: null,
+        role: 'member' as const,
+        isActive: true,
+      })
       // signInWithAuthJs calls authJsSignIn, which should reject on auth failure
       authJsSignInMock.mockRejectedValueOnce(new Error('Auth failed'))
 
@@ -440,21 +513,25 @@ describe('auth service', () => {
       expect(result.id).toBe('new-user-id')
     })
 
-    it('creates a session with the default server client when no session client is provided', async () => {
+    it('creates a session with Auth.js when no session client is provided', async () => {
       authCreateUserMock.mockResolvedValueOnce({ data: { user: { id: 'new-user-id' } }, error: null })
-      const newProfile = makeProfile({ id: 'new-user-id', member_number: '100099' })
-      adminState.byId.set('new-user-id', newProfile)
-      adminUpdateProfileEq.mockResolvedValueOnce({ data: newProfile, error: null })
+      verifyCredentialsMock.mockResolvedValueOnce({
+        id: 'new-user-id',
+        email: '100099@members.alea.internal',
+        name: null,
+        role: 'member' as const,
+        isActive: true,
+      })
 
       const { register } = await loadService()
       await register({ memberNumber: '100099', password: 'Password123' })
 
-      expect(authSignInWithPasswordMock).toHaveBeenCalled()
+      expect(authJsSignInMock).toHaveBeenCalled()
     })
 
-    it('cleans up the auth user and rejects when profile update returns no row', async () => {
+    it('cleans up the auth user and rejects when profile insert returns no row', async () => {
       authCreateUserMock.mockResolvedValueOnce({ data: { user: { id: 'new-user-id' } }, error: null })
-      adminUpdateProfileEq.mockResolvedValueOnce([])
+      drizzleState.insertReturnsRow = false
 
       const { register } = await loadService()
 
@@ -476,7 +553,7 @@ describe('auth service', () => {
       await expect(getCurrentUser({ id: 'unknown-user', role: 'member' })).rejects.toThrow()
     })
 
-    it('reads the current profile through the session-scoped client instead of the admin client', async () => {
+    it('reads the current profile through the Drizzle seam', async () => {
       const profile = makeProfile()
       adminState.byId.set('user-1', profile)
 
