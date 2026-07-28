@@ -61,10 +61,10 @@ for completeness/audit only.
   (varchar(20), unique), `email`, `role` (enum, default `member`), `created_at`,
   `updated_at`, `is_active` (default false), `no_show_count` (default 0),
   `blocked_until`, `auth_email` (unique index `profiles_auth_email_key`), `full_name`,
-  `active_from`, `psw_changed`, `phone`, `password_hash` (nullable — **not** present
-  in the Supabase source; added here as forward schema for the target Auth.js
-  stack, since PR #170 (KIM-416)'s credentials provider and the KIM-419 cutover
-  runbook both already depend on `profiles.password_hash` existing — see §7.1/§8).
+  `active_from`, `psw_changed`, `phone`, `password_hash` (nullable, transitional
+  Auth.js credential storage), `clerk_user_id` (nullable external identity key
+  for Clerk, unique when present). Existing `profiles.id` UUID values remain the
+  domain identity and continue to own all application foreign keys.
 - RLS (final state): `profiles_admin_delete` (DELETE, `internal.is_admin()`),
   `profiles_admin_insert` (INSERT, `internal.is_admin()`), `profiles_admin_update`
   (UPDATE, `internal.is_admin()`), `profiles_member_select` (SELECT,

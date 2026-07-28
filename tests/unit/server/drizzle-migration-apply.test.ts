@@ -143,6 +143,18 @@ describe("F1 Drizzle Migration Static SQL Verification (Zero DB)", () => {
       const declaredType = extractColumnType(profilesSection, "password_hash")
       expect(declaredType).toBe("text")
     })
+
+    it("clerk_user_id is nullable text with a unique partial index", () => {
+      expect(allSchemaSrc).toContain("clerk_user_id")
+      expect(concatenatedSql).toContain("clerk_user_id")
+
+      const profilesSection = allMigrationsSql.substring(
+        allMigrationsSql.indexOf("CREATE TABLE \"profiles\"")
+      )
+      expect(extractColumnType(profilesSection, "clerk_user_id")).toBe("text")
+      expect(concatenatedSql).toContain("profiles_clerk_user_id_key")
+      expect(concatenatedSql).toContain("where \"profiles\".\"clerk_user_id\" is not null")
+    })
   })
 
   describe("Schema-derived Constraint Verification", () => {
@@ -258,8 +270,8 @@ describe("F1 Drizzle Migration Static SQL Verification (Zero DB)", () => {
     // See docs/MIGRATION-F1-DRIZZLE-COVERAGE.md for details.
 
     // Supabase Auth's auth.users table (with its FK to profiles.id) was intentionally
-    // dropped when migrating from Supabase to Auth.js on Neon. This relationship no
-    // longer exists in the target schema and is not derivable from Drizzle definitions.
+    // dropped when migrating to Clerk on Neon. profiles remains the domain identity;
+    // profiles.clerk_user_id provides the external auth mapping.
     // See docs/MIGRATION-F1-DRIZZLE-COVERAGE.md "Supabase Auth linkage" section.
   })
 })

@@ -1,0 +1,2 @@
+ALTER TABLE "profiles" ADD COLUMN "clerk_user_id" text;--> statement-breakpoint
+CREATE UNIQUE INDEX "profiles_clerk_user_id_key" ON "profiles" USING btree ("clerk_user_id") WHERE "profiles"."clerk_user_id" is not null;

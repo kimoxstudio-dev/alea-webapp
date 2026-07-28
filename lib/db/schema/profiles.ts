@@ -1,3 +1,4 @@
+import { sql } from 'drizzle-orm'
 import { boolean, integer, pgTable, text, timestamp, uniqueIndex, uuid, varchar } from 'drizzle-orm/pg-core'
 import { roleEnum } from './enums'
 
@@ -7,9 +8,10 @@ import { roleEnum } from './enums'
  * Supabase-era `id` referenced `auth.users(id) ON DELETE CASCADE` (a Supabase
  * Auth-managed table with no Drizzle/Neon equivalent). That FK is intentionally
  * NOT translated here — see docs/MIGRATION-F1-DRIZZLE-COVERAGE.md, "Supabase
- * Auth linkage" ambiguity. Under the target Auth.js stack, `profiles` becomes
- * the root identity table; how `id` is populated (app-generated default vs.
- * assigned at signup) is for KIM-416 (Auth.js) to decide, not this schema.
+ * Auth linkage" ambiguity. Under the target Clerk stack, `profiles` remains
+ * the root domain identity table and keeps its UUID primary key so existing
+ * foreign keys do not need to be rewritten. `clerk_user_id` links that domain
+ * identity to Clerk without making Clerk's string ID the application PK.
  *
  * Trigger `profiles_updated_at` (BEFORE UPDATE -> handle_updated_at()) has no
  * Drizzle schema-builder equivalent (no trigger support) — see coverage doc.
@@ -41,6 +43,12 @@ export const profiles = pgTable(
     pswChanged: timestamp('psw_changed', { withTimezone: true }),
     phone: text('phone'),
     passwordHash: text('password_hash'),
+    clerkUserId: text('clerk_user_id'),
   },
-  (t) => [uniqueIndex('profiles_auth_email_key').on(t.authEmail)],
+  (t) => [
+    uniqueIndex('profiles_auth_email_key').on(t.authEmail),
+    uniqueIndex('profiles_clerk_user_id_key')
+      .on(t.clerkUserId)
+      .where(sql`${t.clerkUserId} is not null`),
+  ],
 )
