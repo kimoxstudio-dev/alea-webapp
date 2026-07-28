@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { createSupabaseRouteHandlerClient } from '@/lib/supabase/server'
 import { enforceMutationSecurity, enforceRateLimit, RATE_LIMIT_POLICIES } from '@/lib/server/shared/security'
 import { logoutWithClient } from '@/lib/server/auth/auth-service'
 import { toServiceErrorResponse } from '@/lib/server/shared/http-error'
@@ -12,9 +11,11 @@ export async function POST(request: NextRequest) {
   if (rateLimitError) return rateLimitError
 
   try {
-    const { supabase, applyCookies } = createSupabaseRouteHandlerClient(request)
-    const body = await logoutWithClient(supabase)
-    return applyCookies(NextResponse.json(body))
+    // Auth.js's `signOut()` (called inside `logoutWithClient()`) clears the
+    // session cookie itself via `next/headers`, attaching directly to this
+    // Route Handler's response — no client/cookie plumbing needed here.
+    const body = await logoutWithClient()
+    return NextResponse.json(body)
   } catch (error) {
     return toServiceErrorResponse(error)
   }

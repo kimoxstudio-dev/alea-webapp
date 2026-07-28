@@ -1,26 +1,14 @@
 import 'server-only'
 import { NextRequest, NextResponse } from 'next/server'
-import { createSupabaseRouteHandlerClient } from '@/lib/supabase/server'
-import { getAuthUser } from '@/lib/auth/session'
-import { getDb } from '@/lib/db'
+import { eq } from 'drizzle-orm'
+import { auth as authJsAuth } from '@/lib/authjs/auth'
+import { getDrizzleDb } from '@/lib/db'
+import { profiles } from '@/lib/db/schema'
 export { enforceSameOriginForMutation } from '@/lib/server/shared/security'
 
 export type SessionUser = {
   id: string
   role: 'member' | 'admin'
-}
-
-type SessionClient = {
-  auth: {
-    getUser: () => Promise<{ data: { user: { id: string } | null }, error: unknown }>
-  }
-  from: (...args: unknown[]) => {
-    select: (...args: unknown[]) => {
-      eq: (...args: unknown[]) => {
-        maybeSingle: () => Promise<{ data: { id: string; role: 'member' | 'admin'; is_active: boolean } | null, error: unknown }>
-      }
-    }
-  }
 }
 
 type RouteSessionResult = {
@@ -33,20 +21,49 @@ type AuthContext = {
   applyCookies: (response: NextResponse) => NextResponse
 }
 
-async function getSessionUser(client: SessionClient) {
-  const authUser = await getAuthUser(client)
+/**
+ * Auth.js (JWT strategy, no adapter) never needs to rewrite/refresh the
+ * session cookie on a plain read — unlike the Supabase Auth client this
+ * replaces, which could rotate the access/refresh token pair on
+ * `auth.getUser()` and needed `applyCookies` to propagate that onto the
+ * response. Kept as a no-op identity function (rather than removed) so
+ * every call site across the app that destructures `applyCookies` off the
+ * `requireAuth`/`requireAdmin` result keeps working unchanged.
+ */
+function identityApplyCookies(response: NextResponse): NextResponse {
+  return response
+}
 
-  if (!authUser) {
+/**
+ * Resolves the current session user.
+ *
+ * Reads the Auth.js JWT session (`auth()` — see `lib/authjs/auth.ts`) to
+ * get the authenticated user id (`session.user.id`, sourced from the JWT
+ * `sub` claim), then — same as the previous Supabase-based implementation —
+ * always re-fetches `profiles.role` / `profiles.is_active` fresh from the
+ * database on every call. This is intentional, preserved behavior: role and
+ * active-status changes (e.g. an admin demoted, a member suspended) must
+ * take effect immediately, not only once a JWT the size of the session
+ * lifetime expires, so the JWT's own `role`/`isActive` claims (added for
+ * display purposes in `lib/authjs/config.ts`'s `session()` callback) are
+ * deliberately NOT trusted here as an authorization source.
+ */
+async function getSessionUser(): Promise<SessionUser | null> {
+  const session = await authJsAuth()
+  const userId = session?.user?.id
+
+  if (!userId) {
     return null
   }
 
-  const { data: profile, error: profileError } = await client
-    .from('profiles')
-    .select('id, role, is_active')
-    .eq('id', authUser.id)
-    .maybeSingle()
+  const db = getDrizzleDb()
+  const [profile] = await db
+    .select({ id: profiles.id, role: profiles.role, isActive: profiles.isActive })
+    .from(profiles)
+    .where(eq(profiles.id, userId))
+    .limit(1)
 
-  if (profileError || !profile || !profile.is_active) {
+  if (!profile || !profile.isActive) {
     return null
   }
 
@@ -56,17 +73,15 @@ async function getSessionUser(client: SessionClient) {
   } satisfies SessionUser
 }
 
-export async function getSessionFromRequest(request: NextRequest): Promise<RouteSessionResult> {
-  const { supabase, applyCookies } = createSupabaseRouteHandlerClient(request)
+export async function getSessionFromRequest(_request: NextRequest): Promise<RouteSessionResult> {
   return {
-    session: await getSessionUser(supabase as unknown as SessionClient),
-    applyCookies,
+    session: await getSessionUser(),
+    applyCookies: identityApplyCookies,
   }
 }
 
 export async function getSessionFromServerCookies(): Promise<SessionUser | null> {
-  const supabase = await getDb()
-  return getSessionUser(supabase as unknown as SessionClient)
+  return getSessionUser()
 }
 
 export async function requireAuth(request: NextRequest): Promise<AuthContext | NextResponse> {
@@ -78,10 +93,10 @@ export async function requireAuth(request: NextRequest): Promise<AuthContext | N
 }
 
 export async function requireAdmin(request: NextRequest): Promise<AuthContext | NextResponse> {
-  const auth = await requireAuth(request)
-  if (auth instanceof NextResponse) return auth
-  if (auth.session.role !== 'admin') {
-    return auth.applyCookies(NextResponse.json({ message: 'Forbidden', statusCode: 403 }, { status: 403 }))
+  const authContext = await requireAuth(request)
+  if (authContext instanceof NextResponse) return authContext
+  if (authContext.session.role !== 'admin') {
+    return authContext.applyCookies(NextResponse.json({ message: 'Forbidden', statusCode: 403 }, { status: 403 }))
   }
-  return auth
+  return authContext
 }
