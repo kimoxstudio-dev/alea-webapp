@@ -247,144 +247,71 @@ describe('auth service', () => {
   })
 
   describe('login', () => {
-    it('returns the public user for a valid member number / password pair', async () => {
-      const profile = makeProfile({ id: 'user-1', member_number: '100001' })
-      adminState.byMemberNumber.set('100001', profile)
-      adminState.byId.set('user-1', profile)
-      adminState.byEmail.set('admin@alea.club', profile)
-      authJsSignInMock.mockResolvedValueOnce({ ok: true })
-
+    it('retires valid credential submissions with 410', async () => {
       const { login } = await loadService()
-      const result = await login({ identifier: '100001', password: 'password123' })
 
-      expect(result).toMatchObject({
-        id: 'user-1',
-        role: 'admin',
-        memberNumber: '100001',
-      })
-      expect(authJsSignInMock).toHaveBeenCalled()
+      await expect(login({ identifier: '100001', password: 'password123' }))
+        .rejects.toMatchObject({ statusCode: 410 })
     })
 
-    it('resolves the member number to the Supabase Auth email before signing in', async () => {
-      const profile = makeProfile({ member_number: '100001', auth_email: 'admin@alea.club' })
-      adminState.byMemberNumber.set('100001', profile)
-      adminState.byId.set('user-1', profile)
-      adminState.byEmail.set('admin@alea.club', profile)
-      authJsSignInMock.mockResolvedValueOnce({ ok: true })
-
+    it('does not expose whether a member number exists', async () => {
       const { login } = await loadService()
-      const result = await login({ identifier: '100001', password: 'password123' })
 
-      expect(result.id).toBe('user-1')
-      expect(authJsSignInMock).toHaveBeenCalled()
+      await expect(login({ identifier: '999999', password: 'password123' }))
+        .rejects.toThrow('Interactive login is handled by Clerk')
     })
 
-    it('rejects missing credentials with a 400 ServiceError', async () => {
+    it('retires missing credential submissions with 410', async () => {
       const { login } = await loadService()
 
-      await expect(login({})).rejects.toThrow()
+      await expect(login({})).rejects.toMatchObject({ statusCode: 410 })
     })
 
-    it('rejects an unknown member number with a 401 ServiceError', async () => {
+    it('retires invalid password submissions with 410', async () => {
       const { login } = await loadService()
 
-      await expect(login({ identifier: '999999', password: 'password123' })).rejects.toThrow()
+      await expect(login({ identifier: '100001', password: 'wrongpassword' }))
+        .rejects.toMatchObject({ statusCode: 410 })
     })
 
-    it('rejects invalid credentials when credential verification fails', async () => {
-      const profile = makeProfile({ member_number: '100001' })
-      adminState.byMemberNumber.set('100001', profile)
-      adminState.byId.set('user-1', profile)
-      adminState.byEmail.set('admin@alea.club', profile)
-      const { AuthError } = await import('next-auth')
-      authJsSignInMock.mockRejectedValueOnce(new AuthError('Invalid credentials'))
-
+    it('retires suspended member submissions without profile lookup', async () => {
+      adminState.byMemberNumber.set('100001', makeProfile({ is_active: false }))
       const { login } = await loadService()
 
-      await expect(login({ identifier: '100001', password: 'wrongpassword' })).rejects.toThrow()
+      await expect(login({ identifier: '100001', password: 'password123' }))
+        .rejects.toMatchObject({ statusCode: 410 })
+      expect(drizzleSelectMock).not.toHaveBeenCalled()
     })
 
-    it('rejects a suspended user (is_active: false) with a 401 ServiceError before signing in', async () => {
-      const profile = makeProfile({ member_number: '100001', is_active: false })
-      adminState.byMemberNumber.set('100001', profile)
-
+    it('retires email identifier submissions with 410', async () => {
       const { login } = await loadService()
 
-      await expect(login({ identifier: '100001', password: 'password123' })).rejects.toThrow()
+      await expect(login({ identifier: 'member@example.com', password: 'password123' }))
+        .rejects.toMatchObject({ statusCode: 410 })
     })
 
-    it('rejects when the credential profile has no auth email', async () => {
-      const profile = makeProfile({ member_number: '100001', auth_email: '', email: undefined })
-      adminState.byMemberNumber.set('100001', profile)
-
+    it('retires empty identifier submissions with 410', async () => {
       const { login } = await loadService()
 
-      await expect(login({ identifier: '100001', password: 'password123' })).rejects.toThrow()
+      await expect(login({ identifier: '', password: 'password123' }))
+        .rejects.toMatchObject({ statusCode: 410 })
       expect(verifyCredentialsMock).not.toHaveBeenCalled()
     })
 
-  })
-
-    it('rejects when authenticated identity differs from member-number-resolved profile (identity-drift guard)', async () => {
-      const credentialProfile = makeProfile({ id: 'user-1', member_number: '100001' })
-      adminState.byMemberNumber.set('100001', credentialProfile)
-      adminState.byId.set('user-1', credentialProfile)
-      adminState.byEmail.set('admin@alea.club', credentialProfile)
-      
-      // verifyCredentials() authenticates a DIFFERENT user ID than the profile we resolved
-      verifyCredentialsMock.mockResolvedValueOnce({
-        id: 'different-user-id',
-        member_number: '100001',
-        auth_email: 'admin@alea.club',
-        email: 'admin@alea.club',
-        role: 'member' as const,
-        is_active: true,
-        created_at: '2024-01-01T00:00:00Z',
-        updated_at: '2024-01-01T00:00:00Z',
-      })
-
+    it('never invokes the retired Auth.js sign-in runtime', async () => {
       const { login } = await loadService()
 
-      // (a) Assertion: login rejects with 401
-      await expect(login({ identifier: '100001', password: 'Admin123' })).rejects.toThrow('Invalid credentials')
-      
-      // (b) Assertion: authJsSignIn is NEVER called
-      // This proves no session cookie was ever issued, even though credentials were valid.
-      // The new design verifies identity BEFORE calling signIn, so a mismatch never results in
-      // any session being issued at all — no window where a valid session rides on a 401 response.
+      await expect(login({ identifier: '100001', password: 'Admin123' })).rejects.toThrow()
       expect(authJsSignInMock).not.toHaveBeenCalled()
     })
 
-
-    it('never attempts same-request session readback via auth() during login (regression guard for KIM-433 root cause)', async () => {
-      const profile = makeProfile({ member_number: '100001' })
-      adminState.byMemberNumber.set('100001', profile)
-      adminState.byId.set('user-1', profile)
-      adminState.byEmail.set('admin@alea.club', profile)
-      
-      // Mock verifyCredentials to succeed with matching ID
-      verifyCredentialsMock.mockResolvedValueOnce({
-        id: 'user-1',
-        member_number: '100001',
-        auth_email: 'admin@alea.club',
-        email: 'admin@alea.club',
-        role: 'member' as const,
-        is_active: true,
-        created_at: '2024-01-01T00:00:00Z',
-        updated_at: '2024-01-01T00:00:00Z',
-      })
-
+    it('never invokes retired Auth.js session reads', async () => {
       const { login } = await loadService()
-      await login({ identifier: '100001', password: 'Admin123' })
 
-      // Trip-wire: auth() should NEVER be called. This guards against a regression
-      // that reintroduces the broken same-request readback pattern (see
-      // establishAuthJsSession() doc comment in lib/server/auth/auth-service.ts
-      // for why that pattern fails: auth() reads from frozen incoming-request
-      // headers snapshot while signIn() writes to mutable cookie jar; the snapshot
-      // doesn't see the write in the same request).
+      await expect(login({ identifier: '100001', password: 'Admin123' })).rejects.toThrow()
       expect(authJsAuthMock).not.toHaveBeenCalled()
     })
+  })
 
   describe('register', () => {
     it('creates a Supabase Auth user, inserts the Drizzle profile row, and returns the public user', async () => {
@@ -402,7 +329,7 @@ describe('auth service', () => {
       })
     })
 
-    it('calls Auth.js signIn after creating the profile to establish a session', async () => {
+    it('does not establish an Auth.js session after registration', async () => {
       authCreateUserMock.mockResolvedValueOnce({ data: { user: { id: 'new-user-id' } }, error: null })
       verifyCredentialsMock.mockResolvedValueOnce({
         id: 'new-user-id',
@@ -418,7 +345,7 @@ describe('auth service', () => {
         password: 'Password123',
       })
 
-      expect(authJsSignInMock).toHaveBeenCalled()
+      expect(authJsSignInMock).not.toHaveBeenCalled()
     })
 
     it('persists the internal auth email during registration', async () => {
@@ -495,7 +422,7 @@ describe('auth service', () => {
       await expect(register({ memberNumber: '100099', password: 'Password123' })).rejects.toThrow('Failed to create user profile')
     })
 
-    it('succeeds even when auto-login after registration fails', async () => {
+    it('does not depend on the retired Auth.js runtime after registration', async () => {
       authCreateUserMock.mockResolvedValueOnce({ data: { user: { id: 'new-user-id' } }, error: null })
       verifyCredentialsMock.mockResolvedValueOnce({
         id: 'new-user-id',
@@ -504,16 +431,16 @@ describe('auth service', () => {
         role: 'member' as const,
         isActive: true,
       })
-      // signInWithAuthJs calls authJsSignIn, which should reject on auth failure
       authJsSignInMock.mockRejectedValueOnce(new Error('Auth failed'))
 
       const { register } = await loadService()
       const result = await register({ memberNumber: '100099', password: 'Password123' })
 
       expect(result.id).toBe('new-user-id')
+      expect(authJsSignInMock).not.toHaveBeenCalled()
     })
 
-    it('creates a session with Auth.js when no session client is provided', async () => {
+    it('does not create a legacy session when no session client is provided', async () => {
       authCreateUserMock.mockResolvedValueOnce({ data: { user: { id: 'new-user-id' } }, error: null })
       verifyCredentialsMock.mockResolvedValueOnce({
         id: 'new-user-id',
@@ -526,7 +453,7 @@ describe('auth service', () => {
       const { register } = await loadService()
       await register({ memberNumber: '100099', password: 'Password123' })
 
-      expect(authJsSignInMock).toHaveBeenCalled()
+      expect(authJsSignInMock).not.toHaveBeenCalled()
     })
 
     it('cleans up the auth user and rejects when profile insert returns no row', async () => {
@@ -565,39 +492,37 @@ describe('auth service', () => {
   })
 
   describe('logout', () => {
-    it('returns success when the server client signs out cleanly', async () => {
+    it('retires server-side logout with 410', async () => {
       signOut.mockResolvedValueOnce({ error: null })
 
       const { logout } = await loadService()
-      const result = await logout()
-
-      expect(result).toEqual({ success: true })
-      expect(authJsSignOutMock).toHaveBeenCalled()
+      await expect(logout()).rejects.toMatchObject({ statusCode: 410 })
+      expect(authJsSignOutMock).not.toHaveBeenCalled()
     })
 
-    it('maps sign-out failures to a 500 ServiceError', async () => {
+    it('does not invoke Auth.js when its sign-out would fail', async () => {
       authJsSignOutMock.mockRejectedValueOnce(new Error('Signout failed'))
 
       const { logout } = await loadService()
 
-      await expect(logout()).rejects.toThrow()
+      await expect(logout()).rejects.toMatchObject({ statusCode: 410 })
+      expect(authJsSignOutMock).not.toHaveBeenCalled()
     })
 
-    it('maps route-handler sign-out failures to a 500 ServiceError', async () => {
+    it('always reports retired logout independently of Auth.js state', async () => {
       authJsSignOutMock.mockRejectedValueOnce(new Error('Auth.js signout failed'))
 
       const { logout } = await loadService()
 
-      await expect(logout()).rejects.toThrow()
+      await expect(logout()).rejects.toThrow('Interactive logout is handled by Clerk')
     })
 
-    it('returns success when a route-handler client signs out cleanly', async () => {
+    it('retires the compatibility logout helper with 410', async () => {
       signOut.mockResolvedValueOnce({ error: null })
 
       const { logoutWithClient } = await loadService()
-      const result = await logoutWithClient()
-
-      expect(result).toEqual({ success: true })
+      await expect(logoutWithClient()).rejects.toMatchObject({ statusCode: 410 })
+      expect(authJsSignOutMock).not.toHaveBeenCalled()
     })
   })
 })

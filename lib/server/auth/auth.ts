@@ -1,7 +1,7 @@
 import 'server-only'
 import { NextRequest, NextResponse } from 'next/server'
 import { eq } from 'drizzle-orm'
-import { auth as authJsAuth } from '@/lib/authjs/auth'
+import { auth as clerkAuth } from '@clerk/nextjs/server'
 import { getDrizzleDb } from '@/lib/db'
 import { profiles } from '@/lib/db/schema'
 export { enforceSameOriginForMutation } from '@/lib/server/shared/security'
@@ -21,36 +21,12 @@ type AuthContext = {
   applyCookies: (response: NextResponse) => NextResponse
 }
 
-/**
- * Auth.js (JWT strategy, no adapter) never needs to rewrite/refresh the
- * session cookie on a plain read — unlike the Supabase Auth client this
- * replaces, which could rotate the access/refresh token pair on
- * `auth.getUser()` and needed `applyCookies` to propagate that onto the
- * response. Kept as a no-op identity function (rather than removed) so
- * every call site across the app that destructures `applyCookies` off the
- * `requireAuth`/`requireAdmin` result keeps working unchanged.
- */
 function identityApplyCookies(response: NextResponse): NextResponse {
   return response
 }
 
-/**
- * Resolves the current session user.
- *
- * Reads the Auth.js JWT session (`auth()` — see `lib/authjs/auth.ts`) to
- * get the authenticated user id (`session.user.id`, sourced from the JWT
- * `sub` claim), then — same as the previous Supabase-based implementation —
- * always re-fetches `profiles.role` / `profiles.is_active` fresh from the
- * database on every call. This is intentional, preserved behavior: role and
- * active-status changes (e.g. an admin demoted, a member suspended) must
- * take effect immediately, not only once a JWT the size of the session
- * lifetime expires, so the JWT's own `role`/`isActive` claims (added for
- * display purposes in `lib/authjs/config.ts`'s `session()` callback) are
- * deliberately NOT trusted here as an authorization source.
- */
 async function getSessionUser(): Promise<SessionUser | null> {
-  const session = await authJsAuth()
-  const userId = session?.user?.id
+  const { userId } = await clerkAuth()
 
   if (!userId) {
     return null
@@ -60,7 +36,7 @@ async function getSessionUser(): Promise<SessionUser | null> {
   const [profile] = await db
     .select({ id: profiles.id, role: profiles.role, isActive: profiles.isActive })
     .from(profiles)
-    .where(eq(profiles.id, userId))
+    .where(eq(profiles.clerkUserId, userId))
     .limit(1)
 
   if (!profile || !profile.isActive) {

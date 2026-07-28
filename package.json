@@ -29,6 +29,7 @@
     "hooks:verify:worktree": "node -e \"if (process.platform === 'win32') { console.log('Skipping worktree hook smoke test on Windows: requires Bash/WSL to run scripts/verify-hooks-worktree.sh.'); process.exit(0); } require('node:child_process').execFileSync('bash', ['./scripts/verify-hooks-worktree.sh'], { stdio: 'inherit' });\""
   },
   "dependencies": {
+    "@clerk/nextjs": "^7.6.2",
     "@hookform/resolvers": "^3.10.0",
     "@radix-ui/react-accordion": "^1.2.12",
     "@radix-ui/react-alert-dialog": "^1.1.15",

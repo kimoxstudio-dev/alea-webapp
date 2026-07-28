@@ -25,21 +25,16 @@ export async function POST(request: NextRequest) {
     const requestBody = typeof body === 'object' && body !== null
       ? body as Record<string, unknown>
       : {}
-    // activateAccount() now establishes the post-activation Auth.js session
-    // itself (see lib/server/auth/auth-service.ts) — no client/cookie
-    // plumbing needed here.
+    // KIM-451 retires server-side session establishment from this route.
+    // Activation still returns the updated profile so the client can
+    // redirect the member into the Clerk-driven login flow.
     const result = await activateAccount({
       token: requestBody.token,
       password: requestBody.password,
     })
 
-    if (result.signInFailed) {
-      return NextResponse.json({
-        message: 'Account activated, but automatic sign-in failed. Please sign in with your member number and new password.',
-        statusCode: 500,
-      }, { status: 500 })
-    }
-
+    // Keep this compatibility branch until activation/recovery UI no longer
+    // expects the legacy result shape during the auth migration.
     return NextResponse.json(result.user)
   } catch (error) {
     return toServiceErrorResponse(error)

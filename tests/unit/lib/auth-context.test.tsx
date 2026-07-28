@@ -3,10 +3,26 @@ import type { User } from '@/lib/types'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const routerPushMock = vi.fn()
+const clerkSignOutMock = vi.fn()
+const signInPasswordMock = vi.fn()
+const signInFinalizeMock = vi.fn()
 
 vi.mock('next/navigation', () => ({
   useRouter: () => ({ push: routerPushMock }),
   usePathname: () => '/es/rooms',
+}))
+
+vi.mock('@clerk/nextjs', () => ({
+  useAuth: () => ({ isLoaded: true, userId: 'clerk-user-1' }),
+  useClerk: () => ({ signOut: clerkSignOutMock }),
+  useSignIn: () => ({
+    fetchStatus: 'idle',
+    signIn: {
+      password: signInPasswordMock,
+      finalize: signInFinalizeMock,
+      status: 'complete',
+    },
+  }),
 }))
 
 const apiClientMock = vi.hoisted(() => ({
@@ -34,6 +50,9 @@ describe('AuthProvider', () => {
     apiClientMock.get.mockReset()
     apiClientMock.post.mockReset()
     routerPushMock.mockReset()
+    clerkSignOutMock.mockReset()
+    signInPasswordMock.mockReset()
+    signInFinalizeMock.mockReset()
   })
 
   it('hydrates from /auth/me when no initial user is provided', async () => {
@@ -90,10 +109,10 @@ describe('AuthProvider', () => {
       role: 'member',
     })
 
-    apiClientMock.post
-      .mockResolvedValueOnce(loggedInUser)
-      .mockResolvedValueOnce(registeredUser)
-      .mockResolvedValueOnce(undefined)
+    signInPasswordMock.mockResolvedValueOnce({ error: null })
+    signInFinalizeMock.mockResolvedValueOnce({ error: null })
+    apiClientMock.get.mockResolvedValueOnce(loggedInUser)
+    apiClientMock.post.mockResolvedValueOnce(registeredUser)
 
     const { AuthProvider, useAuth } = await import('@/lib/auth/auth-context')
     const wrapper = ({ children }: { children: React.ReactNode }) => (
@@ -103,10 +122,15 @@ describe('AuthProvider', () => {
     const { result } = renderHook(() => useAuth(), { wrapper })
 
     await act(async () => {
-      await result.current.login('admin@alea.club', 'Admin123')
+      await result.current.login('100001', 'Admin123')
     })
 
     expect(result.current.user).toEqual(loggedInUser)
+    expect(signInPasswordMock).toHaveBeenCalledWith({
+      identifier: '100001@members.alea.internal',
+      password: 'Admin123',
+    })
+    expect(signInFinalizeMock).toHaveBeenCalledOnce()
 
     await act(async () => {
       await result.current.register('100099', 'Password123')
@@ -120,6 +144,25 @@ describe('AuthProvider', () => {
 
     expect(result.current.user).toBeNull()
     expect(result.current.isAuthenticated).toBe(false)
+    expect(clerkSignOutMock).toHaveBeenCalledOnce()
     expect(routerPushMock).toHaveBeenCalledWith('/es/login')
+  })
+
+  it('signs Clerk out when the authenticated identity is unmapped or suspended', async () => {
+    signInPasswordMock.mockResolvedValueOnce({ error: null })
+    signInFinalizeMock.mockResolvedValueOnce({ error: null })
+    apiClientMock.get.mockRejectedValueOnce(new Error('Unauthorized'))
+
+    const { AuthProvider, useAuth } = await import('@/lib/auth/auth-context')
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <AuthProvider initialUser={null}>{children}</AuthProvider>
+    )
+    const { result } = renderHook(() => useAuth(), { wrapper })
+
+    await expect(
+      act(async () => result.current.login('100099', 'Password123')),
+    ).rejects.toThrow('Invalid credentials')
+    expect(clerkSignOutMock).toHaveBeenCalledOnce()
+    expect(result.current.user).toBeNull()
   })
 })
