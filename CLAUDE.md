@@ -83,28 +83,6 @@ If this field is missing, product-manager will ask you where issues are tracked.
 
 ---
 
-## Agent Logging for Alea Webapp
-
-Progress logging (per `~/.claude/CLAUDE.md` Agent Progress Logging) applies here. Agents append to `.claude/agent-progress.md`.
-
-**What to log:**
-- product-manager: Linear issue fetch, branch creation, team-lead spawn, completion
-- team-lead: task handoffs (impl → qa → security), blocking issues
-- software-engineer: file changes (count + key paths), build/typecheck results, commits pushed
-- qa-engineer: test files created/modified, test run results (pass/fail counts), blocking failures
-- security-reviewer: review findings, PR open + link
-
-**Log template per agent:**
-
-```markdown
-#### [TASK_ID] {agent-name} — {task}
-- [HH:MM] Started
-- [HH:MM] {milestone or significant change}
-- [HH:MM] ✅ Complete — {result} or ⚠️ BLOCKED — {error}
-```
-
----
-
 ## Team Coordination for Alea Webapp
 
 ### Always Use Product Manager (Universal Entry Point)
@@ -164,7 +142,7 @@ Agent prepares + validates. User applies.
 
 ### Shared Working Directory
 
-- The shared checkout is read-only to every agent, with exactly one exception: appending to `.claude/agent-progress.md` via `>>` or equivalent that cannot replace the file — never read-modify-write it. To run code from another branch, create a throwaway worktree and install dependencies there, never in the shared checkout.
+- The shared checkout is read-only to every agent. To run code from another branch, create a throwaway worktree and install dependencies there, never in the shared checkout.
 - Worktree cleanup removes only the agent's own worktree, by absolute path: `git worktree remove /absolute/path/to/own-worktree` then `git worktree prune`. Never `rm -rf` the parent worktrees directory — in a multi-pipeline session that destroys other agents' active work.
 - Commit early and often on the worktree's branch. Uncommitted work exists in exactly one place and survives nothing — committing after each meaningful step is cheap insurance against losing hours of work.
 

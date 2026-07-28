@@ -6,7 +6,7 @@
 -- for PostgreSQL EXCLUDE constraints, so these three constraints — faithfully
 -- translated from the Supabase migration history — are hand-written here as
 -- a drizzle-kit "custom" SQL migration instead of being expressed in
--- lib/db/schema/*.ts. See docs/MIGRATION-F1-DRIZZLE-COVERAGE.md for details.
+-- lib/db/schema/*.ts. See Linear KIM-417 for details.
 --
 -- Requires the "btree_gist" extension (for the uuid equality operator class
 -- used alongside the range "&&" operator in a GIST index). Supabase installed
@@ -19,8 +19,7 @@
 -- "pgcrypto" (gen_random_uuid(), used throughout lib/db/schema) is now
 -- created in 0000_fine_magma.sql instead of here -- it must exist before the
 -- first CREATE TABLE with a gen_random_uuid() default, not just before this
--- migration's EXCLUDE constraints. See docs/MIGRATION-F1-DRIZZLE-COVERAGE.md
--- §7.3.
+-- migration's EXCLUDE constraints. See Linear KIM-417.
 
 CREATE EXTENSION IF NOT EXISTS "btree_gist";
 

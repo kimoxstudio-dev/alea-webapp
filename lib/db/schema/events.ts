@@ -30,7 +30,7 @@ import { equipment } from './equipment'
  * (Supabase Auth-managed, no Neon equivalent). Adapted here to reference
  * `public.profiles(id) ON DELETE SET NULL` instead — profiles is the durable
  * identity table in the target schema. This is a judgment call; see
- * docs/MIGRATION-F1-DRIZZLE-COVERAGE.md.
+ * Linear KIM-417.
  */
 export const events = pgTable(
   'events',
@@ -114,7 +114,7 @@ export const eventRoomBlocks = pgTable(
  * Internal-only join table; never exposed to the public landing (see
  * 20260704000006_oir208_table_blocks_and_materials.sql). No RLS policies were
  * ever defined for this table in Supabase (service_role-only via GRANT) — see
- * coverage doc.
+ * Linear KIM-418.
  */
 export const eventEquipment = pgTable(
   'event_equipment',

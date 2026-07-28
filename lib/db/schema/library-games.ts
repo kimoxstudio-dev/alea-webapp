@@ -7,7 +7,7 @@ import { boolean, integer, numeric, pgTable, text, timestamp, uuid } from 'drizz
  *
  * Public SELECT is restricted to active=true rows; writes go exclusively
  * through the admin/service-role client (lib/server/library-games-service.ts)
- * — no INSERT/UPDATE/DELETE RLS policies were ever defined. See coverage doc.
+ * — no INSERT/UPDATE/DELETE RLS policies were ever defined. See Linear KIM-418.
  */
 export const libraryGames = pgTable('library_games', {
   id: uuid('id').primaryKey().defaultRandom(),

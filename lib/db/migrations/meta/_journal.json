@@ -22,6 +22,13 @@
       "when": 1784969695002,
       "tag": "0002_room_default_equipment_equipment_unique",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1785258996816,
+      "tag": "0003_clerk_profile_identity",
+      "breakpoints": true
     }
   ]
 }

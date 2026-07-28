@@ -3,8 +3,7 @@
 -- 0001_exclusion_constraints.sql (needed there for btree_gist), which left a
 -- window where applying this migration to a fresh database with no pgcrypto
 -- pre-installed would fail on the very first CREATE TABLE. Moved here so it
--- runs before any gen_random_uuid() usage. See
--- docs/MIGRATION-F1-DRIZZLE-COVERAGE.md §7.3.
+-- runs before any gen_random_uuid() usage. See Linear KIM-417.
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";--> statement-breakpoint
 CREATE TYPE "public"."reservation_status" AS ENUM('active', 'cancelled', 'completed', 'pending', 'no_show');--> statement-breakpoint
 CREATE TYPE "public"."role" AS ENUM('member', 'admin');--> statement-breakpoint

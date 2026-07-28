@@ -143,6 +143,23 @@ describe("F1 Drizzle Migration Static SQL Verification (Zero DB)", () => {
       const declaredType = extractColumnType(profilesSection, "password_hash")
       expect(declaredType).toBe("text")
     })
+
+    it("clerk_user_id is nullable text with a unique partial index", () => {
+      expect(allSchemaSrc).toContain("clerk_user_id")
+      expect(concatenatedSql).toContain("clerk_user_id")
+
+      const clerkMigration = readFileSync(
+        join(MIGRATION_DIR, "0003_clerk_profile_identity.sql"),
+        "utf-8",
+      )
+      expect(clerkMigration).toMatch(
+        /ALTER TABLE "profiles" ADD COLUMN "clerk_user_id" text;/,
+      )
+      expect(clerkMigration).not.toMatch(/"clerk_user_id" text NOT NULL/i)
+      expect(clerkMigration).toMatch(
+        /CREATE UNIQUE INDEX "profiles_clerk_user_id_key" ON "profiles" USING btree \("clerk_user_id"\) WHERE "profiles"\."clerk_user_id" is not null;/,
+      )
+    })
   })
 
   describe("Schema-derived Constraint Verification", () => {
@@ -255,11 +272,11 @@ describe("F1 Drizzle Migration Static SQL Verification (Zero DB)", () => {
     // PL/pgSQL triggers (like profiles_updated_at) are hand-written SQL that Drizzle ORM
     // does not support in schema definitions. They exist in the database but cannot be
     // verified via schema parsing alone. This is an intentional, documented gap.
-    // See docs/MIGRATION-F1-DRIZZLE-COVERAGE.md for details.
+    // See Linear KIM-417 for details.
 
     // Supabase Auth's auth.users table (with its FK to profiles.id) was intentionally
-    // dropped when migrating from Supabase to Auth.js on Neon. This relationship no
-    // longer exists in the target schema and is not derivable from Drizzle definitions.
-    // See docs/MIGRATION-F1-DRIZZLE-COVERAGE.md "Supabase Auth linkage" section.
+    // dropped when migrating to Clerk on Neon. profiles remains the domain identity;
+    // profiles.clerk_user_id provides the external auth mapping.
+    // See Linear KIM-417 ("Supabase Auth linkage").
   })
 })

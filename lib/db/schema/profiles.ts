@@ -1,3 +1,4 @@
+import { sql } from 'drizzle-orm'
 import { boolean, integer, pgTable, text, timestamp, uniqueIndex, uuid, varchar } from 'drizzle-orm/pg-core'
 import { roleEnum } from './enums'
 
@@ -6,22 +7,20 @@ import { roleEnum } from './enums'
  *
  * Supabase-era `id` referenced `auth.users(id) ON DELETE CASCADE` (a Supabase
  * Auth-managed table with no Drizzle/Neon equivalent). That FK is intentionally
- * NOT translated here — see docs/MIGRATION-F1-DRIZZLE-COVERAGE.md, "Supabase
- * Auth linkage" ambiguity. Under the target Auth.js stack, `profiles` becomes
- * the root identity table; how `id` is populated (app-generated default vs.
- * assigned at signup) is for KIM-416 (Auth.js) to decide, not this schema.
+ * NOT translated here — see Linear KIM-417, "Supabase
+ * Auth linkage" ambiguity. Under the target Clerk stack, `profiles` remains
+ * the root domain identity table and keeps its UUID primary key so existing
+ * foreign keys do not need to be rewritten. `clerk_user_id` links that domain
+ * identity to Clerk without making Clerk's string ID the application PK.
  *
  * Trigger `profiles_updated_at` (BEFORE UPDATE -> handle_updated_at()) has no
- * Drizzle schema-builder equivalent (no trigger support) — see coverage doc.
+ * Drizzle schema-builder equivalent (no trigger support) — see Linear KIM-417.
  *
  * `passwordHash` has NO Supabase-era equivalent (Supabase Auth stored
  * `auth.users.encrypted_password` in its own managed table, not on
- * `profiles`). It is added here, nullable, as forward schema for the target
- * Auth.js stack: PR #170 (KIM-416)'s credentials provider already selects
- * `profiles.password_hash`, and the F2 cutover runbook (KIM-419) copies
- * `auth.users.encrypted_password` verbatim into this column. Nullable so
- * existing rows (pre-cutover) don't need a value; see
- * docs/MIGRATION-F1-DRIZZLE-COVERAGE.md §7.1/§8.
+ * `profiles`). It remains nullable for the transitional Auth.js runtime
+ * until Clerk replaces that runtime in KIM-451. Existing rows therefore
+ * do not need a value; see Linear KIM-417.
  */
 export const profiles = pgTable(
   'profiles',
@@ -41,6 +40,12 @@ export const profiles = pgTable(
     pswChanged: timestamp('psw_changed', { withTimezone: true }),
     phone: text('phone'),
     passwordHash: text('password_hash'),
+    clerkUserId: text('clerk_user_id'),
   },
-  (t) => [uniqueIndex('profiles_auth_email_key').on(t.authEmail)],
+  (t) => [
+    uniqueIndex('profiles_auth_email_key').on(t.authEmail),
+    uniqueIndex('profiles_clerk_user_id_key')
+      .on(t.clerkUserId)
+      .where(sql`${t.clerkUserId} is not null`),
+  ],
 )

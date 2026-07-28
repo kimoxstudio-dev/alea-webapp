@@ -126,6 +126,26 @@ describe('F1 Drizzle Schema Smoke Tests', () => {
       expect(passwordHashLine).not.toMatch(/\.notNull\(\)/)
     })
 
+    it('defines a nullable Clerk identity mapping with a unique partial index', () => {
+      const schemaPath = join(__dirname, '../../../lib/db/schema/profiles.ts')
+      const schemaTsContent = readFileSync(schemaPath, 'utf-8')
+
+      expect(schemaTsContent).toContain("clerkUserId: text('clerk_user_id')")
+      expect(schemaTsContent).toContain("uniqueIndex('profiles_clerk_user_id_key')")
+      expect(schemaTsContent).toContain('.where(sql`${t.clerkUserId} is not null`)')
+
+      const clerkUserIdLine = schemaTsContent.match(/clerkUserId:\s*text\([^)]+\)([^,}]*)/)?.[0]
+      expect(clerkUserIdLine).toBeDefined()
+      expect(clerkUserIdLine).not.toMatch(/\.notNull\(\)/)
+    })
+
+    it('keeps the schema-drift manifest aligned with the Clerk identity column', () => {
+      const driftScriptPath = join(__dirname, '../../../scripts/check-schema-drift.mjs')
+      const driftScriptContent = readFileSync(driftScriptPath, 'utf-8')
+
+      expect(driftScriptContent).toContain("clerk_user_id: 'text'")
+    })
+
     it('migrations directory structure is complete (0000 + 0001 + meta)', () => {
       const fs = require('fs')
       const files = fs.readdirSync(MIGRATION_DIR)
@@ -156,10 +176,10 @@ describe('F1 Drizzle Schema Smoke Tests', () => {
     })
   })
 
-  describe('Migration consistency with KIM-419 F2 cutover runbook', () => {
-    it('password_hash column exists in profiles (for F2 password copy)', () => {
-      // PR #171 (KIM-419) runs a cutover that copies auth.users.encrypted_password → profiles.password_hash
-      // This test verifies the target column exists.
+  describe('Transitional Auth.js schema compatibility', () => {
+    it('password_hash column exists in profiles until Clerk replaces Auth.js', () => {
+      // KIM-451 removes the transitional Auth.js runtime. Until then, its
+      // credentials provider still requires profiles.password_hash.
 
       const sql = readMigration('0000_fine_magma.sql')
       const profilesStart = sql.indexOf('CREATE TABLE "profiles"')

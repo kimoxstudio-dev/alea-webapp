@@ -33,9 +33,8 @@ const PASSWORD_HASH_COST = 10
  * This is NOT redundant with `updateAuthUserById()` above/below: that call
  * only changes the password on the legacy Supabase Auth (GoTrue) seam
  * (`getAdminDb()` / `NEXT_PUBLIC_SUPABASE_URL`), a physically different
- * database from the one `POSTGRES_URL` points at (see `lib/db/index.ts`
- * file header — Neon/Vercel Postgres is a separate target until the F2
- * cutover, KIM-419/420). `verifyCredentials()`
+ * database from the one `POSTGRES_URL` points at (see `lib/db/index.ts`).
+ * `verifyCredentials()`
  * (`lib/authjs/credentials-user.ts`) authenticates exclusively against the
  * Drizzle/Neon row, so without this write every Auth.js login attempt after
  * activation/recovery would fail against a null or stale hash (KIM-433
@@ -45,7 +44,7 @@ const PASSWORD_HASH_COST = 10
  * `verifyCredentials()` afterward — not merely when no exception was
  * thrown. Drizzle's `.update()` over node-postgres does NOT throw when the
  * `WHERE` clause matches zero rows (e.g. no Neon row exists yet for this
- * `profileId` — the common case pre-F2-cutover, not an edge case); it just
+ * `profileId` during the transition); it just
  * resolves with nothing updated. `.returning({ id: profiles.id })` lets us
  * distinguish "updated one row" from "matched nothing", following the same
  * pattern other Drizzle-backed services in `lib/server/` already use
@@ -252,7 +251,7 @@ function getActivationTokenTable(client: { from: (table: 'activation_tokens') =>
 // Privilege check (role === 'admin') lives here in the service layer, not in
 // route handlers (repo convention). activation_tokens is now locked down to
 // service_role only at the RLS layer (no anon/authenticated policies remain —
-// see docs/RLS-SERVICE-LAYER-AUDIT.md), so this in-function check is the only
+// see Linear KIM-418), so this in-function check is the only
 // authorization guard for admin-triggered activation/recovery link
 // generation once RLS is removed as part of the Vercel/Postgres migration.
 function requireAdminSession(session: SessionUser): void {
