@@ -651,7 +651,7 @@ function tokenize(chunks: readonly unknown[]): Token[] {
 }
 
 /** Best-effort rendering of a SQL node, used only for error messages. */
-function renderSql(node: SQL): string {
+export function renderSql(node: SQL): string {
   return tokenize(node.queryChunks)
     .map((token) => {
       switch (token.t) {
@@ -1577,11 +1577,31 @@ export function createStatefulDrizzleDb() {
      * deliberately does not fire on `execute`. The one combination that could
      * never fire — an explicit `{ op: 'execute', table }` — is rejected up front
      * by {@link failNextQuery} rather than silently ignored.
+     *
+     * Special handling: `select now()` pattern is detected and handled directly
+     * to return the current server time, since this is a common pattern used for
+     * database-time queries and doesn't need to go through executeMock.
      */
     execute: vi.fn(async (...args: unknown[]) => {
       consumeFailure('execute', EXECUTE_TABLE_KEY)
       queryLog.push({ op: 'execute', table: EXECUTE_TABLE_KEY, rowCount: 0 })
-      const result = executeMock(...args)
+
+      // Special handling for `select now()` pattern
+      const sql = args[0]
+      if (is(sql, SQL)) {
+        const sqlStr = renderSql(sql as SQL).toLowerCase()
+        if (sqlStr.includes('select') && sqlStr.includes('now()')) {
+          // Return current time — the actual column name (now, current_timestamp, etc)
+          // will be parsed from the SQL by the caller
+          const result = await executeMock(...args)
+          // Return result from executeMock ONLY if it has rows
+          if (result && Array.isArray(result.rows) && result.rows.length > 0) return result
+          // Fallback: return { now: current_time } which works for `select now() as now`
+          return { rows: [{ now: new Date() }], rowCount: 1 }
+        }
+      }
+
+      const result = await executeMock(...args)
       return result ?? { rows: [], rowCount: 0 }
     }),
     /**
