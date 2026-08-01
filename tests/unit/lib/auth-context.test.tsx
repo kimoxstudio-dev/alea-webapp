@@ -101,18 +101,12 @@ describe('AuthProvider', () => {
     expect(apiClientMock.get).not.toHaveBeenCalled()
   })
 
-  it('updates the auth state on login, register, and logout', async () => {
+  it('updates the auth state on login and logout', async () => {
     const loggedInUser = createUser()
-    const registeredUser = createUser({
-      id: '2',
-      memberNumber: '100099',
-      role: 'member',
-    })
 
     signInPasswordMock.mockResolvedValueOnce({ error: null })
     signInFinalizeMock.mockResolvedValueOnce({ error: null })
     apiClientMock.get.mockResolvedValueOnce(loggedInUser)
-    apiClientMock.post.mockResolvedValueOnce(registeredUser)
 
     const { AuthProvider, useAuth } = await import('@/lib/auth/auth-context')
     const wrapper = ({ children }: { children: React.ReactNode }) => (
@@ -133,12 +127,6 @@ describe('AuthProvider', () => {
     expect(signInFinalizeMock).toHaveBeenCalledOnce()
 
     await act(async () => {
-      await result.current.register('100099', 'Password123')
-    })
-
-    expect(result.current.user).toEqual(registeredUser)
-
-    await act(async () => {
       await result.current.logout()
     })
 
@@ -146,6 +134,28 @@ describe('AuthProvider', () => {
     expect(result.current.isAuthenticated).toBe(false)
     expect(clerkSignOutMock).toHaveBeenCalledOnce()
     expect(routerPushMock).toHaveBeenCalledWith('/es/login')
+  })
+
+  it('reject register() immediately without calling setUser', async () => {
+    const { AuthProvider, useAuth } = await import('@/lib/auth/auth-context')
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <AuthProvider initialUser={null}>{children}</AuthProvider>
+    )
+
+    const { result } = renderHook(() => useAuth(), { wrapper })
+
+    let registerError: unknown
+    await act(async () => {
+      try {
+        await result.current.register('100099', 'Password123')
+      } catch (error) {
+        registerError = error
+      }
+    })
+
+    expect(registerError).toEqual(new Error('Self-registration is disabled'))
+    expect(result.current.user).toBeNull()
+    expect(apiClientMock.post).not.toHaveBeenCalled()
   })
 
   it('signs Clerk out when the authenticated identity is unmapped or suspended', async () => {
