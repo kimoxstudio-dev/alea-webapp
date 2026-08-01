@@ -1039,17 +1039,14 @@ describe('reservations service', () => {
 
   describe('access control and isolation', () => {
     it('allows owners and admins to access the reservation', async () => {
-      const { getReservationForSession } = await loadReservationModules()
+      const { checkReservationAccess } = await loadReservationModules()
 
-      const ownerResult = await getReservationForSession(memberSession, 'r1')
-      expect(ownerResult).toBeDefined()
-
-      const adminResult = await getReservationForSession(adminSession, 'r1')
-      expect(adminResult).toBeDefined()
+      await expect(checkReservationAccess(memberSession, 'r1')).resolves.toBeUndefined()
+      await expect(checkReservationAccess(adminSession, 'r1')).resolves.toBeUndefined()
     })
 
     it('throws 403 when a member accesses another user reservation', async () => {
-      const { getReservationForSession } = await loadReservationModules()
+      const { checkReservationAccess } = await loadReservationModules()
 
       const otherMember: SessionUser = { id: 'other-user', role: 'member' }
       seed({
@@ -1057,7 +1054,7 @@ describe('reservations service', () => {
       })
 
       await expect(
-        getReservationForSession(otherMember, 'r1'),
+        checkReservationAccess(otherMember, 'r1'),
       ).rejects.toMatchObject({ statusCode: 403 })
     })
 
