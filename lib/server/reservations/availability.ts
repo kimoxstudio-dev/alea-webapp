@@ -1,10 +1,22 @@
 import 'server-only'
 import type { GameTable, TableAvailability, TimeSlot } from '@/lib/types'
-import type { Tables } from '@/lib/supabase/types'
 import { getCurrentClubDate, isValidDateOnlyString } from '@/lib/club-time'
 import { serviceError } from '@/lib/server/shared/service-error'
 
-type ReservationRow = Tables<'reservations'>
+/**
+ * GitHub #238: this type used to be `Tables<'reservations'>` (the generated
+ * Supabase row shape). Declared structurally here instead — only the fields
+ * `buildAvailability()` actually reads — so this module has no dependency on
+ * either backend's client. `reservations-service.ts` (Drizzle/Neon) and the
+ * not-yet-migrated `tables-service.ts`/`rooms-service.ts` (legacy Supabase)
+ * both produce snake_case rows shaped like this and can keep passing them in
+ * unchanged.
+ */
+type ReservationRow = {
+  start_time: string
+  end_time: string
+  surface?: 'top' | 'bottom' | null
+}
 type ReservedSlot = {
   start: string
   end: string
