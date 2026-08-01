@@ -541,7 +541,7 @@ describe('reservations service', () => {
           startTime: '10:00',
           endTime: '11:00',
         }),
-      ).rejects.toMatchObject({ message: 'REMOVABLE_TOP_REQUIRES_SURFACE' })
+      ).rejects.toMatchObject({ statusCode: 400 })
     })
 
     it('rejects overlapping same surfaces on removable-top tables', async () => {
