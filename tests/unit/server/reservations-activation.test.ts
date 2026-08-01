@@ -478,6 +478,21 @@ describe('reservations service', () => {
         ...overrides,
       })
       reservationsState.push(row)
+      // Also seed in Drizzle mock so activateReservationByTable can find it
+      seedDrizzleDb({
+        reservations: [{
+          id: row.id,
+          tableId: row.table_id,
+          userId: row.user_id,
+          date: row.date,
+          startTime: row.start_time,
+          endTime: row.end_time,
+          status: row.status,
+          surface: row.surface,
+          activatedAt: row.activated_at,
+          createdAt: row.created_at,
+        }],
+      })
       return row
     }
 
