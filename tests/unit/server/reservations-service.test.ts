@@ -435,22 +435,22 @@ describe('reservations service', () => {
       const { createReservationForSession } = await loadReservationModules()
 
       const result = await createReservationForSession(memberSession, {
-        tableId: 't2',
-        date: '2027-06-15',
+        tableId: 't4',
+        date: '2027-06-20',
         startTime: '10:00',
         endTime: '11:00',
-        equipment: ['eq-2'],
+        equipment: ['eq-3'],
       })
 
       expect(result).toMatchObject({
         userId: 'member-1',
-        tableId: 't2',
-        date: '2027-06-15',
+        tableId: 't4',
+        date: '2027-06-20',
         startTime: '10:00',
         endTime: '11:00',
         status: 'pending',
       })
-      expect(result.equipment).toContainEqual(expect.objectContaining({ id: 'eq-2' }))
+      expect(result.equipment).toContainEqual(expect.objectContaining({ id: 'eq-3' }))
     })
 
     it('creates an active reservation through the session-scoped client', async () => {
@@ -483,7 +483,7 @@ describe('reservations service', () => {
       const { createReservationForSession } = await loadReservationModules()
 
       const result = await createReservationForSession(memberSession, {
-        tableId: 't1',
+        tableId: 't2',
         date: '2027-06-15',
         startTime: '18:00',
         endTime: '19:00',
@@ -695,7 +695,7 @@ describe('reservations service', () => {
       const { createReservationForSession } = await loadReservationModules()
 
       const result = await createReservationForSession(memberSession, {
-        tableId: 't1',
+        tableId: 't4',
         date: '2027-06-01',
         startTime: '10:00',
         endTime: '11:00',
@@ -709,7 +709,7 @@ describe('reservations service', () => {
       const { createReservationForSession } = await loadReservationModules()
 
       const result = await createReservationForSession(memberSession, {
-        tableId: 't1',
+        tableId: 't5',
         date: '2027-06-01',
         startTime: '10:00',
         endTime: '11:00',
