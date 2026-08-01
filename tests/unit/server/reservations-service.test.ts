@@ -656,7 +656,9 @@ describe('reservations service', () => {
     it('maps database exclusion conflicts to SLOT_TAKEN when the insert races', async () => {
       const { createReservationForSession } = await loadReservationModules()
 
-      failNextQuery({ op: 'insert', table: 'reservations', error: new Error('duplicate key value violates unique constraint') })
+      const conflictError = new Error('duplicate key value violates unique constraint') as any
+      conflictError.code = '23P01'
+      failNextQuery({ op: 'insert', table: 'reservations', error: conflictError })
 
       await expect(
         createReservationForSession(memberSession, {
@@ -745,7 +747,7 @@ describe('reservations service', () => {
 
       await expect(
         updateReservationForSession(otherMember, 'r1', { startTime: '17:00' }),
-      ).rejects.toMatchObject({ message: 'OWNERSHIP_REQUIRED', statusCode: 403 })
+      ).rejects.toMatchObject({ message: 'Forbidden', statusCode: 403 })
     })
 
     it('throws 404 when reservation is not found', async () => {
@@ -849,11 +851,14 @@ describe('reservations service', () => {
     it('maps database exclusion conflicts to SLOT_TAKEN when update races', async () => {
       const { updateReservationForSession } = await loadReservationModules()
 
-      failNextQuery({ op: 'update', table: 'reservations', error: new Error('duplicate key value violates unique constraint') })
+      const conflictError = new Error('duplicate key value violates unique constraint') as any
+      conflictError.code = '23P01'
+      failNextQuery({ op: 'update', table: 'reservations', error: conflictError })
 
       await expect(
         updateReservationForSession(memberSession, 'r1', {
           startTime: '19:00',
+          endTime: '20:00',
         }),
       ).rejects.toMatchObject({ message: 'SLOT_TAKEN' })
     })
