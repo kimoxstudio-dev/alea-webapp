@@ -1,8 +1,18 @@
 // @vitest-environment node
 import type { SessionUser } from '@/lib/server/auth/auth'
 import { beforeEach, describe, expect, it, vi, afterEach } from 'vitest'
+import {
+  createStatefulDrizzleDb,
+  resetDb as resetDrizzleDb,
+  seed as seedDrizzleDb,
+} from '@/tests/unit/mocks/drizzle-mock'
 
 vi.mock('@/lib/server/games/saved-games-service', () => ({ recordSavedGameAttendance: vi.fn() }))
+
+vi.mock('@/lib/db', () => ({
+  getDrizzleDb: vi.fn(() => createStatefulDrizzleDb()),
+  getDrizzleAdminDb: vi.fn(() => createStatefulDrizzleDb()),
+}))
 
 type ReservationRow = {
   id: string
@@ -429,7 +439,17 @@ describe('reservations service', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     vi.unstubAllEnvs()
+    resetDrizzleDb()
     seedState()
+
+    // Seed tables in Drizzle mock so getTable() calls in reservations-service work
+    seedDrizzleDb({
+      tables: [
+        { id: 't1', roomId: 'room-1', name: 'Mesa 1', type: 'large' },
+        { id: 't2', roomId: 'room-1', name: 'Mesa 2', type: 'small' },
+        { id: 't3', roomId: 'room-1', name: 'Mesa 3', type: 'removable_top' },
+      ],
+    })
   })
 
   describe('activateReservationByTable', () => {
