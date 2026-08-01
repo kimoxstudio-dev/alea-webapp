@@ -513,6 +513,29 @@ describe('reservations service', () => {
       return row
     }
 
+    function seedReservationToMocks(row: ReservationRow) {
+      // Seed to both Supabase mock and Drizzle mock
+      reservationsState.push(row)
+      const existingReservations = getRows('reservations')
+      seedDrizzleDb({
+        reservations: [
+          ...existingReservations,
+          {
+            id: row.id,
+            tableId: row.table_id,
+            userId: row.user_id,
+            date: row.date,
+            startTime: row.start_time,
+            endTime: row.end_time,
+            status: row.status,
+            surface: row.surface,
+            activatedAt: row.activated_at ? new Date(row.activated_at) : null,
+            createdAt: new Date(row.created_at),
+          },
+        ],
+      })
+    }
+
     function makeStartTime(offsetMinutes: number): string {
       const nowUtc = new Date()
       const clubTz = process.env.CLUB_TIMEZONE ?? 'Europe/Madrid'
@@ -655,7 +678,7 @@ describe('reservations service', () => {
     it('throws CHECK_IN_ALREADY_ACTIVE when reservation is already active', async () => {
       const { activateReservationByTable } = await loadReservationModules()
 
-      reservationsState.push(makeReservation({
+      seedReservationToMocks(makeReservation({
         id: 'rActive',
         table_id: 't3',
         user_id: '2',
@@ -817,7 +840,7 @@ describe('reservations service', () => {
       // t1 is type 'large' — isRemovableTop=false → no surface filter applied
       const { activateReservationByTable } = await loadReservationModules()
 
-      reservationsState.push(makeReservation({
+      seedReservationToMocks(makeReservation({
         id: 'rLarge',
         table_id: 't1',
         user_id: '2',
