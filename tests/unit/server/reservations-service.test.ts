@@ -107,20 +107,24 @@ describe('reservations service', () => {
       return Promise.resolve({ rows: [], rowCount: 0 })
     })
 
-    // Seed standard test data
+    // Seed comprehensive test data for all scenarios
     seed({
       profiles: [
         { id: 'member-1', memberNumber: 'M-00000001', createdAt: new Date(), email: null, emailVerified: false, avatar: null, fullName: null },
         { id: 'admin-1', memberNumber: 'M-00000000', createdAt: new Date(), email: null, emailVerified: false, avatar: null, fullName: null },
         { id: 'user-9', memberNumber: 'M-00000009', createdAt: new Date(), email: null, emailVerified: false, avatar: null, fullName: null },
+        { id: 'other-user', memberNumber: 'M-00000099', createdAt: new Date(), email: null, emailVerified: false, avatar: null, fullName: null },
       ],
       rooms: [
         { id: 'room-1', name: 'Sala Mirkwood', createdAt: new Date(), description: '', tableCount: 3 },
+        { id: 'room-2', name: 'Sala Lothlórien', createdAt: new Date(), description: '', tableCount: 2 },
       ],
       tables: [
-        makeTable({ id: 't1', name: 'Mesa 1', type: 'large' }),
-        makeTable({ id: 't2', name: 'Mesa 2', type: 'small' }),
-        makeTable({ id: 't3', name: 'Mesa 3', type: 'removable_top' }),
+        makeTable({ id: 't1', name: 'Mesa 1', type: 'large', roomId: 'room-1' }),
+        makeTable({ id: 't2', name: 'Mesa 2', type: 'small', roomId: 'room-1' }),
+        makeTable({ id: 't3', name: 'Mesa 3', type: 'removable_top', roomId: 'room-1' }),
+        makeTable({ id: 't4', name: 'Mesa 4', type: 'large', roomId: 'room-2' }),
+        makeTable({ id: 't5', name: 'Mesa 5', type: 'small', roomId: 'room-2' }),
       ],
       equipment: [
         {
@@ -135,10 +139,17 @@ describe('reservations service', () => {
           description: 'Portable speakers',
           createdAt: new Date('2026-04-01T10:00:00.000Z'),
         },
+        {
+          id: 'eq-3',
+          name: 'Locked Equipment',
+          description: 'Equipment locked to room-2',
+          createdAt: new Date('2026-04-01T10:00:00.000Z'),
+        },
       ],
       room_default_equipment: [
         { roomId: 'room-1', equipmentId: 'eq-1' },
         { roomId: 'room-1', equipmentId: 'eq-2' },
+        { roomId: 'room-2', equipmentId: 'eq-3' },
       ],
       reservations: [
         makeReservation({ id: 'r1', userId: 'member-1', tableId: 't1', surface: null }),
@@ -154,6 +165,8 @@ describe('reservations service', () => {
       reservation_equipment: [
         { reservationId: 'r1', equipmentId: 'eq-1' },
       ],
+      saved_games: [],
+      event_room_blocks: [],
     })
   })
 
