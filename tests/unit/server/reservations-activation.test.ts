@@ -5,6 +5,8 @@ import {
   createStatefulDrizzleDb,
   resetDb as resetDrizzleDb,
   seed as seedDrizzleDb,
+  getRows,
+  executeMock,
 } from '@/tests/unit/mocks/drizzle-mock'
 
 vi.mock('@/lib/server/games/saved-games-service', () => ({ recordSavedGameAttendance: vi.fn() }))
@@ -442,6 +444,17 @@ describe('reservations service', () => {
     resetDrizzleDb()
     seedState()
 
+    // Mock database time queries to return current time
+    executeMock.mockImplementation((sql: unknown) => {
+      const sqlStr = (sql && typeof sql === 'object' && 'queryChunks' in sql)
+        ? String((sql as any).queryChunks)
+        : String(sql)
+      if (sqlStr.includes('select now()') || sqlStr.includes('select') || sqlStr.includes('now')) {
+        return Promise.resolve({ rows: [{ now: new Date() }], rowCount: 1 })
+      }
+      return Promise.resolve({ rows: [], rowCount: 0 })
+    })
+
     // Seed tables in Drizzle mock so getTable() calls in reservations-service work
     seedDrizzleDb({
       tables: [
@@ -478,20 +491,24 @@ describe('reservations service', () => {
         ...overrides,
       })
       reservationsState.push(row)
-      // Also seed in Drizzle mock so activateReservationByTable can find it
+      // Also seed in Drizzle mock, preserving any existing reservations
+      const existingReservations = getRows('reservations')
       seedDrizzleDb({
-        reservations: [{
-          id: row.id,
-          tableId: row.table_id,
-          userId: row.user_id,
-          date: row.date,
-          startTime: row.start_time,
-          endTime: row.end_time,
-          status: row.status,
-          surface: row.surface,
-          activatedAt: row.activated_at,
-          createdAt: row.created_at,
-        }],
+        reservations: [
+          ...existingReservations,
+          {
+            id: row.id,
+            tableId: row.table_id,
+            userId: row.user_id,
+            date: row.date,
+            startTime: row.start_time,
+            endTime: row.end_time,
+            status: row.status,
+            surface: row.surface,
+            activatedAt: row.activated_at,
+            createdAt: row.created_at,
+          },
+        ],
       })
       return row
     }
