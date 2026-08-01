@@ -83,9 +83,13 @@ export function AuthProvider({ children, initialUser }: { children: React.ReactN
     router.push(`/${locale}/login`)
   }
 
-  const register = async (memberNumber: string, password: string) => {
-    const data = await apiClient.post<User>(endpoints.auth.register, { memberNumber, password })
-    setUser(data)
+  // Self-registration has no server-side Clerk identity creation (see auth/register route,
+  // which unconditionally returns 410 Gone). register() must never call setUser() with data
+  // that doesn't reflect a real, verified Clerk session, so it fails closed immediately instead
+  // of trusting the dead endpoint's response. UI-facing copy comes from i18n at the call site,
+  // not from this error's message (same convention as login()'s thrown errors).
+  const register = async (_memberNumber: string, _password: string): Promise<void> => {
+    throw new Error('Self-registration is disabled')
   }
 
   return (

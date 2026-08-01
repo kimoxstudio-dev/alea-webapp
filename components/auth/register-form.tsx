@@ -1,119 +1,38 @@
-'use client'
-
-import { useState } from 'react'
-import { useForm } from 'react-hook-form'
-import { zodResolver } from '@hookform/resolvers/zod'
-import { useRouter } from 'next/navigation'
-import { useTranslations } from 'next-intl'
-import { Check, X } from 'lucide-react'
-import { DiceLoader } from '@/components/ui/dice-loader'
-import { getPasswordRequirementChecks, registerSchema, type RegisterFormData } from '@/lib/validations/auth'
-import { useAuth } from '@/lib/auth/auth-context'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { PasswordInput } from '@/components/ui/password-input'
-
-function PasswordStrengthIndicator({ password }: { password: string }) {
-  const t = useTranslations('auth.passwordRequirements')
-  const checks = getPasswordRequirementChecks(password)
-
-  return (
-    <ul className="mt-2 space-y-1" aria-label={t('title')}>
-      {checks.map((check) => (
-        <li key={check.key} className="flex items-center gap-2 text-xs">
-          {check.passed
-            ? <Check className="h-3 w-3 text-emerald-500 flex-shrink-0" aria-hidden="true" />
-            : <X className="h-3 w-3 text-muted-foreground flex-shrink-0" aria-hidden="true" />}
-          <span className={check.passed ? 'text-emerald-400' : 'text-muted-foreground'}>
-            {t(check.key)}
-          </span>
-          <span className="sr-only">{check.passed ? t('met') : t('pending')}</span>
-        </li>
-      ))}
-    </ul>
-  )
-}
+import Link from 'next/link'
+import { getTranslations } from 'next-intl/server'
 
 interface RegisterFormProps { locale: string }
 
-export function RegisterForm({ locale }: RegisterFormProps) {
-  const t = useTranslations('auth')
-  const { register: registerUser } = useAuth()
-  const router = useRouter()
-  const [serverError, setServerError] = useState<string | null>(null)
-
-  const { register, handleSubmit, watch, formState: { errors, isSubmitting } } = useForm<RegisterFormData>({
-    resolver: zodResolver(registerSchema),
-  })
-
-  const passwordValue = watch('password', '')
-  const allPasswordChecksPassed = getPasswordRequirementChecks(passwordValue).every((c) => c.passed)
-
-  const onSubmit = async (data: RegisterFormData) => {
-    setServerError(null)
-    try {
-      await registerUser(data.memberNumber, data.password)
-      router.push(`/${locale}/rooms`)
-    } catch (err: unknown) {
-      const error = err as { message?: string }
-      setServerError(error?.message ?? t('errors.invalidCredentials'))
-    }
-  }
+// Self-registration is disabled while the Clerk migration is in progress — the
+// /api/auth/register route unconditionally returns 410 Gone. This renders the
+// disabled-state explanation instead of a live sign-up form so users never
+// believe they successfully registered/authenticated (see GitHub issue #284).
+export async function RegisterForm({ locale }: RegisterFormProps) {
+  const t = await getTranslations('auth')
 
   return (
-    <form onSubmit={handleSubmit(onSubmit)} noValidate className="space-y-5">
-      {serverError && (
-        <div role="alert" className="rounded-md bg-destructive/15 border border-destructive/30 px-4 py-3 text-sm text-destructive">
-          {serverError}
+    <>
+      <div className="space-y-4 text-center">
+        <div className="rounded-md border border-primary/30 bg-primary/10 px-4 py-4 text-sm text-foreground">
+          <p className="font-medium">{t('registerUnavailableTitle')}</p>
+          <p className="mt-2 text-muted-foreground">{t('registerUnavailableBody')}</p>
         </div>
-      )}
-
-      <div className="space-y-1.5">
-        <Label htmlFor="memberNumber">{t('memberNumber')}</Label>
-        <Input id="memberNumber" type="text" placeholder="123456"
-          aria-describedby={errors.memberNumber ? 'memberNumber-error' : undefined}
-          aria-invalid={!!errors.memberNumber}
-          {...register('memberNumber')}
-        />
-        {errors.memberNumber && <p id="memberNumber-error" role="alert" className="text-xs text-destructive">{t(errors.memberNumber.message as Parameters<typeof t>[0])}</p>}
+        <Link
+          href={`/${locale}/login`}
+          className="inline-flex w-full items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {t('login')}
+        </Link>
       </div>
-
-      <div className="space-y-1.5">
-        <Label htmlFor="reg-password">{t('password')}</Label>
-        <PasswordInput id="reg-password" autoComplete="new-password"
-          aria-describedby="password-requirements"
-          aria-invalid={!!errors.password}
-          {...register('password')}
-        />
-        <div id="password-requirements"><PasswordStrengthIndicator password={passwordValue} /></div>
-        {errors.password && <p role="alert" className="text-xs text-destructive">{t(errors.password.message as Parameters<typeof t>[0])}</p>}
+      <div className="mt-6 text-center text-sm">
+        <span className="text-muted-foreground">{t('hasAccount')}</span>{' '}
+        <Link
+          href={`/${locale}/login`}
+          className="text-primary hover:text-primary/80 font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded"
+        >
+          {t('login')}
+        </Link>
       </div>
-
-      <div className="space-y-1.5">
-        <Label htmlFor="confirmPassword">{t('confirmPassword')}</Label>
-        <PasswordInput id="confirmPassword" variant="confirmation" autoComplete="new-password"
-          aria-describedby={errors.confirmPassword ? 'confirm-error' : undefined}
-          aria-invalid={!!errors.confirmPassword}
-          {...register('confirmPassword')}
-        />
-        {errors.confirmPassword && <p id="confirm-error" role="alert" className="text-xs text-destructive">{t(errors.confirmPassword.message as Parameters<typeof t>[0])}</p>}
-      </div>
-
-      <Button
-        type="submit"
-        className="w-full h-11 text-base font-semibold bg-primary text-primary-foreground hover:bg-primary/90 shadow-lg shadow-primary/25 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:shadow-none"
-        disabled={isSubmitting || !allPasswordChecksPassed}
-      >
-        {isSubmitting
-          ? (
-            <span className="inline-flex items-center gap-2">
-              <DiceLoader size="sm" />
-              <span>{t('register')}...</span>
-            </span>
-          )
-          : t('register')}
-      </Button>
-    </form>
+    </>
   )
 }
