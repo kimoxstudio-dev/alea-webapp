@@ -463,7 +463,7 @@ describe('reservations service', () => {
           startTime: '16:30',
           endTime: '17:30',
         }),
-      ).rejects.toMatchObject({ message: 'SLOT_TAKEN' })
+      ).rejects.toMatchObject({ message: 'USER_ALREADY_HAS_RESERVATION_IN_SLOT' })
     })
 
     it('allows a reservation that starts exactly when another ends', async () => {
