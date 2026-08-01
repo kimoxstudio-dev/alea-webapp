@@ -681,6 +681,18 @@ describe('OIR-208: Unified Events', () => {
   })
 
   describe('Availability table-granularity (highest-risk)', () => {
+    beforeEach(() => {
+      resetDb()
+      // Seed tables and profiles needed for reservation creation tests
+      seedTable('tables', [
+        { id: 'res-table-1', roomId: 'room-1', name: 'Test Table 1', type: 'large' },
+        { id: 'res-table-2', roomId: 'room-1', name: 'Test Table 2', type: 'small' },
+      ])
+      seedTable('profiles', [
+        { id: 'user-1', memberNumber: 'M-0000001', createdAt: new Date(), email: null, emailVerified: false, avatar: null, fullName: null },
+      ])
+    })
+
     // Shared query-chain stub: every method (eq/in/lt/gt/etc.) returns the
     // same thenable object so callers can `await` at whatever point their
     // real query chain happens to end — the different service files under
