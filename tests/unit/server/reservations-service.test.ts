@@ -497,7 +497,7 @@ describe('reservations service', () => {
 
       const result = await createReservationForSession(memberSession, {
         tableId: 't1',
-        date: '2027-06-01',
+        date: '2027-06-20',
         startTime: '16:00',
         endTime: '18:00',
       })
@@ -537,7 +537,7 @@ describe('reservations service', () => {
       await expect(
         createReservationForSession(memberSession, {
           tableId: 't3',
-          date: '2027-06-01',
+          date: '2027-06-20',
           startTime: '10:00',
           endTime: '11:00',
         }),
@@ -604,7 +604,7 @@ describe('reservations service', () => {
       await expect(
         createReservationForSession(memberSession, {
           tableId: 't1',
-          date: '2027-06-01',
+          date: '2027-06-20',
           startTime: '10:00',
           endTime: '11:00',
           equipment: ['eq-locked'],
@@ -661,7 +661,7 @@ describe('reservations service', () => {
       await expect(
         createReservationForSession(memberSession, {
           tableId: 't2',
-          date: '2027-06-01',
+          date: '2027-06-20',
           startTime: '10:00',
           endTime: '11:00',
         }),
@@ -696,7 +696,7 @@ describe('reservations service', () => {
 
       const result = await createReservationForSession(memberSession, {
         tableId: 't4',
-        date: '2027-06-01',
+        date: '2027-06-20',
         startTime: '10:00',
         endTime: '11:00',
         surface: null,
@@ -710,7 +710,7 @@ describe('reservations service', () => {
 
       const result = await createReservationForSession(memberSession, {
         tableId: 't5',
-        date: '2027-06-01',
+        date: '2027-06-20',
         startTime: '10:00',
         endTime: '11:00',
       })
@@ -820,7 +820,7 @@ describe('reservations service', () => {
             eventId: 'evt-1',
             roomId: 'room-1',
             tableId: 't1',
-            date: '2027-06-01',
+            date: '2027-06-20',
             startTime: '10:00:00',
             endTime: '11:00:00',
             allDay: false,
@@ -830,7 +830,7 @@ describe('reservations service', () => {
 
       await expect(
         updateReservationForSession(memberSession, 'r1', {
-          date: '2027-06-01',
+          date: '2027-06-20',
           startTime: '10:30',
         }),
       ).rejects.toMatchObject({ message: 'EVENT_BLOCK_CONFLICT' })
@@ -1178,7 +1178,7 @@ describe('reservations service', () => {
       await expect(
         createReservationForSession(memberSession, {
           tableId: 't1',
-          date: '2027-06-01',
+          date: '2027-06-20',
           startTime: '25:00',
           endTime: '26:00',
         }),
@@ -1191,7 +1191,7 @@ describe('reservations service', () => {
       await expect(
         createReservationForSession(memberSession, {
           tableId: 't1',
-          date: '2027-06-01',
+          date: '2027-06-20',
           startTime: '18:70',
           endTime: '19:00',
         }),
@@ -1204,7 +1204,7 @@ describe('reservations service', () => {
       await expect(
         createReservationForSession(memberSession, {
           tableId: 't1',
-          date: '2027-06-01',
+          date: '2027-06-20',
           startTime: '9:00',
           endTime: '10:00',
         }),
@@ -1216,7 +1216,7 @@ describe('reservations service', () => {
 
       const result = await createReservationForSession(memberSession, {
         tableId: 't1',
-        date: '2027-06-01',
+        date: '2027-06-20',
         startTime: '00:00',
         endTime: '01:00',
       })
@@ -1229,7 +1229,7 @@ describe('reservations service', () => {
 
       const result = await createReservationForSession(memberSession, {
         tableId: 't1',
-        date: '2027-06-01',
+        date: '2027-06-20',
         startTime: '23:00',
         endTime: '24:00',
       })
@@ -1242,7 +1242,7 @@ describe('reservations service', () => {
 
       const result = await createReservationForSession(memberSession, {
         tableId: 't1',
-        date: '2027-06-01',
+        date: '2027-06-20',
         startTime: '22:00',
         endTime: '24:00',
       })
@@ -1406,7 +1406,7 @@ describe('reservations service', () => {
             id: 'r-future-pending',
             userId: 'member-1',
             status: 'pending',
-            date: '2027-06-01',
+            date: '2027-06-20',
             startTime: '10:00:00',
             endTime: '11:00:00',
             tableId: 't2',
