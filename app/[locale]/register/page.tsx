@@ -5,7 +5,7 @@ import { RegisterForm } from '@/components/auth/register-form'
 
 export async function generateMetadata(): Promise<Metadata> {
   const t = await getTranslations('auth')
-  return { title: `${t('register')} -- Alea` }
+  return { title: `${t('register')} — Alea` }
 }
 
 interface RegisterPageProps {
