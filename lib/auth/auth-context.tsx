@@ -1,6 +1,7 @@
 'use client'
 
-import { createContext, useContext, useState, useEffect, useCallback } from 'react'
+import { useAuth as useClerkAuth, useClerk, useSignIn } from '@clerk/nextjs'
+import { createContext, useCallback, useContext, useState, useEffect } from 'react'
 import { usePathname, useRouter } from 'next/navigation'
 import type { User } from '@/lib/types'
 import { apiClient } from '@/lib/api/client'
@@ -20,6 +21,9 @@ const AuthContext = createContext<AuthContextValue | null>(null)
 export function AuthProvider({ children, initialUser }: { children: React.ReactNode; initialUser?: User | null }) {
   const [user, setUser] = useState<User | null>(initialUser ?? null)
   const [isLoading, setIsLoading] = useState(initialUser === undefined)
+  const clerk = useClerk()
+  const { isLoaded: isClerkLoaded, userId } = useClerkAuth()
+  const { signIn, fetchStatus: signInFetchStatus } = useSignIn()
   const router = useRouter()
   const pathname = usePathname()
 
@@ -29,24 +33,56 @@ export function AuthProvider({ children, initialUser }: { children: React.ReactN
     try {
       const data = await apiClient.get<User>(endpoints.auth.me)
       setUser(data)
-    } catch { setUser(null) }
-    finally { setIsLoading(false) }
+      return data
+    } catch {
+      setUser(null)
+      return null
+    } finally {
+      setIsLoading(false)
+    }
   }, [])
 
   useEffect(() => {
-    if (initialUser !== undefined) return
+    if (initialUser !== undefined || !isClerkLoaded) return
+    if (!userId) {
+      setUser(null)
+      setIsLoading(false)
+      return
+    }
     checkAuth()
-  }, [checkAuth, initialUser])
+  }, [checkAuth, initialUser, isClerkLoaded, userId])
 
   const login = async (identifier: string, password: string) => {
-    const data = await apiClient.post<User>(endpoints.auth.login, { identifier, password })
-    setUser(data)
+    if (!signIn || signInFetchStatus === 'fetching') {
+      throw new Error('Clerk sign-in is not ready')
+    }
+
+    const { error } = await signIn.password({
+      identifier: `${identifier.trim()}@members.alea.internal`,
+      password,
+    })
+
+    if (error || signIn.status !== 'complete') {
+      throw new Error('Invalid credentials')
+    }
+
+    const { error: finalizeError } = await signIn.finalize()
+    if (finalizeError) {
+      throw new Error('Invalid credentials')
+    }
+    const mappedUser = await checkAuth()
+    if (!mappedUser) {
+      await clerk.signOut()
+      throw new Error('Invalid credentials')
+    }
   }
+
   const logout = async () => {
-    await apiClient.post(endpoints.auth.logout)
+    await clerk.signOut()
     setUser(null)
     router.push(`/${locale}/login`)
   }
+
   const register = async (memberNumber: string, password: string) => {
     const data = await apiClient.post<User>(endpoints.auth.register, { memberNumber, password })
     setUser(data)

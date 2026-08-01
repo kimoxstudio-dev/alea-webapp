@@ -5,30 +5,23 @@ import { NextRequest, NextResponse } from 'next/server'
 const createI18nResponse = vi.fn((request: NextRequest) =>
   NextResponse.redirect(new URL('/es', request.url)),
 )
-const getTokenMock = vi.fn()
 
 vi.mock('next-intl/middleware', () => ({
   default: vi.fn(() => (request: NextRequest) => createI18nResponse(request)),
 }))
 
-vi.mock('next-auth/jwt', () => ({
-  getToken: getTokenMock,
-}))
-
-vi.mock('@/lib/authjs/config-edge', () => ({
-  AUTHJS_SESSION_COOKIE_NAME: 'authjs.session-token',
+vi.mock('@clerk/nextjs/server', () => ({
+  clerkMiddleware: vi.fn((handler: (auth: unknown, request: NextRequest) => Response | Promise<Response>) =>
+    (request: NextRequest) => handler({}, request)),
 }))
 
 describe('middleware', () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
-    vi.unstubAllEnvs()
-    vi.stubEnv('AUTH_SECRET', 'test-secret')
-    getTokenMock.mockResolvedValue(null)
   })
 
-  it('preserves the locale middleware response while reading Auth.js JWT session', async () => {
+  it('preserves the locale middleware response while setting a CSRF cookie', async () => {
     const middleware = (await import('@/middleware')).default
 
     const response = await middleware(new NextRequest('http://localhost:3000/rooms'))
@@ -38,7 +31,6 @@ describe('middleware', () => {
     expect(csrfCookie?.value).toBeTruthy()
     expect(csrfCookie?.httpOnly).toBe(false)
     expect(csrfCookie?.sameSite).toBe('lax')
-
   })
 
   it('does not rewrite the CSRF cookie when a valid token already exists', async () => {
@@ -53,4 +45,11 @@ describe('middleware', () => {
     expect(response.cookies.get('alea-csrf-token')).toBeUndefined()
   })
 
+  it('sets the CSRF cookie for matched api requests too', async () => {
+    const middleware = (await import('@/middleware')).default
+
+    const response = await middleware(new NextRequest('http://localhost:3000/api/auth/me'))
+
+    expect(response.cookies.get('alea-csrf-token')?.value).toBeTruthy()
+  })
 })

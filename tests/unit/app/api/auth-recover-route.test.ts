@@ -45,7 +45,6 @@ describe('POST /api/auth/recover', () => {
     enforceMutationSecurityMock.mockReturnValue(null)
     enforceRateLimitMock.mockReturnValue(null)
     recoverAccountMock.mockResolvedValue({
-      signInFailed: false,
       user: {
         id: 'user-20',
         memberNumber: '100020',
@@ -57,7 +56,7 @@ describe('POST /api/auth/recover', () => {
     })
   })
 
-  it('recovers account, signs member in, returns user payload and cookies', async () => {
+  it('recovers the account and returns the user without a legacy session', async () => {
     const { POST } = await import('@/app/api/auth/recover/route')
     const response = await POST(createJsonRequest({
       token: 'plain-token',
@@ -116,7 +115,7 @@ describe('POST /api/auth/recover', () => {
     expect(recoverAccountMock).not.toHaveBeenCalled()
   })
 
-  it('returns 500 when recovery succeeds but automatic sign-in fails', async () => {
+  it('ignores obsolete legacy session flags from transitional service mocks', async () => {
     recoverAccountMock.mockResolvedValueOnce({
       signInFailed: true,
       user: {
@@ -135,11 +134,8 @@ describe('POST /api/auth/recover', () => {
       password: 'Password123',
     }))
 
-    expect(response.status).toBe(500)
-    await expect(response.json()).resolves.toMatchObject({
-      message: 'Password updated, but automatic sign-in failed. Please sign in with your member number and new password.',
-      statusCode: 500,
-    })
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({ memberNumber: '100020' })
   })
 
   it('returns the security response before touching recovery logic', async () => {

@@ -2,19 +2,23 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { NextRequest, NextResponse } from 'next/server'
 
-const authJsAuthMock = vi.fn()
+const clerkAuthMock = vi.fn()
 const drizzleSelectMock = vi.fn()
 const drizzleFromMock = vi.fn()
 const drizzleWhereMock = vi.fn()
 const drizzleLimitMock = vi.fn()
+const eqMock = vi.fn((column, value) => ({ column, value }))
 
-// Mock Auth.js auth() to prevent loading next-auth
-vi.mock('@/lib/authjs/auth', () => ({
-  auth: authJsAuthMock,
-  handlers: { GET: vi.fn(), POST: vi.fn() },
+vi.mock('drizzle-orm', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('drizzle-orm')>()
+  return { ...actual, eq: eqMock }
+})
+
+vi.mock('@clerk/nextjs/server', () => ({
+  auth: clerkAuthMock,
+  clerkMiddleware: vi.fn((handler: unknown) => handler),
 }))
 
-// Mock Drizzle database
 vi.mock('@/lib/db', () => ({
   getDrizzleDb: vi.fn(() => ({
     select: drizzleSelectMock,
@@ -23,66 +27,57 @@ vi.mock('@/lib/db', () => ({
   getAdminDb: vi.fn(),
 }))
 
-// Mock next-auth/jwt to prevent loading next-auth
-vi.mock('next-auth/jwt', () => ({
-  getToken: vi.fn(),
-}))
-
-function withSession(userId = 'user-1', role: 'member' | 'admin' = 'admin') {
-  const sessionResult = { user: { id: userId } }
-  const profileResult = [
-    {
-      id: userId,
-      role,
-      isActive: true,
-      email: 'admin@alea.club',
-      memberNumber: '100001',
-      createdAt: '2024-01-01T00:00:00.000Z',
-      updatedAt: '2024-01-01T00:00:00.000Z',
-    },
-  ]
-  authJsAuthMock.mockResolvedValue(sessionResult)
+function withSession(userId = 'clerk-user-1', role: 'member' | 'admin' = 'admin') {
+  clerkAuthMock.mockResolvedValue({ userId })
   drizzleSelectMock.mockReturnValue({ from: drizzleFromMock })
   drizzleFromMock.mockReturnValue({ where: drizzleWhereMock })
   drizzleWhereMock.mockReturnValue({ limit: drizzleLimitMock })
-  drizzleLimitMock.mockResolvedValue(profileResult)
+  drizzleLimitMock.mockResolvedValue([
+    {
+      id: 'profile-1',
+      role,
+      isActive: true,
+    },
+  ])
 }
 
 describe('server auth helpers', () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
-    authJsAuthMock.mockResolvedValue(null)
+    clerkAuthMock.mockResolvedValue({ userId: null })
     drizzleSelectMock.mockReturnValue({ from: drizzleFromMock })
     drizzleFromMock.mockReturnValue({ where: drizzleWhereMock })
     drizzleWhereMock.mockReturnValue({ limit: drizzleLimitMock })
     drizzleLimitMock.mockResolvedValue([])
   })
 
-  it('reads the session from a request-scoped Drizzle client', async () => {
-    withSession('user-1', 'admin')
+  it('reads the session from a Clerk identity mapped in Drizzle', async () => {
+    withSession('clerk-admin', 'admin')
     const { getSessionFromRequest } = await import('@/lib/server/auth/auth')
+    const { profiles } = await import('@/lib/db/schema')
 
     await expect(
       getSessionFromRequest(new NextRequest('http://localhost:3000/api/auth/me')),
     ).resolves.toMatchObject({
-      session: { id: 'user-1', role: 'admin' },
+      session: { id: 'profile-1', role: 'admin' },
       applyCookies: expect.any(Function),
     })
+    expect(eqMock).toHaveBeenCalledWith(profiles.clerkUserId, 'clerk-admin')
   })
 
   it('reads the session from server cookies for SSR hydration', async () => {
-    withSession('user-2', 'member')
+    withSession('clerk-member', 'member')
     const { getSessionFromServerCookies } = await import('@/lib/server/auth/auth')
 
     await expect(getSessionFromServerCookies()).resolves.toEqual({
-      id: 'user-2',
+      id: 'profile-1',
       role: 'member',
     })
   })
 
-  it('returns null when the profile lookup fails after a valid auth session', async () => {
-    authJsAuthMock.mockResolvedValueOnce({ user: { id: 'user-1' } })
+  it('returns null when the Clerk user has no mapped profile', async () => {
+    clerkAuthMock.mockResolvedValueOnce({ userId: 'clerk-unmapped' })
     drizzleLimitMock.mockResolvedValueOnce([])
     const { getSessionFromRequest } = await import('@/lib/server/auth/auth')
 
@@ -91,10 +86,10 @@ describe('server auth helpers', () => {
     ).resolves.toMatchObject({ session: null })
   })
 
-  it('returns null when the profile is inactive', async () => {
-    authJsAuthMock.mockResolvedValueOnce({ user: { id: 'user-1' } })
+  it('returns null when the mapped profile is inactive', async () => {
+    clerkAuthMock.mockResolvedValueOnce({ userId: 'clerk-suspended' })
     drizzleLimitMock.mockResolvedValueOnce([
-      { id: 'user-1', role: 'admin', isActive: false },
+      { id: 'profile-1', role: 'admin', isActive: false },
     ])
     const { getSessionFromRequest } = await import('@/lib/server/auth/auth')
 
@@ -103,7 +98,7 @@ describe('server auth helpers', () => {
     ).resolves.toMatchObject({ session: null })
   })
 
-  it('returns 401 from requireAuth when no Auth.js session is present', async () => {
+  it('returns 401 from requireAuth when no Clerk session is present', async () => {
     const { requireAuth } = await import('@/lib/server/auth/auth')
 
     const response = await requireAuth(new NextRequest('http://localhost:3000/api/users'))
@@ -112,7 +107,7 @@ describe('server auth helpers', () => {
   })
 
   it('returns 403 from requireAdmin for authenticated members', async () => {
-    withSession('user-2', 'member')
+    withSession('clerk-member', 'member')
     const { requireAdmin } = await import('@/lib/server/auth/auth')
 
     const response = await requireAdmin(new NextRequest('http://localhost:3000/api/users'))
@@ -121,13 +116,13 @@ describe('server auth helpers', () => {
   })
 
   it('returns the session user from requireAdmin for admins', async () => {
-    withSession('user-1', 'admin')
+    withSession('clerk-admin', 'admin')
     const { requireAdmin } = await import('@/lib/server/auth/auth')
 
     await expect(
       requireAdmin(new NextRequest('http://localhost:3000/api/users')),
     ).resolves.toMatchObject({
-      session: { id: 'user-1', role: 'admin' },
+      session: { id: 'profile-1', role: 'admin' },
       applyCookies: expect.any(Function),
     })
   })
@@ -178,7 +173,6 @@ describe('server auth helpers', () => {
         },
       }),
     )
-
     expect(schemeMismatch?.status).toBe(403)
 
     const rejected = enforceSameOriginForMutation(
@@ -191,22 +185,17 @@ describe('server auth helpers', () => {
         },
       }),
     )
-
     expect(rejected?.status).toBe(403)
 
     const missingOrigin = enforceSameOriginForMutation(
-      new NextRequest('http://localhost:3000/api/auth/login', {
-        method: 'POST',
-      }),
+      new NextRequest('http://localhost:3000/api/auth/login', { method: 'POST' }),
     )
     expect(missingOrigin?.status).toBe(403)
 
     const malformedOrigin = enforceSameOriginForMutation(
       new NextRequest('http://localhost:3000/api/auth/login', {
         method: 'POST',
-        headers: {
-          origin: 'not-a-valid-origin',
-        },
+        headers: { origin: 'not-a-valid-origin' },
       }),
     )
     expect(malformedOrigin?.status).toBe(403)
@@ -227,9 +216,7 @@ describe('server auth helpers', () => {
     const missingCsrf = enforceSameOriginForMutation(
       new NextRequest('http://localhost:3000/api/auth/login', {
         method: 'POST',
-        headers: {
-          origin: 'http://localhost:3000',
-        },
+        headers: { origin: 'http://localhost:3000' },
       }),
     )
     expect(missingCsrf?.status).toBe(403)

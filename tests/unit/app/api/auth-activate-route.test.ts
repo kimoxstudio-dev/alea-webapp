@@ -61,7 +61,6 @@ describe('POST /api/auth/activate', () => {
     enforceMutationSecurityMock.mockReturnValue(null)
     enforceRateLimitMock.mockReturnValue(null)
     activateAccountMock.mockResolvedValue({
-      signInFailed: false,
       user: {
         id: 'user-20',
         memberNumber: '100020',
@@ -73,7 +72,7 @@ describe('POST /api/auth/activate', () => {
     })
   })
 
-  it('activates account, signs member in, returns user payload and cookies', async () => {
+  it('activates the account and returns the user without a legacy session', async () => {
     const { POST } = await import('@/app/api/auth/activate/route')
     const response = await POST(createJsonRequest({
       token: 'plain-token',
@@ -146,7 +145,7 @@ describe('POST /api/auth/activate', () => {
     })
   })
 
-  it('returns 500 when activation succeeds but automatic sign-in fails', async () => {
+  it('ignores obsolete legacy session flags from transitional service mocks', async () => {
     activateAccountMock.mockResolvedValueOnce({
       signInFailed: true,
       user: {
@@ -165,11 +164,8 @@ describe('POST /api/auth/activate', () => {
       password: 'Password123',
     }))
 
-    expect(response.status).toBe(500)
-    await expect(response.json()).resolves.toMatchObject({
-      message: 'Account activated, but automatic sign-in failed. Please sign in with your member number and new password.',
-      statusCode: 500,
-    })
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({ memberNumber: '100020' })
   })
 
   it('returns the security response before touching activation logic', async () => {

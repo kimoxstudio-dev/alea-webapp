@@ -64,8 +64,7 @@ export function RecoveryForm({ locale, token }: RecoveryFormProps) {
         token,
         password: data.password,
       })
-      router.push(`/${locale}/rooms`)
-      router.refresh()
+      router.push(`/${locale}/login`)
     } catch (error) {
       const message = error instanceof Error
         ? error.message
