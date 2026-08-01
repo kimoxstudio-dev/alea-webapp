@@ -505,8 +505,8 @@ describe('reservations service', () => {
             endTime: row.end_time,
             status: row.status,
             surface: row.surface,
-            activatedAt: row.activated_at,
-            createdAt: row.created_at,
+            activatedAt: row.activated_at ? new Date(row.activated_at) : null,
+            createdAt: new Date(row.created_at),
           },
         ],
       })
