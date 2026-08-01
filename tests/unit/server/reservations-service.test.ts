@@ -1511,4 +1511,57 @@ describe('reservations service', () => {
       vi.useRealTimers()
     })
   })
+
+  describe('savedGames conflict detection (GitHub #248 split-brain fix)', () => {
+    it('blocks bottom-surface reservations when overlapping saved game exists', async () => {
+      const { createReservationForSession } = await loadReservationModules()
+
+      seed({
+        saved_games: [
+          {
+            id: 'sg-1',
+            tableId: 't3',
+            userId: 'other-user',
+            startDate: '2027-06-15',
+            endDate: '2027-06-30',
+            status: 'active',
+            attendanceCount: 0,
+            renewedFromId: null,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
+        ],
+      })
+
+      await expect(
+        createReservationForSession(memberSession, {
+          tableId: 't3',
+          date: '2027-06-20',
+          startTime: '10:00',
+          endTime: '11:00',
+          surface: 'bottom',
+        }),
+      ).rejects.toMatchObject({ message: 'SAVED_GAME_BOTTOM_RESERVED', statusCode: 409 })
+    })
+
+    it('allows bottom-surface reservations when no overlapping saved game exists', async () => {
+      const { createReservationForSession } = await loadReservationModules()
+
+      const result = await createReservationForSession(memberSession, {
+        tableId: 't3',
+        date: '2027-06-20',
+        startTime: '10:00',
+        endTime: '11:00',
+        surface: 'bottom',
+      })
+
+      expect(result).toMatchObject({
+        tableId: 't3',
+        date: '2027-06-20',
+        startTime: '10:00',
+        endTime: '11:00',
+        surface: 'bottom',
+      })
+    })
+  })
 })
