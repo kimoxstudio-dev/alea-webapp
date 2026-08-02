@@ -1556,6 +1556,7 @@ describe('reservations service', () => {
 
       seed({
         reservations: [
+          ...getRows('reservations'),
           makeReservation({
             id: 'r-future-pending',
             userId: 'member-1',
