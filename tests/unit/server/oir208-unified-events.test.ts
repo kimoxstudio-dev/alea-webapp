@@ -806,6 +806,9 @@ describe('OIR-208: Unified Events', () => {
       // Real where(eq(tables.id, ...)) matching now, so both tables are
       // seeded once — each call finds its own row regardless of order.
       seedTable('tables', [mockTableRow('table-A', ROOM), mockTableRow('table-B', ROOM)])
+      // KIM-434 F3c: production code now queries event_room_blocks via getDrizzleAdminDb (Drizzle)
+      // instead of getAdminDb (Supabase). Must seed Drizzle mock with event block data.
+      seedTable('event_room_blocks', eventBlocks)
 
       const { getTableAvailability } = await import('@/lib/server/tables/tables-service')
 
@@ -831,6 +834,9 @@ describe('OIR-208: Unified Events', () => {
         buildAvailabilityAdminClient(eventBlocks) as any,
       )
       seedTable('tables', [mockTableRow('table-A', ROOM), mockTableRow('table-B', ROOM)])
+      // KIM-434 F3c: production code now queries event_room_blocks via getDrizzleAdminDb (Drizzle)
+      // instead of getAdminDb (Supabase). Must seed Drizzle mock with event block data.
+      seedTable('event_room_blocks', eventBlocks)
 
       const { getTableAvailability } = await import('@/lib/server/tables/tables-service')
 
@@ -852,6 +858,9 @@ describe('OIR-208: Unified Events', () => {
         buildAvailabilityAdminClient(eventBlocks) as any,
       )
       seedTable('tables', [mockTableRow('table-A', ROOM), mockTableRow('table-B', ROOM)])
+      // KIM-434 F3c: production code now queries event_room_blocks via getDrizzleAdminDb (Drizzle)
+      // instead of getAdminDb (Supabase). Must seed Drizzle mock with event block data.
+      seedTable('event_room_blocks', eventBlocks)
 
       const { getRoomTablesAvailability } = await import('@/lib/server/rooms/rooms-service')
 
@@ -872,6 +881,9 @@ describe('OIR-208: Unified Events', () => {
         buildAvailabilityAdminClient(eventBlocks) as any,
       )
       seedTable('tables', [mockTableRow('table-A', ROOM), mockTableRow('table-B', ROOM)])
+      // KIM-434 F3c: production code now queries event_room_blocks via getDrizzleAdminDb (Drizzle)
+      // instead of getAdminDb (Supabase). Must seed Drizzle mock with event block data.
+      seedTable('event_room_blocks', eventBlocks)
 
       const { getRoomTablesAvailability } = await import('@/lib/server/rooms/rooms-service')
 
