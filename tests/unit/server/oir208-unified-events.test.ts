@@ -394,39 +394,14 @@ describe('OIR-208: Unified Events', () => {
     })
 
     it('accepts materials with valid equipmentId and quantity >= 1', async () => {
-      const mockSupabase = buildSupabaseMock()
-      mockSupabase.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            insert: vi.fn(() => ({
-              select: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: {
-                    id: 'evt-with-materials',
-                    title: 'Event',
-                    title_es: 'Evento',
-                    title_en: 'Event',
-                    date: '2026-05-01',
-                    date_kind: 'single',
-                    created_at: '2026-04-01T00:00:00Z',
-                  } as EventRow,
-                  error: null,
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
+      // Drizzle migration: seed equipment, let createClubEvent use Drizzle mock
+      getDrizzleDbInternal.instance = null
+      resetDb()
+      vi.clearAllMocks()
 
-      mockSupabase.rpc = vi.fn(async () => ({
-        data: [],
-        error: null,
-      }))
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
+      seedTable('equipment', [
+        { id: 'eq-1', name: 'Equipment 1' },
+      ])
 
       const { createClubEvent } = await import('@/lib/server/events/club-events-service')
 
@@ -438,7 +413,11 @@ describe('OIR-208: Unified Events', () => {
         materials: [{ equipmentId: 'eq-1', quantity: 2 }],
       })
 
-      expect(result.id).toBe('evt-with-materials')
+      expect(result.id).toBeDefined()
+      expect(result.titleEs).toBe('Evento')
+      expect(result.materials).toHaveLength(1)
+      expect(result.materials[0].equipmentId).toBe('eq-1')
+      expect(result.materials[0].quantity).toBe(2)
     })
 
     it('rejects duplicate equipment IDs in materials array', async () => {
