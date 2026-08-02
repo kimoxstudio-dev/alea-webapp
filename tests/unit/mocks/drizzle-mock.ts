@@ -144,6 +144,7 @@ declare global {
   var __drizzleMockQueryLog: MockQueryLogEntry[] | undefined
   var __drizzleMockFailures: FailureSpec[] | undefined
   var __drizzleMockColumnKeyCache: WeakMap<object, Map<string, string>> | undefined
+  var __drizzleMockFilterBypass: { columnName: string; tableName?: string } | undefined
 }
 
 // ── Mock state: global response objects for each query type (legacy mock) ───────
@@ -494,8 +495,41 @@ export function resetDb(): void {
   store.clear()
   queryLog.length = 0
   failures.length = 0
+  globalThis.__drizzleMockFilterBypass = undefined
   // Note: columnKeyCache is not cleared because it's a WeakMap keyed by table objects.
   // Table objects persist across tests and their schema never changes, so the cache is safe.
+}
+
+/**
+ * Configure the mock to bypass (skip) a WHERE-clause filter on a specific column for the next query.
+ * This simulates a regression where a crucial filter (e.g., `.eq('user_id', ...)`) is accidentally
+ * removed, returning rows that should have been excluded. The defense-in-depth layer
+ * (`assertMemberRowsScoped()`) should then catch the leak.
+ *
+ * Usage:
+ * ```typescript
+ * bypassWhereFilterOnColumn('userId')
+ * // Next SELECT query will ignore `.eq('userId', ...)` filters
+ * const result = await listVisibleReservations({ session: memberSession })
+ * // assertMemberRowsScoped() should catch the foreign rows
+ * ```
+ *
+ * The bypass is consumed (cleared) after the next query executes, or when `resetDb()` is called.
+ * To bypass a column from a specific table, pass the table name:
+ * ```typescript
+ * bypassWhereFilterOnColumn('userId', 'reservations')
+ * ```
+ */
+export function bypassWhereFilterOnColumn(columnName: string, tableName?: string): void {
+  globalThis.__drizzleMockFilterBypass = {
+    columnName: columnName.toLowerCase(),
+    tableName: tableName ? tableKey(tableName) : undefined,
+  }
+}
+
+/** Clear any active filter bypass. */
+export function clearFilterBypass(): void {
+  globalThis.__drizzleMockFilterBypass = undefined
 }
 
 /** Snapshot of a table's current rows — use it to assert what a write persisted. */
@@ -848,6 +882,27 @@ function evaluateTokens(rawTokens: Token[], ctx: QueryContext, source: SQL): boo
 function evaluateComparison(tokens: Token[], ctx: QueryContext, source: SQL): boolean {
   const operatorIndex = tokens.findIndex((token) => token.t === 'text')
   if (operatorIndex <= 0) throw mockError(`unsupported condition: ${renderSql(source)}`)
+
+  // Check if this comparison involves a column marked for filter bypass.
+  // If so, skip the filter (return true) to simulate a regression where the
+  // WHERE clause was accidentally removed from a query, allowing defense-in-depth
+  // mechanisms like assertMemberRowsScoped() to catch the leak.
+  const bypass = globalThis.__drizzleMockFilterBypass
+  if (bypass) {
+    const leftTokens = tokens.slice(0, operatorIndex)
+    if (leftTokens.length === 1 && leftTokens[0].t === 'col') {
+      const column = leftTokens[0].v
+      const columnProp = columnPropertyKey(column)
+      const tableKey_ = tableKey(column.table)
+      if (
+        columnProp.toLowerCase() === bypass.columnName &&
+        (bypass.tableName === undefined || tableKey_ === bypass.tableName)
+      ) {
+        // This comparison is for a bypassed column — skip the filter
+        return true
+      }
+    }
+  }
 
   const operator = (tokens[operatorIndex] as { v: string }).v.toLowerCase()
   const left = evaluateOperand(tokens.slice(0, operatorIndex), ctx)
@@ -1231,6 +1286,8 @@ class MockSelectBuilder {
 
     const rows = this.hasAggregate() ? this.projectAggregated(contexts) : this.projectRows(contexts)
     queryLog.push({ op: 'select', table: baseKey, rowCount: rows.length })
+    // Clear the filter bypass after the query completes, so it only applies to this one query
+    globalThis.__drizzleMockFilterBypass = undefined
     return rows
   }
 

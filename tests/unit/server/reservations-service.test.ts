@@ -9,6 +9,7 @@ import {
   failNextQuery,
   createMockServiceError,
   executeMock,
+  bypassWhereFilterOnColumn,
 } from '@/tests/unit/mocks/drizzle-mock'
 import { tables, rooms, reservations, equipment, roomDefaultEquipment, reservationEquipment, eventRoomBlocks, savedGames, profiles } from '@/lib/db/schema'
 import type { InferSelectModel } from 'drizzle-orm'
@@ -1204,9 +1205,48 @@ describe('reservations service', () => {
     })
 
     it('rejects with a 500 when the query layer leaks a foreign row past the user_id filter (assertMemberRowsScoped regression)', async () => {
-      // This test would require injecting a query that bypasses the filter,
-      // which the Drizzle mock handles correctly by design.
-      // Skipping this test as it was testing Supabase-specific behavior.
+      const { listVisibleReservations } = await loadReservationModules()
+
+      // Create a reservation belonging to a different user
+      const foreignReservation = makeReservation({
+        id: 'r-foreign-leak',
+        userId: '999',
+        tableId: 't-foreign',
+        date: '2026-12-31',
+        startTime: '14:00:00',
+        endTime: '15:00:00',
+      })
+
+      // Also seed the foreign table so the join succeeds
+      seed({
+        reservations: [
+          ...getRows('reservations'),
+          foreignReservation,
+        ],
+        tables: [
+          ...getRows('tables'),
+          makeTable({
+            id: 't-foreign',
+            roomId: 'room-1',
+            name: 'Foreign Table',
+          }),
+        ],
+      })
+
+      // Simulate the `.eq('user_id', ...)` query filter being accidentally
+      // removed/bypassed at the query layer, so the mock now returns mixed
+      // rows across users — exactly what a regression in the query filter
+      // would produce in production. This proves assertMemberRowsScoped()
+      // itself catches the leak, not just the (working) query filter.
+      bypassWhereFilterOnColumn('userId', 'reservations')
+
+      await expect(
+        listVisibleReservations({ session: memberSession }),
+      ).rejects.toMatchObject({
+        name: 'ServiceError',
+        statusCode: 500,
+        message: 'Data isolation violation: member read returned foreign rows',
+      })
     })
   })
 
