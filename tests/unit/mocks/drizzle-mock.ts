@@ -138,6 +138,14 @@
 import { vi } from 'vitest'
 import { Column, Param, SQL, StringChunk, Table, getTableColumns, getTableName, is } from 'drizzle-orm'
 
+// Extend globalThis to hold mock state across module re-evaluations
+declare global {
+  var __drizzleMockStore: Map<string, MockRow[]> | undefined
+  var __drizzleMockQueryLog: MockQueryLogEntry[] | undefined
+  var __drizzleMockFailures: FailureSpec[] | undefined
+  var __drizzleMockColumnKeyCache: WeakMap<object, Map<string, string>> | undefined
+}
+
 // ── Mock state: global response objects for each query type (legacy mock) ───────
 // These are imported by the test file and configured per test in beforeEach/it.
 // They back the chainable query builder mocks below.
@@ -428,11 +436,11 @@ function mockError(message: string): Error {
 
 // ── Store ──────────────────────────────────────────────────────────────────────
 
-const store = new Map<string, MockRow[]>()
-const queryLog: MockQueryLogEntry[] = []
+const store: Map<string, MockRow[]> = (globalThis.__drizzleMockStore ??= new Map())
+const queryLog: MockQueryLogEntry[] = (globalThis.__drizzleMockQueryLog ??= [])
 
 type FailureSpec = { op?: QueryOp; table?: string; times: number; error: unknown }
-const failures: FailureSpec[] = []
+const failures: FailureSpec[] = (globalThis.__drizzleMockFailures ??= [])
 
 /**
  * Table key used for raw `db.execute(sql\`...\`)` calls, in the query log and
@@ -486,6 +494,8 @@ export function resetDb(): void {
   store.clear()
   queryLog.length = 0
   failures.length = 0
+  // Note: columnKeyCache is not cleared because it's a WeakMap keyed by table objects.
+  // Table objects persist across tests and their schema never changes, so the cache is safe.
 }
 
 /** Snapshot of a table's current rows — use it to assert what a write persisted. */
@@ -564,7 +574,7 @@ function restoreStore(snapshot: Map<string, MockRow[]>): void {
 
 // ── Column ↔ row-property resolution ───────────────────────────────────────────
 
-const columnKeyCache = new WeakMap<object, Map<string, string>>()
+const columnKeyCache: WeakMap<object, Map<string, string>> = (globalThis.__drizzleMockColumnKeyCache ??= new WeakMap())
 
 /** Map a Drizzle column back to the property name its rows use (`user_id` → `userId`). */
 function columnPropertyKey(column: Column): string {
