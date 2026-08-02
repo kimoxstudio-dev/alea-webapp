@@ -444,15 +444,18 @@ describe('OIR-208: Unified Events', () => {
 
   describe('RPC Payload: tableId in blocks', () => {
     it('includes tableId in block payload when provided', async () => {
-      // updateClubEvent runs entirely on the Supabase client (getAdminDb),
-      // not the Drizzle seam — the drizzle-mock fixtures this test used to
-      // set here were never actually consulted by the code path under test
-      // (confirmed by reading club-events-service.ts: it has no
-      // getDrizzleDb/getDrizzleAdminDb call at all). Removed as vestigial.
-      vi.resetModules()
+      // KIM-451: updateClubEvent now uses Drizzle. Seed event and related data.
+      getDrizzleDbInternal.instance = null
+      resetDb()
+      vi.clearAllMocks()
+
+      seedTable('events', [{ id: 'evt-1', title: 'Event', titleEs: 'Event', titleEn: 'Event', dateKind: 'single', date: '2026-04-20' }])
+      seedTable('rooms', [{ id: 'room-1', name: 'Room 1' }])
+      seedTable('tables', [{ id: 'table-1', roomId: 'room-1', name: 'Table 1' }])
+
       const { updateClubEvent } = await import('@/lib/server/events/club-events-service')
 
-      await updateClubEvent(createAdminSession(), 'evt-1', {
+      const result = await updateClubEvent(createAdminSession(), 'evt-1', {
         schedules: [
           {
             roomId: 'room-1',
@@ -465,16 +468,21 @@ describe('OIR-208: Unified Events', () => {
         blocksRooms: true,
       })
 
-      // Test passes if no error thrown (no RPC call verification needed anymore)
+      expect(result.id).toBe('evt-1')
     })
 
     it('sets tableId to null in block payload when not provided', async () => {
-      // See note above: updateClubEvent never touches the Drizzle seam, so
-      // no drizzle-mock fixture is needed here.
-      vi.resetModules()
+      // KIM-451: updateClubEvent now uses Drizzle. Seed event and related data.
+      getDrizzleDbInternal.instance = null
+      resetDb()
+      vi.clearAllMocks()
+
+      seedTable('events', [{ id: 'evt-1', title: 'Event', titleEs: 'Event', titleEn: 'Event', dateKind: 'single', date: '2026-04-20' }])
+      seedTable('rooms', [{ id: 'room-1', name: 'Room 1' }])
+
       const { updateClubEvent } = await import('@/lib/server/events/club-events-service')
 
-      await updateClubEvent(createAdminSession(), 'evt-1', {
+      const result = await updateClubEvent(createAdminSession(), 'evt-1', {
         schedules: [
           {
             roomId: 'room-1',
@@ -486,46 +494,26 @@ describe('OIR-208: Unified Events', () => {
         blocksRooms: true,
       })
 
-      // Test passes if no error thrown
+      expect(result.id).toBe('evt-1')
     })
 
     it('rejects a block whose table_id does not belong to room_id (mismatched room/table payload)', async () => {
-      // table-1 belongs to room-1, so pairing with room-2 should fail. The
-      // TABLE_ROOM_MAP inside the RPC mock (buildSupabaseMock, top of file)
-      // is what actually enforces this — updateClubEvent never touches the
-      // Drizzle seam, so no drizzle-mock fixture is needed here.
+      // KIM-451: updateClubEvent now uses Drizzle. Table validation happens in assertClubEventBlocksTableRoomConsistency.
+      // Seed: table-1 belongs to room-1, so pairing with room-2 should fail.
+      getDrizzleDbInternal.instance = null
+      resetDb()
+      vi.clearAllMocks()
 
-      // This test must explicitly wire its own admin-client mock rather than
-      // relying on whatever a PRECEDING test's `.mockReturnValue()` left in
-      // place (vi.clearAllMocks() does not reset mock implementations) —
-      // otherwise it may hit an admin mock whose `rpc` doesn't simulate the
-      // mismatched room/table 23514 error this test targets (KIM-434 3/5).
-      const mockSupabase = buildSupabaseMock()
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
+      seedTable('events', [{ id: 'evt-1', title: 'Event', titleEs: 'Event', titleEn: 'Event', dateKind: 'single', date: '2026-04-20' }])
+      seedTable('rooms', [
+        { id: 'room-1', name: 'Room 1' },
+        { id: 'room-2', name: 'Room 2' },
+      ])
+      seedTable('tables', [{ id: 'table-1', roomId: 'room-1', name: 'Table 1' }])
 
-      vi.resetModules()
       const { updateClubEvent } = await import('@/lib/server/events/club-events-service')
 
-      // The module-level stub for validateAndNormaliseSchedule (top of file)
-      // always returns `[]`, which is fine for the other tests in this
-      // describe block (they don't inspect the built RPC payload) but loses
-      // roomId/tableId entirely — the block would get filtered out before
-      // ever reaching the RPC's mismatch check. This test specifically
-      // exercises that RPC-error path, so it needs a real per-schedule
-      // normalisation matching validateAndNormaliseSchedule's actual shape.
-      vi.mocked(await import('@/lib/server/events/events-service')).validateAndNormaliseSchedule.mockImplementation(
-        (raw: any) => ({
-          room_id: raw.roomId ?? null,
-          table_id: raw.tableId ?? null,
-          date: raw.date,
-          start_time: raw.startTime,
-          end_time: raw.endTime,
-          all_day: raw.allDay === true,
-        }),
-      )
-
+      // Try to attach table-1 (belongs to room-1) to room-2 blocks — should fail
       await expect(
         updateClubEvent(createAdminSession(), 'evt-1', {
           schedules: [
@@ -547,14 +535,21 @@ describe('OIR-208: Unified Events', () => {
 
   describe('blocksMatchSchedules includes tableId comparison', () => {
     it('treats a schedule as unchanged when its tableId matches the stored block (RPC skipped)', async () => {
-      // updateClubEvent reads current blocks via the Supabase admin client
-      // (fetchEventRoomBlocks -> admin.from('event_room_blocks')...), not the
-      // Drizzle seam, so the drizzle-mock fixture this test used to set here
-      // was never consulted — removed as vestigial.
-      vi.resetModules()
+      // KIM-451: updateClubEvent now uses Drizzle. Seed event with table-scoped block.
+      getDrizzleDbInternal.instance = null
+      resetDb()
+      vi.clearAllMocks()
+
+      seedTable('events', [{ id: 'evt-1', title: 'Event', titleEs: 'Event', titleEn: 'Event', dateKind: 'single', date: '2026-04-20' }])
+      seedTable('rooms', [{ id: 'room-1', name: 'Room 1' }])
+      seedTable('tables', [{ id: 'table-1', roomId: 'room-1', name: 'Table 1' }])
+      seedTable('eventRoomBlocks', [
+        { id: 'block-1', eventId: 'evt-1', roomId: 'room-1', tableId: 'table-1', date: '2026-04-20', startTime: '14:00:00', endTime: '16:00:00', allDay: false },
+      ])
+
       const { updateClubEvent } = await import('@/lib/server/events/club-events-service')
 
-      await updateClubEvent(createAdminSession(), 'evt-1', {
+      const result = await updateClubEvent(createAdminSession(), 'evt-1', {
         schedules: [
           {
             roomId: 'room-1',
@@ -567,15 +562,28 @@ describe('OIR-208: Unified Events', () => {
         blocksRooms: true,
       })
 
-      // Test passes if update succeeds (RPC skipped due to blocksMatchSchedules optimization)
+      expect(result.id).toBe('evt-1')
     })
 
     it('detects difference when tableId changes between the stored block and incoming schedule', async () => {
-      // See note above: no drizzle-mock fixture needed.
-      vi.resetModules()
+      // KIM-451: updateClubEvent now uses Drizzle. Seed event with table-scoped block.
+      getDrizzleDbInternal.instance = null
+      resetDb()
+      vi.clearAllMocks()
+
+      seedTable('events', [{ id: 'evt-1', title: 'Event', titleEs: 'Event', titleEn: 'Event', dateKind: 'single', date: '2026-04-20' }])
+      seedTable('rooms', [{ id: 'room-1', name: 'Room 1' }])
+      seedTable('tables', [
+        { id: 'table-1', roomId: 'room-1', name: 'Table 1' },
+        { id: 'table-3', roomId: 'room-1', name: 'Table 3' },
+      ])
+      seedTable('eventRoomBlocks', [
+        { id: 'block-1', eventId: 'evt-1', roomId: 'room-1', tableId: 'table-1', date: '2026-04-20', startTime: '14:00:00', endTime: '16:00:00', allDay: false },
+      ])
+
       const { updateClubEvent } = await import('@/lib/server/events/club-events-service')
 
-      await updateClubEvent(createAdminSession(), 'evt-1', {
+      const result = await updateClubEvent(createAdminSession(), 'evt-1', {
         schedules: [
           {
             roomId: 'room-1',
@@ -588,15 +596,25 @@ describe('OIR-208: Unified Events', () => {
         blocksRooms: true,
       })
 
-      // Test passes - different tableId causes block update (not skipped)
+      expect(result.id).toBe('evt-1')
     })
 
     it('detects difference when table_id differs (room-level block vs. table-scoped schedule)', async () => {
-      // See note above: no drizzle-mock fixture needed.
-      vi.resetModules()
+      // KIM-451: updateClubEvent now uses Drizzle. Seed event with room-level block.
+      getDrizzleDbInternal.instance = null
+      resetDb()
+      vi.clearAllMocks()
+
+      seedTable('events', [{ id: 'evt-1', title: 'Event', titleEs: 'Event', titleEn: 'Event', dateKind: 'single', date: '2026-04-20' }])
+      seedTable('rooms', [{ id: 'room-1', name: 'Room 1' }])
+      seedTable('tables', [{ id: 'table-3', roomId: 'room-1', name: 'Table 3' }])
+      seedTable('eventRoomBlocks', [
+        { id: 'block-1', eventId: 'evt-1', roomId: 'room-1', tableId: null, date: '2026-04-20', startTime: '14:00:00', endTime: '16:00:00', allDay: false },
+      ])
+
       const { updateClubEvent } = await import('@/lib/server/events/club-events-service')
 
-      await updateClubEvent(createAdminSession(), 'evt-1', {
+      const result = await updateClubEvent(createAdminSession(), 'evt-1', {
         schedules: [
           {
             roomId: 'room-1',
@@ -609,7 +627,7 @@ describe('OIR-208: Unified Events', () => {
         blocksRooms: true,
       })
 
-      // Test passes - null -> table-3 is a meaningful change
+      expect(result.id).toBe('evt-1')
     })
   })
 
