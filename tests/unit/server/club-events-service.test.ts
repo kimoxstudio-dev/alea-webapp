@@ -1480,28 +1480,67 @@ describe('club-events-service', () => {
   describe('deleteClubEvent', () => {
     it('admin can delete a club event', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+
+      seed({
+        events: [
+          {
+            id: 'evt-1',
+            title: 'Event',
+            titleEs: 'Evento',
+            titleEn: 'Event',
+            blurbEs: null,
+            blurbEn: null,
+            descriptionEs: null,
+            descriptionEn: null,
+            categoryEs: null,
+            categoryEn: null,
+            dateKind: 'single',
+            date: '2026-04-20',
+            endDate: null,
+            recurrenceLabelEs: null,
+            recurrenceLabelEn: null,
+            imageUrl: null,
+            linkUrl: null,
+            createdBy: 'user-1',
+            createdAt: '2026-04-01T00:00:00Z',
+          },
+        ],
+      })
 
       const { deleteClubEvent } = await loadClubEventsService()
 
       await deleteClubEvent(adminSession, 'evt-1')
+      // Deletion succeeds without error
     })
 
     it('non-admin member gets 403 Forbidden on delete', async () => {
       const memberSession = createMemberSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
+
+      seed({
+        events: [
+          {
+            id: 'evt-1',
+            title: 'Event',
+            titleEs: 'Evento',
+            titleEn: 'Event',
+            blurbEs: null,
+            blurbEn: null,
+            descriptionEs: null,
+            descriptionEn: null,
+            categoryEs: null,
+            categoryEn: null,
+            dateKind: 'single',
+            date: '2026-04-20',
+            endDate: null,
+            recurrenceLabelEs: null,
+            recurrenceLabelEn: null,
+            imageUrl: null,
+            linkUrl: null,
+            createdBy: 'user-1',
+            createdAt: '2026-04-01T00:00:00Z',
+          },
+        ],
+      })
 
       const { deleteClubEvent } = await loadClubEventsService()
 
@@ -1514,10 +1553,32 @@ describe('club-events-service', () => {
   describe('listAdminClubEvents', () => {
     it('admin gets upcoming and past events split by date', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+
+      seed({
+        events: [
+          {
+            id: 'evt-upcoming-1',
+            title: 'Upcoming',
+            titleEs: 'Próximo',
+            titleEn: 'Upcoming',
+            blurbEs: null,
+            blurbEn: null,
+            descriptionEs: null,
+            descriptionEn: null,
+            categoryEs: null,
+            categoryEn: null,
+            dateKind: 'single',
+            date: '2026-09-01',
+            endDate: null,
+            recurrenceLabelEs: null,
+            recurrenceLabelEn: null,
+            imageUrl: null,
+            linkUrl: null,
+            createdBy: 'user-1',
+            createdAt: '2026-04-01T00:00:00Z',
+          },
+        ],
+      })
 
       const { listAdminClubEvents } = await loadClubEventsService()
 
@@ -1531,17 +1592,6 @@ describe('club-events-service', () => {
 
     it('non-admin member gets 403 Forbidden', async () => {
       const memberSession = createMemberSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/shared/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
-
       const { listAdminClubEvents } = await loadClubEventsService()
 
       await expect(
@@ -1552,10 +1602,31 @@ describe('club-events-service', () => {
 
   describe('listClubEvents', () => {
     it('returns upcoming and past club events for public listing', async () => {
-      const mockSupabaseClient = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient
-        .mockResolvedValue(mockSupabaseClient as any)
+      seed({
+        events: [
+          {
+            id: 'evt-public-1',
+            title: 'Public Event',
+            titleEs: 'Evento Público',
+            titleEn: 'Public Event',
+            blurbEs: null,
+            blurbEn: null,
+            descriptionEs: null,
+            descriptionEn: null,
+            categoryEs: null,
+            categoryEn: null,
+            dateKind: 'single',
+            date: '2026-09-01',
+            endDate: null,
+            recurrenceLabelEs: null,
+            recurrenceLabelEn: null,
+            imageUrl: null,
+            linkUrl: null,
+            createdBy: 'user-1',
+            createdAt: '2026-04-01T00:00:00Z',
+          },
+        ],
+      })
 
       const { listClubEvents } = await loadClubEventsService()
 
@@ -1568,46 +1639,31 @@ describe('club-events-service', () => {
 
   describe('listEvents (from events-service.ts)', () => {
     it('excludes landing-only rows (both title_es and title_en populated)', async () => {
-      const mockSupabaseClient = buildSupabaseMock()
-      mockSupabaseClient.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              or: vi.fn(function (filter: string) {
-                expect(filter).toContain('title_es')
-                expect(filter).toContain('title_en')
-                return {
-                  order: vi.fn(function () {
-                    return {
-                      order: vi.fn(async () => ({
-                        data: [
-                          {
-                            id: 'evt-internal-1',
-                            title: 'Internal Event',
-                            description: null,
-                            date: '2026-04-20',
-                            start_time: '18:00',
-                            end_time: '22:00',
-                            created_by: 'user-1',
-                            created_at: '2026-04-01T00:00:00Z',
-                          },
-                        ],
-                        error: null,
-                      })),
-                    }
-                  }),
-                }
-              }),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient
-        .mockResolvedValue(mockSupabaseClient as any)
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(buildSupabaseMock() as any)
+      seed({
+        events: [
+          {
+            id: 'evt-landing-1',
+            title: 'Landing Event',
+            titleEs: 'Evento Landing',
+            titleEn: 'Landing Event',
+            blurbEs: null,
+            blurbEn: null,
+            descriptionEs: null,
+            descriptionEn: null,
+            categoryEs: null,
+            categoryEn: null,
+            dateKind: 'single',
+            date: '2026-09-01',
+            endDate: null,
+            recurrenceLabelEs: null,
+            recurrenceLabelEn: null,
+            imageUrl: null,
+            linkUrl: null,
+            createdBy: 'user-1',
+            createdAt: '2026-04-01T00:00:00Z',
+          },
+        ],
+      })
 
       const { listEvents } = await loadEventsService()
 
@@ -1620,63 +1676,32 @@ describe('club-events-service', () => {
   describe('updateClubEvent with fallback semantics edge cases (OIR-206 round 2)', () => {
     it('rule 2: explicit different titleEn + blank titleEn payload = re-enable auto-copy to new ES', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      // Current row: title_en !== title_es (deliberately set)
-      const currentRow = {
-        id: 'evt-1',
-        title: 'Event',
-        title_es: 'Evento Antiguo',
-        title_en: 'Old Explicit Title', // Deliberately different from ES
-        blurb_es: null,
-        blurb_en: null,
-        description_es: null,
-        description_en: null,
-        category_es: null,
-        category_en: null,
-        date_kind: 'single',
-        date: '2026-04-20',
-        end_date: null,
-        recurrence_label_es: null,
-        recurrence_label_en: null,
-        image_url: null,
-        link_url: null,
-        created_by: 'user-1',
-        created_at: '2026-04-01T00:00:00Z',
-      }
 
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: currentRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      ...currentRow,
-                      title_es: 'Evento Nuevo',
-                      title_en: 'Evento Nuevo', // Should become new ES (rule 2)
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      seed({
+        events: [
+          {
+            id: 'evt-1',
+            title: 'Event',
+            titleEs: 'Evento Antiguo',
+            titleEn: 'Old Explicit Title',
+            blurbEs: null,
+            blurbEn: null,
+            descriptionEs: null,
+            descriptionEn: null,
+            categoryEs: null,
+            categoryEn: null,
+            dateKind: 'single',
+            date: '2026-04-20',
+            endDate: null,
+            recurrenceLabelEs: null,
+            recurrenceLabelEn: null,
+            imageUrl: null,
+            linkUrl: null,
+            createdBy: 'user-1',
+            createdAt: '2026-04-01T00:00:00Z',
+          },
+        ],
+      })
 
       const { updateClubEvent } = await loadClubEventsService()
 
@@ -1685,68 +1710,37 @@ describe('club-events-service', () => {
         titleEn: '', // Blank = re-enable auto-copy
       })
 
-      expect(result.titleEn).toBe('Evento Nuevo') // Follows new ES
+      expect(result.titleEn).toBe('Evento Nuevo')
     })
 
     it('rule 1: resending identical titleEn (en === es deliberately) + ES change = EN preserved', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      // Current row: title_en === title_es (could be deliberate or auto-copied, but identical)
-      const currentRow = {
-        id: 'evt-1',
-        title: 'Event',
-        title_es: 'Evento Antiguo',
-        title_en: 'Evento Antiguo', // Same as ES (deliberately or auto-copied)
-        blurb_es: null,
-        blurb_en: null,
-        description_es: null,
-        description_en: null,
-        category_es: null,
-        category_en: null,
-        date_kind: 'single',
-        date: '2026-04-20',
-        end_date: null,
-        recurrence_label_es: null,
-        recurrence_label_en: null,
-        image_url: null,
-        link_url: null,
-        created_by: 'user-1',
-        created_at: '2026-04-01T00:00:00Z',
-      }
 
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: currentRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      ...currentRow,
-                      title_es: 'Evento Nuevo',
-                      title_en: 'Evento Antiguo', // Preserved because explicitly resent (rule 1)
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      seed({
+        events: [
+          {
+            id: 'evt-1',
+            title: 'Event',
+            titleEs: 'Evento Antiguo',
+            titleEn: 'Evento Antiguo',
+            blurbEs: null,
+            blurbEn: null,
+            descriptionEs: null,
+            descriptionEn: null,
+            categoryEs: null,
+            categoryEn: null,
+            dateKind: 'single',
+            date: '2026-04-20',
+            endDate: null,
+            recurrenceLabelEs: null,
+            recurrenceLabelEn: null,
+            imageUrl: null,
+            linkUrl: null,
+            createdBy: 'user-1',
+            createdAt: '2026-04-01T00:00:00Z',
+          },
+        ],
+      })
 
       const { updateClubEvent } = await loadClubEventsService()
 
@@ -1755,136 +1749,76 @@ describe('club-events-service', () => {
         titleEn: 'Evento Antiguo', // Resend explicit identical value
       })
 
-      expect(result.titleEn).toBe('Evento Antiguo') // Preserved by rule 1
+      expect(result.titleEn).toBe('Evento Antiguo')
     })
 
     it('rule 2: whitespace-only titleEn behaves as blank (re-enable auto-copy to new ES)', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      const currentRow = {
-        id: 'evt-1',
-        title: 'Event',
-        title_es: 'Evento Antiguo',
-        title_en: 'Old Explicit Title',
-        blurb_es: null,
-        blurb_en: null,
-        description_es: null,
-        description_en: null,
-        category_es: null,
-        category_en: null,
-        date_kind: 'single',
-        date: '2026-04-20',
-        end_date: null,
-        recurrence_label_es: null,
-        recurrence_label_en: null,
-        image_url: null,
-        link_url: null,
-        created_by: 'user-1',
-        created_at: '2026-04-01T00:00:00Z',
-      }
 
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: currentRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      ...currentRow,
-                      title_es: 'Evento Nuevo',
-                      title_en: 'Evento Nuevo', // Should become new ES (whitespace trimmed = empty)
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      seed({
+        events: [
+          {
+            id: 'evt-1',
+            title: 'Event',
+            titleEs: 'Evento Antiguo',
+            titleEn: 'Old Explicit Title',
+            blurbEs: null,
+            blurbEn: null,
+            descriptionEs: null,
+            descriptionEn: null,
+            categoryEs: null,
+            categoryEn: null,
+            dateKind: 'single',
+            date: '2026-04-20',
+            endDate: null,
+            recurrenceLabelEs: null,
+            recurrenceLabelEn: null,
+            imageUrl: null,
+            linkUrl: null,
+            createdBy: 'user-1',
+            createdAt: '2026-04-01T00:00:00Z',
+          },
+        ],
+      })
 
       const { updateClubEvent } = await loadClubEventsService()
 
       const result = await updateClubEvent(adminSession, 'evt-1', {
         titleEs: 'Evento Nuevo',
-        titleEn: '   ', // Whitespace-only = treated as empty (rule 2)
+        titleEn: '   ', // Whitespace-only = treated as empty
       })
 
-      expect(result.titleEn).toBe('Evento Nuevo') // Follows new ES
+      expect(result.titleEn).toBe('Evento Nuevo')
     })
 
     it('rule 2: blank blurbEn (nullable) re-enables auto-copy to new ES (nullable field)', async () => {
       const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      const currentRow = {
-        id: 'evt-1',
-        title: 'Event',
-        title_es: 'Evento',
-        title_en: 'Event',
-        blurb_es: 'Viejo resumen',
-        blurb_en: 'Old blurb summary', // Explicitly set
-        description_es: null,
-        description_en: null,
-        category_es: null,
-        category_en: null,
-        date_kind: 'single',
-        date: '2026-04-20',
-        end_date: null,
-        recurrence_label_es: null,
-        recurrence_label_en: null,
-        image_url: null,
-        link_url: null,
-        created_by: 'user-1',
-        created_at: '2026-04-01T00:00:00Z',
-      }
 
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: currentRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      ...currentRow,
-                      blurb_es: 'Nuevo resumen',
-                      blurb_en: 'Nuevo resumen', // Becomes new ES (rule 2, nullable)
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      seed({
+        events: [
+          {
+            id: 'evt-1',
+            title: 'Event',
+            titleEs: 'Evento',
+            titleEn: 'Event',
+            blurbEs: 'Viejo resumen',
+            blurbEn: 'Old blurb summary',
+            descriptionEs: null,
+            descriptionEn: null,
+            categoryEs: null,
+            categoryEn: null,
+            dateKind: 'single',
+            date: '2026-04-20',
+            endDate: null,
+            recurrenceLabelEs: null,
+            recurrenceLabelEn: null,
+            imageUrl: null,
+            linkUrl: null,
+            createdBy: 'user-1',
+            createdAt: '2026-04-01T00:00:00Z',
+          },
+        ],
+      })
 
       const { updateClubEvent } = await loadClubEventsService()
 
