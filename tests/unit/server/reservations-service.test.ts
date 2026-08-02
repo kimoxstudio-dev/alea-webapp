@@ -584,8 +584,10 @@ describe('reservations service', () => {
     it('rejects overlapping same surfaces on removable-top tables', async () => {
       const { createReservationForSession } = await loadReservationModules()
 
+      // r2 is already on t3 with surface='top' at 10:00-12:00 by member-1
+      // Try to create a different user's reservation on the same surface (should fail)
       await expect(
-        createReservationForSession(memberSession, {
+        createReservationForSession({ id: 'other-user', role: 'member' }, {
           tableId: 't3',
           surface: 'top',
           date: '2027-06-15',
@@ -598,7 +600,9 @@ describe('reservations service', () => {
     it('allows overlapping opposite surfaces on removable-top tables', async () => {
       const { createReservationForSession } = await loadReservationModules()
 
-      const result = await createReservationForSession(memberSession, {
+      // r2 is on t3 with surface='top' at 10:00-12:00
+      // We should be able to reserve the 'bottom' surface at the same time
+      const result = await createReservationForSession({ id: 'other-user', role: 'member' }, {
         tableId: 't3',
         surface: 'bottom',
         date: '2027-06-15',
@@ -612,13 +616,15 @@ describe('reservations service', () => {
     it('rejects equipment already reserved in an overlapping booking', async () => {
       const { createReservationForSession } = await loadReservationModules()
 
+      // r1 has eq-1 reserved at 16:00-18:00 on t1
+      // Try to reserve eq-1 with a different user at overlapping time (should fail on equipment conflict)
       await expect(
-        createReservationForSession(memberSession, {
+        createReservationForSession({ id: 'user-9', role: 'member' }, {
           tableId: 't2',
           date: '2027-06-15',
           startTime: '16:30',
           endTime: '17:30',
-          equipment: ['eq-1'],
+          equipmentIds: ['eq-1'],
         }),
       ).rejects.toMatchObject({ message: 'EQUIPMENT_UNAVAILABLE' })
     })
@@ -658,23 +664,24 @@ describe('reservations service', () => {
             id: 'event-1',
             eventId: 'evt-1',
             roomId: 'room-1',
-            tableId: 't1',
             date: '2027-06-15',
             startTime: '16:30',
             endTime: '17:30',
+            tableId: null,
             allDay: false,
           },
         ],
       })
 
+      // Use a different user to avoid the same-user overlap with r1
       await expect(
-        createReservationForSession(memberSession, {
+        createReservationForSession({ id: 'user-9', role: 'member' }, {
           tableId: 't1',
           date: '2027-06-15',
           startTime: '16:30',
           endTime: '17:30',
         }),
-      ).rejects.toMatchObject({ message: 'EVENT_BLOCK_CONFLICT' })
+      ).rejects.toMatchObject({ message: 'ROOM_BLOCKED_BY_EVENT' })
     })
 
     it('maps conflicting slots to a 409 service error', async () => {
