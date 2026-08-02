@@ -49,21 +49,17 @@ vi.mock('@/lib/club-time', () => ({
   isValidDateOnlyString: vi.fn((s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s)),
 }))
 
-let sharedDrizzleDb: ReturnType<typeof createStatefulDrizzleDb> | null = null
+function getDrizzleDbInternal() {
+  if (!getDrizzleDbInternal.instance) {
+    getDrizzleDbInternal.instance = createStatefulDrizzleDb()
+  }
+  return getDrizzleDbInternal.instance
+}
+getDrizzleDbInternal.instance = null as ReturnType<typeof createStatefulDrizzleDb> | null
 
 vi.mock('@/lib/db', () => ({
-  getDrizzleDb: vi.fn(() => {
-    if (!sharedDrizzleDb) {
-      sharedDrizzleDb = createStatefulDrizzleDb()
-    }
-    return sharedDrizzleDb
-  }),
-  getDrizzleAdminDb: vi.fn(() => {
-    if (!sharedDrizzleDb) {
-      sharedDrizzleDb = createStatefulDrizzleDb()
-    }
-    return sharedDrizzleDb
-  }),
+  getDrizzleDb: vi.fn(() => getDrizzleDbInternal()),
+  getDrizzleAdminDb: vi.fn(() => getDrizzleDbInternal()),
   getAdminDb: vi.fn(),
   getDb: vi.fn(),
 }))
@@ -703,6 +699,9 @@ describe('OIR-208: Unified Events', () => {
       seedTable('profiles', [
         { id: 'user-1', memberNumber: 'M-0000001', createdAt: new Date(), email: null, emailVerified: false, avatar: null, fullName: null },
       ])
+      seedTable('rooms', [
+        { id: 'room-1', name: 'Reservation Room' },
+      ])
     })
 
     // Shared query-chain stub: every method (eq/in/lt/gt/etc.) returns the
@@ -994,6 +993,10 @@ describe('OIR-208: Unified Events', () => {
     }
 
     it('hasEventBlockConflict: detects conflict on exact table when table_id set', async () => {
+      // Ensure Supabase mocks are cleared (prevent inheritance from previous test)
+      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockClear()
+      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockClear()
+
       const { seedTable } = await import('@/tests/unit/mocks/drizzle-mock')
       const { eventRoomBlocks } = await import('@/lib/db/schema')
 
