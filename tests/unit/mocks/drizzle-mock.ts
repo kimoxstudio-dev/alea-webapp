@@ -398,10 +398,10 @@ export function createDrizzleQueryBuilder() {
         return createDeleteWhereReturningMock()
       }),
     })),
-    // Raw SQL execution
+    // Raw SQL execution — returns whatever executeMock resolves to, allowing
+    // tests to configure the shape (e.g., { rows: [{ now: Date }] } for getDatabaseNow)
     execute: vi.fn((...args: unknown[]) => {
-      executeMock(...args)
-      return Promise.resolve({ rowCount: 0 })
+      return executeMock(...args)
     }),
     // Support db.transaction() wrapper for atomic operations.
     // The callback receives a query builder (tx) with the same chainable structure.

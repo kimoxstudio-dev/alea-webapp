@@ -6,6 +6,7 @@ import {
   insertMock,
   updateMock,
   deleteMock,
+  executeMock,
   createAdminSession,
   createMemberSession,
 } from '@/tests/unit/mocks/drizzle-mock'
@@ -122,24 +123,34 @@ describe('getTableAvailability', () => {
     listSavedGamesMock.mockResolvedValue({ data: [], error: null })
     listEventBlocksMock.mockResolvedValue({ data: [], error: null })
     listEventsMock.mockResolvedValue({ data: [], error: null })
-    
-    // Setup default table fixture for select mock
-    selectMock.mockResolvedValue([
-      {
-        id: 'c3d4e5f6-a7b8-9012-cdef-012345678901',
-        roomId: '1',
-        name: 'Mesa 3',
-        type: 'removable_top',
-        qrCode: 'QR-3',
-        posX: 1,
-        posY: 1,
-      },
-    ])
+
+    // Setup executeMock to handle getDatabaseNow query: select now() as now
+    executeMock.mockResolvedValue({ rows: [{ now: new Date('2026-05-26T12:00:00Z') }], rowCount: 1 })
+
+    // NOTE: Each individual test will load modules (calling vi.resetModules()), which clears
+    // these mocks. Tests must set up their own selectMock values AFTER loading modules.
+    // This beforeEach is here only for setup of other mocks (executeMock, rpcMock, etc.)
+    // that don't need per-test customization.
   })
 
   it('builds removable-top availability from Supabase reservations', async () => {
-    listReservationsMock.mockResolvedValue({
-      data: [
+    const { getTableAvailability } = await loadTablesModules()
+
+    // Setup mocks AFTER loading modules (vi.resetModules() in loadTablesModules() clears all mocks)
+    executeMock.mockResolvedValue({ rows: [{ now: new Date('2025-01-01T09:00:00.000Z') }], rowCount: 1 })
+    selectMock
+      .mockResolvedValueOnce([
+        {
+          id: 'c3d4e5f6-a7b8-9012-cdef-012345678901',
+          roomId: '1',
+          name: 'Mesa 3',
+          type: 'removable_top',
+          qrCode: 'QR-3',
+          posX: 1,
+          posY: 1,
+        },
+      ])
+      .mockResolvedValueOnce([
         {
           id: 'r2',
           table_id: 'c3d4e5f6-a7b8-9012-cdef-012345678901',
@@ -148,15 +159,11 @@ describe('getTableAvailability', () => {
           end_time: '12:00:00',
           status: 'active',
           surface: 'top',
-          user_id: '2',
-          created_at: '2025-01-01T00:00:00.000Z',
           activated_at: null,
         },
-      ],
-      error: null,
-    })
-    
-    const { getTableAvailability } = await loadTablesModules()
+      ])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
 
     const availability = await getTableAvailability('c3d4e5f6-a7b8-9012-cdef-012345678901', '2025-01-01')
 
@@ -165,8 +172,23 @@ describe('getTableAvailability', () => {
   })
 
   it('filters reservations with status in [active, pending]', async () => {
-    listReservationsMock.mockResolvedValue({
-      data: [
+    const { getTableAvailability } = await loadTablesModules()
+
+    // Setup mocks AFTER loading modules
+    executeMock.mockResolvedValue({ rows: [{ now: new Date('2026-05-26T12:00:00Z') }], rowCount: 1 })
+    selectMock
+      .mockResolvedValueOnce([
+        {
+          id: 'c3d4e5f6-a7b8-9012-cdef-012345678901',
+          roomId: '1',
+          name: 'Mesa 3',
+          type: 'removable_top',
+          qrCode: 'QR-3',
+          posX: 1,
+          posY: 1,
+        },
+      ])
+      .mockResolvedValueOnce([
         {
           id: 'r2',
           table_id: 'c3d4e5f6-a7b8-9012-cdef-012345678901',
@@ -175,28 +197,35 @@ describe('getTableAvailability', () => {
           end_time: '12:00:00',
           status: 'active',
           surface: 'top',
-          user_id: '2',
-          created_at: '2025-01-01T00:00:00.000Z',
           activated_at: null,
         },
-      ],
-      error: null,
-    })
-    
-    const { getTableAvailability } = await loadTablesModules()
+      ])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
 
     await getTableAvailability('c3d4e5f6-a7b8-9012-cdef-012345678901', '2025-01-01')
 
-    expect(listReservationsMock).toHaveBeenCalled()
+    expect(selectMock).toHaveBeenCalled()
   })
 
   it('treats pending reservations as occupying time slots', async () => {
-    // Use a recent created_at time so isPendingReservationExpired doesn't filter it out
-    // If the pending reservation was created within ~24-48 hours of the current mock time
-    const recentCreatedAt = new Date('2026-05-25T14:00:00Z').toISOString()
-    
-    listReservationsMock.mockResolvedValue({
-      data: [
+    const { getTableAvailability } = await loadTablesModules()
+
+    // Setup mocks AFTER loading modules
+    executeMock.mockResolvedValue({ rows: [{ now: new Date('2026-05-26T12:00:00Z') }], rowCount: 1 })
+    selectMock
+      .mockResolvedValueOnce([
+        {
+          id: 'c3d4e5f6-a7b8-9012-cdef-012345678901',
+          roomId: '1',
+          name: 'Mesa 3',
+          type: 'removable_top',
+          qrCode: 'QR-3',
+          posX: 1,
+          posY: 1,
+        },
+      ])
+      .mockResolvedValueOnce([
         {
           id: 'r_pending',
           table_id: 'c3d4e5f6-a7b8-9012-cdef-012345678901',
@@ -205,15 +234,11 @@ describe('getTableAvailability', () => {
           end_time: '15:00:00',
           status: 'pending',
           surface: 'top',
-          user_id: '2',
-          created_at: recentCreatedAt,
           activated_at: null,
         },
-      ],
-      error: null,
-    })
-
-    const { getTableAvailability } = await loadTablesModules()
+      ])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
 
     const availability = await getTableAvailability('c3d4e5f6-a7b8-9012-cdef-012345678901', '2026-05-26')
 
@@ -221,10 +246,25 @@ describe('getTableAvailability', () => {
   })
 
   it('blocks the lower surface for the full day when an active Saved Game covers the date', async () => {
-    listReservationsMock.mockResolvedValue({ data: [], error: null })
-    listSavedGamesMock.mockResolvedValue({ data: [{ id: 'sg-1' }], error: null })
-    
     const { getTableAvailability } = await loadTablesModules()
+
+    // Setup mocks AFTER loading modules
+    executeMock.mockResolvedValue({ rows: [{ now: new Date('2026-05-26T12:00:00Z') }], rowCount: 1 })
+    selectMock
+      .mockResolvedValueOnce([
+        {
+          id: 'c3d4e5f6-a7b8-9012-cdef-012345678901',
+          roomId: '1',
+          name: 'Mesa 3',
+          type: 'removable_top',
+          qrCode: 'QR-3',
+          posX: 1,
+          posY: 1,
+        },
+      ])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'sg-1', table_id: 'c3d4e5f6-a7b8-9012-cdef-012345678901' }])
 
     const availability = await getTableAvailability('c3d4e5f6-a7b8-9012-cdef-012345678901', '2026-05-26')
 
