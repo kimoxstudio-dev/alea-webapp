@@ -982,13 +982,20 @@ describe('OIR-208: Unified Events', () => {
     }
 
     it('hasEventBlockConflict: detects conflict on exact table when table_id set', async () => {
-      const eventBlocks = [{ id: 'blk-5', table_id: 'res-table-1' }]
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        buildReservationSessionClient({}) as any,
-      )
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        buildReservationAdminClient({ eventBlocks }) as any,
-      )
+      const { seedTable } = await import('@/tests/unit/mocks/drizzle-mock')
+      const { eventRoomBlocks } = await import('@/lib/db/schema')
+
+      // Seed event room block in Drizzle mock
+      seedTable(eventRoomBlocks, [{
+        id: 'blk-5',
+        eventId: 'evt-1',
+        roomId: 'room-1',
+        tableId: 'res-table-1',
+        date: '2026-04-20',
+        startTime: '14:00',
+        endTime: '16:00',
+        allDay: false,
+      }])
 
       const { createReservationForSession } = await import('@/lib/server/reservations/reservations-service')
 
@@ -1021,13 +1028,20 @@ describe('OIR-208: Unified Events', () => {
     })
 
     it('hasEventBlockConflict: conflict on any table when table_id is null', async () => {
-      const eventBlocks = [{ id: 'blk-7', table_id: null }]
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        buildReservationSessionClient({}) as any,
-      )
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        buildReservationAdminClient({ eventBlocks }) as any,
-      )
+      const { seedTable } = await import('@/tests/unit/mocks/drizzle-mock')
+      const { eventRoomBlocks } = await import('@/lib/db/schema')
+
+      // Seed room-level event block (no table_id) in Drizzle mock
+      seedTable(eventRoomBlocks, [{
+        id: 'blk-7',
+        eventId: 'evt-1',
+        roomId: 'room-1',
+        tableId: null,
+        date: '2026-04-20',
+        startTime: '14:00',
+        endTime: '16:00',
+        allDay: false,
+      }])
 
       const { createReservationForSession } = await import('@/lib/server/reservations/reservations-service')
 
