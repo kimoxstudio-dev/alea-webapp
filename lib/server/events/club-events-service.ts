@@ -1,4 +1,5 @@
 import 'server-only'
+import { and, asc, eq, gt, inArray, isNotNull, lt } from 'drizzle-orm'
 import type {
   AdminClubEvent,
   AdminEventMaterial,
@@ -8,12 +9,13 @@ import type {
   ClubEventDateKind,
   ClubEventStatus,
 } from '@/lib/types'
-import { getDb, getAdminDb } from '@/lib/db'
-import { serviceError } from '@/lib/server/shared/service-error'
+import { getDrizzleAdminDb, getDrizzleDb, type AdminDbClient } from '@/lib/db'
+import { equipment, eventEquipment, events, eventRoomBlocks, reservations, rooms, tables } from '@/lib/db/schema'
+import { ServiceError, serviceError } from '@/lib/server/shared/service-error'
 import { getCurrentClubDate } from '@/lib/club-time'
-import type { Tables } from '@/lib/supabase/types'
 import type { SessionUser } from '@/lib/server/auth/auth'
 import {
+  cancelSavedGamesForBlockedRoom,
   deleteEventCascade,
   isClubEventRow,
   validateAndNormaliseSchedule,
@@ -23,16 +25,38 @@ import { validateOptionalUrl } from '@/lib/validations/url'
 
 export type { AdminClubEvent, AdminListClubEventsResult }
 
-type EventRow = Tables<'events'>
-type EventRoomBlockRow = Tables<'event_room_blocks'>
+type EventRow = typeof events.$inferSelect
+type EventRoomBlockRow = typeof eventRoomBlocks.$inferSelect
 
-const CLUB_EVENT_COLUMNS = 'id, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url'
+/**
+ * KIM-438: `events` / `event_room_blocks` / `event_equipment` reads/writes
+ * below use the Drizzle/Neon seam (`getDrizzleDb()` / `getDrizzleAdminDb()`),
+ * following the pattern established in `lib/server/events/events-service.ts`
+ * (KIM-434 PR3) and `lib/server/reservations/reservations-service.ts`
+ * (#238). Unlike events-service.ts's `cancelOverlappingReservationsForBlocks`
+ * (written while `reservations` was still on the legacy Supabase seam and
+ * therefore had to run as a non-transactional follow-up call), `reservations`
+ * is now also on Drizzle/Neon (#238) — so the reservation-cancellation for a
+ * blocked room/table below runs INSIDE the same `db.transaction()` as the
+ * event/block write, giving true all-or-nothing atomicity again (matching
+ * the atomicity the removed `apply_club_event_room_blocks` Postgres RPC used
+ * to provide).
+ */
 
-// Same as CLUB_EVENT_COLUMNS plus the admin-only category fields and id/date
-// needed to drive the dashboard "Club events" management view (OIR-203).
-// Kept as its own string literal (not built via concatenation) so Supabase's
-// select() overload can still infer a concrete row shape.
-const ADMIN_CLUB_EVENT_COLUMNS = 'id, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url, category_es, category_en'
+/**
+ * Runs a Drizzle query, translating any thrown DB/driver error into a
+ * uniform 500 ServiceError. Business-logic outcomes (e.g. "no row
+ * returned" -> 404, validation -> 400) are handled by callers, outside this
+ * wrapper, so their specific status codes aren't swallowed into a 500.
+ * (Same helper as lib/server/events/events-service.ts.)
+ */
+async function runQuery<T>(query: Promise<T>): Promise<T> {
+  try {
+    return await query
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+}
 
 const DEFAULT_PAST_LIMIT = 24
 
@@ -41,28 +65,28 @@ const DEFAULT_PAST_LIMIT = 24
  * stored — a recurring event (e.g. "every Friday") is always upcoming since
  * it has no defined end.
  */
-function statusFor(row: Pick<EventRow, 'date_kind' | 'date' | 'end_date'>, today: string): ClubEventStatus {
-  if (row.date_kind === 'recurring') return 'upcoming'
-  const referenceDate = row.end_date ?? row.date
+function statusFor(row: Pick<EventRow, 'dateKind' | 'date' | 'endDate'>, today: string): ClubEventStatus {
+  if (row.dateKind === 'recurring') return 'upcoming'
+  const referenceDate = row.endDate ?? row.date
   return referenceDate < today ? 'past' : 'upcoming'
 }
 
 function toClubEvent(row: EventRow, today: string): ClubEvent {
   return {
     id: row.id,
-    titleEs: row.title_es ?? row.title,
-    titleEn: row.title_en ?? row.title,
-    blurbEs: row.blurb_es ?? '',
-    blurbEn: row.blurb_en ?? '',
-    descriptionEs: row.description_es,
-    descriptionEn: row.description_en,
-    dateKind: (row.date_kind as ClubEventDateKind) ?? 'single',
+    titleEs: row.titleEs ?? row.title,
+    titleEn: row.titleEn ?? row.title,
+    blurbEs: row.blurbEs ?? '',
+    blurbEn: row.blurbEn ?? '',
+    descriptionEs: row.descriptionEs,
+    descriptionEn: row.descriptionEn,
+    dateKind: (row.dateKind as ClubEventDateKind) ?? 'single',
     startDate: row.date,
-    endDate: row.end_date,
-    recurrenceLabelEs: row.recurrence_label_es,
-    recurrenceLabelEn: row.recurrence_label_en,
-    imageUrl: row.image_url,
-    linkUrl: row.link_url,
+    endDate: row.endDate,
+    recurrenceLabelEs: row.recurrenceLabelEs,
+    recurrenceLabelEn: row.recurrenceLabelEn,
+    imageUrl: row.imageUrl,
+    linkUrl: row.linkUrl,
     status: statusFor(row, today),
   }
 }
@@ -90,23 +114,19 @@ export async function listClubEvents(options: ListClubEventsOptions = {}): Promi
   const pastLimit = options.pastLimit ?? DEFAULT_PAST_LIMIT
   const today = getCurrentClubDate()
 
-  const supabase = await getDb()
-  const { data, error } = await supabase
-    .from('events')
-    .select(CLUB_EVENT_COLUMNS)
-    .not('title_es', 'is', null)
-    .not('title_en', 'is', null)
-    .order('date', { ascending: true })
+  const db = getDrizzleDb()
+  const rows = await runQuery(
+    db
+      .select()
+      .from(events)
+      .where(and(isNotNull(events.titleEs), isNotNull(events.titleEn)))
+      .orderBy(asc(events.date)),
+  )
 
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
+  const eventList = rows.map((row) => toClubEvent(row, today))
 
-  const rows = (data ?? []) as EventRow[]
-  const events = rows.map((row) => toClubEvent(row, today))
-
-  const upcoming = events.filter((event) => event.status === 'upcoming')
-  const past = events
+  const upcoming = eventList.filter((event) => event.status === 'upcoming')
+  const past = eventList
     .filter((event) => event.status === 'past')
     .sort((a, b) => b.startDate.localeCompare(a.startDate))
     .slice(0, pastLimit)
@@ -253,29 +273,29 @@ function resolveBilingualEnFallback(
 interface ClubEventFieldSet {
   // OIR-208: null when visibleOnLanding is false (internal-only event) — the
   // paired-titles CHECK constraint holds since both are nulled together.
-  title_es: string | null
-  title_en: string | null
-  blurb_es: string | null
-  blurb_en: string | null
-  description_es: string | null
-  description_en: string | null
-  category_es: string | null
-  category_en: string | null
-  date_kind: ClubEventDateKind
+  titleEs: string | null
+  titleEn: string | null
+  blurbEs: string | null
+  blurbEn: string | null
+  descriptionEs: string | null
+  descriptionEn: string | null
+  categoryEs: string | null
+  categoryEn: string | null
+  dateKind: ClubEventDateKind
   date: string
-  end_date: string | null
-  recurrence_label_es: string | null
-  recurrence_label_en: string | null
-  image_url: string | null
-  link_url: string | null
+  endDate: string | null
+  recurrenceLabelEs: string | null
+  recurrenceLabelEn: string | null
+  imageUrl: string | null
+  linkUrl: string | null
   // Legacy single-locale anchor columns kept NOT NULL by the original
   // "events" schema — mirrored from the ES copy / all-day sentinel, same
   // convention used by the OIR-202 seed migration, since club events have no
   // meaningful room-block time-of-day unless blocksRooms is also set.
   title: string
   description: string | null
-  start_time: string
-  end_time: string
+  startTime: string
+  endTime: string
 }
 
 /**
@@ -290,7 +310,7 @@ function resolveClubEventFields(body: ClubEventInput, current: EventRow | null):
   // so editing an internal event without resending titleEs doesn't 400.
   const titleEs = body.titleEs !== undefined
     ? requireNonEmptyString(body.titleEs, 'titleEs')
-    : requireNonEmptyString(current ? (current.title_es ?? current.title) : null, 'titleEs')
+    : requireNonEmptyString(current ? (current.titleEs ?? current.title) : null, 'titleEs')
   // OIR-206: titleEn is optional — falls back to titleEs (see
   // resolveBilingualEnFallback) rather than being required client- or
   // service-side. `?? titleEs` is a type-level safety net only; in practice
@@ -301,47 +321,47 @@ function resolveClubEventFields(body: ClubEventInput, current: EventRow | null):
     titleEs,
     body.titleEn,
     body.titleEn !== undefined,
-    current ? { es: current.title_es, en: current.title_en } : null,
+    current ? { es: current.titleEs, en: current.titleEn } : null,
   ) ?? titleEs
 
-  const blurbEs = body.blurbEs !== undefined ? optionalString(body.blurbEs, 'blurbEs') : (current?.blurb_es ?? null)
+  const blurbEs = body.blurbEs !== undefined ? optionalString(body.blurbEs, 'blurbEs') : (current?.blurbEs ?? null)
   const blurbEn = resolveBilingualEnFallback(
     'blurbEn',
     blurbEs,
     body.blurbEn,
     body.blurbEn !== undefined,
-    current ? { es: current.blurb_es, en: current.blurb_en } : null,
+    current ? { es: current.blurbEs, en: current.blurbEn } : null,
   )
-  const descriptionEs = body.descriptionEs !== undefined ? optionalString(body.descriptionEs, 'descriptionEs') : (current?.description_es ?? null)
+  const descriptionEs = body.descriptionEs !== undefined ? optionalString(body.descriptionEs, 'descriptionEs') : (current?.descriptionEs ?? null)
   const descriptionEn = resolveBilingualEnFallback(
     'descriptionEn',
     descriptionEs,
     body.descriptionEn,
     body.descriptionEn !== undefined,
-    current ? { es: current.description_es, en: current.description_en } : null,
+    current ? { es: current.descriptionEs, en: current.descriptionEn } : null,
   )
-  const categoryEs = body.categoryEs !== undefined ? optionalString(body.categoryEs, 'categoryEs') : (current?.category_es ?? null)
+  const categoryEs = body.categoryEs !== undefined ? optionalString(body.categoryEs, 'categoryEs') : (current?.categoryEs ?? null)
   const categoryEn = resolveBilingualEnFallback(
     'categoryEn',
     categoryEs,
     body.categoryEn,
     body.categoryEn !== undefined,
-    current ? { es: current.category_es, en: current.category_en } : null,
+    current ? { es: current.categoryEs, en: current.categoryEn } : null,
   )
   const recurrenceLabelEs = body.recurrenceLabelEs !== undefined
     ? optionalString(body.recurrenceLabelEs, 'recurrenceLabelEs')
-    : (current?.recurrence_label_es ?? null)
+    : (current?.recurrenceLabelEs ?? null)
   const recurrenceLabelEn = resolveBilingualEnFallback(
     'recurrenceLabelEn',
     recurrenceLabelEs,
     body.recurrenceLabelEn,
     body.recurrenceLabelEn !== undefined,
-    current ? { es: current.recurrence_label_es, en: current.recurrence_label_en } : null,
+    current ? { es: current.recurrenceLabelEs, en: current.recurrenceLabelEn } : null,
   )
 
   const dateKind = body.dateKind !== undefined
     ? normaliseDateKind(body.dateKind)
-    : ((current?.date_kind as ClubEventDateKind | undefined) ?? 'single')
+    : ((current?.dateKind as ClubEventDateKind | undefined) ?? 'single')
 
   const startDate = body.date !== undefined
     ? requireDateString(body.date, 'date')
@@ -351,26 +371,25 @@ function resolveClubEventFields(body: ClubEventInput, current: EventRow | null):
   if (dateKind === 'range') {
     endDate = body.endDate !== undefined
       ? optionalDateString(body.endDate, 'endDate')
-      : (current?.end_date ?? null)
+      : (current?.endDate ?? null)
     if (!endDate) serviceError('endDate is required when dateKind is range', 400)
     if (endDate < startDate) serviceError('endDate must be on or after date', 400)
   }
 
-  const imageUrl = body.imageUrl !== undefined ? validateOptionalUrl(body.imageUrl, 'imageUrl') : (current?.image_url ?? null)
-  const linkUrl = body.linkUrl !== undefined ? validateOptionalUrl(body.linkUrl, 'linkUrl') : (current?.link_url ?? null)
+  const imageUrl = body.imageUrl !== undefined ? validateOptionalUrl(body.imageUrl, 'imageUrl') : (current?.imageUrl ?? null)
+  const linkUrl = body.linkUrl !== undefined ? validateOptionalUrl(body.linkUrl, 'linkUrl') : (current?.linkUrl ?? null)
 
   // OIR-208: ON (default for new events) publishes the bilingual columns;
   // OFF nulls them (paired constraint holds) and keeps only the legacy
   // `title` column populated — an internal-only event. When omitted on an
   // update, preserve whatever the row currently is.
-  // KIM-434 PR3/PR3b compatibility note: isClubEventRow now expects the
-  // camelCase (Drizzle) shape { titleEs, titleEn } since events-service.ts
-  // was migrated in PR3 (commit 6c6928f). This file remains on the legacy
-  // Supabase seam (snake_case rows), so map the two fields it needs inline
-  // rather than migrating the whole row shape.
+  // KIM-438: isClubEventRow (imported from the already-migrated
+  // events-service.ts) expects the camelCase (Drizzle) shape
+  // { titleEs, titleEn } — `current` is now a Drizzle row already in that
+  // shape, so no inline snake_case->camelCase mapping is needed here anymore.
   const visibleOnLanding = body.visibleOnLanding !== undefined
     ? parseBooleanFlag(body.visibleOnLanding)
-    : (current ? isClubEventRow({ titleEs: current.title_es, titleEn: current.title_en }) : true)
+    : (current ? isClubEventRow(current) : true)
 
   // OIR-208 review fix: the unified form never edits description/start_time/
   // end_time, so an UPDATE must preserve whatever is already on the row (a
@@ -379,33 +398,33 @@ function resolveClubEventFields(body: ClubEventInput, current: EventRow | null):
   // destroy that data) — only a CREATE gets the all-day/no-description
   // defaults, since there is no prior row to preserve.
   const description = current ? current.description : null
-  const startTime = current ? current.start_time : '00:00:00'
-  const endTime = current ? current.end_time : '23:59:00'
+  const startTime = current ? current.startTime : '00:00:00'
+  const endTime = current ? current.endTime : '23:59:00'
 
   return {
-    title_es: visibleOnLanding ? titleEs : null,
-    title_en: visibleOnLanding ? titleEn : null,
+    titleEs: visibleOnLanding ? titleEs : null,
+    titleEn: visibleOnLanding ? titleEn : null,
     // Deliberate (toggle OFF stale content): blurb/description/image are kept
     // as-is when visibleOnLanding flips to false rather than being cleared.
     // This preserves the marketing copy for a later re-publish and lets the
     // admin form show it back for review when the event is re-enabled.
-    blurb_es: blurbEs,
-    blurb_en: blurbEn,
-    description_es: descriptionEs,
-    description_en: descriptionEn,
-    category_es: categoryEs,
-    category_en: categoryEn,
-    date_kind: dateKind,
+    blurbEs,
+    blurbEn,
+    descriptionEs,
+    descriptionEn,
+    categoryEs,
+    categoryEn,
+    dateKind,
     date: startDate,
-    end_date: endDate,
-    recurrence_label_es: recurrenceLabelEs,
-    recurrence_label_en: recurrenceLabelEn,
-    image_url: imageUrl,
-    link_url: linkUrl,
+    endDate,
+    recurrenceLabelEs,
+    recurrenceLabelEn,
+    imageUrl,
+    linkUrl,
     title: titleEs,
     description,
-    start_time: startTime,
-    end_time: endTime,
+    startTime,
+    endTime,
   }
 }
 
@@ -417,39 +436,39 @@ function toAdminClubEvent(
 ): AdminClubEvent {
   const roomBlocks: AdminEventRoomBlock[] = blocks.map((b) => ({
     id: b.id,
-    roomId: b.room_id,
-    tableId: b.table_id ?? null,
+    roomId: b.roomId,
+    tableId: b.tableId ?? null,
     date: b.date,
-    startTime: b.start_time.slice(0, 5),
-    endTime: b.end_time.slice(0, 5),
-    allDay: b.all_day,
+    startTime: b.startTime.slice(0, 5),
+    endTime: b.endTime.slice(0, 5),
+    allDay: b.allDay,
   }))
 
   return {
     id: row.id,
-    titleEs: row.title_es ?? row.title,
-    titleEn: row.title_en ?? row.title,
-    blurbEs: row.blurb_es ?? '',
-    blurbEn: row.blurb_en ?? '',
-    descriptionEs: row.description_es,
-    descriptionEn: row.description_en,
-    dateKind: (row.date_kind as ClubEventDateKind) ?? 'single',
+    titleEs: row.titleEs ?? row.title,
+    titleEn: row.titleEn ?? row.title,
+    blurbEs: row.blurbEs ?? '',
+    blurbEn: row.blurbEn ?? '',
+    descriptionEs: row.descriptionEs,
+    descriptionEn: row.descriptionEn,
+    dateKind: (row.dateKind as ClubEventDateKind) ?? 'single',
     startDate: row.date,
-    endDate: row.end_date,
-    recurrenceLabelEs: row.recurrence_label_es,
-    recurrenceLabelEn: row.recurrence_label_en,
-    imageUrl: row.image_url,
-    linkUrl: row.link_url,
-    categoryEs: row.category_es,
-    categoryEn: row.category_en,
+    endDate: row.endDate,
+    recurrenceLabelEs: row.recurrenceLabelEs,
+    recurrenceLabelEn: row.recurrenceLabelEn,
+    imageUrl: row.imageUrl,
+    linkUrl: row.linkUrl,
+    categoryEs: row.categoryEs,
+    categoryEn: row.categoryEn,
     status: statusFor(row, today),
     blocksRooms: roomBlocks.length > 0,
     roomBlocks,
     // OIR-208: unified events — a row is landing-visible once both bilingual
     // titles are populated (same predicate as isClubEventRow).
-    // KIM-434 PR3/PR3b compatibility note: see the mapping comment above —
-    // isClubEventRow expects camelCase, this file's rows are snake_case.
-    visibleOnLanding: isClubEventRow({ titleEs: row.title_es, titleEn: row.title_en }),
+    // KIM-438: row is already the camelCase Drizzle shape isClubEventRow
+    // expects — no inline mapping needed anymore.
+    visibleOnLanding: isClubEventRow(row),
     materials,
   }
 }
