@@ -6,6 +6,7 @@ import {
   selectMock,
   insertMock,
   updateMock,
+  executeMock,
   createAdminSession,
   createMemberSession,
 } from '@/tests/unit/mocks/drizzle-mock'
@@ -348,20 +349,43 @@ describe('getRoomTablesAvailability', () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
-    // Setup Drizzle mocks for tables table
-    selectMock.mockResolvedValue([
-      {
-        id: 't3',
-        roomId: '1',
-        name: 'Mesa 3',
-        type: 'removable_top',
-        qrCode: 'QR-3',
-        posX: 1,
-        posY: 1,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      },
-    ])
+
+    // Setup executeMock to handle getDatabaseNow query: select now() as now
+    executeMock.mockResolvedValue({ rows: [{ now: new Date('2025-01-01T09:00:00.000Z') }], rowCount: 1 })
+
+    // The production code makes multiple SELECT queries via Drizzle in this order:
+    // 1. listTablesByRoom() queries tables by roomId
+    // 2. Promise.all([reservations, eventRoomBlocks, savedGames, getDatabaseNow])
+    // Use mockResolvedValueOnce() for each query to return the right shape
+    selectMock
+      .mockResolvedValueOnce([
+        {
+          id: 't3',
+          roomId: '1',
+          name: 'Mesa 3',
+          type: 'removable_top',
+          qrCode: 'QR-3',
+          posX: 1,
+          posY: 1,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          id: 'r2',
+          table_id: 't3',
+          date: '2025-01-01',
+          start_time: '10:00:00',
+          end_time: '12:00:00',
+          status: 'active',
+          surface: 'top',
+          activated_at: null,
+        },
+      ])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+
     listReservationsMock.mockResolvedValue({
       data: [
         {
@@ -386,6 +410,37 @@ describe('getRoomTablesAvailability', () => {
 
   it('builds availability from Supabase rows', async () => {
     const { getRoomTablesAvailability } = await loadRoomsModules()
+
+    // Setup mocks AFTER loading modules (loadRoomsModules calls vi.resetModules)
+    executeMock.mockResolvedValue({ rows: [{ now: new Date('2025-01-01T09:00:00.000Z') }], rowCount: 1 })
+    selectMock
+      .mockResolvedValueOnce([
+        {
+          id: 't3',
+          roomId: '1',
+          name: 'Mesa 3',
+          type: 'removable_top',
+          qrCode: 'QR-3',
+          posX: 1,
+          posY: 1,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          id: 'r2',
+          table_id: 't3',
+          date: '2025-01-01',
+          start_time: '10:00:00',
+          end_time: '12:00:00',
+          status: 'active',
+          surface: 'top',
+          activated_at: null,
+        },
+      ])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
 
     const availability = await getRoomTablesAvailability('1', '2025-01-01')
 
