@@ -127,25 +127,10 @@ describe('getTableAvailability', () => {
     // Setup executeMock to handle getDatabaseNow query: select now() as now
     executeMock.mockResolvedValue({ rows: [{ now: new Date('2026-05-26T12:00:00Z') }], rowCount: 1 })
 
-    // The production code makes multiple SELECT queries via Drizzle in this order:
-    // 1. .from(tables) to check the table exists
-    // 2. Promise.all([reservations, eventRoomBlocks, savedGames, getDatabaseNow])
-    // Use mockResolvedValueOnce() for each query to return the right shape
-    selectMock
-      .mockResolvedValueOnce([
-        {
-          id: 'c3d4e5f6-a7b8-9012-cdef-012345678901',
-          roomId: '1',
-          name: 'Mesa 3',
-          type: 'removable_top',
-          qrCode: 'QR-3',
-          posX: 1,
-          posY: 1,
-        },
-      ])
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([])
+    // NOTE: Each individual test will load modules (calling vi.resetModules()), which clears
+    // these mocks. Tests must set up their own selectMock values AFTER loading modules.
+    // This beforeEach is here only for setup of other mocks (executeMock, rpcMock, etc.)
+    // that don't need per-test customization.
   })
 
   it('builds removable-top availability from Supabase reservations', async () => {
