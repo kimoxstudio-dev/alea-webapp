@@ -1489,7 +1489,7 @@ describe('reservations service', () => {
         reservations: [
           makeReservation({
             id: 'r-pending',
-            userId: 'member-1',
+            userId: 'user-9',
             status: 'pending',
             startTime: '16:00:00',
             endTime: '18:00:00',
@@ -1514,7 +1514,7 @@ describe('reservations service', () => {
         reservations: [
           makeReservation({
             id: 'r-pending',
-            userId: 'member-1',
+            userId: 'user-9',
             status: 'pending',
             startTime: '16:00:00',
             endTime: '18:00:00',
