@@ -626,7 +626,7 @@ describe('reservations service', () => {
           endTime: '17:30',
           equipmentIds: ['eq-1'],
         }),
-      ).rejects.toMatchObject({ message: 'EQUIPMENT_UNAVAILABLE' })
+      ).rejects.toMatchObject({ message: 'EQUIPMENT_ALREADY_RESERVED' })
     })
 
     it('rejects equipment that does not belong to the room defaults', async () => {
@@ -642,6 +642,11 @@ describe('reservations service', () => {
             createdAt: new Date(),
           },
         ],
+        room_default_equipment: [
+          ...getRows('room_default_equipment'),
+          // Lock eq-locked to room-2 so it cannot be used in room-1
+          { roomId: 'room-2', equipmentId: 'eq-locked' },
+        ],
       })
 
       await expect(
@@ -652,7 +657,7 @@ describe('reservations service', () => {
           endTime: '11:00',
           equipment: ['eq-locked'],
         }),
-      ).rejects.toMatchObject({ message: 'EQUIPMENT_NOT_AVAILABLE_FOR_ROOM' })
+      ).rejects.toMatchObject({ message: 'EQUIPMENT_LOCKED_TO_ANOTHER_ROOM' })
     })
 
     it('rejects create when an overlapping event room block exists', async () => {
