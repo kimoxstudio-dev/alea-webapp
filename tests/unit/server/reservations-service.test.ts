@@ -499,6 +499,20 @@ describe('reservations service', () => {
     it('allows a reservation that starts exactly when another ends', async () => {
       const { createReservationForSession } = await loadReservationModules()
 
+      // Seed a reservation on t2 from 16:00-18:00
+      seed({
+        reservations: [
+          makeReservation({
+            id: 'r-existing',
+            userId: 'user-other',
+            tableId: 't2',
+            startTime: '16:00:00',
+            endTime: '18:00:00',
+          }),
+        ],
+      })
+
+      // Create a new reservation starting exactly when the existing one ends
       const result = await createReservationForSession(memberSession, {
         tableId: 't2',
         date: '2027-06-15',
@@ -525,10 +539,11 @@ describe('reservations service', () => {
     it('rejects reservations created more than one week in advance', async () => {
       const { createReservationForSession } = await loadReservationModules()
 
+      // Current date is 2027-06-15, so booking more than 7 days ahead (2027-06-23) should fail
       await expect(
         createReservationForSession(memberSession, {
           tableId: 't1',
-          date: '2027-06-10',
+          date: '2027-06-23',
           startTime: '10:00',
           endTime: '11:00',
         }),
@@ -538,6 +553,9 @@ describe('reservations service', () => {
     it('rejects same-day reservations whose start time is already in the past', async () => {
       const { createReservationForSession } = await loadReservationModules()
 
+      vi.useFakeTimers()
+      vi.setSystemTime(new Date('2027-06-15T12:00:00.000Z'))
+
       await expect(
         createReservationForSession(memberSession, {
           tableId: 't1',
@@ -546,6 +564,8 @@ describe('reservations service', () => {
           endTime: '10:00',
         }),
       ).rejects.toMatchObject({ message: 'START_TIME_IN_PAST' })
+
+      vi.useRealTimers()
     })
 
     it('requires a surface for removable-top tables', async () => {
