@@ -58,7 +58,18 @@ vi.mock('@/lib/server/shared/service-error', () => ({
 }))
 
 vi.mock('@/lib/server/events/events-service', () => ({
-  validateAndNormaliseSchedule: vi.fn((schedule) => schedule),
+  validateAndNormaliseSchedule: vi.fn((schedule) => {
+    // Perform roomId→room_id and tableId→table_id mapping
+    // to match the real implementation (lib/server/events/events-service.ts:191-218)
+    return {
+      room_id: schedule.roomId ? String(schedule.roomId).trim() : null,
+      table_id: schedule.roomId && schedule.tableId ? String(schedule.tableId).trim() || null : null,
+      date: schedule.date,
+      start_time: schedule.startTime,
+      end_time: schedule.endTime,
+      all_day: schedule.allDay,
+    }
+  }),
   deleteEventCascade: vi.fn(),
   cancelSavedGamesForBlockedRoom: vi.fn(),
   cancelOverlappingReservationsForClubEventBlocks: vi.fn(),
@@ -447,27 +458,39 @@ describe('club-events-service', () => {
 
       // KIM-438: Drizzle transactions provide automatic rollback.
       // This test verifies that transaction-based cleanup works correctly.
+      // Inject a failure during the block insert step to force rollback.
+      const { eventRoomBlocks } = await import('@/lib/db/schema')
+      failNextQuery({ op: 'insert', table: eventRoomBlocks })
+
       const { createClubEvent } = await loadClubEventsService()
 
-      const result = await createClubEvent(adminSession, {
-        titleEs: 'Torneo con Bloques',
-        titleEn: 'Tournament with Blocks',
-        date: '2026-05-01',
-        dateKind: 'single',
-        blocksRooms: true,
-        schedules: [
-          {
-            date: '2026-05-01',
-            startTime: '18:00',
-            endTime: '22:00',
-            allDay: false,
-            roomId: 'room-1',
-          },
-        ],
-      })
+      // Expect the call to fail due to the injected error
+      await expect(
+        createClubEvent(adminSession, {
+          titleEs: 'Torneo con Bloques',
+          titleEn: 'Tournament with Blocks',
+          date: '2026-05-01',
+          dateKind: 'single',
+          blocksRooms: true,
+          schedules: [
+            {
+              date: '2026-05-01',
+              startTime: '18:00',
+              endTime: '22:00',
+              allDay: false,
+              roomId: 'room-1',
+            },
+          ],
+        }),
+      ).rejects.toThrow()
 
-      // Just verify the event was created (rollback behavior is implicit)
-      expect(result).toBeDefined()
+      // Verify the transaction rolled back: no event row was created
+      const eventRows = getRows('events')
+      expect(eventRows).toHaveLength(0)
+
+      // Verify no blocks were created
+      const blockRows = getRows('eventRoomBlocks')
+      expect(blockRows).toHaveLength(0)
     })
 
     it('logs the orphaned event id when BOTH the block RPC and the compensating delete fail, and still rethrows the original RPC error (PR #149 review round 2)', async () => {
@@ -483,26 +506,41 @@ describe('club-events-service', () => {
       })
 
       // KIM-438: Drizzle transactions eliminate the need for compensating logic.
+      // With Drizzle, if the block insert fails, the entire transaction (including
+      // the event insert) rolls back atomically — no orphan event row, no need for
+      // a compensating delete. This test verifies rollback on block insert failure.
+      const { eventRoomBlocks } = await import('@/lib/db/schema')
+      failNextQuery({ op: 'insert', table: eventRoomBlocks })
+
       const { createClubEvent } = await loadClubEventsService()
 
-      const result = await createClubEvent(adminSession, {
-        titleEs: 'Torneo con Bloques',
-        titleEn: 'Tournament with Blocks',
-        date: '2026-05-01',
-        dateKind: 'single',
-        blocksRooms: true,
-        schedules: [
-          {
-            date: '2026-05-01',
-            startTime: '18:00',
-            endTime: '22:00',
-            allDay: false,
-            roomId: 'room-1',
-          },
-        ],
-      })
+      // Expect the call to fail due to the injected error
+      await expect(
+        createClubEvent(adminSession, {
+          titleEs: 'Torneo con Bloques',
+          titleEn: 'Tournament with Blocks',
+          date: '2026-05-01',
+          dateKind: 'single',
+          blocksRooms: true,
+          schedules: [
+            {
+              date: '2026-05-01',
+              startTime: '18:00',
+              endTime: '22:00',
+              allDay: false,
+              roomId: 'room-1',
+            },
+          ],
+        }),
+      ).rejects.toThrow()
 
-      expect(result).toBeDefined()
+      // Verify the transaction rolled back: no event row exists
+      const eventRows = getRows('events')
+      expect(eventRows).toHaveLength(0)
+
+      // Verify no blocks were created
+      const blockRows = getRows('eventRoomBlocks')
+      expect(blockRows).toHaveLength(0)
     })
 
     it('rejects an unknown room id in schedules with 400 BEFORE inserting the event row (PR #149 review)', async () => {
@@ -520,27 +558,30 @@ describe('club-events-service', () => {
 
       const { createClubEvent } = await loadClubEventsService()
 
-      // TODO KIM-451: investigate why room validation doesn't reject non-existent roomId
-      // Temporarily expect success; service should reject invalid room
-      const result = await createClubEvent(adminSession, {
-        titleEs: 'Event',
-        titleEn: 'Event',
-        date: '2026-05-01',
-        dateKind: 'single',
-        blocksRooms: true,
-        schedules: [
-          {
-            date: '2026-05-01',
-            startTime: '18:00',
-            endTime: '22:00',
-            allDay: false,
-            roomId: 'room-does-not-exist',
-          },
-        ],
-      })
+      // With the fixed mock that performs roomId→room_id mapping,
+      // validateRoomsExist now correctly rejects non-existent room ids
+      await expect(
+        createClubEvent(adminSession, {
+          titleEs: 'Event',
+          titleEn: 'Event',
+          date: '2026-05-01',
+          dateKind: 'single',
+          blocksRooms: true,
+          schedules: [
+            {
+              date: '2026-05-01',
+              startTime: '18:00',
+              endTime: '22:00',
+              allDay: false,
+              roomId: 'room-does-not-exist',
+            },
+          ],
+        }),
+      ).rejects.toMatchObject({ statusCode: 400 })
 
-      // For now: verify event created
-      expect(result.id).toBeDefined()
+      // Verify the event was NOT created (validation failed before insert)
+      const eventRows = getRows('events')
+      expect(eventRows).toHaveLength(0)
     })
 
     it('rejects malformed schedules with 400 and no insert on events table (Finding 2)', async () => {
@@ -648,8 +689,17 @@ describe('club-events-service', () => {
       // Verify the event was created successfully as part of the atomic transaction
       expect(result.titleEs).toBe('Event with Blocks')
       expect(result.titleEn).toBe('Event with Blocks EN')
-      // blocksRooms flag indicates whether room blocks were created
-      expect(result.blocksRooms).toBeDefined()
+      expect(result.blocksRooms).toBe(true)
+
+      // Prove both event and blocks exist: atomicity means both succeeded together
+      const eventRows = getRows('events')
+      expect(eventRows).toHaveLength(1)
+      expect(eventRows[0].id).toBe(result.id)
+
+      const blockRows = getRows('eventRoomBlocks')
+      expect(blockRows).toHaveLength(1)
+      expect(blockRows[0].eventId).toBe(result.id)
+      expect(blockRows[0].roomId).toBe('room-1')
     })
   })
 
@@ -783,6 +833,10 @@ describe('club-events-service', () => {
       const adminSession = createAdminSession()
 
       seed({
+        rooms: [
+          { id: 'room-1', name: 'Room 1' },
+          { id: 'room-2', name: 'Room 2' },
+        ],
         events: [
           {
             id: 'evt-1',
@@ -991,26 +1045,31 @@ describe('club-events-service', () => {
 
       const { updateClubEvent } = await loadClubEventsService()
 
-      // TODO KIM-451: investigate room validation in updateClubEvent
-      // Temporarily allow success; service should reject room-unknown
-      const result = await updateClubEvent(adminSession, 'evt-1', {
-        titleEs: 'Evento',
-        titleEn: 'Event',
-        date: '2026-04-20',
-        dateKind: 'single',
-        blocksRooms: true,
-        schedules: [
-          {
-            date: '2026-04-20',
-            startTime: '18:00',
-            endTime: '22:00',
-            allDay: false,
-            roomId: 'room-unknown',
-          },
-        ],
-      })
+      // With the fixed mock that performs roomId→room_id mapping,
+      // validateRoomsExist now correctly rejects non-existent room ids
+      await expect(
+        updateClubEvent(adminSession, 'evt-1', {
+          titleEs: 'Evento',
+          titleEn: 'Event',
+          date: '2026-04-20',
+          dateKind: 'single',
+          blocksRooms: true,
+          schedules: [
+            {
+              date: '2026-04-20',
+              startTime: '18:00',
+              endTime: '22:00',
+              allDay: false,
+              roomId: 'room-unknown',
+            },
+          ],
+        }),
+      ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(result.id).toBe('evt-1')
+      // Verify the event was NOT updated (validation failed before update)
+      const eventRows = getRows('events')
+      expect(eventRows).toHaveLength(1)
+      expect(eventRows[0].titleEs).toBe('Evento') // unchanged
     })
 
     it('with atomicity: validates materials BEFORE any event or block writes (PR #149 / PR #154 review)', async () => {
@@ -1083,28 +1142,41 @@ describe('club-events-service', () => {
         rooms: [{ id: 'room-1', name: 'Room 1' }],
       })
 
+      // With Drizzle transactions: atomicity guaranteed.
+      // Inject a failure when inserting blocks to test rollback of the update.
+      const { eventRoomBlocks } = await import('@/lib/db/schema')
+      failNextQuery({ op: 'insert', table: eventRoomBlocks })
+
       const { updateClubEvent } = await loadClubEventsService()
 
-      // With Drizzle transactions: atomicity guaranteed,
-      // no compensating reverts needed
-      const result = await updateClubEvent(adminSession, 'evt-1', {
-        titleEs: 'Nuevo Titulo',
-        titleEn: 'Old Event',
-        date: '2026-04-20',
-        dateKind: 'single',
-        blocksRooms: true,
-        schedules: [
-          {
-            date: '2026-04-20',
-            startTime: '18:00',
-            endTime: '22:00',
-            allDay: false,
-            roomId: 'room-1',
-          },
-        ],
-      })
+      // Expect the call to fail due to the injected error
+      await expect(
+        updateClubEvent(adminSession, 'evt-1', {
+          titleEs: 'Nuevo Titulo',
+          titleEn: 'Old Event',
+          date: '2026-04-20',
+          dateKind: 'single',
+          blocksRooms: true,
+          schedules: [
+            {
+              date: '2026-04-20',
+              startTime: '18:00',
+              endTime: '22:00',
+              allDay: false,
+              roomId: 'room-1',
+            },
+          ],
+        }),
+      ).rejects.toThrow()
 
-      expect(result.titleEs).toBe('Nuevo Titulo')
+      // Verify the transaction rolled back: event fields were NOT updated
+      const eventRows = getRows('events')
+      expect(eventRows).toHaveLength(1)
+      expect(eventRows[0].titleEs).toBe('Evento Antiguo') // unchanged
+
+      // Verify no blocks were inserted (validation failed before transaction)
+      const blockRows = getRows('eventRoomBlocks')
+      expect(blockRows).toHaveLength(0)
     })
 
     it('rejects an unknown table id in schedules with 400 BEFORE updating the event fields (PR #154 review)', async () => {
@@ -1127,26 +1199,32 @@ describe('club-events-service', () => {
 
       const { updateClubEvent } = await loadClubEventsService()
 
-      // TODO KIM-451: verify table validation works in updateClubEvent
-      const result = await updateClubEvent(adminSession, 'evt-1', {
-        titleEs: 'Evento',
-        titleEn: 'Event',
-        date: '2026-04-20',
-        dateKind: 'single',
-        blocksRooms: true,
-        schedules: [
-          {
-            date: '2026-04-20',
-            startTime: '18:00',
-            endTime: '22:00',
-            allDay: false,
-            roomId: 'room-1',
-            tableId: 'table-unknown',
-          },
-        ],
-      })
+      // With the fixed mock that performs tableId→table_id mapping,
+      // validateTablesExist now correctly rejects non-existent table ids
+      await expect(
+        updateClubEvent(adminSession, 'evt-1', {
+          titleEs: 'Evento',
+          titleEn: 'Event',
+          date: '2026-04-20',
+          dateKind: 'single',
+          blocksRooms: true,
+          schedules: [
+            {
+              date: '2026-04-20',
+              startTime: '18:00',
+              endTime: '22:00',
+              allDay: false,
+              roomId: 'room-1',
+              tableId: 'table-unknown',
+            },
+          ],
+        }),
+      ).rejects.toMatchObject({ statusCode: 400 })
 
-      expect(result.id).toBe('evt-1')
+      // Verify the event was NOT updated (validation failed before update)
+      const eventRows = getRows('events')
+      expect(eventRows).toHaveLength(1)
+      expect(eventRows[0].titleEs).toBe('Evento') // unchanged
     })
 
     it('rejects an unknown equipment id in materials with 400 BEFORE updating the event fields (PR #154 review)', async () => {
@@ -1203,19 +1281,31 @@ describe('club-events-service', () => {
         equipment: [{ id: 'equip-1', name: 'Equipment 1' }],
       })
 
+      // Inject a failure when inserting materials to test rollback of the event update.
+      const { eventEquipment } = await import('@/lib/db/schema')
+      failNextQuery({ op: 'insert', table: eventEquipment })
+
       const { updateClubEvent } = await loadClubEventsService()
 
-      // With Drizzle transactions: materials-only update succeeds atomically
-      const result = await updateClubEvent(adminSession, 'evt-1', {
-        titleEs: 'Nuevo Titulo',
-        titleEn: 'Old Event',
-        date: '2026-04-20',
-        dateKind: 'single',
-        materials: [{ equipmentId: 'equip-1', quantity: 2 }],
-      })
+      // Expect the call to fail due to the injected error
+      await expect(
+        updateClubEvent(adminSession, 'evt-1', {
+          titleEs: 'Nuevo Titulo',
+          titleEn: 'Old Event',
+          date: '2026-04-20',
+          dateKind: 'single',
+          materials: [{ equipmentId: 'equip-1', quantity: 2 }],
+        }),
+      ).rejects.toThrow()
 
-      expect(result.titleEs).toBe('Nuevo Titulo')
-      expect(result.materials).toHaveLength(1)
+      // Verify the transaction rolled back: event title was NOT updated
+      const eventRows = getRows('events')
+      expect(eventRows).toHaveLength(1)
+      expect(eventRows[0].titleEs).toBe('Evento Antiguo') // unchanged
+
+      // Verify no materials were created
+      const materialRows = getRows('eventEquipment')
+      expect(materialRows).toHaveLength(0)
     })
   })
 
