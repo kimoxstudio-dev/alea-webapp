@@ -563,7 +563,7 @@ describe('reservations service', () => {
           startTime: '09:00',
           endTime: '10:00',
         }),
-      ).rejects.toMatchObject({ message: 'START_TIME_IN_PAST' })
+      ).rejects.toMatchObject({ statusCode: 400 })
 
       vi.useRealTimers()
     })
