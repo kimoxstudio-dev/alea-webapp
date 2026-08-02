@@ -1,34 +1,35 @@
-import { eq } from 'drizzle-orm'
+import { and, eq, gte, inArray, lte } from 'drizzle-orm'
 import qrcode from 'qrcode'
 import type { GameTable } from '@/lib/types'
 import { uploadToStorage, getPublicStorageUrl } from '@/lib/storage/qr'
-import { getAdminDb, getDrizzleAdminDb, getDrizzleDb } from '@/lib/db'
-import { tables } from '@/lib/db/schema'
+import { getDrizzleAdminDb, getDrizzleDb } from '@/lib/db'
+import { eventRoomBlocks, events, reservations, savedGames, tables } from '@/lib/db/schema'
 import { serviceError } from '@/lib/server/shared/service-error'
 import { resolveDate, buildAvailability } from '@/lib/server/reservations/availability'
-import type { Tables } from '@/lib/supabase/types'
 import { toGameTable } from '@/lib/server/tables/table-mappers'
 import { getDatabaseNow } from '@/lib/server/shared/database-time'
 import { isPendingReservationExpired } from '@/lib/server/reservations/pending-reservation-expiry'
 import type { SessionUser } from '@/lib/server/auth/auth'
 
-type ReservationRow = Tables<'reservations'>
-type EventBlockRow = Tables<'event_room_blocks'>
-
 /**
- * KIM-434 (F3c) PR2: `tables` reads/writes below use the Drizzle/Neon seam
- * (`getDrizzleDb()` / `getDrizzleAdminDb()`), following the pilot pattern
- * established in `lib/server/equipment/equipment-service.ts` (PR1).
+ * GitHub #244 (KIM-434 F3c stack, split-brain follow-up to #238): finishes
+ * migrating this file off the legacy Supabase `getAdminDb()` seam onto the
+ * Drizzle/Neon client (`getDrizzleDb()` / `getDrizzleAdminDb()`). PR2 (KIM-434)
+ * already migrated `tables` reads/writes; `getTableAvailability()` below was
+ * the last holdout reading `reservations`, `event_room_blocks`, `saved_games`
+ * and `events` from Supabase — a live cross-backend read now that
+ * `reservations-service.ts` (#238) writes those same tables to Neon. All
+ * reads in this file now go through Drizzle/Neon; no Supabase client usage
+ * remains.
  *
- * `reservations`, `event_room_blocks`, `saved_games` and `events` are owned
- * by services NOT yet migrated (PR3-PR5), so those cross-domain reads
- * intentionally stay on the legacy Supabase seam (`getDb()` / `getAdminDb()`)
- * — their source of truth hasn't moved to Neon yet. Combining a Neon read
- * (the table row) with Supabase reads (reservations/blocks/saved games) here
- * is two independent round-trips joined in application code, same as
- * before this PR — not a single SQL join — but see the PR description's
- * "Split-brain disclosure" section for the consistency caveat this implies
- * during the migration window.
+ * Row-shape convention: query results below are selected with explicit
+ * snake_case column aliases (e.g. `table_id: reservations.tableId`) so they
+ * keep matching the structural, backend-agnostic `ReservationRow` shape
+ * `buildAvailability()` (lib/server/reservations/availability.ts) and
+ * `isPendingReservationExpired()` (lib/server/reservations/pending-
+ * reservation-expiry.ts) already expect — both were intentionally kept
+ * snake_case-shaped so this migration wouldn't need to touch either shared
+ * helper. See `rooms-service.ts` for the identical convention.
  */
 
 // Privilege checks (role === 'admin') live here in the service layer, not in
@@ -140,82 +141,89 @@ export async function getTableAvailability(tableId: string, date?: string | null
   }
 
   const effectiveDate = resolveDate(date)
-  const admin = getAdminDb()
+  const adminDb = getDrizzleAdminDb()
 
-  const [reservationsResult, eventBlocksResult, savedGameResult, nowUtc] = await Promise.all([
-    admin
-      .from('reservations')
-      .select('id, table_id, date, start_time, end_time, status, surface, user_id, activated_at, created_at')
-      .eq('table_id', tableId)
-      .eq('date', effectiveDate)
-      .in('status', ['active', 'pending']),
-    admin
-      .from('event_room_blocks')
-      .select('id, event_id, room_id, table_id, date, start_time, end_time, all_day')
-      .eq('room_id', table.roomId)
-      .eq('date', effectiveDate),
-    admin
-      .from('saved_games')
-      .select('id')
-      .eq('table_id', tableId)
-      .eq('status', 'active')
-      .lte('start_date', effectiveDate)
-      .gte('end_date', effectiveDate)
-      .limit(1),
-    getDatabaseNow(admin),
+  const [allReservations, eventBlocksResult, savedGameRows, nowUtc] = await Promise.all([
+    runQuery(
+      adminDb
+        .select({
+          start_time: reservations.startTime,
+          end_time: reservations.endTime,
+          status: reservations.status,
+          surface: reservations.surface,
+          date: reservations.date,
+          activated_at: reservations.activatedAt,
+        })
+        .from(reservations)
+        .where(
+          and(
+            eq(reservations.tableId, tableId),
+            eq(reservations.date, effectiveDate),
+            inArray(reservations.status, ['active', 'pending']),
+          ),
+        ),
+    ),
+    runQuery(
+      adminDb
+        .select({
+          event_id: eventRoomBlocks.eventId,
+          table_id: eventRoomBlocks.tableId,
+          start_time: eventRoomBlocks.startTime,
+          end_time: eventRoomBlocks.endTime,
+        })
+        .from(eventRoomBlocks)
+        .where(and(eq(eventRoomBlocks.roomId, table.roomId), eq(eventRoomBlocks.date, effectiveDate))),
+    ),
+    runQuery(
+      adminDb
+        .select({ id: savedGames.id })
+        .from(savedGames)
+        .where(
+          and(
+            eq(savedGames.tableId, tableId),
+            eq(savedGames.status, 'active'),
+            lte(savedGames.startDate, effectiveDate),
+            gte(savedGames.endDate, effectiveDate),
+          ),
+        )
+        .limit(1),
+    ),
+    getDatabaseNow(adminDb),
   ])
 
-  const allReservations = (reservationsResult.data ?? []) as ReservationRow[]
-  const reservationsError = reservationsResult.error
-
-  if (reservationsError) {
-    serviceError('Internal server error', 500)
-  }
-
   // Pending rows stop blocking availability only after their check-in deadline.
-  const reservations = allReservations.filter((row) => {
+  const reservationRows = allReservations.filter((row) => {
     if (row.status === 'pending' && row.activated_at === null) {
       return !isPendingReservationExpired(row, nowUtc)
     }
     return true
   })
 
-  if (eventBlocksResult.error) {
-    serviceError('Internal server error', 500)
-  }
-  if (savedGameResult.error) serviceError('Internal server error', 500)
-
   // OIR-208: a block with a table_id only blocks that single table; NULL
   // (the pre-OIR-208 default) blocks every table of the room, unchanged.
-  const eventBlocks = ((eventBlocksResult.data ?? []) as EventBlockRow[])
-    .filter((block) => block.table_id == null || block.table_id === tableId)
+  const eventBlocks = eventBlocksResult.filter(
+    (block) => block.table_id == null || block.table_id === tableId,
+  )
 
   let eventTitleById = new Map<string, string>()
   const eventIds = [...new Set(eventBlocks.map((block) => block.event_id))]
   if (eventIds.length > 0) {
-    const eventsResult = await admin
-      .from('events')
-      .select('id, title')
-      .in('id', eventIds)
-
-    if (eventsResult.error) {
-      serviceError('Internal server error', 500)
-    }
-
-    eventTitleById = new Map(
-      ((eventsResult.data ?? []) as Array<{ id: string; title: string }>).map((event) => [event.id, event.title]),
+    const eventRows = await runQuery(
+      adminDb.select({ id: events.id, title: events.title }).from(events).where(inArray(events.id, eventIds)),
     )
+
+    eventTitleById = new Map(eventRows.map((event) => [event.id, event.title]))
   }
 
   return buildAvailability(
     toGameTable(table),
     effectiveDate,
-    reservations,
+    reservationRows,
     eventBlocks.map((block) => ({
       start: block.start_time.slice(0, 5),
       end: block.end_time.slice(0, 5),
       label: eventTitleById.get(block.event_id) ?? null,
     })),
-    Boolean(savedGameResult.data?.length),
+    Boolean(savedGameRows.length),
   )
 }
