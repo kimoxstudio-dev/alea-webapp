@@ -138,6 +138,15 @@
 import { vi } from 'vitest'
 import { Column, Param, SQL, StringChunk, Table, getTableColumns, getTableName, is } from 'drizzle-orm'
 
+// Extend globalThis to hold mock state across module re-evaluations
+declare global {
+  var __drizzleMockStore: Map<string, MockRow[]> | undefined
+  var __drizzleMockQueryLog: MockQueryLogEntry[] | undefined
+  var __drizzleMockFailures: FailureSpec[] | undefined
+  var __drizzleMockColumnKeyCache: WeakMap<object, Map<string, string>> | undefined
+  var __drizzleMockFilterBypass: { columnName: string; tableName?: string } | undefined
+}
+
 // ── Mock state: global response objects for each query type (legacy mock) ───────
 // These are imported by the test file and configured per test in beforeEach/it.
 // They back the chainable query builder mocks below.
@@ -428,11 +437,11 @@ function mockError(message: string): Error {
 
 // ── Store ──────────────────────────────────────────────────────────────────────
 
-const store = new Map<string, MockRow[]>()
-const queryLog: MockQueryLogEntry[] = []
+const store: Map<string, MockRow[]> = (globalThis.__drizzleMockStore ??= new Map())
+const queryLog: MockQueryLogEntry[] = (globalThis.__drizzleMockQueryLog ??= [])
 
 type FailureSpec = { op?: QueryOp; table?: string; times: number; error: unknown }
-const failures: FailureSpec[] = []
+const failures: FailureSpec[] = (globalThis.__drizzleMockFailures ??= [])
 
 /**
  * Table key used for raw `db.execute(sql\`...\`)` calls, in the query log and
@@ -486,6 +495,41 @@ export function resetDb(): void {
   store.clear()
   queryLog.length = 0
   failures.length = 0
+  globalThis.__drizzleMockFilterBypass = undefined
+  // Note: columnKeyCache is not cleared because it's a WeakMap keyed by table objects.
+  // Table objects persist across tests and their schema never changes, so the cache is safe.
+}
+
+/**
+ * Configure the mock to bypass (skip) a WHERE-clause filter on a specific column for the next query.
+ * This simulates a regression where a crucial filter (e.g., `.eq('user_id', ...)`) is accidentally
+ * removed, returning rows that should have been excluded. The defense-in-depth layer
+ * (`assertMemberRowsScoped()`) should then catch the leak.
+ *
+ * Usage:
+ * ```typescript
+ * bypassWhereFilterOnColumn('userId')
+ * // Next SELECT query will ignore `.eq('userId', ...)` filters
+ * const result = await listVisibleReservations({ session: memberSession })
+ * // assertMemberRowsScoped() should catch the foreign rows
+ * ```
+ *
+ * The bypass is consumed (cleared) after the next query executes, or when `resetDb()` is called.
+ * To bypass a column from a specific table, pass the table name:
+ * ```typescript
+ * bypassWhereFilterOnColumn('userId', 'reservations')
+ * ```
+ */
+export function bypassWhereFilterOnColumn(columnName: string, tableName?: string): void {
+  globalThis.__drizzleMockFilterBypass = {
+    columnName: columnName.toLowerCase(),
+    tableName: tableName ? tableKey(tableName) : undefined,
+  }
+}
+
+/** Clear any active filter bypass. */
+export function clearFilterBypass(): void {
+  globalThis.__drizzleMockFilterBypass = undefined
 }
 
 /** Snapshot of a table's current rows — use it to assert what a write persisted. */
@@ -564,7 +608,7 @@ function restoreStore(snapshot: Map<string, MockRow[]>): void {
 
 // ── Column ↔ row-property resolution ───────────────────────────────────────────
 
-const columnKeyCache = new WeakMap<object, Map<string, string>>()
+const columnKeyCache: WeakMap<object, Map<string, string>> = (globalThis.__drizzleMockColumnKeyCache ??= new WeakMap())
 
 /** Map a Drizzle column back to the property name its rows use (`user_id` → `userId`). */
 function columnPropertyKey(column: Column): string {
@@ -651,7 +695,7 @@ function tokenize(chunks: readonly unknown[]): Token[] {
 }
 
 /** Best-effort rendering of a SQL node, used only for error messages. */
-function renderSql(node: SQL): string {
+export function renderSql(node: SQL): string {
   return tokenize(node.queryChunks)
     .map((token) => {
       switch (token.t) {
@@ -838,6 +882,27 @@ function evaluateTokens(rawTokens: Token[], ctx: QueryContext, source: SQL): boo
 function evaluateComparison(tokens: Token[], ctx: QueryContext, source: SQL): boolean {
   const operatorIndex = tokens.findIndex((token) => token.t === 'text')
   if (operatorIndex <= 0) throw mockError(`unsupported condition: ${renderSql(source)}`)
+
+  // Check if this comparison involves a column marked for filter bypass.
+  // If so, skip the filter (return true) to simulate a regression where the
+  // WHERE clause was accidentally removed from a query, allowing defense-in-depth
+  // mechanisms like assertMemberRowsScoped() to catch the leak.
+  const bypass = globalThis.__drizzleMockFilterBypass
+  if (bypass) {
+    const leftTokens = tokens.slice(0, operatorIndex)
+    if (leftTokens.length === 1 && leftTokens[0].t === 'col') {
+      const column = leftTokens[0].v
+      const columnProp = columnPropertyKey(column)
+      const tableKey_ = tableKey(column.table)
+      if (
+        columnProp.toLowerCase() === bypass.columnName &&
+        (bypass.tableName === undefined || tableKey_ === bypass.tableName)
+      ) {
+        // This comparison is for a bypassed column — skip the filter
+        return true
+      }
+    }
+  }
 
   const operator = (tokens[operatorIndex] as { v: string }).v.toLowerCase()
   const left = evaluateOperand(tokens.slice(0, operatorIndex), ctx)
@@ -1221,6 +1286,8 @@ class MockSelectBuilder {
 
     const rows = this.hasAggregate() ? this.projectAggregated(contexts) : this.projectRows(contexts)
     queryLog.push({ op: 'select', table: baseKey, rowCount: rows.length })
+    // Clear the filter bypass after the query completes, so it only applies to this one query
+    globalThis.__drizzleMockFilterBypass = undefined
     return rows
   }
 
@@ -1577,11 +1644,31 @@ export function createStatefulDrizzleDb() {
      * deliberately does not fire on `execute`. The one combination that could
      * never fire — an explicit `{ op: 'execute', table }` — is rejected up front
      * by {@link failNextQuery} rather than silently ignored.
+     *
+     * Special handling: `select now()` pattern is detected and handled directly
+     * to return the current server time, since this is a common pattern used for
+     * database-time queries and doesn't need to go through executeMock.
      */
     execute: vi.fn(async (...args: unknown[]) => {
       consumeFailure('execute', EXECUTE_TABLE_KEY)
       queryLog.push({ op: 'execute', table: EXECUTE_TABLE_KEY, rowCount: 0 })
-      const result = executeMock(...args)
+
+      // Special handling for `select now()` pattern
+      const sql = args[0]
+      if (is(sql, SQL)) {
+        const sqlStr = renderSql(sql as SQL).toLowerCase()
+        if (sqlStr.includes('select') && sqlStr.includes('now()')) {
+          // Return current time — the actual column name (now, current_timestamp, etc)
+          // will be parsed from the SQL by the caller
+          const result = await executeMock(...args)
+          // Return result from executeMock ONLY if it has rows
+          if (result && Array.isArray(result.rows) && result.rows.length > 0) return result
+          // Fallback: return { now: current_time } which works for `select now() as now`
+          return { rows: [{ now: new Date() }], rowCount: 1 }
+        }
+      }
+
+      const result = await executeMock(...args)
       return result ?? { rows: [], rowCount: 0 }
     }),
     /**
