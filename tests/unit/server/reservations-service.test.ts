@@ -1538,6 +1538,7 @@ describe('reservations service', () => {
 
       seed({
         reservations: [
+          ...getRows('reservations'),
           makeReservation({ id: 'r-other', userId: 'user-9', tableId: 't1', startTime: '17:00:00', endTime: '18:30:00' }),
         ],
       })
