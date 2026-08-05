@@ -967,6 +967,68 @@ describe('reservations service', () => {
         message: expect.stringContaining('CHECK_IN_ALREADY_ACTIVE'),
       })
     })
+
+    it('calls recordSavedGameAttendance with the activated reservation data', async () => {
+      // Verify that activateReservationByTable calls recordSavedGameAttendance
+      // with the updated reservation row (KIM-246 reimplementation of
+      // record_saved_game_attendance_after_activation trigger)
+      const { recordSavedGameAttendance } = await import('@/lib/server/games/saved-games-service')
+      const recordMock = vi.mocked(recordSavedGameAttendance)
+
+      const { activateReservationByTable } = await loadReservationModules()
+
+      seedPendingReservation({
+        id: 'r-sg-test',
+        table_id: 't3',
+        user_id: '2',
+        surface: 'top',
+        start_time: makeStartTime(10),
+      })
+
+      recordMock.mockClear()
+
+      await activateReservationByTable('t3', '2', undefined)
+
+      // Verify recordSavedGameAttendance was called with the reservation data
+      expect(recordMock).toHaveBeenCalledOnce()
+      const call = recordMock.mock.calls[0]![0]
+      expect(call).toMatchObject({
+        id: 'r-sg-test',
+        table_id: 't3',
+        user_id: '2',
+        surface: 'top',
+        status: 'active',
+        date: FIXED_DATE,
+      })
+    })
+
+    it('activation succeeds even when reservation has no matching saved game', async () => {
+      // Verify that activateReservationByTable completes successfully whether or not
+      // there's a saved game for the reservation. recordSavedGameAttendance handles
+      // the case where no matching saved_games row exists (it's a no-op).
+      const { recordSavedGameAttendance } = await import('@/lib/server/games/saved-games-service')
+      const recordMock = vi.mocked(recordSavedGameAttendance)
+
+      const { activateReservationByTable } = await loadReservationModules()
+
+      // Seed a reservation with no corresponding saved game
+      seedPendingReservation({
+        id: 'r-orphan',
+        table_id: 't3',
+        user_id: '2',
+        surface: 'top',
+        start_time: makeStartTime(10),
+      })
+
+      recordMock.mockClear()
+
+      // Activation should succeed
+      const result = await activateReservationByTable('t3', '2', undefined)
+      expect(result).toMatchObject({ status: 'active', tableId: 't3' })
+
+      // recordSavedGameAttendance should still be called (it handles the no-match case)
+      expect(recordMock).toHaveBeenCalledOnce()
+    })
   })
 
 

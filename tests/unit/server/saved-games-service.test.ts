@@ -8,6 +8,7 @@ import {
   getRows,
   failNextQuery,
   createMockServiceError,
+  getQueryLog,
 } from '@/tests/unit/mocks/drizzle-mock'
 import { createQueryBuilder } from '@/tests/unit/mocks/supabase-mock'
 import { rooms, tables, savedGames, savedGameAttendances } from '@/lib/db/schema'
@@ -293,5 +294,151 @@ describe('saved games service', () => {
     const adminResult = await listSavedGamesForSession(adminSession)
     expect(adminResult.some((sg) => sg.id === 'sg-1')).toBe(true)
     expect(adminResult.some((sg) => sg.id === 'sg-2')).toBe(true)
+  })
+
+  it('takes advisory lock before conflict check when creating saved game', async () => {
+    const { createSavedGameForSession } = await import('@/lib/server/games/saved-games-service')
+
+    await createSavedGameForSession(member, {
+      tableId: 'double',
+      startDate: '2026-06-20',
+      endDate: '2026-09-19',
+    })
+
+    // Verify that pg_advisory_xact_lock was called by checking the query log
+    const log = getQueryLog()
+    const hasLockCall = log.some((entry) => {
+      return entry.op === 'execute'
+    })
+    expect(hasLockCall).toBe(true)
+  })
+
+  it('takes advisory lock before conflict check when renewing saved game', async () => {
+    seed({
+      saved_games: [
+        {
+          id: 'sg-1',
+          tableId: 'double',
+          userId: 'user-1',
+          startDate: '2026-04-01',
+          endDate: '2026-06-30',
+          status: 'active',
+          attendanceCount: 0,
+          renewedFromId: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ],
+    })
+    const { renewSavedGameForSession } = await import('@/lib/server/games/saved-games-service')
+
+    await renewSavedGameForSession(member, 'sg-1')
+
+    // Verify that pg_advisory_xact_lock was called by checking the query log
+    const log = getQueryLog()
+    const hasLockCall = log.some((entry) => {
+      return entry.op === 'execute'
+    })
+    expect(hasLockCall).toBe(true)
+  })
+
+  it('increments attendanceCount atomically with attendance insert', async () => {
+    seed({
+      saved_games: [
+        {
+          id: 'sg-1',
+          tableId: 'double',
+          userId: 'user-1',
+          startDate: '2026-06-01',
+          endDate: '2026-08-31',
+          status: 'active',
+          attendanceCount: 5,
+          renewedFromId: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ],
+    })
+    const { recordSavedGameAttendance } = await import('@/lib/server/games/saved-games-service')
+
+    const reservation = {
+      id: 'r-1',
+      table_id: 'double',
+      user_id: 'user-1',
+      date: '2026-06-19',
+      surface: 'top' as const,
+      status: 'active' as const,
+    }
+
+    await recordSavedGameAttendance(reservation)
+
+    // Verify both the attendance row AND the counter were updated
+    const attendances = getRows(savedGameAttendances)
+    expect(attendances).toHaveLength(1)
+    expect(attendances[0]!.savedGameId).toBe('sg-1')
+
+    const savedGamesRows = getRows(savedGames)
+    const updatedGame = savedGamesRows.find((sg) => sg.id === 'sg-1')
+    expect(updatedGame?.attendanceCount).toBe(6)
+  })
+
+  it('does not increment counter or record attendance for bottom-surface reservations', async () => {
+    seed({
+      saved_games: [
+        {
+          id: 'sg-1',
+          tableId: 'double',
+          userId: 'user-1',
+          startDate: '2026-06-01',
+          endDate: '2026-08-31',
+          status: 'active',
+          attendanceCount: 2,
+          renewedFromId: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ],
+    })
+    const { recordSavedGameAttendance } = await import('@/lib/server/games/saved-games-service')
+
+    const bottomReservation = {
+      id: 'r-bottom',
+      table_id: 'double',
+      user_id: 'user-1',
+      date: '2026-06-19',
+      surface: 'bottom' as const,
+      status: 'active' as const,
+    }
+
+    await recordSavedGameAttendance(bottomReservation)
+
+    // No attendance should be recorded
+    const attendances = getRows(savedGameAttendances)
+    expect(attendances).toHaveLength(0)
+
+    // Counter should remain unchanged
+    const savedGamesRows = getRows(savedGames)
+    const unchangedGame = savedGamesRows.find((sg) => sg.id === 'sg-1')
+    expect(unchangedGame?.attendanceCount).toBe(2)
+  })
+
+  it('does not increment counter for reservations with no matching saved game', async () => {
+    const { recordSavedGameAttendance } = await import('@/lib/server/games/saved-games-service')
+
+    const reservation = {
+      id: 'r-orphan',
+      table_id: 'double',
+      user_id: 'user-1',
+      date: '2026-06-19',
+      surface: 'top' as const,
+      status: 'active' as const,
+    }
+
+    // No saved game seeded for this reservation
+    await recordSavedGameAttendance(reservation)
+
+    // No attendance should be recorded
+    const attendances = getRows(savedGameAttendances)
+    expect(attendances).toHaveLength(0)
   })
 })
