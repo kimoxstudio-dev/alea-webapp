@@ -24,6 +24,7 @@ import {
   getPendingCheckInDeadline,
   isPendingReservationExpired,
 } from '@/lib/server/reservations/pending-reservation-expiry'
+import { recordSavedGameAttendance } from '@/lib/server/games/saved-games-service'
 
 /**
  * GitHub #238 (KIM-434 F3c stack, remaining consumer): migrated off the
@@ -53,6 +54,7 @@ import {
 type ReservationRow = typeof reservations.$inferSelect
 type TableRow = { id: string; type: 'small' | 'large' | 'removable_top'; roomId: string }
 type EquipmentRow = typeof equipment.$inferSelect
+type ReservationTx = Parameters<Parameters<DbClient['transaction']>[0]>[0]
 
 type EnrichedReservationRow = ReservationRow & {
   memberNumber: string | null
@@ -98,11 +100,36 @@ function isConflictError(error: unknown): boolean {
   return code === '23P01'
 }
 
+function isServiceError(error: unknown): error is { statusCode: number } {
+  return (
+    typeof error === 'object'
+    && error !== null
+    && 'statusCode' in error
+    && typeof (error as { statusCode: unknown }).statusCode === 'number'
+  )
+}
+
 /** Bridges a Drizzle reservation row's `date`/`startTime`/`endTime` fields to
  * the snake_case `PendingReservationSlot` shape shared with the
  * (not-yet-migrated) `pending-reservation-expiry.ts` consumers. */
 function toPendingSlot(row: { date: string; startTime: string; endTime: string }) {
   return { date: row.date, start_time: row.startTime, end_time: row.endTime }
+}
+
+/** Bridges a Drizzle reservation row (camelCase) to the snake_case shape
+ * `recordSavedGameAttendance()` (saved-games-service.ts) expects — same
+ * kind of conversion as `toPendingSlot()` above, for the same reason: that
+ * service's shape predates this file's migration off the legacy Supabase
+ * seam and hasn't been changed to avoid touching its other callers. */
+function toAttendanceReservation(row: ReservationRow) {
+  return {
+    id: row.id,
+    table_id: row.tableId,
+    user_id: row.userId,
+    date: row.date,
+    surface: row.surface,
+    status: row.status,
+  }
 }
 
 function parseDate(value: string): string {
@@ -240,13 +267,10 @@ async function hasEventBlockConflict(input: {
   return blocks.some((block) => block.tableId == null || block.tableId === input.tableId)
 }
 
-async function hasSavedGameBottomConflict(input: {
+async function hasSavedGameBottomConflict(db: Pick<DbClient, 'select'>, input: {
   tableId: string
   date: string
-  surface?: TableSurface
 }) {
-  if (input.surface !== 'bottom') return false
-  const db = getDrizzleAdminDb()
   const rows = await runQuery(
     db
       .select({ id: savedGames.id })
@@ -263,6 +287,22 @@ async function hasSavedGameBottomConflict(input: {
   )
 
   return rows.length > 0
+}
+
+async function assertNoSavedGameBottomConflict(
+  tx: ReservationTx,
+  input: { tableId: string; date: string; surface: TableSurface | null; status: ReservationRow['status'] },
+): Promise<void> {
+  if (input.surface !== 'bottom' || (input.status !== 'pending' && input.status !== 'active')) return
+
+  // Reimplement validate_reservation_against_saved_game's matching half of
+  // the per-table lock protocol. This must run in the same transaction as the
+  // reservation write so create/renew saved-game operations cannot race this
+  // check and both commit incompatible rows.
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${input.tableId}::text, 0))`)
+  if (await hasSavedGameBottomConflict(tx, input)) {
+    serviceError(ERROR_CODES.SAVED_GAME_BOTTOM_RESERVED, 409)
+  }
 }
 
 async function getReservationForAccess(reservationId: string) {
@@ -817,9 +857,6 @@ export async function createReservationForSession(
   if (await hasEventBlockConflict({ roomId: table.roomId, tableId, date, startTime, endTime })) {
     serviceError(ERROR_CODES.ROOM_BLOCKED_BY_EVENT, 409)
   }
-  if (await hasSavedGameBottomConflict({ tableId, date, surface })) {
-    serviceError(ERROR_CODES.SAVED_GAME_BOTTOM_RESERVED, 409)
-  }
   await assertEquipmentSelectionAllowed({
     roomId: table.roomId,
     equipmentIds,
@@ -830,18 +867,29 @@ export async function createReservationForSession(
 
   let insertedRow: ReservationRow | undefined
   try {
-    ;[insertedRow] = await db
-      .insert(reservations)
-      .values({
+    insertedRow = await db.transaction(async (tx) => {
+      await assertNoSavedGameBottomConflict(tx, {
         tableId,
-        userId: session.id,
         date,
-        startTime,
-        endTime,
         surface: surface ?? null,
+        status: 'pending',
       })
-      .returning()
+
+      const [row] = await tx
+        .insert(reservations)
+        .values({
+          tableId,
+          userId: session.id,
+          date,
+          startTime,
+          endTime,
+          surface: surface ?? null,
+        })
+        .returning()
+      return row
+    })
   } catch (err) {
+    if (isServiceError(err)) throw err
     if (isConflictError(err)) {
       throwSlotTaken()
     }
@@ -963,14 +1011,6 @@ export async function updateReservationForSession(
   })) {
     serviceError(ERROR_CODES.ROOM_BLOCKED_BY_EVENT, 409)
   }
-  if (await hasSavedGameBottomConflict({
-    tableId: existingReservation.tableId,
-    date: nextDate,
-    surface: nextSurface ?? undefined,
-  })) {
-    serviceError(ERROR_CODES.SAVED_GAME_BOTTOM_RESERVED, 409)
-  }
-
   const db = getDrizzleDb()
   if (needsUserOverlapCheck) {
     await checkUserSlotOverlap(
@@ -994,20 +1034,34 @@ export async function updateReservationForSession(
     })
   }
 
+  const resolvedStatus = nextStatus == null
+    ? existingReservation.status
+    : (String(nextStatus) as ReservationRow['status'])
   let updatedRow: ReservationRow | undefined
   try {
-    ;[updatedRow] = await db
-      .update(reservations)
-      .set({
+    updatedRow = await db.transaction(async (tx) => {
+      await assertNoSavedGameBottomConflict(tx, {
+        tableId: existingReservation.tableId,
         date: nextDate,
-        startTime: nextStartTime,
-        endTime: nextEndTime,
         surface: nextSurface,
-        status: nextStatus == null ? existingReservation.status : (String(nextStatus) as ReservationRow['status']),
+        status: resolvedStatus,
       })
-      .where(eq(reservations.id, reservationId))
-      .returning()
+
+      const [row] = await tx
+        .update(reservations)
+        .set({
+          date: nextDate,
+          startTime: nextStartTime,
+          endTime: nextEndTime,
+          surface: nextSurface,
+          status: resolvedStatus,
+        })
+        .where(eq(reservations.id, reservationId))
+        .returning()
+      return row
+    })
   } catch (err) {
+    if (isServiceError(err)) throw err
     if (isConflictError(err)) {
       throwSlotTaken()
     }
@@ -1127,17 +1181,37 @@ export async function activateReservationByTable(
   // Zero rows returned (rather than an error) means the reservation was
   // already activated by a concurrent request (TOCTOU race) between our read
   // and this UPDATE — handled the same way as "not found" below (409).
-  const [updated] = await runQuery(
-    db
-      .update(reservations)
-      .set({ status: 'active', activatedAt: nowUtc })
-      .where(and(eq(reservations.id, reservation.id), eq(reservations.status, 'pending')))
-      .returning(),
-  )
+  //
+  // The status UPDATE and the saved-game attendance recording below run
+  // inside a single transaction so they commit or roll back together —
+  // together they reimplement the dropped
+  // `record_saved_game_attendance_after_activation` trigger (AFTER UPDATE OF
+  // status ON reservations), which used to record check-in attendance
+  // against an active saved_game in the same transaction as this activation
+  // UPDATE. Running them as two separate `db.transaction()` calls would let
+  // the activation commit while the attendance write failed, silently
+  // diverging from the old trigger-based behavior (activated reservation,
+  // missed attendance count). `recordSavedGameAttendance()` is passed this
+  // transaction's `tx` handle (same pattern as `assertTableAndEventAvailability`
+  // in saved-games-service.ts) so its writes participate in it rather than
+  // opening a second, independent transaction.
+  const updated = await db.transaction(async (tx) => {
+    const [row] = await runQuery(
+      tx
+        .update(reservations)
+        .set({ status: 'active', activatedAt: nowUtc })
+        .where(and(eq(reservations.id, reservation.id), eq(reservations.status, 'pending')))
+        .returning(),
+    )
 
-  if (!updated) {
-    serviceError(ERROR_CODES.CHECK_IN_ALREADY_ACTIVE, 409)
-  }
+    if (!row) {
+      serviceError(ERROR_CODES.CHECK_IN_ALREADY_ACTIVE, 409)
+    }
+
+    await recordSavedGameAttendance(tx, toAttendanceReservation(row))
+
+    return row
+  })
 
   return mapReservation(updated)
 }

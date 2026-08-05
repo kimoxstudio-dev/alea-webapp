@@ -145,7 +145,7 @@ async function importMembersFromNormalizedRows(input: {
       }
 
       try {
-        await db.update(profiles).set(updatePayload).where(eq(profiles.id, existing.id))
+        await db.update(profiles).set({ ...updatePayload, updatedAt: new Date() }).where(eq(profiles.id, existing.id))
       } catch {
         return {
           created: 0,
@@ -393,6 +393,7 @@ export async function updateUser(
 
   const previousMemberNumber = existingProfile.memberNumber
   const previousAuthEmail = existingProfile.authEmail
+  updates.updatedAt = new Date()
   let data: PublicProfileRow | undefined
   try {
     ;[data] = await db.update(profiles).set(updates).where(eq(profiles.id, id)).returning(PROFILE_COLUMNS)
@@ -417,6 +418,7 @@ export async function updateUser(
           .set({
             memberNumber: previousMemberNumber,
             authEmail: previousAuthEmail,
+            updatedAt: new Date(),
           })
           .where(eq(profiles.id, id))
       } catch {
@@ -435,7 +437,11 @@ export async function resetNoShows(session: SessionUser, id: string) {
   requireAdminSession(session)
   const db = getDrizzleAdminDb()
   const [row] = await runQuery(
-    db.update(profiles).set({ noShowCount: 0, blockedUntil: null }).where(eq(profiles.id, id)).returning({ id: profiles.id }),
+    db
+      .update(profiles)
+      .set({ noShowCount: 0, blockedUntil: null, updatedAt: new Date() })
+      .where(eq(profiles.id, id))
+      .returning({ id: profiles.id }),
   )
   if (!row) serviceError('User not found', 404)
 }
@@ -444,7 +450,11 @@ export async function unblockUser(session: SessionUser, id: string) {
   requireAdminSession(session)
   const db = getDrizzleAdminDb()
   const [row] = await runQuery(
-    db.update(profiles).set({ blockedUntil: null }).where(eq(profiles.id, id)).returning({ id: profiles.id }),
+    db
+      .update(profiles)
+      .set({ blockedUntil: null, updatedAt: new Date() })
+      .where(eq(profiles.id, id))
+      .returning({ id: profiles.id }),
   )
   if (!row) serviceError('User not found', 404)
 }

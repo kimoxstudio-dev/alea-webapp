@@ -7,9 +7,9 @@ import {
   seed as seedDrizzleDb,
   getRows,
   executeMock,
+  failNextQuery,
 } from '@/tests/unit/mocks/drizzle-mock'
-
-vi.mock('@/lib/server/games/saved-games-service', () => ({ recordSavedGameAttendance: vi.fn() }))
+import { savedGameAttendances } from '@/lib/db/schema'
 
 vi.mock('@/lib/db', () => ({
   getDrizzleDb: vi.fn(() => createStatefulDrizzleDb()),
@@ -966,6 +966,124 @@ describe('reservations service', () => {
         statusCode: 409,
         message: expect.stringContaining('CHECK_IN_ALREADY_ACTIVE'),
       })
+    })
+
+    it('records saved-game attendance from the activated reservation', async () => {
+      const { activateReservationByTable } = await loadReservationModules()
+
+      seedDrizzleDb({
+        saved_games: [{
+          id: 'sg-call-test',
+          tableId: 't3',
+          userId: '2',
+          startDate: '2025-06-01',
+          endDate: '2025-08-31',
+          status: 'active',
+          attendanceCount: 0,
+          renewedFromId: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }],
+      })
+
+      seedPendingReservation({
+        id: 'r-sg-test',
+        table_id: 't3',
+        user_id: '2',
+        surface: 'top',
+        start_time: makeStartTime(10),
+      })
+
+      await activateReservationByTable('t3', '2', undefined)
+
+      expect(getRows('saved_game_attendances')).toEqual([
+        expect.objectContaining({
+          savedGameId: 'sg-call-test',
+          playReservationId: 'r-sg-test',
+          attendedOn: FIXED_DATE,
+        }),
+      ])
+      expect(getRows('saved_games')).toEqual([
+        expect.objectContaining({ id: 'sg-call-test', attendanceCount: 1 }),
+      ])
+    })
+
+    it('activation succeeds even when reservation has no matching saved game', async () => {
+      // Verify that activateReservationByTable completes successfully whether or not
+      // there's a saved game for the reservation. recordSavedGameAttendance handles
+      // the case where no matching saved_games row exists (it's a no-op).
+      const { activateReservationByTable } = await loadReservationModules()
+
+      // Seed a reservation with no corresponding saved game
+      seedPendingReservation({
+        id: 'r-orphan',
+        table_id: 't3',
+        user_id: '2',
+        surface: 'top',
+        start_time: makeStartTime(10),
+      })
+
+      // Activation should succeed
+      const result = await activateReservationByTable('t3', '2', undefined)
+      expect(result).toMatchObject({ status: 'active', tableId: 't3' })
+
+      expect(getRows('saved_game_attendances')).toHaveLength(0)
+    })
+
+    it('rolls back activation atomically when attendance recording fails', async () => {
+      // Regression test for KIM-246: verify that a failure in attendance recording
+      // rolls back the activation UPDATE. Before the fix, two separate transactions
+      // meant a failure in attendance write left an activated reservation behind.
+      const { activateReservationByTable } = await loadReservationModules()
+
+      // Seed a saved game so attendance recording will attempt a write
+      seedDrizzleDb({
+        saved_games: [
+          {
+            id: 'sg-atomicity',
+            tableId: 't3',
+            userId: '2',
+            startDate: '2025-06-01',
+            endDate: '2025-08-31',
+            status: 'active',
+            attendanceCount: 0,
+            renewedFromId: null,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
+        ],
+      })
+
+      seedPendingReservation({
+        id: 'r-atomicity-test',
+        table_id: 't3',
+        user_id: '2',
+        surface: 'top',
+        start_time: makeStartTime(10),
+      })
+
+      // Inject a real failure into the attendance INSERT. The production
+      // recordSavedGameAttendance() implementation runs and maps this to 500;
+      // the outer activation transaction must roll every write back.
+      failNextQuery({
+        op: 'insert',
+        table: savedGameAttendances,
+        error: new Error('attendance write failed'),
+      })
+
+      // Activation should fail and roll back the reservation state
+      await expect(activateReservationByTable('t3', '2', undefined)).rejects.toThrow()
+
+      // Verify the reservation is still pending (activation rolled back)
+      const reservationsInDb = getRows('reservations')
+      const reservation = reservationsInDb.find((r) => r.id === 'r-atomicity-test')
+      expect(reservation?.status).toBe('pending')
+      expect(reservation?.activatedAt).toBeNull()
+
+      // Verify the saved game counter didn't move (attendance didn't commit)
+      const savedGamesInDb = getRows('saved_games')
+      const savedGame = savedGamesInDb.find((sg) => sg.id === 'sg-atomicity')
+      expect(savedGame?.attendanceCount).toBe(0)
     })
   })
 
