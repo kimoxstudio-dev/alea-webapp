@@ -630,7 +630,7 @@ async function applyClubEventRoomBlocksAndMaterials(
       // inside this same tx for true atomicity with the block insert.
       await cancelSavedGamesForBlockedRoom(
         tx,
-        insertedBlocks.map((b) => ({ roomId: b.roomId, date: b.date })),
+        insertedBlocks.map((b) => ({ roomId: b.roomId, tableId: b.tableId, date: b.date })),
       )
 
       await cancelOverlappingReservationsForClubEventBlocks(tx, insertedBlocks)
@@ -899,6 +899,9 @@ export async function createClubEvent(session: SessionUser, body: ClubEventInput
   // would just roll back anyway.
   if (schedules) {
     await validateRoomsExist(db, schedules)
+  }
+  if (materials.length > 0) {
+    await validateEquipmentExists(db, materials)
   }
 
   // KIM-438: the event insert AND the block/material replace (including

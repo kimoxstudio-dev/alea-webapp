@@ -380,6 +380,11 @@ export async function cancelOverlappingReservationsForBlocks(
 // qa-engineer-owned, not software-engineer's — qa-engineer should add a
 // `tx.execute` mock (e.g. resolving to `{ rows: [] }`) to close that gap.
 //
+// OIR-208 adds table-scoped event blocks. `tableId` is therefore mandatory in
+// the input shape: a non-null value cancels only that table, while null keeps
+// the legacy room-wide behavior. Requiring the property prevents callers from
+// accidentally dropping table scope and cancelling unrelated saved games.
+//
 // Exported (same pattern as deleteEventCascade below) so
 // lib/server/events/club-events-service.ts can reuse it once its own
 // room-block write path (KIM-438, tracked separately) is wired to call this
@@ -387,20 +392,24 @@ export async function cancelOverlappingReservationsForBlocks(
 // ---------------------------------------------------------------------------
 export async function cancelSavedGamesForBlockedRoom(
   tx: AdminTx,
-  blocks: Array<{ roomId: string; date: string }>,
+  blocks: Array<{ roomId: string; tableId: string | null; date: string }>,
 ): Promise<number> {
   if (blocks.length === 0) return 0
 
   let cancelledCount = 0
 
   for (const block of blocks) {
-    const roomTables = await tx
-      .select({ id: tables.id })
-      .from(tables)
-      .where(eq(tables.roomId, block.roomId))
-      .orderBy(asc(tables.id))
-
-    const tableIds = roomTables.map((t) => t.id)
+    let tableIds: string[]
+    if (block.tableId !== null) {
+      tableIds = [block.tableId]
+    } else {
+      const roomTables = await tx
+        .select({ id: tables.id })
+        .from(tables)
+        .where(eq(tables.roomId, block.roomId))
+        .orderBy(asc(tables.id))
+      tableIds = roomTables.map((t) => t.id)
+    }
     if (tableIds.length === 0) continue
 
     // Reimplemented `pg_advisory_xact_lock` loop (see doc comment above for
@@ -478,7 +487,7 @@ async function createEventAtomic(
 
         await cancelSavedGamesForBlockedRoom(
           tx,
-          insertedBlocks.map((b) => ({ roomId: b.roomId, date: b.date })),
+          insertedBlocks.map((b) => ({ roomId: b.roomId, tableId: b.tableId, date: b.date })),
         )
       }
 
@@ -532,7 +541,7 @@ async function updateEventAtomic(
 
         await cancelSavedGamesForBlockedRoom(
           tx,
-          insertedBlocks.map((b) => ({ roomId: b.roomId, date: b.date })),
+          insertedBlocks.map((b) => ({ roomId: b.roomId, tableId: b.tableId, date: b.date })),
         )
       }
 
@@ -641,7 +650,7 @@ async function createEventWithBlocksAtomic(
 
         await cancelSavedGamesForBlockedRoom(
           tx,
-          insertedBlocks.map((b) => ({ roomId: b.roomId, date: b.date })),
+          insertedBlocks.map((b) => ({ roomId: b.roomId, tableId: b.tableId, date: b.date })),
         )
       }
 
@@ -722,7 +731,7 @@ async function updateEventWithBlocksAtomic(
 
         await cancelSavedGamesForBlockedRoom(
           tx,
-          insertedBlocks.map((b) => ({ roomId: b.roomId, date: b.date })),
+          insertedBlocks.map((b) => ({ roomId: b.roomId, tableId: b.tableId, date: b.date })),
         )
       }
 

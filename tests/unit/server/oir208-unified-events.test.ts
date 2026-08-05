@@ -20,6 +20,7 @@ import {
   createStatefulDrizzleDb,
   resetDb,
   seedTable,
+  getRows,
   createMockServiceError,
   MockServiceError,
 } from '@/tests/unit/mocks/drizzle-mock'
@@ -34,8 +35,16 @@ vi.mock('@/lib/server/shared/service-error', () => ({
   serviceError: createMockServiceError(),
 }))
 vi.mock('@/lib/server/events/events-service', () => ({
-  validateAndNormaliseSchedule: vi.fn(() => []),
+  validateAndNormaliseSchedule: vi.fn((schedule) => ({
+    room_id: schedule.roomId ? String(schedule.roomId).trim() : null,
+    table_id: schedule.roomId && schedule.tableId ? String(schedule.tableId).trim() || null : null,
+    date: schedule.date,
+    start_time: schedule.startTime,
+    end_time: schedule.endTime,
+    all_day: schedule.allDay === true,
+  })),
   deleteEventCascade: vi.fn(),
+  cancelSavedGamesForBlockedRoom: vi.fn(),
   cancelOverlappingReservationsForBlocks: vi.fn(),
   // KIM-434 PR3/PR3b: the real isClubEventRow (lib/server/events/events-service.ts)
   // takes the camelCase Drizzle shape { titleEs, titleEn } — see
@@ -469,6 +478,14 @@ describe('OIR-208: Unified Events', () => {
       })
 
       expect(result.id).toBe('evt-1')
+      expect(result.roomBlocks).toEqual([
+        expect.objectContaining({ roomId: 'room-1', tableId: 'table-1' }),
+      ])
+      const { cancelSavedGamesForBlockedRoom } = await import('@/lib/server/events/events-service')
+      expect(cancelSavedGamesForBlockedRoom).toHaveBeenCalledWith(
+        expect.anything(),
+        [{ roomId: 'room-1', tableId: 'table-1', date: '2026-04-20' }],
+      )
     })
 
     it('sets tableId to null in block payload when not provided', async () => {
@@ -495,6 +512,9 @@ describe('OIR-208: Unified Events', () => {
       })
 
       expect(result.id).toBe('evt-1')
+      expect(result.roomBlocks).toEqual([
+        expect.objectContaining({ roomId: 'room-1', tableId: null }),
+      ])
     })
 
     it('rejects a block whose table_id does not belong to room_id (mismatched room/table payload)', async () => {
@@ -513,23 +533,20 @@ describe('OIR-208: Unified Events', () => {
 
       const { updateClubEvent } = await import('@/lib/server/events/club-events-service')
 
-      // Update should handle blocks even when table/room mismatch exists
-      // (The validation is in assertClubEventBlocksTableRoomConsistency during transaction)
-      const result = await updateClubEvent(createAdminSession(), 'evt-1', {
-        schedules: [
-          {
-            roomId: 'room-2',
-            tableId: 'table-1',
-            date: '2026-04-20',
-            startTime: '14:00',
-            endTime: '16:00',
-          },
-        ],
-        blocksRooms: true,
-      })
-
-      // Verify update completed (validation is at DB constraint level in production)
-      expect(result.id).toBe('evt-1')
+      await expect(
+        updateClubEvent(createAdminSession(), 'evt-1', {
+          schedules: [
+            {
+              roomId: 'room-2',
+              tableId: 'table-1',
+              date: '2026-04-20',
+              startTime: '14:00',
+              endTime: '16:00',
+            },
+          ],
+          blocksRooms: true,
+        }),
+      ).rejects.toMatchObject({ statusCode: 400 })
     })
   })
 
@@ -565,6 +582,9 @@ describe('OIR-208: Unified Events', () => {
       })
 
       expect(result.id).toBe('evt-1')
+      expect(result.roomBlocks).toEqual([
+        expect.objectContaining({ roomId: 'room-1', tableId: 'table-1' }),
+      ])
     })
 
     it('detects difference when tableId changes between the stored block and incoming schedule', async () => {
@@ -599,6 +619,9 @@ describe('OIR-208: Unified Events', () => {
       })
 
       expect(result.id).toBe('evt-1')
+      expect(result.roomBlocks).toEqual([
+        expect.objectContaining({ roomId: 'room-1', tableId: 'table-3' }),
+      ])
     })
 
     it('detects difference when table_id differs (room-level block vs. table-scoped schedule)', async () => {
@@ -630,6 +653,9 @@ describe('OIR-208: Unified Events', () => {
       })
 
       expect(result.id).toBe('evt-1')
+      expect(result.roomBlocks).toEqual([
+        expect.objectContaining({ roomId: 'room-1', tableId: 'table-3' }),
+      ])
     })
   })
 
@@ -1308,6 +1334,8 @@ describe('OIR-208: Unified Events', () => {
           titleEn: 'Event With Times',
           dateKind: 'single',
           date: '2026-05-15',
+          startTime: '18:00:00',
+          endTime: '22:00:00',
         }])
 
         const { updateClubEvent } = await import('@/lib/server/events/club-events-service')
@@ -1316,6 +1344,13 @@ describe('OIR-208: Unified Events', () => {
         })
 
         expect(result.titleEs).toBe('Updated Title')
+        expect(getRows('events')).toEqual([
+          expect.objectContaining({
+            id: 'evt-times-1',
+            startTime: '18:00:00',
+            endTime: '22:00:00',
+          }),
+        ])
       })
     })
 
@@ -1337,6 +1372,13 @@ describe('OIR-208: Unified Events', () => {
 
         expect(result.id).toBeDefined()
         expect(result.titleEs).toBe('New Event')
+        expect(getRows('events')).toEqual([
+          expect.objectContaining({
+            description: null,
+            startTime: '00:00:00',
+            endTime: '23:59:00',
+          }),
+        ])
       })
     })
 

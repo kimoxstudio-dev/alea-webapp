@@ -231,6 +231,23 @@ describe('club-events-service', () => {
       expect(result.linkUrl).toBeNull()
     })
 
+    it('rejects an unknown equipment id in materials with 400 before creating the event', async () => {
+      const adminSession = createAdminSession()
+      const { createClubEvent } = await loadClubEventsService()
+
+      await expect(
+        createClubEvent(adminSession, {
+          titleEs: 'Evento con material inexistente',
+          date: '2026-05-01',
+          dateKind: 'single',
+          materials: [{ equipmentId: 'equipment-unknown', quantity: 1 }],
+        }),
+      ).rejects.toMatchObject({ statusCode: 400 })
+
+      expect(getRows('events')).toHaveLength(0)
+      expect(getRows('eventEquipment')).toHaveLength(0)
+    })
+
     it('creates a club event with titleEn absent, succeeds with title_en === title_es in DB (OIR-206)', async () => {
       const adminSession = createAdminSession()
       const { createClubEvent } = await loadClubEventsService()
