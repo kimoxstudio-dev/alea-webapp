@@ -846,6 +846,41 @@ describe('club-events-service', () => {
       ).rejects.toMatchObject({ statusCode: 400 })
     })
 
+    it('requires schedules when enabling room blocks and leaves the event unchanged', async () => {
+      const adminSession = createAdminSession()
+
+      seed({
+        events: [
+          {
+            id: 'evt-1',
+            title: 'Event',
+            titleEs: 'Evento original',
+            titleEn: 'Original event',
+            dateKind: 'single',
+            date: '2026-04-20',
+            createdBy: 'user-1',
+            createdAt: '2026-04-01T00:00:00Z',
+          },
+        ],
+      })
+
+      const { updateClubEvent } = await loadClubEventsService()
+
+      await expect(
+        updateClubEvent(adminSession, 'evt-1', {
+          titleEs: 'Evento modificado',
+          blocksRooms: true,
+        }),
+      ).rejects.toMatchObject({
+        statusCode: 400,
+        message: 'At least one schedule is required when blocksRooms is true',
+      })
+
+      expect(getRows('events')).toEqual([
+        expect.objectContaining({ id: 'evt-1', titleEs: 'Evento original' }),
+      ])
+    })
+
     it('skips RPC when schedules match current blocks (order-insensitive, Finding 4)', async () => {
       const adminSession = createAdminSession()
 

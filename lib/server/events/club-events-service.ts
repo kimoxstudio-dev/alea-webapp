@@ -968,6 +968,10 @@ export async function updateClubEvent(session: SessionUser, id: string, body: Cl
   const schedulesProvided = body.schedules !== undefined
   const wantsBlocks = blocksRoomsProvided ? parseBooleanFlag(body.blocksRooms) : undefined
 
+  if (wantsBlocks === true && !schedulesProvided) {
+    serviceError('At least one schedule is required when blocksRooms is true', 400)
+  }
+
   const validatedSchedules = wantsBlocks !== false && schedulesProvided
     ? validateSchedulesPayload(body.schedules)
     : null
