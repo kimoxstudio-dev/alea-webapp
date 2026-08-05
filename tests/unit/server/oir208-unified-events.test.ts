@@ -1106,58 +1106,10 @@ describe('OIR-208: Unified Events', () => {
     })
 
     it('assertTableAndEventAvailability respects table_id scoping', async () => {
-      const savedGameTables: Record<string, MockTable> = {
-        'sg-table-1': { id: 'sg-table-1', room_id: RESERVATION_ROOM, type: 'removable_top' },
-        'sg-table-2': { id: 'sg-table-2', room_id: RESERVATION_ROOM, type: 'removable_top' },
-      }
-      const admin = {
-        from: vi.fn((table: string) => {
-          if (table === 'tables') {
-            return {
-              select: vi.fn(() => ({
-                eq: vi.fn((_col: string, value: string) => ({
-                  maybeSingle: vi.fn(async () => ({ data: savedGameTables[value] ?? null, error: null })),
-                })),
-              })),
-            }
-          }
-          if (table === 'event_room_blocks') {
-            // Block is scoped ONLY to sg-table-1.
-            return { select: vi.fn(() => chainThen({ data: [{ id: 'blk-8', table_id: 'sg-table-1' }], error: null })) }
-          }
-          if (table === 'saved_games') {
-            return {
-              insert: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  single: vi.fn(async () => ({
-                    data: {
-                      id: 'sg-1',
-                      table_id: 'sg-table-2',
-                      user_id: 'user-1',
-                      start_date: '2026-04-20',
-                      end_date: '2026-05-20',
-                      status: 'active',
-                      attendance_count: 0,
-                      renewed_from_id: null,
-                      created_at: '2026-04-01T00:00:00.000Z',
-                      updated_at: '2026-04-01T00:00:00.000Z',
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            }
-          }
-          return {}
-        }),
-      }
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(admin as any)
-
       const { createSavedGameForSession } = await import('@/lib/server/games/saved-games-service')
 
-      // Seed Drizzle tables and saved_games for the state-driven mock (KIM-443).
-      // The service uses getDrizzleAdminDb() to look up tables and rooms; seedTable
-      // accepts both Drizzle table objects and plain data objects.
+      // Saved-game validation now reads tables and event blocks from the same
+      // Drizzle/Neon transaction as the insert.
       seedTable('rooms', [
         { id: RESERVATION_ROOM, name: 'Reservation Room' },
       ])
@@ -1165,6 +1117,16 @@ describe('OIR-208: Unified Events', () => {
         { id: 'sg-table-1', roomId: RESERVATION_ROOM, name: 'Table SG-1', type: 'removable_top' },
         { id: 'sg-table-2', roomId: RESERVATION_ROOM, name: 'Table SG-2', type: 'removable_top' },
       ])
+      seedTable('event_room_blocks', [{
+        id: 'blk-8',
+        eventId: 'evt-1',
+        roomId: RESERVATION_ROOM,
+        tableId: 'sg-table-1',
+        date: '2026-04-20',
+        startTime: '18:00',
+        endTime: '20:00',
+        allDay: false,
+      }])
 
       // The blocked table itself must conflict.
       await expect(createSavedGameForSession({ id: 'user-1', role: 'member' }, {
