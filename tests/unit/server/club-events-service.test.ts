@@ -456,9 +456,9 @@ describe('club-events-service', () => {
         ],
       })
 
-      // Verify the event was created (blocksRooms would be true if blocks persisted)
+      // Verify the event and its room block were persisted.
       expect(result.titleEs).toBe('Torneo con Bloques')
-      expect(result.blocksRooms).toBeDefined()
+      expect(result.blocksRooms).toBe(true)
     })
 
     it('rolls back (deletes) the created event when apply_club_event_room_blocks RPC fails, leaving no orphan row (PR #149 review)', async () => {
