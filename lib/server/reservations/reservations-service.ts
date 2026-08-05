@@ -24,6 +24,7 @@ import {
   getPendingCheckInDeadline,
   isPendingReservationExpired,
 } from '@/lib/server/reservations/pending-reservation-expiry'
+import { recordSavedGameAttendance } from '@/lib/server/games/saved-games-service'
 
 /**
  * GitHub #238 (KIM-434 F3c stack, remaining consumer): migrated off the
@@ -103,6 +104,22 @@ function isConflictError(error: unknown): boolean {
  * (not-yet-migrated) `pending-reservation-expiry.ts` consumers. */
 function toPendingSlot(row: { date: string; startTime: string; endTime: string }) {
   return { date: row.date, start_time: row.startTime, end_time: row.endTime }
+}
+
+/** Bridges a Drizzle reservation row (camelCase) to the snake_case shape
+ * `recordSavedGameAttendance()` (saved-games-service.ts) expects — same
+ * kind of conversion as `toPendingSlot()` above, for the same reason: that
+ * service's shape predates this file's migration off the legacy Supabase
+ * seam and hasn't been changed to avoid touching its other callers. */
+function toAttendanceReservation(row: ReservationRow) {
+  return {
+    id: row.id,
+    table_id: row.tableId,
+    user_id: row.userId,
+    date: row.date,
+    surface: row.surface,
+    status: row.status,
+  }
 }
 
 function parseDate(value: string): string {
@@ -1138,6 +1155,15 @@ export async function activateReservationByTable(
   if (!updated) {
     serviceError(ERROR_CODES.CHECK_IN_ALREADY_ACTIVE, 409)
   }
+
+  // Reimplements the dropped `record_saved_game_attendance_after_activation`
+  // trigger (AFTER UPDATE OF status ON reservations), which used to record
+  // check-in attendance against an active saved_game in the same transaction
+  // as this activation UPDATE. No production code called this until now —
+  // see `recordSavedGameAttendance()`'s doc comment (saved-games-service.ts)
+  // for its own atomicity (attendance insert + saved_games.attendance_count
+  // increment happen together there).
+  await recordSavedGameAttendance(toAttendanceReservation(updated))
 
   return mapReservation(updated)
 }
