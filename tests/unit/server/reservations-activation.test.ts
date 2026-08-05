@@ -989,10 +989,12 @@ describe('reservations service', () => {
 
       await activateReservationByTable('t3', '2', undefined)
 
-      // Verify recordSavedGameAttendance was called with the reservation data
+      // Verify recordSavedGameAttendance was called with the tx and reservation data
       expect(recordMock).toHaveBeenCalledOnce()
-      const call = recordMock.mock.calls[0]![0]
-      expect(call).toMatchObject({
+      const call = recordMock.mock.calls[0]!
+      // First argument is tx, second is the reservation
+      expect(call[0]).toBeDefined() // tx should be provided
+      expect(call[1]).toMatchObject({
         id: 'r-sg-test',
         table_id: 't3',
         user_id: '2',

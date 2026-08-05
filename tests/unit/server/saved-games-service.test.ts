@@ -12,6 +12,7 @@ import {
 } from '@/tests/unit/mocks/drizzle-mock'
 import { createQueryBuilder } from '@/tests/unit/mocks/supabase-mock'
 import { rooms, tables, savedGames, savedGameAttendances } from '@/lib/db/schema'
+import { getDrizzleAdminDb } from '@/lib/db'
 
 // In-memory store for event_room_blocks (still using legacy Supabase)
 const eventRoomBlocksStore: Array<{ id: string; room_id: string; table_id: string | null; date: string }> = []
@@ -230,14 +231,15 @@ describe('saved games service', () => {
       activated_at: '2026-06-19T18:00:00Z',
       created_at: '2026-06-19T10:00:00Z',
     }
-    await recordSavedGameAttendance(reservation)
+    const tx = getDrizzleAdminDb()
+    await recordSavedGameAttendance(tx, reservation)
 
     // Second call should fail with 23505 (unique constraint on playReservationId)
     // Create an Error-like object with a code property that passes the duck-type check
     const pgError = new Error('unique_violation') as unknown as { code: string }
     ;(pgError as any).code = '23505'
     failNextQuery({ op: 'insert', table: savedGameAttendances, error: pgError })
-    await recordSavedGameAttendance(reservation)
+    await recordSavedGameAttendance(tx, reservation)
 
     const attendances = getRows(savedGameAttendances)
     expect(attendances).toHaveLength(1)
@@ -370,7 +372,8 @@ describe('saved games service', () => {
       status: 'active' as const,
     }
 
-    await recordSavedGameAttendance(reservation)
+    const tx = getDrizzleAdminDb()
+    await recordSavedGameAttendance(tx, reservation)
 
     // Verify both the attendance row AND the counter were updated
     const attendances = getRows(savedGameAttendances)
@@ -410,7 +413,8 @@ describe('saved games service', () => {
       status: 'active' as const,
     }
 
-    await recordSavedGameAttendance(bottomReservation)
+    const tx = getDrizzleAdminDb()
+    await recordSavedGameAttendance(tx, bottomReservation)
 
     // No attendance should be recorded
     const attendances = getRows(savedGameAttendances)
@@ -435,7 +439,8 @@ describe('saved games service', () => {
     }
 
     // No saved game seeded for this reservation
-    await recordSavedGameAttendance(reservation)
+    const tx = getDrizzleAdminDb()
+    await recordSavedGameAttendance(tx, reservation)
 
     // No attendance should be recorded
     const attendances = getRows(savedGameAttendances)
