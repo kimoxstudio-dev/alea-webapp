@@ -132,10 +132,17 @@ conflict-check-then-insert in `db.transaction()`, taking
 (line ~181) was changed to take the transaction handle (`tx: AdminTx`) as its
 first parameter instead of opening its own `getDrizzleAdminDb()` connection,
 so its read is guaranteed to run after the lock is held. Both callers rethrow
-`ServiceError` instances (`if (err instanceof ServiceError) throw err`) so the
-existing 400/404/409 validation responses from
-`assertTableAndEventAvailability()` are preserved instead of collapsing into
-a generic 500 — see the "Known test-mock gap" note in §5 below.
+business-validation errors from `assertTableAndEventAvailability()`
+(400/404/409) instead of collapsing them into a generic 500 — via a local
+`isServiceError()` duck-type check (`error is { statusCode: number }`)
+rather than `instanceof ServiceError` (the `instanceof` pattern used
+elsewhere in this codebase, e.g. `events-service.ts:660`,
+`club-events-service.ts:938`, requires importing the `ServiceError` class,
+and this file's own existing test mock
+(`tests/unit/server/saved-games-service.test.ts`) factory-mocks
+`@/lib/server/shared/service-error` without exporting `ServiceError` —
+duck-typing on `statusCode` gets the identical rethrow behavior without
+requiring a test-file change).
 
 ### Item 2 — `saved_game_attendance_count`: never incremented
 
@@ -221,24 +228,33 @@ context (`activateReservationByTable()`), correctly outside that invariant's
 scope — it never reads or returns saved-games/reservations rows to a member
 session, it only writes.
 
-## 6. Known test-mock gap (flagged for qa-engineer, not fixed here)
+## 6. Test-mock compatibility note (why item 1 duck-types instead of `instanceof`)
 
-`tests/unit/server/saved-games-service.test.ts` mocks
+`tests/unit/server/saved-games-service.test.ts` factory-mocks
 `@/lib/server/shared/service-error` with only `serviceError:
-createMockServiceError()` (no `ServiceError` export). Item 1's fix follows
-the same `if (err instanceof ServiceError) throw err` pattern already used
-elsewhere in this codebase (`club-events-service.ts:938,1035`,
-`events-service.ts:660,741`, `equipment-service.ts:236`) — those services'
-test files already mock `ServiceError: MockServiceError` for exactly this
-reason (see `tests/unit/server/club-events-service.test.ts:56` and
-`tests/unit/server/events-service-multiday.test.ts:54`).
-`saved-games-service.test.ts` predates this pattern in this file and doesn't
-yet have that one-line addition, so 2 of its 8 tests
-("rejects regular tables and durations over three months",
-"rejects date ranges blocked by an event") currently fail with "No
-'ServiceError' export is defined on the mock". This is a test-file change
-(mock factory only, not test bodies/assertions) — out of scope for
-software-engineer per repo convention; flagged for qa-engineer to add
-`ServiceError: MockServiceError` to that file's existing
-`vi.mock('@/lib/server/shared/service-error', …)` call, mirroring the two
-sibling test files above.
+createMockServiceError()` — no `ServiceError` class export. The first
+implementation of item 1 used `if (err instanceof ServiceError) throw err`,
+the same pattern already used elsewhere in this codebase
+(`club-events-service.ts:938,1035`, `events-service.ts:660,741`,
+`equipment-service.ts:236`), whose test files already mock `ServiceError:
+MockServiceError` for exactly this reason (see
+`tests/unit/server/club-events-service.test.ts:56` and
+`tests/unit/server/events-service-multiday.test.ts:54`). That first version
+made 2 of `saved-games-service.test.ts`'s 8 tests fail locally and (via the
+repo's pre-push hook, which runs the full suite) blocked pushing this
+branch at all — `instanceof` against an import that a `vi.mock()` factory
+doesn't re-export throws "No 'ServiceError' export is defined on the mock"
+before the assertion is even reached.
+
+Rather than editing that test file (owned exclusively by qa-engineer — see
+repo convention), the final implementation uses a local duck-typed
+`isServiceError()` check (`error is { statusCode: number }`,
+`lib/server/games/saved-games-service.ts`) instead of `instanceof
+ServiceError`, achieving the identical rethrow behavior (preserving the
+original 400/404/409 from `assertTableAndEventAvailability()`) without
+importing the `ServiceError` class at all. This is a one-file deviation
+from the `instanceof` convention used in the 3 files above, made
+specifically to avoid a test-file edit for a production-code change; if
+qa-engineer prefers strict consistency with the `instanceof` pattern
+instead, the one-line mock addition (`ServiceError: MockServiceError`,
+mirroring the two sibling test files above) is the alternative fix.

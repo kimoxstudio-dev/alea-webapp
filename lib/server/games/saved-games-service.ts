@@ -36,7 +36,7 @@ import type { SessionUser } from '@/lib/server/auth/auth'
 import { getCurrentClubDate, isValidDateOnlyString } from '@/lib/club-time'
 import { getAdminDb, getDrizzleAdminDb, type AdminDbClient } from '@/lib/db'
 import { rooms, savedGameAttendances, savedGames, tables } from '@/lib/db/schema'
-import { ServiceError, serviceError } from '@/lib/server/shared/service-error'
+import { serviceError } from '@/lib/server/shared/service-error'
 import { assertMemberRowsScoped } from '@/lib/server/shared/data-scoping'
 import type { Tables } from '@/lib/supabase/types'
 
@@ -99,6 +99,24 @@ function getPgErrorCode(error: unknown): string | undefined {
   if (typeof error !== 'object' || error === null) return undefined
   const { code } = error as { code?: unknown }
   return typeof code === 'string' ? code : undefined
+}
+
+/**
+ * Duck-typed `ServiceError` check (same intent as `instanceof ServiceError`
+ * elsewhere in this codebase — e.g. `events-service.ts`, `club-events-service.ts`)
+ * rather than importing the class: `assertTableAndEventAvailability()` can
+ * throw a real `ServiceError` (400/404/409) from inside the transactions
+ * below, and this needs to distinguish "rethrow the original status code"
+ * from "an unexpected DB/driver error, map to 500" without also treating
+ * every unrelated thrown value as a rethrow candidate.
+ */
+function isServiceError(error: unknown): error is { statusCode: number; message: string } {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'statusCode' in error &&
+    typeof (error as { statusCode: unknown }).statusCode === 'number'
+  )
 }
 
 /** Builds the saved_games -> tables -> rooms join used by every read below. */
@@ -270,7 +288,7 @@ export async function createSavedGameForSession(
       return inserted
     })
   } catch (err) {
-    if (err instanceof ServiceError) throw err
+    if (isServiceError(err)) throw err
     const code = getPgErrorCode(err)
     if (code === '23P01') serviceError(ERROR_CODES.SAVED_GAME_CONFLICT, 409)
     if (code === '23514') serviceError((err as Error).message, 400)
@@ -334,7 +352,7 @@ export async function renewSavedGameForSession(session: SessionUser, id: string)
       return inserted
     })
   } catch (err) {
-    if (err instanceof ServiceError) throw err
+    if (isServiceError(err)) throw err
     const code = getPgErrorCode(err)
     if (code === '23505') serviceError(ERROR_CODES.SAVED_GAME_ALREADY_RENEWED, 409)
     if (code === '23P01') serviceError(ERROR_CODES.SAVED_GAME_CONFLICT, 409)
