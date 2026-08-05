@@ -54,6 +54,7 @@ import { recordSavedGameAttendance } from '@/lib/server/games/saved-games-servic
 type ReservationRow = typeof reservations.$inferSelect
 type TableRow = { id: string; type: 'small' | 'large' | 'removable_top'; roomId: string }
 type EquipmentRow = typeof equipment.$inferSelect
+type ReservationTx = Parameters<Parameters<DbClient['transaction']>[0]>[0]
 
 type EnrichedReservationRow = ReservationRow & {
   memberNumber: string | null
@@ -97,6 +98,15 @@ function isConflictError(error: unknown): boolean {
   if (typeof error !== 'object' || error === null) return false
   const { code } = error as { code?: unknown }
   return code === '23P01'
+}
+
+function isServiceError(error: unknown): error is { statusCode: number } {
+  return (
+    typeof error === 'object'
+    && error !== null
+    && 'statusCode' in error
+    && typeof (error as { statusCode: unknown }).statusCode === 'number'
+  )
 }
 
 /** Bridges a Drizzle reservation row's `date`/`startTime`/`endTime` fields to
@@ -257,13 +267,10 @@ async function hasEventBlockConflict(input: {
   return blocks.some((block) => block.tableId == null || block.tableId === input.tableId)
 }
 
-async function hasSavedGameBottomConflict(input: {
+async function hasSavedGameBottomConflict(db: Pick<DbClient, 'select'>, input: {
   tableId: string
   date: string
-  surface?: TableSurface
 }) {
-  if (input.surface !== 'bottom') return false
-  const db = getDrizzleAdminDb()
   const rows = await runQuery(
     db
       .select({ id: savedGames.id })
@@ -280,6 +287,22 @@ async function hasSavedGameBottomConflict(input: {
   )
 
   return rows.length > 0
+}
+
+async function assertNoSavedGameBottomConflict(
+  tx: ReservationTx,
+  input: { tableId: string; date: string; surface: TableSurface | null; status: ReservationRow['status'] },
+): Promise<void> {
+  if (input.surface !== 'bottom' || (input.status !== 'pending' && input.status !== 'active')) return
+
+  // Reimplement validate_reservation_against_saved_game's matching half of
+  // the per-table lock protocol. This must run in the same transaction as the
+  // reservation write so create/renew saved-game operations cannot race this
+  // check and both commit incompatible rows.
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${input.tableId}::text, 0))`)
+  if (await hasSavedGameBottomConflict(tx, input)) {
+    serviceError(ERROR_CODES.SAVED_GAME_BOTTOM_RESERVED, 409)
+  }
 }
 
 async function getReservationForAccess(reservationId: string) {
@@ -834,9 +857,6 @@ export async function createReservationForSession(
   if (await hasEventBlockConflict({ roomId: table.roomId, tableId, date, startTime, endTime })) {
     serviceError(ERROR_CODES.ROOM_BLOCKED_BY_EVENT, 409)
   }
-  if (await hasSavedGameBottomConflict({ tableId, date, surface })) {
-    serviceError(ERROR_CODES.SAVED_GAME_BOTTOM_RESERVED, 409)
-  }
   await assertEquipmentSelectionAllowed({
     roomId: table.roomId,
     equipmentIds,
@@ -847,18 +867,29 @@ export async function createReservationForSession(
 
   let insertedRow: ReservationRow | undefined
   try {
-    ;[insertedRow] = await db
-      .insert(reservations)
-      .values({
+    insertedRow = await db.transaction(async (tx) => {
+      await assertNoSavedGameBottomConflict(tx, {
         tableId,
-        userId: session.id,
         date,
-        startTime,
-        endTime,
         surface: surface ?? null,
+        status: 'pending',
       })
-      .returning()
+
+      const [row] = await tx
+        .insert(reservations)
+        .values({
+          tableId,
+          userId: session.id,
+          date,
+          startTime,
+          endTime,
+          surface: surface ?? null,
+        })
+        .returning()
+      return row
+    })
   } catch (err) {
+    if (isServiceError(err)) throw err
     if (isConflictError(err)) {
       throwSlotTaken()
     }
@@ -980,14 +1011,6 @@ export async function updateReservationForSession(
   })) {
     serviceError(ERROR_CODES.ROOM_BLOCKED_BY_EVENT, 409)
   }
-  if (await hasSavedGameBottomConflict({
-    tableId: existingReservation.tableId,
-    date: nextDate,
-    surface: nextSurface ?? undefined,
-  })) {
-    serviceError(ERROR_CODES.SAVED_GAME_BOTTOM_RESERVED, 409)
-  }
-
   const db = getDrizzleDb()
   if (needsUserOverlapCheck) {
     await checkUserSlotOverlap(
@@ -1011,20 +1034,34 @@ export async function updateReservationForSession(
     })
   }
 
+  const resolvedStatus = nextStatus == null
+    ? existingReservation.status
+    : (String(nextStatus) as ReservationRow['status'])
   let updatedRow: ReservationRow | undefined
   try {
-    ;[updatedRow] = await db
-      .update(reservations)
-      .set({
+    updatedRow = await db.transaction(async (tx) => {
+      await assertNoSavedGameBottomConflict(tx, {
+        tableId: existingReservation.tableId,
         date: nextDate,
-        startTime: nextStartTime,
-        endTime: nextEndTime,
         surface: nextSurface,
-        status: nextStatus == null ? existingReservation.status : (String(nextStatus) as ReservationRow['status']),
+        status: resolvedStatus,
       })
-      .where(eq(reservations.id, reservationId))
-      .returning()
+
+      const [row] = await tx
+        .update(reservations)
+        .set({
+          date: nextDate,
+          startTime: nextStartTime,
+          endTime: nextEndTime,
+          surface: nextSurface,
+          status: resolvedStatus,
+        })
+        .where(eq(reservations.id, reservationId))
+        .returning()
+      return row
+    })
   } catch (err) {
+    if (isServiceError(err)) throw err
     if (isConflictError(err)) {
       throwSlotTaken()
     }

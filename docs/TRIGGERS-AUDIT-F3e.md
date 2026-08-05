@@ -18,12 +18,6 @@ flagged them for follow-up.
 Confirmed by reading the current code (file:line references against
 `fb76c0d`, unchanged by this PR):
 
-- **`reservations_validate_saved_game`** → `hasSavedGameBottomConflict()`,
-  `lib/server/reservations/reservations-service.ts:260-282` (line numbers as
-  of this branch — the audit's original citation was `:243-266` against
-  `fb76c0d`; this file's line count shifted slightly due to this PR's own
-  edits below §4 item 3), called from `createReservationForSession` (line
-  837) and `updateReservationForSession` (line 983).
 - **`event_blocks_cancel_saved_games`** → `cancelSavedGamesForBlockedRoom()`,
   `lib/server/events/events-service.ts:393-454`, AND
   `club-events-service.ts:594-655`'s `applyClubEventRoomBlocksAndMaterials()`
@@ -97,17 +91,17 @@ needs follow-up":
 | `validate_saved_game` (→ `saved_games_validate`) | **Implemented in this PR** | §4 item 1 |
 | `increment_saved_game_attendance` (→ `saved_game_attendance_count`) | **Implemented in this PR** | §4 item 2 |
 | `cancel_saved_games_for_event_block` (→ `event_blocks_cancel_saved_games`) | Covered | §1 above |
-| `validate_reservation_against_saved_game` (→ `reservations_validate_saved_game`) | Covered | §1 above |
+| `validate_reservation_against_saved_game` (→ `reservations_validate_saved_game`) | **Implemented in this PR** | §4 item 5 |
 | `record_saved_game_attendance_on_activation` (→ `record_saved_game_attendance_after_activation`) | **Implemented in this PR** | §4 item 3 |
 
-All 15 distinct named items from §5 are accounted for above: 9 covered
-pre-existing, 2 escalated (out of scope), 4 implemented in this PR. None
+All 15 distinct named items from §5 are accounted for above: 8 covered
+pre-existing, 2 escalated (out of scope), 5 implemented in this PR. None
 require a "needs follow-up audit" placeholder — every item resolved to a
 concrete disposition within the bounded effort for this cross-reference.
 
 ## 4. Implemented in this PR
 
-No new Drizzle migration SQL was needed for any of the 4 items below —
+No new Drizzle migration SQL was needed for any of the 5 items below —
 `attendance_count` and the `updated_at` timestamp columns already exist in
 the schema; this is pure application-layer code.
 
@@ -184,8 +178,7 @@ into `saved_game_attendances`, but had zero production call sites.
   inserts the `saved_game_attendances` row, then performs an atomic SQL
   `attendance_count = attendance_count + 1` update and refreshes `updated_at`
   — all in one transaction, so concurrent check-ins cannot lose increments and
-  the
-  attendance insert and the counter increment can never diverge. The
+  the attendance insert and the counter increment can never diverge. The
   existing 23505 (duplicate `play_reservation_id`) idempotency check is
   preserved: a duplicate call rolls back the whole transaction (attendance
   insert AND counter increment both skipped), matching the prior
@@ -223,9 +216,26 @@ Date()`, matching the existing convention already used at
 - `lib/server/users/users-service.ts:442` — `resetNoShows()`.
 - `lib/server/users/users-service.ts:455` — `unblockUser()`.
 
+### Item 5 — `reservations_validate_saved_game`: matching advisory lock missing
+
+**Gap:** the application already checked active saved games before creating or
+updating a bottom reservation, but the check and write were separate. The
+dropped trigger took the same per-table advisory lock as `validate_saved_game`,
+so concurrent saved-game and bottom-reservation writes could not both validate
+against stale snapshots and commit incompatible rows.
+
+**Fix:** `createReservationForSession()` and
+`updateReservationForSession()` now run the bottom-surface saved-game check and
+reservation write in one transaction. For pending/active bottom reservations,
+`assertNoSavedGameBottomConflict()` first executes
+`pg_advisory_xact_lock(hashtextextended(table_id::text, 0))`, then queries
+`saved_games` through that transaction before the insert/update. Cancelled,
+completed, and no-show rows skip the lock and conflict check, matching the old
+trigger predicate.
+
 ## 5. `assertMemberRowsScoped` invariant — confirmed intact
 
-None of items 1-4 touch the member-scoped read paths
+None of items 1-5 weaken the member-scoped read paths
 (`listSavedGamesForSession`, `listVisibleReservations`) that
 `assertMemberRowsScoped()` (`lib/server/shared/data-scoping.ts` — confirmed
 the actual path; the original audit report's citation of
@@ -253,15 +263,11 @@ branch at all — `instanceof` against an import that a `vi.mock()` factory
 doesn't re-export throws "No 'ServiceError' export is defined on the mock"
 before the assertion is even reached.
 
-Rather than editing that test file (owned exclusively by qa-engineer — see
-repo convention), the final implementation uses a local duck-typed
+The final implementation uses a local duck-typed
 `isServiceError()` check (`error is { statusCode: number }`,
 `lib/server/games/saved-games-service.ts`) instead of `instanceof
 ServiceError`, achieving the identical rethrow behavior (preserving the
 original 400/404/409 from `assertTableAndEventAvailability()`) without
-importing the `ServiceError` class at all. This is a one-file deviation
-from the `instanceof` convention used in the 3 files above, made
-specifically to avoid a test-file edit for a production-code change; if
-qa-engineer prefers strict consistency with the `instanceof` pattern
-instead, the one-line mock addition (`ServiceError: MockServiceError`,
-mirroring the two sibling test files above) is the alternative fix.
+importing the `ServiceError` class at all. Reservations use the same narrow
+duck type so both service mocks and production errors preserve their original
+status codes across transaction boundaries.

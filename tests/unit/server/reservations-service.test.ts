@@ -10,6 +10,8 @@ import {
   createMockServiceError,
   executeMock,
   bypassWhereFilterOnColumn,
+  getQueryLog,
+  renderSql,
 } from '@/tests/unit/mocks/drizzle-mock'
 import { tables, rooms, reservations, equipment, roomDefaultEquipment, reservationEquipment, eventRoomBlocks, savedGames, profiles } from '@/lib/db/schema'
 import type { InferSelectModel } from 'drizzle-orm'
@@ -1735,6 +1737,44 @@ describe('reservations service', () => {
   })
 
   describe('savedGames conflict detection (GitHub #248 split-brain fix)', () => {
+    it('locks the table before checking saved games and creating a bottom reservation', async () => {
+      const { createReservationForSession } = await loadReservationModules()
+
+      await createReservationForSession(memberSession, {
+        tableId: 't3',
+        date: '2027-06-20',
+        startTime: '10:00',
+        endTime: '11:00',
+        surface: 'bottom',
+      })
+
+      const log = getQueryLog()
+      const lockIndex = log.findIndex((entry) => entry.op === 'execute')
+      const savedGameReadIndex = log.findIndex((entry) => entry.op === 'select' && entry.table === 'savedgames')
+      const reservationInsertIndex = log.findIndex((entry) => entry.op === 'insert' && entry.table === 'reservations')
+      expect(lockIndex).toBeGreaterThanOrEqual(0)
+      expect(lockIndex).toBeLessThan(savedGameReadIndex)
+      expect(savedGameReadIndex).toBeLessThan(reservationInsertIndex)
+      expect(renderSql(executeMock.mock.calls[0]![0] as Parameters<typeof renderSql>[0]))
+        .toContain('pg_advisory_xact_lock(hashtextextended')
+    })
+
+    it('locks the table before checking saved games and updating to bottom', async () => {
+      const { updateReservationForSession } = await loadReservationModules()
+
+      await updateReservationForSession(memberSession, 'r2', { surface: 'bottom' })
+
+      const log = getQueryLog()
+      const lockIndex = log.findIndex((entry) => entry.op === 'execute')
+      const savedGameReadIndex = log.findIndex((entry) => entry.op === 'select' && entry.table === 'savedgames')
+      const reservationUpdateIndex = log.findIndex((entry) => entry.op === 'update' && entry.table === 'reservations')
+      expect(lockIndex).toBeGreaterThanOrEqual(0)
+      expect(lockIndex).toBeLessThan(savedGameReadIndex)
+      expect(savedGameReadIndex).toBeLessThan(reservationUpdateIndex)
+      expect(renderSql(executeMock.mock.calls[0]![0] as Parameters<typeof renderSql>[0]))
+        .toContain('pg_advisory_xact_lock(hashtextextended')
+    })
+
     it('blocks bottom-surface reservations when overlapping saved game exists', async () => {
       const { createReservationForSession } = await loadReservationModules()
 
@@ -1764,6 +1804,52 @@ describe('reservations service', () => {
           surface: 'bottom',
         }),
       ).rejects.toMatchObject({ message: 'SAVED_GAME_BOTTOM_RESERVED', statusCode: 409 })
+    })
+
+    it('blocks updates to bottom when an overlapping saved game exists', async () => {
+      const { updateReservationForSession } = await loadReservationModules()
+      seed({
+        saved_games: [{
+          id: 'sg-update-conflict',
+          tableId: 't3',
+          userId: 'other-user',
+          startDate: '2027-06-15',
+          endDate: '2027-06-30',
+          status: 'active',
+          attendanceCount: 0,
+          renewedFromId: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }],
+      })
+
+      await expect(updateReservationForSession(memberSession, 'r2', { surface: 'bottom' }))
+        .rejects.toMatchObject({ message: 'SAVED_GAME_BOTTOM_RESERVED', statusCode: 409 })
+    })
+
+    it('allows a bottom reservation to leave active state despite an overlapping saved game', async () => {
+      const { updateReservationForSession } = await loadReservationModules()
+      seed({
+        reservations: getRows(reservations).map((row) => (
+          row.id === 'r2' ? { ...row, surface: 'bottom' } : row
+        )),
+        saved_games: [{
+          id: 'sg-cancel',
+          tableId: 't3',
+          userId: 'other-user',
+          startDate: '2027-06-15',
+          endDate: '2027-06-30',
+          status: 'active',
+          attendanceCount: 0,
+          renewedFromId: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }],
+      })
+
+      await expect(updateReservationForSession(memberSession, 'r2', { status: 'cancelled' }))
+        .resolves.toMatchObject({ status: 'cancelled', surface: 'bottom' })
+      expect(getQueryLog().some((entry) => entry.op === 'execute')).toBe(false)
     })
 
     it('allows bottom-surface reservations when no overlapping saved game exists', async () => {
