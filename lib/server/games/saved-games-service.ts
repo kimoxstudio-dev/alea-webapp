@@ -386,20 +386,27 @@ type PlayReservationForAttendance = Pick<
  *   - `saved_game_attendance_count` (AFTER INSERT ON saved_game_attendances
  *     -> increment_saved_game_attendance(), bumps the parent
  *     `saved_games.attendance_count`)
- * Both steps run inside one `db.transaction()` so the attendance insert and
- * the counter increment can never diverge.
+ *
+ * `tx` is the caller's transaction (see `activateReservationByTable()` in
+ * reservations-service.ts) — this function never opens its own top-level
+ * connection, so the attendance insert/counter increment below and the
+ * reservation activation UPDATE that triggers them commit or roll back
+ * together. Same "always take the caller's `tx`" contract as
+ * `assertTableAndEventAvailability()` above.
+ *
+ * The insert+update pair itself still runs inside a nested `tx.transaction()`
+ * (a SAVEPOINT on the node-postgres driver) rather than directly against
+ * `tx`: that lets the 23505 (unique_violation on play_reservation_id, i.e.
+ * "already recorded") case below roll back just this pair and continue
+ * using the outer `tx` for the caller's remaining work, instead of leaving
+ * the whole outer transaction aborted.
  */
-export async function recordSavedGameAttendance(playReservation: PlayReservationForAttendance): Promise<void> {
+export async function recordSavedGameAttendance(tx: AdminTx, playReservation: PlayReservationForAttendance): Promise<void> {
   if (playReservation.surface !== 'top' || playReservation.status !== 'active') return
 
-  // Admin client required: this function is called from a system/cron context
-  // (not a user request) and intentionally reads across all users to match a
-  // reservation to its saved game. No per-user scoping is appropriate here.
-  const db = getDrizzleAdminDb()
-
   try {
-    await db.transaction(async (tx) => {
-      const [savedGame] = await tx
+    await tx.transaction(async (savepointTx) => {
+      const [savedGame] = await savepointTx
         .select({ id: savedGames.id, attendanceCount: savedGames.attendanceCount })
         .from(savedGames)
         .where(
@@ -414,13 +421,13 @@ export async function recordSavedGameAttendance(playReservation: PlayReservation
 
       if (!savedGame) return
 
-      await tx.insert(savedGameAttendances).values({
+      await savepointTx.insert(savedGameAttendances).values({
         savedGameId: savedGame.id,
         playReservationId: playReservation.id,
         attendedOn: playReservation.date,
       })
 
-      await tx
+      await savepointTx
         .update(savedGames)
         .set({ attendanceCount: savedGame.attendanceCount + 1 })
         .where(eq(savedGames.id, savedGame.id))
@@ -429,7 +436,7 @@ export async function recordSavedGameAttendance(playReservation: PlayReservation
     // 23505 (unique_violation on play_reservation_id) means this reservation
     // already recorded attendance — idempotent no-op, matches prior behavior.
     // The counter increment above is skipped too since it's in the same
-    // transaction, which rolls back entirely on any error.
+    // nested transaction, which rolls back to the savepoint on any error.
     if (getPgErrorCode(err) !== '23505') serviceError('Internal server error', 500)
   }
 }

@@ -1144,26 +1144,37 @@ export async function activateReservationByTable(
   // Zero rows returned (rather than an error) means the reservation was
   // already activated by a concurrent request (TOCTOU race) between our read
   // and this UPDATE — handled the same way as "not found" below (409).
-  const [updated] = await runQuery(
-    db
-      .update(reservations)
-      .set({ status: 'active', activatedAt: nowUtc })
-      .where(and(eq(reservations.id, reservation.id), eq(reservations.status, 'pending')))
-      .returning(),
-  )
+  //
+  // The status UPDATE and the saved-game attendance recording below run
+  // inside a single transaction so they commit or roll back together —
+  // together they reimplement the dropped
+  // `record_saved_game_attendance_after_activation` trigger (AFTER UPDATE OF
+  // status ON reservations), which used to record check-in attendance
+  // against an active saved_game in the same transaction as this activation
+  // UPDATE. Running them as two separate `db.transaction()` calls would let
+  // the activation commit while the attendance write failed, silently
+  // diverging from the old trigger-based behavior (activated reservation,
+  // missed attendance count). `recordSavedGameAttendance()` is passed this
+  // transaction's `tx` handle (same pattern as `assertTableAndEventAvailability`
+  // in saved-games-service.ts) so its writes participate in it rather than
+  // opening a second, independent transaction.
+  const updated = await db.transaction(async (tx) => {
+    const [row] = await runQuery(
+      tx
+        .update(reservations)
+        .set({ status: 'active', activatedAt: nowUtc })
+        .where(and(eq(reservations.id, reservation.id), eq(reservations.status, 'pending')))
+        .returning(),
+    )
 
-  if (!updated) {
-    serviceError(ERROR_CODES.CHECK_IN_ALREADY_ACTIVE, 409)
-  }
+    if (!row) {
+      serviceError(ERROR_CODES.CHECK_IN_ALREADY_ACTIVE, 409)
+    }
 
-  // Reimplements the dropped `record_saved_game_attendance_after_activation`
-  // trigger (AFTER UPDATE OF status ON reservations), which used to record
-  // check-in attendance against an active saved_game in the same transaction
-  // as this activation UPDATE. No production code called this until now —
-  // see `recordSavedGameAttendance()`'s doc comment (saved-games-service.ts)
-  // for its own atomicity (attendance insert + saved_games.attendance_count
-  // increment happen together there).
-  await recordSavedGameAttendance(toAttendanceReservation(updated))
+    await recordSavedGameAttendance(tx, toAttendanceReservation(row))
+
+    return row
+  })
 
   return mapReservation(updated)
 }
