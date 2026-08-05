@@ -8,14 +8,12 @@ import {
   getRows,
   failNextQuery,
   createMockServiceError,
+  executeMock,
   getQueryLog,
+  renderSql,
 } from '@/tests/unit/mocks/drizzle-mock'
-import { createQueryBuilder } from '@/tests/unit/mocks/supabase-mock'
-import { rooms, tables, savedGames, savedGameAttendances } from '@/lib/db/schema'
+import { savedGames, savedGameAttendances } from '@/lib/db/schema'
 import { getDrizzleAdminDb } from '@/lib/db'
-
-// In-memory store for event_room_blocks (still using legacy Supabase)
-const eventRoomBlocksStore: Array<{ id: string; room_id: string; table_id: string | null; date: string }> = []
 
 vi.mock('@/lib/club-time', async () => {
   const actual = await vi.importActual<typeof import('@/lib/club-time')>('@/lib/club-time')
@@ -29,14 +27,6 @@ vi.mock('@/lib/server/shared/service-error', () => ({
 vi.mock('@/lib/db', () => ({
   getDrizzleDb: vi.fn(() => createStatefulDrizzleDb()),
   getDrizzleAdminDb: vi.fn(() => createStatefulDrizzleDb()),
-  getAdminDb: vi.fn(() => ({
-    from: (table: string) => {
-      if (table === 'event_room_blocks') {
-        return { select: () => createQueryBuilder(eventRoomBlocksStore) }
-      }
-      throw new Error(`Unexpected table ${table}`)
-    },
-  })),
 }))
 
 const member: SessionUser = { id: 'user-1', role: 'member' }
@@ -44,7 +34,6 @@ const member: SessionUser = { id: 'user-1', role: 'member' }
 describe('saved games service', () => {
   beforeEach(() => {
     resetDb()
-    eventRoomBlocksStore.length = 0
     vi.clearAllMocks()
 
     // Seed common test data: room, two tables (one removable_top, one regular)
@@ -111,7 +100,18 @@ describe('saved games service', () => {
   })
 
   it('rejects date ranges blocked by an event', async () => {
-    eventRoomBlocksStore.push({ id: 'event-1', room_id: 'room-1', table_id: null, date: '2026-07-01' })
+    seed({
+      event_room_blocks: [{
+        id: 'block-1',
+        eventId: 'event-1',
+        roomId: 'room-1',
+        tableId: null,
+        date: '2026-07-01',
+        startTime: '18:00',
+        endTime: '20:00',
+        allDay: false,
+      }],
+    })
     const { createSavedGameForSession } = await import('@/lib/server/games/saved-games-service')
     await expect(
       createSavedGameForSession(member, {
@@ -121,6 +121,55 @@ describe('saved games service', () => {
       }),
     ).rejects.toMatchObject({ message: 'SAVED_GAME_EVENT_CONFLICT', statusCode: 409 })
   })
+
+  it('allows a table-scoped event block on another table in the room', async () => {
+    seed({
+      event_room_blocks: [{
+        id: 'block-other-table',
+        eventId: 'event-1',
+        roomId: 'room-1',
+        tableId: 'regular',
+        date: '2026-07-01',
+        startTime: '18:00',
+        endTime: '20:00',
+        allDay: false,
+      }],
+    })
+    const { createSavedGameForSession } = await import('@/lib/server/games/saved-games-service')
+
+    await expect(createSavedGameForSession(member, {
+      tableId: 'double',
+      startDate: '2026-06-20',
+      endDate: '2026-07-20',
+    })).resolves.toMatchObject({ tableId: 'double' })
+  })
+
+  it.each(['pending', 'active'] as const)(
+    'rejects a saved game that overlaps an existing %s bottom reservation',
+    async (status) => {
+      seed({
+        reservations: [{
+          id: 'reservation-bottom',
+          tableId: 'double',
+          userId: 'user-2',
+          date: '2026-07-01',
+          startTime: '18:00',
+          endTime: '20:00',
+          surface: 'bottom',
+          status,
+          activatedAt: null,
+          createdAt: new Date(),
+        }],
+      })
+      const { createSavedGameForSession } = await import('@/lib/server/games/saved-games-service')
+
+      await expect(createSavedGameForSession(member, {
+        tableId: 'double',
+        startDate: '2026-06-20',
+        endDate: '2026-07-20',
+      })).rejects.toMatchObject({ message: 'SAVED_GAME_BOTTOM_RESERVED', statusCode: 409 })
+    },
+  )
 
   it('allows renewal only during the final fifteen days and creates the next period', async () => {
     seed({
@@ -146,6 +195,39 @@ describe('saved games service', () => {
       endDate: '2026-09-30',
       renewedFromId: 'sg-1',
     })
+  })
+
+  it('rejects renewal when the next period overlaps a bottom reservation', async () => {
+    seed({
+      saved_games: [{
+        id: 'sg-renew-conflict',
+        tableId: 'double',
+        userId: 'user-1',
+        startDate: '2026-04-01',
+        endDate: '2026-06-30',
+        status: 'active',
+        attendanceCount: 0,
+        renewedFromId: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }],
+      reservations: [{
+        id: 'reservation-renew-conflict',
+        tableId: 'double',
+        userId: 'user-2',
+        date: '2026-07-15',
+        startTime: '18:00',
+        endTime: '20:00',
+        surface: 'bottom',
+        status: 'active',
+        activatedAt: new Date(),
+        createdAt: new Date(),
+      }],
+    })
+    const { renewSavedGameForSession } = await import('@/lib/server/games/saved-games-service')
+
+    await expect(renewSavedGameForSession(member, 'sg-renew-conflict'))
+      .rejects.toMatchObject({ message: 'SAVED_GAME_BOTTOM_RESERVED', statusCode: 409 })
   })
 
   it('rejects renewal before the final fifteen days', async () => {
@@ -307,12 +389,14 @@ describe('saved games service', () => {
       endDate: '2026-09-19',
     })
 
-    // Verify that pg_advisory_xact_lock was called by checking the query log
+    // Verify the exact lock statement and that it precedes validation reads.
     const log = getQueryLog()
-    const hasLockCall = log.some((entry) => {
-      return entry.op === 'execute'
-    })
-    expect(hasLockCall).toBe(true)
+    const lockIndex = log.findIndex((entry) => entry.op === 'execute')
+    const tableReadIndex = log.findIndex((entry) => entry.op === 'select' && entry.table === 'tables')
+    expect(lockIndex).toBeGreaterThanOrEqual(0)
+    expect(lockIndex).toBeLessThan(tableReadIndex)
+    expect(renderSql(executeMock.mock.calls[0]![0] as Parameters<typeof renderSql>[0]))
+      .toContain('pg_advisory_xact_lock(hashtextextended')
   })
 
   it('takes advisory lock before conflict check when renewing saved game', async () => {
@@ -336,15 +420,18 @@ describe('saved games service', () => {
 
     await renewSavedGameForSession(member, 'sg-1')
 
-    // Verify that pg_advisory_xact_lock was called by checking the query log
+    // Verify the exact lock statement and that it precedes validation reads.
     const log = getQueryLog()
-    const hasLockCall = log.some((entry) => {
-      return entry.op === 'execute'
-    })
-    expect(hasLockCall).toBe(true)
+    const lockIndex = log.findIndex((entry) => entry.op === 'execute')
+    const tableReadIndex = log.findIndex((entry) => entry.op === 'select' && entry.table === 'tables')
+    expect(lockIndex).toBeGreaterThanOrEqual(0)
+    expect(lockIndex).toBeLessThan(tableReadIndex)
+    expect(renderSql(executeMock.mock.calls[0]![0] as Parameters<typeof renderSql>[0]))
+      .toContain('pg_advisory_xact_lock(hashtextextended')
   })
 
   it('increments attendanceCount atomically with attendance insert', async () => {
+    const originalUpdatedAt = new Date('2026-06-01T00:00:00Z')
     seed({
       saved_games: [
         {
@@ -357,7 +444,7 @@ describe('saved games service', () => {
           attendanceCount: 5,
           renewedFromId: null,
           createdAt: new Date(),
-          updatedAt: new Date(),
+          updatedAt: originalUpdatedAt,
         },
       ],
     })
@@ -383,6 +470,44 @@ describe('saved games service', () => {
     const savedGamesRows = getRows(savedGames)
     const updatedGame = savedGamesRows.find((sg) => sg.id === 'sg-1')
     expect(updatedGame?.attendanceCount).toBe(6)
+    expect(updatedGame?.updatedAt).toBeInstanceOf(Date)
+    expect((updatedGame?.updatedAt as Date).getTime()).toBeGreaterThan(originalUpdatedAt.getTime())
+  })
+
+  it('does not lose attendance increments during concurrent check-ins', async () => {
+    seed({
+      saved_games: [{
+        id: 'sg-concurrent',
+        tableId: 'double',
+        userId: 'user-1',
+        startDate: '2026-06-01',
+        endDate: '2026-08-31',
+        status: 'active',
+        attendanceCount: 0,
+        renewedFromId: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      }],
+    })
+    const { recordSavedGameAttendance } = await import('@/lib/server/games/saved-games-service')
+    const db = getDrizzleAdminDb()
+    const reservation = {
+      table_id: 'double',
+      user_id: 'user-1',
+      date: '2026-06-19',
+      surface: 'top' as const,
+      status: 'active' as const,
+    }
+
+    await Promise.all([
+      db.transaction((tx) => recordSavedGameAttendance(tx, { ...reservation, id: 'r-concurrent-1' })),
+      db.transaction((tx) => recordSavedGameAttendance(tx, { ...reservation, id: 'r-concurrent-2' })),
+    ])
+
+    expect(getRows(savedGameAttendances)).toHaveLength(2)
+    expect(getRows(savedGames)).toEqual([
+      expect.objectContaining({ id: 'sg-concurrent', attendanceCount: 2 }),
+    ])
   })
 
   it('does not increment counter or record attendance for bottom-surface reservations', async () => {

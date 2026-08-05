@@ -10,13 +10,9 @@
  * PR2, `lib/server/rooms/rooms-service.ts` PR2) are read/written via Drizzle
  * below.
  *
- * `event_room_blocks` is NOT yet migrated — `lib/server/events/events-service.ts`
- * still owns that domain on the legacy Supabase seam — so
- * `assertTableAndEventAvailability()` intentionally keeps reading it via
- * `getAdminDb()`, mirroring the exact "split-brain" disclosure documented in
- * `tables-service.ts` for the same table: combining a Neon read (tables) with
- * a Supabase read (event_room_blocks) here is two independent round-trips
- * joined in application code, not a single SQL join.
+ * `event_room_blocks` and `reservations` are also on the Drizzle/Neon seam.
+ * Saved-game validation reads them through the caller's transaction so the
+ * advisory lock, conflict checks, and insert all observe one database.
  *
  * Member isolation policy (unchanged from the pre-migration version):
  *   - explicit `user_id = session.id` filter on member-scoped reads (see the
@@ -29,13 +25,13 @@
  * Cross-user operations (attendance recording, table/event conflict checks)
  * legitimately need to span users and therefore require the admin client.
  */
-import { and, asc, eq, gte, lte, sql } from 'drizzle-orm'
+import { and, asc, eq, gte, inArray, lte, sql } from 'drizzle-orm'
 import type { SavedGame, SavedGameStatus } from '@/lib/types'
 import { ERROR_CODES } from '@/lib/types/error-codes'
 import type { SessionUser } from '@/lib/server/auth/auth'
 import { getCurrentClubDate, isValidDateOnlyString } from '@/lib/club-time'
-import { getAdminDb, getDrizzleAdminDb, type AdminDbClient } from '@/lib/db'
-import { rooms, savedGameAttendances, savedGames, tables } from '@/lib/db/schema'
+import { getDrizzleAdminDb, type AdminDbClient } from '@/lib/db'
+import { eventRoomBlocks, reservations, rooms, savedGameAttendances, savedGames, tables } from '@/lib/db/schema'
 import { serviceError } from '@/lib/server/shared/service-error'
 import { assertMemberRowsScoped } from '@/lib/server/shared/data-scoping'
 import type { Tables } from '@/lib/supabase/types'
@@ -198,25 +194,47 @@ async function assertTableAndEventAvailability(tx: AdminTx, tableId: string, sta
   if (!table) serviceError('Table not found', 404)
   if (table.type !== 'removable_top') serviceError(ERROR_CODES.SAVED_GAME_REQUIRES_REMOVABLE_TOP, 400)
 
-  // Legacy Supabase read: `event_room_blocks` is owned by events-service.ts,
-  // which has not migrated yet — see file header "split-brain" disclosure.
-  const admin = getAdminDb()
-  const { data: blocks, error: blocksError } = await admin
-    .from('event_room_blocks')
-    .select('id, table_id')
-    .eq('room_id', table.roomId)
-    .gte('date', startDate)
-    .lte('date', endDate)
-
-  if (blocksError) serviceError('Internal server error', 500)
+  const blocks = await runQuery(
+    tx
+      .select({ tableId: eventRoomBlocks.tableId })
+      .from(eventRoomBlocks)
+      .where(
+        and(
+          eq(eventRoomBlocks.roomId, table.roomId),
+          gte(eventRoomBlocks.date, startDate),
+          lte(eventRoomBlocks.date, endDate),
+        ),
+      ),
+  )
 
   // OIR-208: a block with a table_id only conflicts with that single table;
   // NULL (the pre-OIR-208 default) conflicts with every table of the room —
   // saved games only ever live on a single removable-top table.
-  const hasConflict = ((blocks ?? []) as Array<{ id: string; table_id: string | null }>).some(
-    (block) => block.table_id == null || block.table_id === tableId,
+  const hasConflict = blocks.some(
+    (block) => block.tableId == null || block.tableId === tableId,
   )
   if (hasConflict) serviceError(ERROR_CODES.SAVED_GAME_EVENT_CONFLICT, 409)
+
+  // Restore the reverse half of the dropped validate_saved_game trigger:
+  // reservation creation already rejects a bottom reservation when a saved
+  // game exists, but saved-game creation/renewal must also reject an existing
+  // pending/active bottom reservation in the requested date range.
+  const [bottomReservation] = await runQuery(
+    tx
+      .select({ id: reservations.id })
+      .from(reservations)
+      .where(
+        and(
+          eq(reservations.tableId, tableId),
+          eq(reservations.surface, 'bottom'),
+          inArray(reservations.status, ['pending', 'active']),
+          gte(reservations.date, startDate),
+          lte(reservations.date, endDate),
+        ),
+      )
+      .limit(1),
+  )
+  if (bottomReservation) serviceError(ERROR_CODES.SAVED_GAME_BOTTOM_RESERVED, 409)
 }
 
 function validateDateRange(startDate: string, endDate: string) {
@@ -407,7 +425,7 @@ export async function recordSavedGameAttendance(tx: AdminTx, playReservation: Pl
   try {
     await tx.transaction(async (savepointTx) => {
       const [savedGame] = await savepointTx
-        .select({ id: savedGames.id, attendanceCount: savedGames.attendanceCount })
+        .select({ id: savedGames.id })
         .from(savedGames)
         .where(
           and(
@@ -429,7 +447,10 @@ export async function recordSavedGameAttendance(tx: AdminTx, playReservation: Pl
 
       await savepointTx
         .update(savedGames)
-        .set({ attendanceCount: savedGame.attendanceCount + 1 })
+        .set({
+          attendanceCount: sql`${savedGames.attendanceCount} + ${1}`,
+          updatedAt: new Date(),
+        })
         .where(eq(savedGames.id, savedGame.id))
     })
   } catch (err) {

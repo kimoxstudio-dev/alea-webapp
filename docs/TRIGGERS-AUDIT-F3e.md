@@ -115,8 +115,10 @@ the schema; this is pure application-layer code.
 
 **Gap:** `assertTableAndEventAvailability()` in
 `lib/server/games/saved-games-service.ts` did the table-type/event-conflict
-check with plain reads, with no transaction or
-`pg_advisory_xact_lock`. The matching lock was already implemented on the
+check with plain reads, read `event_room_blocks` from the obsolete Supabase
+seam, omitted the trigger's reverse check for existing bottom reservations,
+and used no transaction or `pg_advisory_xact_lock`. The matching lock was
+already implemented on the
 "blocking a room" side (`cancelSavedGamesForBlockedRoom()` in
 `lib/server/events/events-service.ts`, `hashtextextended(table_id, 0)`), but
 nothing on the "creating a saved game" side took the same lock — so a
@@ -131,7 +133,11 @@ conflict-check-then-insert in `db.transaction()`, taking
 `cancelSavedGamesForBlockedRoom()`. `assertTableAndEventAvailability()`
 (line ~181) was changed to take the transaction handle (`tx: AdminTx`) as its
 first parameter instead of opening its own `getDrizzleAdminDb()` connection,
-so its read is guaranteed to run after the lock is held. Both callers rethrow
+so its reads are guaranteed to run after the lock is held. The helper now
+checks `event_room_blocks` and pending/active bottom `reservations` through
+that same Neon transaction, restoring both directions of the dropped
+`validate_saved_game` contract without a Supabase/Neon split-brain read. Both
+callers rethrow
 business-validation errors from `assertTableAndEventAvailability()`
 (400/404/409) instead of collapsing them into a generic 500 — via a local
 `isServiceError()` duck-type check (`error is { statusCode: number }`)
@@ -174,10 +180,11 @@ into `saved_game_attendances`, but had zero production call sites.
   named `PlayReservationForAttendance` — so callers with a partial Drizzle
   row don't need to fabricate the rest of the legacy Supabase row shape.
 - Items 2 and 3 are combined atomically: inside `recordSavedGameAttendance()`,
-  `db.transaction()` selects the matching active `saved_games` row
-  (including its current `attendanceCount`), inserts the
-  `saved_game_attendances` row, then updates
-  `savedGames.attendanceCount` to `+ 1` — all in one transaction, so the
+  the caller's transaction selects the matching active `saved_games` row,
+  inserts the `saved_game_attendances` row, then performs an atomic SQL
+  `attendance_count = attendance_count + 1` update and refreshes `updated_at`
+  — all in one transaction, so concurrent check-ins cannot lose increments and
+  the
   attendance insert and the counter increment can never diverge. The
   existing 23505 (duplicate `play_reservation_id`) idempotency check is
   preserved: a duplicate call rolls back the whole transaction (attendance
