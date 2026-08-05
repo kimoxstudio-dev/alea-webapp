@@ -750,11 +750,13 @@ function isNumericLike(value: unknown): boolean {
 }
 
 /** SQL `=` semantics, tolerant of the string/number/Date shapes rows carry. */
-function looseEquals(left: unknown, right: unknown): boolean {
+function looseEquals(left: unknown, right: unknown, compareAsSqlTime = false): boolean {
   if (isNil(left) || isNil(right)) return false
-  const leftSqlTime = asSqlTime(left)
-  const rightSqlTime = asSqlTime(right)
-  if (leftSqlTime !== null && rightSqlTime !== null) return leftSqlTime === rightSqlTime
+  if (compareAsSqlTime) {
+    const leftSqlTime = asSqlTime(left)
+    const rightSqlTime = asSqlTime(right)
+    if (leftSqlTime !== null && rightSqlTime !== null) return leftSqlTime === rightSqlTime
+  }
   if (left instanceof Date || right instanceof Date) {
     const a = asTime(left)
     const b = asTime(right)
@@ -767,12 +769,14 @@ function looseEquals(left: unknown, right: unknown): boolean {
 }
 
 /** Returns -1/0/1, or `null` when the comparison is unknown (SQL NULL). */
-function compareValues(left: unknown, right: unknown): number | null {
+function compareValues(left: unknown, right: unknown, compareAsSqlTime = false): number | null {
   if (isNil(left) || isNil(right)) return null
-  const leftSqlTime = asSqlTime(left)
-  const rightSqlTime = asSqlTime(right)
-  if (leftSqlTime !== null && rightSqlTime !== null) {
-    return leftSqlTime === rightSqlTime ? 0 : leftSqlTime < rightSqlTime ? -1 : 1
+  if (compareAsSqlTime) {
+    const leftSqlTime = asSqlTime(left)
+    const rightSqlTime = asSqlTime(right)
+    if (leftSqlTime !== null && rightSqlTime !== null) {
+      return leftSqlTime === rightSqlTime ? 0 : leftSqlTime < rightSqlTime ? -1 : 1
+    }
   }
   if (left instanceof Date || right instanceof Date) {
     const a = asTime(left)
@@ -833,6 +837,15 @@ function stripOuterParens(tokens: Token[]): Token[] {
   return current
 }
 
+function tokensUseSqlTimeColumn(tokens: Token[]): boolean {
+  return stripOuterParens(tokens).some((token) => {
+    if (token.t === 'sql') return tokensUseSqlTimeColumn(tokenize(token.v.queryChunks))
+    if (token.t !== 'col') return false
+    const getSQLType = (token.v as Column & { getSQLType?: () => string }).getSQLType
+    return typeof getSQLType === 'function' && /^time(?:\(|\s|$)/i.test(getSQLType.call(token.v))
+  })
+}
+
 function splitOnConnective(tokens: Token[], word: 'and' | 'or'): Token[][] | null {
   const parts: Token[][] = []
   let current: Token[] = []
@@ -875,13 +888,14 @@ function evaluateTokens(rawTokens: Token[], ctx: QueryContext, source: SQL): boo
   if (betweenIndex > 0) {
     const negated = (tokens[betweenIndex] as { v: string }).v.toLowerCase().startsWith('not')
     const subject = evaluateOperand(tokens.slice(0, betweenIndex), ctx)
+    const compareAsSqlTime = tokensUseSqlTimeColumn(tokens.slice(0, betweenIndex))
     const rest = tokens.slice(betweenIndex + 1)
     const andIndex = rest.findIndex((token) => token.t === 'text' && token.v.toLowerCase() === 'and')
     if (andIndex === -1) throw mockError(`malformed BETWEEN in: ${renderSql(source)}`)
     const lower = evaluateOperand(rest.slice(0, andIndex), ctx)
     const upper = evaluateOperand(rest.slice(andIndex + 1), ctx)
-    const low = compareValues(subject, lower)
-    const high = compareValues(subject, upper)
+    const low = compareValues(subject, lower, compareAsSqlTime)
+    const high = compareValues(subject, upper, compareAsSqlTime)
     if (low === null || high === null) return false
     const inRange = low >= 0 && high <= 0
     return negated ? !inRange : inRange
@@ -929,6 +943,10 @@ function evaluateComparison(tokens: Token[], ctx: QueryContext, source: SQL): bo
   const operator = (tokens[operatorIndex] as { v: string }).v.toLowerCase()
   const left = evaluateOperand(tokens.slice(0, operatorIndex), ctx)
   const rightTokens = tokens.slice(operatorIndex + 1)
+  const compareAsSqlTime = tokensUseSqlTimeColumn([
+    ...tokens.slice(0, operatorIndex),
+    ...rightTokens,
+  ])
 
   switch (operator) {
     case 'is null':
@@ -947,15 +965,15 @@ function evaluateComparison(tokens: Token[], ctx: QueryContext, source: SQL): bo
 
   switch (operator) {
     case '=':
-      return looseEquals(left, right)
+      return looseEquals(left, right, compareAsSqlTime)
     case '<>':
     case '!=':
-      return !isNil(left) && !isNil(right) && !looseEquals(left, right)
+      return !isNil(left) && !isNil(right) && !looseEquals(left, right, compareAsSqlTime)
     case '>':
     case '>=':
     case '<':
     case '<=': {
-      const order = compareValues(left, right)
+      const order = compareValues(left, right, compareAsSqlTime)
       if (order === null) return false
       if (operator === '>') return order > 0
       if (operator === '>=') return order >= 0
@@ -965,7 +983,7 @@ function evaluateComparison(tokens: Token[], ctx: QueryContext, source: SQL): bo
     case 'in':
     case 'not in': {
       const list = Array.isArray(right) ? right : [right]
-      const contained = list.some((candidate) => looseEquals(left, candidate))
+      const contained = list.some((candidate) => looseEquals(left, candidate, compareAsSqlTime))
       return operator === 'in' ? contained : !isNil(left) && !contained
     }
     case 'like':

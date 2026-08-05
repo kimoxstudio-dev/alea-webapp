@@ -173,6 +173,10 @@ describe('AC1 state-driven resolution', () => {
       .resolves.toEqual([expect.objectContaining({ id: 'after' })])
     await expect(db().select().from(reservations).where(lt(reservations.endTime, '14:00')))
       .resolves.toEqual([expect.objectContaining({ id: 'before' })])
+
+    seed({ profiles: [{ id: 'text-value', memberNumber: '14:00:00' }] })
+    await expect(db().select().from(profiles).where(eq(profiles.memberNumber, '14:00')))
+      .resolves.toEqual([])
   })
 
   it('applies projection, ordering, limit/offset and aggregates', async () => {
