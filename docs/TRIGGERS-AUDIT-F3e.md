@@ -42,10 +42,9 @@ Confirmed by reading the current code (file:line references against
   era itself (KIM-366), replaced by lazy evaluation;
   `app/api/cron/cancel-pending/route.ts` returns `410 Gone`.
 - **`get_database_time()`** → confirmed via grep:
-  `lib/server/shared/database-time.ts`'s `getDatabaseNow()` now understands
-  both the Drizzle/Neon seam (`select now()`, line 50) and the legacy
-  Supabase RPC seam (`admin.rpc('get_database_time')`, line 62, kept only
-  for the 11 not-yet-migrated services per that file's own doc comment).
+  `lib/server/shared/database-time.ts`'s `getDatabaseNow()` executes
+  `select now()` through Drizzle/Neon. The legacy Supabase RPC path has been
+  removed; callers may still pass a Drizzle client/transaction explicitly.
 
 ## 2. Escalated — not implemented in this PR, needs product decision
 

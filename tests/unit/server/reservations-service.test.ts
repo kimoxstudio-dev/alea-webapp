@@ -1468,7 +1468,7 @@ describe('reservations service', () => {
   })
 
   describe('markNoShowReservations', () => {
-    it('calls admin.rpc with mark_no_show_reservations and returns count', async () => {
+    it('executes the Neon no-show sweep and returns the affected count', async () => {
       const { markNoShowReservations } = await loadReservationModules()
 
       executeMock.mockResolvedValueOnce({ rowCount: 3 })
@@ -1479,7 +1479,7 @@ describe('reservations service', () => {
       expect(executeMock).toHaveBeenCalled()
     })
 
-    it('returns 0 when rpc returns null data without error', async () => {
+    it('returns 0 when the update affects no rows', async () => {
       const { markNoShowReservations } = await loadReservationModules()
 
       executeMock.mockResolvedValueOnce({ rowCount: 0 })
@@ -1489,17 +1489,25 @@ describe('reservations service', () => {
       expect(count).toBe(0)
     })
 
-    it('returns 0 when no reservations need marking', async () => {
+    it('preserves the slot-relative expiry rules from the former RPC', async () => {
       const { markNoShowReservations } = await loadReservationModules()
 
       executeMock.mockResolvedValueOnce({ rowCount: 0 })
 
-      const count = await markNoShowReservations()
+      await markNoShowReservations()
 
-      expect(count).toBe(0)
+      const rendered = renderSql(executeMock.mock.calls[0]![0] as Parameters<typeof renderSql>[0])
+      expect(rendered).toContain("SET status = 'no_show'")
+      expect(rendered).toContain("status = 'pending'")
+      expect(rendered).toContain('activated_at IS NULL')
+      expect(rendered).toContain('LEAST')
+      expect(rendered).toContain(process.env.CLUB_TIMEZONE ?? 'Atlantic/Canary')
+      expect(rendered).toContain("interval '1 minute'")
+      expect(rendered).toContain('60')
+      expect(rendered).toContain('< now()')
     })
 
-    it('throws serviceError when rpc returns error', async () => {
+    it('throws serviceError when the Neon update fails', async () => {
       const { markNoShowReservations } = await loadReservationModules()
 
       failNextQuery({ op: 'execute', error: new Error('Database error') })
