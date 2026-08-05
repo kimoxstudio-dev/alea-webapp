@@ -36,14 +36,10 @@ type AdminTx = Parameters<Parameters<AdminDbClient['transaction']>[0]>[0]
  * below use the Drizzle/Neon seam (`getDrizzleDb()` / `getDrizzleAdminDb()`),
  * following the pattern established in `lib/server/events/events-service.ts`
  * (KIM-434 PR3) and `lib/server/reservations/reservations-service.ts`
- * (#238). Unlike events-service.ts's `cancelOverlappingReservationsForBlocks`
- * (written while `reservations` was still on the legacy Supabase seam and
- * therefore had to run as a non-transactional follow-up call), `reservations`
- * is now also on Drizzle/Neon (#238) — so the reservation-cancellation for a
- * blocked room/table below runs INSIDE the same `db.transaction()` as the
- * event/block write, giving true all-or-nothing atomicity again (matching
- * the atomicity the removed `apply_club_event_room_blocks` Postgres RPC used
- * to provide).
+ * (#238). `reservations` is also on Drizzle/Neon, so reservation cancellation
+ * for blocked rooms/tables runs inside the same transaction as event/block
+ * writes here and in `events-service.ts`. Both paths now preserve the
+ * all-or-nothing behavior of the removed Postgres RPCs.
  */
 
 /**
@@ -517,11 +513,8 @@ async function assertClubEventBlocksTableRoomConsistency(
  * `tableId` (OIR-208) or the whole room's tables when it doesn't — same
  * overlap predicate the removed `apply_club_event_room_blocks` RPC used.
  *
- * KIM-438: unlike `events-service.ts`'s `cancelOverlappingReservationsForBlocks`
- * (written while `reservations` was still on the legacy Supabase seam and
- * had to run as a non-transactional follow-up call), `reservations` is now
- * also on Drizzle/Neon (#238) — so this runs INSIDE the caller's `tx`,
- * restoring true same-transaction atomicity with the event/block write.
+ * Reservations are on Drizzle/Neon (#238), so this runs inside the caller's
+ * transaction and remains atomic with the event/block write.
  */
 async function cancelOverlappingReservationsForClubEventBlocks(
   tx: AdminTx,

@@ -729,6 +729,20 @@ function asTime(value: unknown): number | null {
   return null
 }
 
+const SQL_TIME_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d)(?:\.(\d{1,6}))?)?$/
+
+/** Normalise PostgreSQL `time` strings so HH:MM and HH:MM:SS compare by value. */
+function asSqlTime(value: unknown): number | null {
+  if (typeof value !== 'string') return null
+  const match = SQL_TIME_PATTERN.exec(value)
+  if (!match) return null
+  const [, hours, minutes, seconds = '0', fraction = ''] = match
+  return (
+    ((Number(hours) * 60 + Number(minutes)) * 60 + Number(seconds)) * 1_000_000 +
+    Number(fraction.padEnd(6, '0'))
+  )
+}
+
 function isNumericLike(value: unknown): boolean {
   if (typeof value === 'number') return Number.isFinite(value)
   if (typeof value === 'string') return value.trim() !== '' && !Number.isNaN(Number(value))
@@ -738,6 +752,9 @@ function isNumericLike(value: unknown): boolean {
 /** SQL `=` semantics, tolerant of the string/number/Date shapes rows carry. */
 function looseEquals(left: unknown, right: unknown): boolean {
   if (isNil(left) || isNil(right)) return false
+  const leftSqlTime = asSqlTime(left)
+  const rightSqlTime = asSqlTime(right)
+  if (leftSqlTime !== null && rightSqlTime !== null) return leftSqlTime === rightSqlTime
   if (left instanceof Date || right instanceof Date) {
     const a = asTime(left)
     const b = asTime(right)
@@ -752,6 +769,11 @@ function looseEquals(left: unknown, right: unknown): boolean {
 /** Returns -1/0/1, or `null` when the comparison is unknown (SQL NULL). */
 function compareValues(left: unknown, right: unknown): number | null {
   if (isNil(left) || isNil(right)) return null
+  const leftSqlTime = asSqlTime(left)
+  const rightSqlTime = asSqlTime(right)
+  if (leftSqlTime !== null && rightSqlTime !== null) {
+    return leftSqlTime === rightSqlTime ? 0 : leftSqlTime < rightSqlTime ? -1 : 1
+  }
   if (left instanceof Date || right instanceof Date) {
     const a = asTime(left)
     const b = asTime(right)

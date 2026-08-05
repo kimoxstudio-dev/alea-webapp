@@ -1,595 +1,224 @@
 // @vitest-environment node
-/**
- * KIM-383: previewEventConflicts service tests
- *
- * Covers:
- * - All null-room schedules → { total: 0, blocks: [] }, no DB queries needed
- * - Room set but no overlapping reservations → total: 0, per-block count 0
- * - Room + overlapping active/pending reservations → correct total and per-block count
- * - Multiple blocks sharing one room → tables lookup is batched (single .in call)
- * - Empty schedules array → early return (not an error); > 366 schedules → 400
- * - Overlap predicate: end_time == block.start_time is NOT counted; real overlap IS counted
- * - Room with no tables → count 0, block still included
- * - Invalid schedule entries propagate 400
- */
-
-import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
-import type { ServiceError } from '@/lib/server/shared/service-error'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  createMockServiceError,
+  createStatefulDrizzleDb,
+  getQueryLog,
+  MockServiceError,
+  resetDb,
+  seed,
+} from '@/tests/unit/mocks/drizzle-mock'
 
 vi.mock('server-only', () => ({}))
 
-// Mock Drizzle database
-const drizzleSelectMock = vi.fn()
-const mockAdminClient = {
-  from: vi.fn(),
-}
-
 vi.mock('@/lib/db', () => ({
-  getDrizzleDb: vi.fn(() => ({
-    select: vi.fn(() => ({
-      from: vi.fn(() => ({
-        where: vi.fn(() => drizzleSelectMock()),
-      })),
-    })),
-  })),
-  getAdminDb: vi.fn(() => mockAdminClient),
-}))
-
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseServerAdminClient: vi.fn(),
-  createSupabaseServerClient: vi.fn(),
+  getDrizzleDb: vi.fn(() => createStatefulDrizzleDb()),
+  getDrizzleAdminDb: vi.fn(() => createStatefulDrizzleDb()),
 }))
 
 vi.mock('@/lib/server/shared/service-error', () => ({
-  serviceError: vi.fn((message: string, statusCode: number) => {
-    const err = new Error(message) as ServiceError
-    err.name = 'ServiceError'
-    err.statusCode = statusCode
-    throw err
-  }),
+  ServiceError: MockServiceError,
+  serviceError: createMockServiceError(),
 }))
 
-// ---------------------------------------------------------------------------
-// Mock builder
-// ---------------------------------------------------------------------------
-
-/**
- * Builds a minimal Supabase admin client mock for previewEventConflicts.
- *
- * The reservations count query chain is:
- *   .select('id', { count: 'exact', head: true })
- *   .in('table_id', tableIds)   ← first .in
- *   .eq('date', ...)
- *   .lt('start_time', ...)
- *   .gt('end_time', ...)
- *   .in('status', [...])        ← second .in (terminal, resolves)
- *
- * `tablesResult` – what `.from('tables').select().in()` resolves to
- * `reservationCountFactory` – called per reservations count query (by call index)
- */
-function buildPreviewMock({
-  tablesResult = { data: [] as { id: string; room_id: string }[], error: null },
-  reservationCountFactory = (_idx: number): { count: number | null; error: unknown } =>
-    ({ count: 0, error: null }),
-}: {
-  tablesResult?: { data: { id: string; room_id: string }[] | null; error: unknown }
-  reservationCountFactory?: (idx: number) => { count: number | null; error: unknown }
-} = {}) {
-  let reservationCallIndex = 0
-
-  // Track the `in` call on the tables mock
-  const tablesInMock = vi.fn().mockResolvedValue(tablesResult)
-  const tablesSelectMock = vi.fn().mockReturnValue({ in: tablesInMock })
-
-  /**
-   * For each reservations count query, build a chainable object where:
-   * - .in() (first call) → returns chain (table_id filter)
-   * - .eq() → returns chain
-   * - .lt() → returns chain
-   * - .gt() → returns chain
-   * - .in() (second call) → returns Promise (status filter, terminal)
-   *
-   * We track how many times `.in` has been called on this specific chain instance.
-   */
-  const makeReservationsChain = () => {
-    const idx = reservationCallIndex++
-    const resolveWith = { ...reservationCountFactory(idx), data: null }
-
-    let inCallCount = 0
-
-    const chain: Record<string, unknown> = {}
-    chain['in'] = vi.fn((..._args: unknown[]) => {
-      inCallCount++
-      if (inCallCount >= 2) {
-        // Second .in() → terminal, resolves with count
-        return Promise.resolve(resolveWith)
-      }
-      // First .in() → chainable
-      return chain
-    })
-    chain['eq'] = vi.fn(() => chain)
-    chain['lt'] = vi.fn(() => chain)
-    chain['gt'] = vi.fn(() => chain)
-    return chain
-  }
-
-  const reservationsSelectMock = vi.fn((_fields: string, opts?: { count?: string; head?: boolean }) => {
-    if (opts?.count === 'exact') {
-      return makeReservationsChain()
-    }
-    // Fallback (not reached in preview path)
-    return { in: vi.fn().mockResolvedValue({ data: [], error: null }) }
-  })
-
-  const mock = {
-    from: vi.fn((table: string) => {
-      if (table === 'tables') {
-        return { select: tablesSelectMock }
-      }
-      if (table === 'reservations') {
-        return { select: reservationsSelectMock }
-      }
-      return {
-        select: vi.fn().mockReturnThis(),
-        eq: vi.fn().mockReturnThis(),
-        in: vi.fn().mockResolvedValue({ data: [], error: null }),
-      }
-    }),
-  }
-
-  return { mock, tablesInMock, tablesSelectMock, reservationsSelectMock }
+function table(id: string, roomId: string) {
+  return { id, roomId }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+function reservation(overrides: Record<string, unknown>) {
+  return {
+    id: crypto.randomUUID(),
+    tableId: 'table-1',
+    userId: crypto.randomUUID(),
+    date: '2026-08-01',
+    startTime: '10:00:00',
+    endTime: '12:00:00',
+    status: 'active',
+    surface: null,
+    activatedAt: null,
+    createdAt: new Date(),
+    ...overrides,
+  }
+}
+
+async function preview(schedules: unknown[]) {
+  const { previewEventConflicts } = await import('@/lib/server/events/events-service')
+  return previewEventConflicts({ schedules })
+}
 
 describe('events-service — previewEventConflicts', () => {
   beforeEach(() => {
-    vi.resetModules()
+    resetDb()
     vi.clearAllMocks()
+    vi.resetModules()
   })
 
-  afterEach(() => {
-    vi.resetModules()
-    vi.clearAllMocks()
+  it('returns no conflicts without querying when every schedule has no room', async () => {
+    await expect(preview([
+      { date: '2026-07-10', startTime: '10:00', endTime: '12:00', roomId: null, allDay: false },
+      { date: '2026-07-11', startTime: '14:00', endTime: '16:00', roomId: null, allDay: false },
+    ])).resolves.toEqual({ total: 0, blocks: [] })
+
+    expect(getQueryLog()).toEqual([])
   })
 
-  // -------------------------------------------------------------------------
-  // 1. All null-room schedules → early return, no DB queries
-  // -------------------------------------------------------------------------
+  it('returns zero when a room has tables but no overlapping reservations', async () => {
+    seed({ tables: [table('table-1', 'room-A')] })
 
-  it('returns { total: 0, blocks: [] } when all schedules have null room_id', async () => {
-    const { mock, tablesInMock, reservationsSelectMock } = buildPreviewMock()
+    await expect(preview([
+      { date: '2026-08-01', startTime: '10:00', endTime: '12:00', roomId: 'room-A', allDay: false },
+    ])).resolves.toEqual({
+      total: 0,
+      blocks: [{ date: '2026-08-01', roomId: 'room-A', count: 0 }],
+    })
+  })
 
-    const { getAdminDb } = await import('@/lib/db')
-    vi.mocked(getAdminDb).mockReturnValue(mock as any)
-
-    const { previewEventConflicts } = await import('@/lib/server/events/events-service')
-
-    const result = await previewEventConflicts({
-      schedules: [
-        { date: '2026-07-10', startTime: '10:00', endTime: '12:00', roomId: null, allDay: false },
-        { date: '2026-07-11', startTime: '14:00', endTime: '16:00', roomId: null, allDay: false },
+  it('counts active and pending overlaps per block using Neon state', async () => {
+    seed({
+      tables: [table('table-1', 'room-B'), table('table-2', 'room-B')],
+      reservations: [
+        reservation({ id: 'r1', tableId: 'table-1', date: '2026-09-01', status: 'active' }),
+        reservation({ id: 'r2', tableId: 'table-1', date: '2026-09-01', status: 'pending' }),
+        reservation({ id: 'r3', tableId: 'table-2', date: '2026-09-01', status: 'active' }),
+        reservation({ id: 'r4', tableId: 'table-1', date: '2026-09-02', status: 'active' }),
+        reservation({ id: 'r5', tableId: 'table-2', date: '2026-09-02', status: 'pending' }),
+        reservation({ id: 'ignored', tableId: 'table-2', date: '2026-09-02', status: 'cancelled' }),
       ],
     })
 
-    expect(result).toEqual({ total: 0, blocks: [] })
-    // No DB queries should have been issued
-    expect(tablesInMock).not.toHaveBeenCalled()
-    expect(reservationsSelectMock).not.toHaveBeenCalled()
-  })
-
-  // -------------------------------------------------------------------------
-  // 2. Room set but no overlapping reservations → total 0, count 0 per block
-  // -------------------------------------------------------------------------
-
-  it('returns total: 0 when room has tables but no overlapping reservations', async () => {
-    const { mock } = buildPreviewMock({
-      tablesResult: {
-        data: [{ id: 'table-1', room_id: 'room-A' }],
-        error: null,
-      },
-      reservationCountFactory: () => ({ count: 0, error: null }),
-    })
-
-    drizzleSelectMock.mockResolvedValue([{ id: 'table-1', roomId: 'room-A' }])
-
-    const { getAdminDb } = await import('@/lib/db')
-    vi.mocked(getAdminDb).mockReturnValue(mock as any)
-
-    const { previewEventConflicts } = await import('@/lib/server/events/events-service')
-
-    const result = await previewEventConflicts({
-      schedules: [
-        { date: '2026-08-01', startTime: '10:00', endTime: '12:00', roomId: 'room-A', allDay: false },
+    await expect(preview([
+      { date: '2026-09-01', startTime: '10:00', endTime: '14:00', roomId: 'room-B', allDay: false },
+      { date: '2026-09-02', startTime: '10:00', endTime: '14:00', roomId: 'room-B', allDay: false },
+    ])).resolves.toEqual({
+      total: 5,
+      blocks: [
+        { date: '2026-09-01', roomId: 'room-B', count: 3 },
+        { date: '2026-09-02', roomId: 'room-B', count: 2 },
       ],
     })
-
-    expect(result.total).toBe(0)
-    expect(result.blocks).toHaveLength(1)
-    expect(result.blocks[0]).toEqual({ date: '2026-08-01', roomId: 'room-A', count: 0 })
   })
 
-  // -------------------------------------------------------------------------
-  // 3. Room + overlapping active/pending reservations → correct total & count
-  // -------------------------------------------------------------------------
+  it('batches the table lookup for multiple blocks', async () => {
+    seed({ tables: [table('table-1', 'room-C')] })
 
-  it('returns correct total and per-block count when overlapping reservations exist', async () => {
-    // Two blocks in the same room; block 0 has 3 overlapping reservations, block 1 has 2.
-    const { mock } = buildPreviewMock({
-      tablesResult: {
-        data: [
-          { id: 'table-1', room_id: 'room-B' },
-          { id: 'table-2', room_id: 'room-B' },
-        ],
-        error: null,
-      },
-      reservationCountFactory: (idx) => ({ count: [3, 2][idx] ?? 0, error: null }),
-    })
-
-    drizzleSelectMock.mockResolvedValue([
-      { id: 'table-1', roomId: 'room-B' },
-      { id: 'table-2', roomId: 'room-B' },
+    await preview([
+      { date: '2026-10-01', startTime: '10:00', endTime: '12:00', roomId: 'room-C', allDay: false },
+      { date: '2026-10-02', startTime: '10:00', endTime: '12:00', roomId: 'room-C', allDay: false },
+      { date: '2026-10-03', startTime: '10:00', endTime: '12:00', roomId: 'room-C', allDay: false },
     ])
 
-    const { getAdminDb } = await import('@/lib/db')
-    vi.mocked(getAdminDb).mockReturnValue(mock as any)
+    expect(getQueryLog().filter((entry) => entry.op === 'select' && entry.table === 'tables')).toHaveLength(1)
+  })
 
-    const { previewEventConflicts } = await import('@/lib/server/events/events-service')
+  it('returns no conflicts for an empty schedules array', async () => {
+    await expect(preview([])).resolves.toEqual({ total: 0, blocks: [] })
+  })
 
-    const result = await previewEventConflicts({
-      schedules: [
-        { date: '2026-09-01', startTime: '10:00', endTime: '14:00', roomId: 'room-B', allDay: false },
-        { date: '2026-09-02', startTime: '10:00', endTime: '14:00', roomId: 'room-B', allDay: false },
+  it('rejects more than 366 schedules', async () => {
+    const schedules = Array.from({ length: 367 }, (_, i) => ({
+      date: new Date(2026, 0, 1 + (i % 365)).toISOString().slice(0, 10),
+      startTime: '10:00',
+      endTime: '12:00',
+      roomId: 'room-1',
+      allDay: false,
+    }))
+
+    await expect(preview(schedules)).rejects.toMatchObject({ statusCode: 400 })
+  })
+
+  it('does not count a reservation ending exactly when the block starts', async () => {
+    seed({
+      tables: [table('table-1', 'room-D')],
+      reservations: [reservation({ tableId: 'table-1', date: '2026-11-01', startTime: '12:00:00', endTime: '14:00:00' })],
+    })
+
+    await expect(preview([
+      { date: '2026-11-01', startTime: '14:00', endTime: '18:00', roomId: 'room-D', allDay: false },
+    ])).resolves.toEqual({
+      total: 0,
+      blocks: [{ date: '2026-11-01', roomId: 'room-D', count: 0 }],
+    })
+  })
+
+  it('counts genuine overlaps', async () => {
+    seed({
+      tables: [table('table-1', 'room-E')],
+      reservations: [
+        reservation({ id: 'r1', tableId: 'table-1', date: '2026-11-02', startTime: '13:00:00', endTime: '15:00:00' }),
+        reservation({ id: 'r2', tableId: 'table-1', date: '2026-11-02', startTime: '17:00:00', endTime: '19:00:00', status: 'pending' }),
       ],
     })
 
-    expect(result.total).toBe(5)
-    expect(result.blocks).toHaveLength(2)
-    expect(result.blocks[0]).toEqual({ date: '2026-09-01', roomId: 'room-B', count: 3 })
-    expect(result.blocks[1]).toEqual({ date: '2026-09-02', roomId: 'room-B', count: 2 })
+    await expect(preview([
+      { date: '2026-11-02', startTime: '14:00', endTime: '18:00', roomId: 'room-E', allDay: false },
+    ])).resolves.toEqual({
+      total: 2,
+      blocks: [{ date: '2026-11-02', roomId: 'room-E', count: 2 }],
+    })
   })
 
-  // -------------------------------------------------------------------------
-  // 4. Multiple blocks sharing one room → tables lookup is batched (single .in call)
-  // -------------------------------------------------------------------------
+  it('includes a zero-count block when a room has no tables', async () => {
+    await expect(preview([
+      { date: '2026-12-01', startTime: '10:00', endTime: '12:00', roomId: 'room-empty', allDay: false },
+    ])).resolves.toEqual({
+      total: 0,
+      blocks: [{ date: '2026-12-01', roomId: 'room-empty', count: 0 }],
+    })
+  })
 
-  it('performs a single batched tables lookup for multiple blocks sharing the same room', async () => {
-    const { mock, tablesInMock } = buildPreviewMock({
-      tablesResult: {
-        data: [{ id: 'table-1', room_id: 'room-C' }],
-        error: null,
+  it('rejects invalid dates', async () => {
+    await expect(preview([
+      { date: 'not-a-date', startTime: '10:00', endTime: '12:00', roomId: 'room-1', allDay: false },
+    ])).rejects.toMatchObject({ statusCode: 400 })
+  })
+
+  it('rejects schedules whose end is not after their start', async () => {
+    await expect(preview([
+      { date: '2026-07-10', startTime: '18:00', endTime: '10:00', roomId: 'room-1', allDay: false },
+    ])).rejects.toMatchObject({ statusCode: 400 })
+  })
+
+  it('skips null-room blocks while counting real-room blocks', async () => {
+    seed({
+      tables: [table('table-1', 'room-F')],
+      reservations: Array.from({ length: 4 }, (_, i) => reservation({
+        id: `r${i}`,
+        tableId: 'table-1',
+        date: '2026-08-11',
+      })),
+    })
+
+    await expect(preview([
+      { date: '2026-08-10', startTime: '10:00', endTime: '12:00', roomId: null, allDay: false },
+      { date: '2026-08-11', startTime: '10:00', endTime: '12:00', roomId: 'room-F', allDay: false },
+      { date: '2026-08-12', startTime: '10:00', endTime: '12:00', roomId: null, allDay: false },
+    ])).resolves.toEqual({
+      total: 4,
+      blocks: [{ date: '2026-08-11', roomId: 'room-F', count: 4 }],
+    })
+  })
+
+  it('scopes table-level blocks to that table instead of the whole room', async () => {
+    seed({
+      tables: [table('table-Y1', 'room-Y'), table('table-Y2', 'room-Y')],
+      reservations: [
+        reservation({ id: 'target', tableId: 'table-Y1', date: '2027-01-01' }),
+        reservation({ id: 'other', tableId: 'table-Y2', date: '2027-01-01' }),
+      ],
+    })
+
+    await expect(preview([
+      {
+        date: '2027-01-01',
+        startTime: '10:00',
+        endTime: '12:00',
+        roomId: 'room-Y',
+        tableId: 'table-Y1',
+        allDay: false,
       },
-      reservationCountFactory: () => ({ count: 1, error: null }),
+    ])).resolves.toEqual({
+      total: 1,
+      blocks: [{ date: '2027-01-01', roomId: 'room-Y', count: 1 }],
     })
-
-    drizzleSelectMock.mockResolvedValue([{ id: 'table-1', roomId: 'room-C' }])
-
-    const { getAdminDb } = await import('@/lib/db')
-    vi.mocked(getAdminDb).mockReturnValue(mock as any)
-
-    const { previewEventConflicts } = await import('@/lib/server/events/events-service')
-
-    await previewEventConflicts({
-      schedules: [
-        { date: '2026-10-01', startTime: '10:00', endTime: '12:00', roomId: 'room-C', allDay: false },
-        { date: '2026-10-02', startTime: '10:00', endTime: '12:00', roomId: 'room-C', allDay: false },
-        { date: '2026-10-03', startTime: '10:00', endTime: '12:00', roomId: 'room-C', allDay: false },
-      ],
-    })
-
-    // Batching is now handled at the Drizzle layer, not Supabase
-  })
-
-  // -------------------------------------------------------------------------
-  // 5a. Empty schedules array → early return (no error per implementation)
-  // -------------------------------------------------------------------------
-
-  it('returns { total: 0, blocks: [] } for empty schedules array (early exit, not 400)', async () => {
-    const { mock } = buildPreviewMock()
-
-    const { getAdminDb } = await import('@/lib/db')
-    vi.mocked(getAdminDb).mockReturnValue(mock as any)
-
-    const { previewEventConflicts } = await import('@/lib/server/events/events-service')
-
-    // The service implementation: `!Array.isArray(schedules) || schedules.length === 0` → early return
-    const result = await previewEventConflicts({ schedules: [] })
-    expect(result).toEqual({ total: 0, blocks: [] })
-  })
-
-  // -------------------------------------------------------------------------
-  // 5b. > 366 schedules → 400
-  // -------------------------------------------------------------------------
-
-  it('throws 400 when schedules array has more than 366 entries', async () => {
-    const { mock } = buildPreviewMock()
-
-    const { getAdminDb } = await import('@/lib/db')
-    vi.mocked(getAdminDb).mockReturnValue(mock as any)
-
-    const { previewEventConflicts } = await import('@/lib/server/events/events-service')
-
-    const schedules = Array.from({ length: 367 }, (_, i) => {
-      const dateStr = new Date(2026, 0, 1 + (i % 365)).toISOString().slice(0, 10)
-      return { date: dateStr, startTime: '10:00', endTime: '12:00', roomId: 'room-1', allDay: false }
-    })
-
-    let caught: ServiceError | undefined
-    try {
-      await previewEventConflicts({ schedules })
-    } catch (err) {
-      caught = err as ServiceError
-    }
-
-    expect(caught).toBeDefined()
-    expect(caught?.statusCode).toBe(400)
-    expect(caught?.message).toMatch(/Too many schedule blocks/)
-  })
-
-  // -------------------------------------------------------------------------
-  // 6a. Overlap predicate: boundary-touching reservation is NOT counted
-  // -------------------------------------------------------------------------
-
-  it('does not count a reservation whose end_time equals the block start_time (strict boundary)', async () => {
-    // The service uses: .lt('start_time', block.end_time).gt('end_time', block.start_time)
-    // A reservation with end_time == '14:00' does NOT satisfy gt('end_time', '14:00').
-    // We simulate this by returning count: 0 from the mock (the DB would do the same).
-    const { mock } = buildPreviewMock({
-      tablesResult: {
-        data: [{ id: 'table-1', room_id: 'room-D' }],
-        error: null,
-      },
-      reservationCountFactory: () => ({ count: 0, error: null }),
-    })
-
-    drizzleSelectMock.mockResolvedValue([{ id: 'table-1', roomId: 'room-D' }])
-
-    const { getAdminDb } = await import('@/lib/db')
-    vi.mocked(getAdminDb).mockReturnValue(mock as any)
-
-    const { previewEventConflicts } = await import('@/lib/server/events/events-service')
-
-    // Block: 14:00–18:00; a boundary-touch reservation ends exactly at 14:00 → not counted.
-    const result = await previewEventConflicts({
-      schedules: [
-        { date: '2026-11-01', startTime: '14:00', endTime: '18:00', roomId: 'room-D', allDay: false },
-      ],
-    })
-
-    expect(result.total).toBe(0)
-    expect(result.blocks[0].count).toBe(0)
-  })
-
-  // -------------------------------------------------------------------------
-  // 6b. Genuine overlap IS counted
-  // -------------------------------------------------------------------------
-
-  it('counts a reservation that genuinely overlaps the block window', async () => {
-    // A reservation 13:00–15:00 overlaps block 14:00–18:00: 13:00 < 18:00 AND 15:00 > 14:00
-    const { mock } = buildPreviewMock({
-      tablesResult: {
-        data: [{ id: 'table-1', room_id: 'room-E' }],
-        error: null,
-      },
-      reservationCountFactory: () => ({ count: 2, error: null }),
-    })
-
-    drizzleSelectMock.mockResolvedValue([{ id: 'table-1', roomId: 'room-E' }])
-
-    const { getAdminDb } = await import('@/lib/db')
-    vi.mocked(getAdminDb).mockReturnValue(mock as any)
-
-    const { previewEventConflicts } = await import('@/lib/server/events/events-service')
-
-    const result = await previewEventConflicts({
-      schedules: [
-        { date: '2026-11-02', startTime: '14:00', endTime: '18:00', roomId: 'room-E', allDay: false },
-      ],
-    })
-
-    expect(result.total).toBe(2)
-    expect(result.blocks[0].count).toBe(2)
-  })
-
-  // -------------------------------------------------------------------------
-  // 7. Room with no tables → count 0, block still appears in result
-  // -------------------------------------------------------------------------
-
-  it('includes a block with count: 0 when the room has no tables in the DB', async () => {
-    const { mock } = buildPreviewMock({
-      tablesResult: { data: [], error: null },
-      // factory won't be called since there are no table ids to filter on
-      reservationCountFactory: () => ({ count: 99, error: null }),
-    })
-
-    drizzleSelectMock.mockResolvedValue([])
-
-    const { getAdminDb } = await import('@/lib/db')
-    vi.mocked(getAdminDb).mockReturnValue(mock as any)
-
-    const { previewEventConflicts } = await import('@/lib/server/events/events-service')
-
-    const result = await previewEventConflicts({
-      schedules: [
-        { date: '2026-12-01', startTime: '10:00', endTime: '12:00', roomId: 'room-empty', allDay: false },
-      ],
-    })
-
-    expect(result.total).toBe(0)
-    expect(result.blocks).toHaveLength(1)
-    expect(result.blocks[0]).toEqual({ date: '2026-12-01', roomId: 'room-empty', count: 0 })
-  })
-
-  // -------------------------------------------------------------------------
-  // 8. Invalid schedule entries propagate 400
-  // -------------------------------------------------------------------------
-
-  it('throws 400 when a schedule has an invalid date format', async () => {
-    const { mock } = buildPreviewMock()
-
-    const { getAdminDb } = await import('@/lib/db')
-    vi.mocked(getAdminDb).mockReturnValue(mock as any)
-
-    const { previewEventConflicts } = await import('@/lib/server/events/events-service')
-
-    let caught: ServiceError | undefined
-    try {
-      await previewEventConflicts({
-        schedules: [
-          { date: 'not-a-date', startTime: '10:00', endTime: '12:00', roomId: 'room-1', allDay: false },
-        ],
-      })
-    } catch (err) {
-      caught = err as ServiceError
-    }
-
-    expect(caught).toBeDefined()
-    expect(caught?.statusCode).toBe(400)
-    expect(caught?.message).toMatch(/date must be in YYYY-MM-DD format/)
-  })
-
-  it('throws 400 when a schedule has endTime <= startTime', async () => {
-    const { mock } = buildPreviewMock()
-
-    const { getAdminDb } = await import('@/lib/db')
-    vi.mocked(getAdminDb).mockReturnValue(mock as any)
-
-    const { previewEventConflicts } = await import('@/lib/server/events/events-service')
-
-    let caught: ServiceError | undefined
-    try {
-      await previewEventConflicts({
-        schedules: [
-          { date: '2026-07-10', startTime: '18:00', endTime: '10:00', roomId: 'room-1', allDay: false },
-        ],
-      })
-    } catch (err) {
-      caught = err as ServiceError
-    }
-
-    expect(caught).toBeDefined()
-    expect(caught?.statusCode).toBe(400)
-    expect(caught?.message).toMatch(/endTime must be after startTime/)
-  })
-
-  // -------------------------------------------------------------------------
-  // 9. Mixed null-room and real-room blocks
-  // -------------------------------------------------------------------------
-
-  it('skips null-room blocks but counts conflicts for real-room blocks in the same call', async () => {
-    const { mock } = buildPreviewMock({
-      tablesResult: {
-        data: [{ id: 'table-1', room_id: 'room-F' }],
-        error: null,
-      },
-      reservationCountFactory: () => ({ count: 4, error: null }),
-    })
-
-    drizzleSelectMock.mockResolvedValue([{ id: 'table-1', roomId: 'room-F' }])
-
-    const { getAdminDb } = await import('@/lib/db')
-    vi.mocked(getAdminDb).mockReturnValue(mock as any)
-
-    const { previewEventConflicts } = await import('@/lib/server/events/events-service')
-
-    const result = await previewEventConflicts({
-      schedules: [
-        { date: '2026-08-10', startTime: '10:00', endTime: '12:00', roomId: null, allDay: false },
-        { date: '2026-08-11', startTime: '10:00', endTime: '12:00', roomId: 'room-F', allDay: false },
-        { date: '2026-08-12', startTime: '10:00', endTime: '12:00', roomId: null, allDay: false },
-      ],
-    })
-
-    // Only the real-room block appears in results
-    expect(result.total).toBe(4)
-    expect(result.blocks).toHaveLength(1)
-    expect(result.blocks[0]).toEqual({ date: '2026-08-11', roomId: 'room-F', count: 4 })
-  })
-
-  // -------------------------------------------------------------------------
-  // 10. KIM-434 PR #182 review fix: a table-level block (table_id set) must
-  //     only count conflicts against that ONE table, not every table in the
-  //     room — matching cancelOverlappingReservationsForBlocks()'s scoping.
-  //     Before the fix, `tableIds = roomTableMap.get(block.room_id)` counted
-  //     against every table in the room regardless of the block's table_id.
-  // -------------------------------------------------------------------------
-
-  it('scopes conflict count to the block\'s specific table_id, not every table in the room', async () => {
-    // room-Y has two tables; the schedule below is a table-level block that
-    // only targets table-Y1. We capture the actual filter args passed to the
-    // reservations count query's first `.in('table_id', tableIds)` call so
-    // this test fails if the implementation regresses to counting the whole
-    // room's tables for a table-scoped block.
-    let capturedTableIds: string[] | undefined
-
-    const tablesInMock = vi.fn().mockResolvedValue({
-      data: [
-        { id: 'table-Y1', room_id: 'room-Y' },
-        { id: 'table-Y2', room_id: 'room-Y' },
-      ],
-      error: null,
-    })
-    const tablesSelectMock = vi.fn().mockReturnValue({ in: tablesInMock })
-
-    let inCallCount = 0
-    const reservationsChain: Record<string, unknown> = {}
-    reservationsChain['in'] = vi.fn((...args: unknown[]) => {
-      inCallCount++
-      if (inCallCount === 1) {
-        // First .in() call is the table_id filter — capture it.
-        capturedTableIds = args[1] as string[]
-        return reservationsChain
-      }
-      // Second .in() call is the status filter — terminal, resolves.
-      return Promise.resolve({ count: 5, error: null, data: null })
-    })
-    reservationsChain['eq'] = vi.fn(() => reservationsChain)
-    reservationsChain['lt'] = vi.fn(() => reservationsChain)
-    reservationsChain['gt'] = vi.fn(() => reservationsChain)
-
-    const reservationsSelectMock = vi.fn(() => reservationsChain)
-
-    const mock = {
-      from: vi.fn((table: string) => {
-        if (table === 'tables') return { select: tablesSelectMock }
-        if (table === 'reservations') return { select: reservationsSelectMock }
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockReturnThis(),
-          in: vi.fn().mockResolvedValue({ data: [], error: null }),
-        }
-      }),
-    }
-
-    drizzleSelectMock.mockResolvedValue([
-      { id: 'table-Y1', roomId: 'room-Y' },
-      { id: 'table-Y2', roomId: 'room-Y' },
-    ])
-
-    const { getAdminDb } = await import('@/lib/db')
-    vi.mocked(getAdminDb).mockReturnValue(mock as any)
-
-    const { previewEventConflicts } = await import('@/lib/server/events/events-service')
-
-    const result = await previewEventConflicts({
-      schedules: [
-        {
-          date: '2027-01-01',
-          startTime: '10:00',
-          endTime: '12:00',
-          roomId: 'room-Y',
-          tableId: 'table-Y1',
-          allDay: false,
-        },
-      ],
-    })
-
-    // The bug would pass ['table-Y1', 'table-Y2'] here (whole room).
-    expect(capturedTableIds).toEqual(['table-Y1'])
-    expect(result.total).toBe(5)
-    expect(result.blocks).toHaveLength(1)
-    expect(result.blocks[0]).toEqual({ date: '2027-01-01', roomId: 'room-Y', count: 5 })
   })
 })

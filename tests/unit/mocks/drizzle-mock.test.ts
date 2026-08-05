@@ -20,7 +20,7 @@
  * objects held in a `Map`.
  */
 import { beforeEach, describe, expect, it } from 'vitest'
-import { and, asc, count, desc, eq, gte, ilike, inArray, isNull, lte, ne, or, sql } from 'drizzle-orm'
+import { and, asc, count, desc, eq, gt, gte, ilike, inArray, isNull, lt, lte, ne, or, sql } from 'drizzle-orm'
 
 import { profiles } from '@/lib/db/schema/profiles'
 import { reservations } from '@/lib/db/schema/reservations'
@@ -155,6 +155,24 @@ describe('AC1 state-driven resolution', () => {
 
     // An empty IN list matches nothing, rather than everything.
     expect(await db().select().from(profiles).where(inArray(profiles.id, []))).toHaveLength(0)
+  })
+
+  it('compares PostgreSQL time strings by value across HH:MM and HH:MM:SS shapes', async () => {
+    seed({
+      reservations: [
+        { id: 'before', endTime: '13:59:59' },
+        { id: 'equal-short', endTime: '14:00' },
+        { id: 'equal-long', endTime: '14:00:00' },
+        { id: 'after', endTime: '14:00:01' },
+      ],
+    })
+
+    await expect(db().select().from(reservations).where(eq(reservations.endTime, '14:00')))
+      .resolves.toHaveLength(2)
+    await expect(db().select().from(reservations).where(gt(reservations.endTime, '14:00')))
+      .resolves.toEqual([expect.objectContaining({ id: 'after' })])
+    await expect(db().select().from(reservations).where(lt(reservations.endTime, '14:00')))
+      .resolves.toEqual([expect.objectContaining({ id: 'before' })])
   })
 
   it('applies projection, ordering, limit/offset and aggregates', async () => {

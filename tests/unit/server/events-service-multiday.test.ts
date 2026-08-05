@@ -6,6 +6,7 @@ import {
   seed,
   seedTable,
   getQueryLog,
+  getRows,
   failNextQuery,
   createMockServiceError,
   MockServiceError,
@@ -33,21 +34,6 @@ vi.mock('server-only', () => ({}))
 vi.mock('@/lib/db', () => ({
   getDrizzleDb: vi.fn(() => createStatefulDrizzleDb()),
   getDrizzleAdminDb: vi.fn(() => createStatefulDrizzleDb()),
-  getAdminDb: vi.fn(() => ({
-    from: vi.fn(() => ({
-      update: vi.fn(() => ({
-        in: vi.fn(() => ({
-          eq: vi.fn(() => ({
-            lt: vi.fn(() => ({
-              gt: vi.fn(() => ({
-                in: vi.fn(async () => ({ data: null, error: null })),
-              })),
-            })),
-          })),
-        })),
-      })),
-    })),
-  })),
 }))
 
 vi.mock('@/lib/server/shared/service-error', () => ({
@@ -615,6 +601,84 @@ describe('events-service — deleteEvent multi-day cancellation', () => {
     const { deleteEvent } = await loadEventsService()
 
     await expect(deleteEvent(adminSession, 'evt-cancel-multi')).resolves.not.toThrow()
+  })
+
+  it('cancels only overlapping pending/active reservations for a table-scoped block', async () => {
+    seed({
+      tables: [
+        { id: 'table-1', roomId: 'room-1' },
+        { id: 'table-2', roomId: 'room-1' },
+      ],
+      reservations: [
+        { id: 'active-overlap', tableId: 'table-1', date: '2026-07-10', startTime: '10:00:00', endTime: '12:00:00', status: 'active' },
+        { id: 'pending-overlap', tableId: 'table-1', date: '2026-07-10', startTime: '11:00:00', endTime: '13:00:00', status: 'pending' },
+        { id: 'completed-overlap', tableId: 'table-1', date: '2026-07-10', startTime: '10:00:00', endTime: '12:00:00', status: 'completed' },
+        { id: 'boundary', tableId: 'table-1', date: '2026-07-10', startTime: '08:00:00', endTime: '09:00:00', status: 'active' },
+        { id: 'other-table', tableId: 'table-2', date: '2026-07-10', startTime: '10:00:00', endTime: '12:00:00', status: 'active' },
+      ],
+    })
+
+    const { cancelOverlappingReservationsForBlocks } = await loadEventsService()
+    await cancelOverlappingReservationsForBlocks([
+      { roomId: 'room-1', tableId: 'table-1', date: '2026-07-10', startTime: '09:00', endTime: '17:00' },
+    ])
+
+    const statuses = Object.fromEntries(getRows('reservations').map((row) => [row.id, row.status]))
+    expect(statuses).toMatchObject({
+      'active-overlap': 'cancelled',
+      'pending-overlap': 'cancelled',
+      'completed-overlap': 'completed',
+      boundary: 'active',
+      'other-table': 'active',
+    })
+  })
+
+  it('rolls back event creation when reservation cancellation fails', async () => {
+    seed({
+      tables: [{ id: 'table-1', roomId: 'room-1' }],
+      reservations: [
+        { id: 'reservation-1', tableId: 'table-1', date: '2026-07-10', startTime: '10:00:00', endTime: '12:00:00', status: 'active' },
+      ],
+    })
+    failNextQuery({ op: 'update', table: 'reservations', error: new Error('cancellation failed') })
+
+    const { createEvent } = await loadEventsService()
+    await expect(createEvent(createAdminSession(), {
+      title: 'Atomic event',
+      description: null,
+      schedules: [
+        { roomId: 'room-1', tableId: null, date: '2026-07-10', startTime: '09:00', endTime: '17:00', allDay: false },
+      ],
+    })).rejects.toThrow(MockServiceError)
+
+    expect(getRows('events')).toEqual([])
+    expect(getRows('event_room_blocks')).toEqual([])
+    expect(getRows('reservations')).toEqual([
+      expect.objectContaining({ id: 'reservation-1', status: 'active' }),
+    ])
+  })
+
+  it('rolls back event deletion when reservation cancellation fails', async () => {
+    seed({
+      events: [{ id: 'event-1', titleEs: null, titleEn: null }],
+      event_room_blocks: [
+        { id: 'block-1', eventId: 'event-1', roomId: 'room-1', tableId: 'table-1', date: '2026-07-10', startTime: '09:00:00', endTime: '17:00:00', allDay: false },
+      ],
+      tables: [{ id: 'table-1', roomId: 'room-1' }],
+      reservations: [
+        { id: 'reservation-1', tableId: 'table-1', date: '2026-07-10', startTime: '10:00:00', endTime: '12:00:00', status: 'active' },
+      ],
+    })
+    failNextQuery({ op: 'update', table: 'reservations', error: new Error('cancellation failed') })
+
+    const { deleteEvent } = await loadEventsService()
+    await expect(deleteEvent(createAdminSession(), 'event-1')).rejects.toThrow(MockServiceError)
+
+    expect(getRows('events')).toEqual([expect.objectContaining({ id: 'event-1' })])
+    expect(getRows('event_room_blocks')).toEqual([expect.objectContaining({ id: 'block-1' })])
+    expect(getRows('reservations')).toEqual([
+      expect.objectContaining({ id: 'reservation-1', status: 'active' }),
+    ])
   })
 
   it('skips reservation cancellation for null-room blocks', async () => {

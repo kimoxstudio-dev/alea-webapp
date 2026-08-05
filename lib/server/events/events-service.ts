@@ -1,7 +1,7 @@
 import 'server-only'
-import { and, asc, eq, gt, gte, inArray, isNull, lt, lte, or, sql } from 'drizzle-orm'
-import { getAdminDb, getDrizzleAdminDb, getDrizzleDb, type AdminDbClient } from '@/lib/db'
-import { events, eventRoomBlocks, savedGames, tables } from '@/lib/db/schema'
+import { and, asc, count, eq, gt, gte, inArray, isNull, lt, lte, or, sql } from 'drizzle-orm'
+import { getDrizzleAdminDb, getDrizzleDb, type AdminDbClient } from '@/lib/db'
+import { events, eventRoomBlocks, reservations, savedGames, tables } from '@/lib/db/schema'
 import { ServiceError, serviceError } from '@/lib/server/shared/service-error'
 import type { AdminEvent, AdminEventRoomBlock, AdminEventSchedule } from '@/lib/types'
 import type { SessionUser } from '@/lib/server/auth/auth'
@@ -14,16 +14,14 @@ export type { AdminEvent, AdminEventRoomBlock, AdminEventSchedule }
  * the pattern established in `lib/server/equipment/equipment-service.ts`
  * (PR1) and `lib/server/tables/tables-service.ts` (PR2).
  *
- * `reservations` is owned by a service NOT yet migrated (PR5), so it
- * intentionally stays on the legacy Supabase seam (`getAdminDb()`) — see
- * `cancelOverlappingReservationsForBlocks()` below for the resulting
- * cross-database reservation-cancellation tradeoff, and the PR description's
- * "Split-brain disclosure" section for the full consistency caveat this
- * implies during the migration window.
+ * `reservations` is now on the same Drizzle/Neon seam. Event/block writes
+ * and their reservation-cancellation cascades therefore share one database
+ * transaction, preserving the atomicity of the removed Postgres RPCs.
  */
 
 type EventRow = typeof events.$inferSelect
 type EventRoomBlockRow = typeof eventRoomBlocks.$inferSelect
+type AdminTx = Parameters<Parameters<AdminDbClient['transaction']>[0]>[0]
 type EventAnchorFields = Pick<
   EventRow,
   'id' | 'title' | 'description' | 'date' | 'startTime' | 'endTime' | 'createdBy' | 'createdAt'
@@ -218,35 +216,10 @@ export function validateAndNormaliseSchedule(
 }
 
 // ---------------------------------------------------------------------------
-// Reservation-cancellation split-brain (KIM-434 PR3, architectural tradeoff
-// — NOT a bug, see PR description's "Split-brain disclosure" section).
-//
-// The legacy Postgres RPCs this PR replaces (create_event_atomic,
-// update_event_atomic, create_event_with_blocks, update_event_with_blocks,
-// apply_club_event_room_blocks — see lib/server/events/club-events-service.ts)
-// used to cancel overlapping `reservations` rows INSIDE the SAME Postgres
-// transaction as the event/block write, so the whole operation was atomic on
-// one database.
-//
-// `reservations` has not been migrated to Neon yet (KIM-434 PR5) — its
-// source of truth is still Supabase. Since the event/block write now targets
-// Neon (this PR) while reservations still live on Supabase, no single
-// database transaction can span both anymore. This function therefore runs
-// the reservation-cancellation step as a SEPARATE, NON-TRANSACTIONAL
-// follow-up call, invoked AFTER the Neon transaction that wrote the
-// event/blocks has already committed.
-//
-// Consequence: if this follow-up call fails (network blip, Supabase outage,
-// etc.) after the Neon transaction committed, the event/block rows remain
-// committed on Neon with their overlapping reservations NOT cancelled — a
-// new inconsistency window that did not exist before this migration. This
-// function does not attempt to "fix" that: it logs a failure loudly per
-// block and keeps going instead of throwing, since the primary (event/block)
-// write already succeeded and must not be reported as failed to the caller.
-//
-// Exported so lib/server/events/club-events-service.ts's
-// applyClubEventRoomBlocksAndMaterials (the apply_club_event_room_blocks
-// replacement) can reuse the same follow-up instead of duplicating it.
+// Reservation cancellation formerly ran as a post-commit Supabase follow-up
+// while reservations were still on the legacy backend. With reservations now
+// migrated to Neon, callers use the in-transaction helper below so event/block
+// writes and cancellation succeed or roll back together.
 // ---------------------------------------------------------------------------
 export interface EventBlockForCancellation {
   roomId: string
@@ -257,7 +230,8 @@ export interface EventBlockForCancellation {
   endTime: string
 }
 
-export async function cancelOverlappingReservationsForBlocks(
+async function cancelOverlappingReservationsForBlocksInTx(
+  tx: AdminTx,
   blocks: EventBlockForCancellation[],
 ): Promise<void> {
   if (blocks.length === 0) return
@@ -271,51 +245,43 @@ export async function cancelOverlappingReservationsForBlocks(
 
   const roomTableMap = new Map<string, string[]>()
   if (roomIdsNeedingLookup.length > 0) {
-    try {
-      const drizzleDb = getDrizzleDb()
-      const tableRows = await drizzleDb
-        .select({ id: tables.id, roomId: tables.roomId })
-        .from(tables)
-        .where(inArray(tables.roomId, roomIdsNeedingLookup))
+    const tableRows = await tx
+      .select({ id: tables.id, roomId: tables.roomId })
+      .from(tables)
+      .where(inArray(tables.roomId, roomIdsNeedingLookup))
 
-      for (const t of tableRows) {
-        const list = roomTableMap.get(t.roomId) ?? []
-        list.push(t.id)
-        roomTableMap.set(t.roomId, list)
-      }
-    } catch (error) {
-      console.error(
-        '[events] cancelOverlappingReservationsForBlocks: failed to resolve room -> table ids from Neon; ' +
-          'whole-room blocks below will skip reservation cancellation entirely for this call',
-        error,
-      )
+    for (const t of tableRows) {
+      const list = roomTableMap.get(t.roomId) ?? []
+      list.push(t.id)
+      roomTableMap.set(t.roomId, list)
     }
   }
-
-  const admin = getAdminDb()
 
   for (const block of blocks) {
     const tableIds = block.tableId ? [block.tableId] : (roomTableMap.get(block.roomId) ?? [])
     if (tableIds.length === 0) continue
 
-    const { error } = await admin
-      .from('reservations')
-      .update({ status: 'cancelled' })
-      .in('table_id', tableIds)
-      .eq('date', block.date)
-      .lt('start_time', block.endTime)
-      .gt('end_time', block.startTime)
-      .in('status', ['active', 'pending'])
-
-    if (error) {
-      console.error(
-        '[events] cancelOverlappingReservationsForBlocks: failed to cancel overlapping reservations for a ' +
-          'block — the event/block rows on Neon are already committed and will NOT be rolled back',
-        { roomId: block.roomId, tableId: block.tableId, date: block.date, startTime: block.startTime, endTime: block.endTime },
-        error,
+    await tx
+      .update(reservations)
+      .set({ status: 'cancelled' })
+      .where(
+        and(
+          inArray(reservations.tableId, tableIds),
+          eq(reservations.date, block.date),
+          lt(reservations.startTime, block.endTime),
+          gt(reservations.endTime, block.startTime),
+          inArray(reservations.status, ['active', 'pending']),
+        ),
       )
-    }
   }
+}
+
+export async function cancelOverlappingReservationsForBlocks(
+  blocks: EventBlockForCancellation[],
+): Promise<void> {
+  if (blocks.length === 0) return
+  const db = getDrizzleAdminDb()
+  await runQuery(db.transaction((tx) => cancelOverlappingReservationsForBlocksInTx(tx, blocks)))
 }
 
 // ---------------------------------------------------------------------------
@@ -342,12 +308,10 @@ export async function cancelOverlappingReservationsForBlocks(
 //       AND saved.status = 'active'
 //       AND NEW.date BETWEEN saved.start_date AND saved.end_date;
 //
-// Unlike cancelOverlappingReservationsForBlocks() above (which must run
-// post-commit, against the still-Supabase `reservations` table), saved_games
-// is already on the Drizzle/Neon seam (PR1 — lib/db/schema/saved-games.ts),
-// so this runs INSIDE the caller's transaction, alongside the
-// event_room_blocks insert, giving true all-or-nothing atomicity: a rollback
-// of the block write also rolls back this cascade.
+// Both saved_games and reservations now use Drizzle/Neon, so their
+// cancellation cascades run inside the caller's transaction alongside the
+// event_room_blocks insert. A rollback of the block write rolls back both
+// cascades as well.
 //
 // Concurrency guard (reimplemented, not dropped — see decision writeup in
 // the PR description / handoff notes for the full reasoning): the
@@ -456,10 +420,8 @@ export async function cancelSavedGamesForBlockedRoom(
 // ---------------------------------------------------------------------------
 // Atomic (Neon-transaction) event+blocks write helpers, replacing the
 // removed Supabase RPCs create_event_atomic / update_event_atomic /
-// create_event_with_blocks / update_event_with_blocks. The reservation
-// cancellation these RPCs used to perform in-transaction now runs as a
-// separate follow-up call via cancelOverlappingReservationsForBlocks() —
-// see that function's doc comment above.
+// create_event_with_blocks / update_event_with_blocks. Reservation and
+// saved-game cancellation share the same transaction as the block write.
 // ---------------------------------------------------------------------------
 
 async function createEventAtomic(
@@ -489,20 +451,11 @@ async function createEventAtomic(
           tx,
           insertedBlocks.map((b) => ({ roomId: b.roomId, tableId: b.tableId, date: b.date })),
         )
+        await cancelOverlappingReservationsForBlocksInTx(tx, insertedBlocks)
       }
 
       return { eventRow, insertedBlocks }
     }),
-  )
-
-  await cancelOverlappingReservationsForBlocks(
-    result.insertedBlocks.map((b) => ({
-      roomId: b.roomId,
-      tableId: b.tableId,
-      date: b.date,
-      startTime: b.startTime,
-      endTime: b.endTime,
-    })),
   )
 
   return toAdminEvent(result.eventRow, result.insertedBlocks)
@@ -543,20 +496,11 @@ async function updateEventAtomic(
           tx,
           insertedBlocks.map((b) => ({ roomId: b.roomId, tableId: b.tableId, date: b.date })),
         )
+        await cancelOverlappingReservationsForBlocksInTx(tx, insertedBlocks)
       }
 
       return { eventRow, insertedBlocks }
     }),
-  )
-
-  await cancelOverlappingReservationsForBlocks(
-    result.insertedBlocks.map((b) => ({
-      roomId: b.roomId,
-      tableId: b.tableId,
-      date: b.date,
-      startTime: b.startTime,
-      endTime: b.endTime,
-    })),
   )
 
   return toAdminEvent(result.eventRow, result.insertedBlocks)
@@ -572,8 +516,6 @@ async function updateEventAtomic(
 // since a table_id from an unrelated room still passes FK checks. This
 // Drizzle rewrite must reimplement that same guard explicitly.
 // ---------------------------------------------------------------------------
-type AdminTx = Parameters<Parameters<AdminDbClient['transaction']>[0]>[0]
-
 async function assertBlocksTableRoomConsistency(
   tx: AdminTx,
   blocksWithRoom: Array<{ room_id: string; table_id: string | null }>,
@@ -652,6 +594,7 @@ async function createEventWithBlocksAtomic(
           tx,
           insertedBlocks.map((b) => ({ roomId: b.roomId, tableId: b.tableId, date: b.date })),
         )
+        await cancelOverlappingReservationsForBlocksInTx(tx, insertedBlocks)
       }
 
       return { eventRow, insertedBlocks }
@@ -664,16 +607,6 @@ async function createEventWithBlocksAtomic(
     }
     serviceError('Internal server error', 500)
   }
-
-  await cancelOverlappingReservationsForBlocks(
-    result.insertedBlocks.map((b) => ({
-      roomId: b.roomId,
-      tableId: b.tableId,
-      date: b.date,
-      startTime: b.startTime,
-      endTime: b.endTime,
-    })),
-  )
 
   return toAdminEvent(result.eventRow, result.insertedBlocks)
 }
@@ -733,6 +666,7 @@ async function updateEventWithBlocksAtomic(
           tx,
           insertedBlocks.map((b) => ({ roomId: b.roomId, tableId: b.tableId, date: b.date })),
         )
+        await cancelOverlappingReservationsForBlocksInTx(tx, insertedBlocks)
       }
 
       return { eventRow, insertedBlocks }
@@ -746,16 +680,6 @@ async function updateEventWithBlocksAtomic(
     serviceError('Internal server error', 500)
   }
 
-  await cancelOverlappingReservationsForBlocks(
-    result.insertedBlocks.map((b) => ({
-      roomId: b.roomId,
-      tableId: b.tableId,
-      date: b.date,
-      startTime: b.startTime,
-      endTime: b.endTime,
-    })),
-  )
-
   return toAdminEvent(result.eventRow, result.insertedBlocks)
 }
 
@@ -768,16 +692,13 @@ async function updateEventWithBlocksAtomic(
  * above — before calling this directly, so it must NOT go through the
  * `isClubEventRow` check in `deleteEvent`).
  *
- * KIM-434 PR3: signature changed from `(admin, id)` to `(id)` — no longer
- * takes a Supabase client parameter, since the event/block delete now runs
- * on the Drizzle/Neon seam. See `cancelOverlappingReservationsForBlocks()`
- * above for why the reservation cancellation below still runs separately,
- * non-transactionally, against the legacy Supabase seam.
+ * Reservation cancellation and deletion share the same Drizzle/Neon
+ * transaction, so either both succeed or both roll back.
  */
 export async function deleteEventCascade(id: string): Promise<void> {
   const db = getDrizzleAdminDb()
 
-  const blocks = await runQuery(
+  await runQuery(
     db.transaction(async (tx) => {
       const rows = await tx
         .select({
@@ -790,14 +711,12 @@ export async function deleteEventCascade(id: string): Promise<void> {
         .from(eventRoomBlocks)
         .where(eq(eventRoomBlocks.eventId, id))
 
+      await cancelOverlappingReservationsForBlocksInTx(tx, rows)
+
       // event_room_blocks / event_equipment cascade-delete via FK ON DELETE CASCADE.
       await tx.delete(events).where(eq(events.id, id))
-
-      return rows
     }),
   )
-
-  await cancelOverlappingReservationsForBlocks(blocks)
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,10 +1003,6 @@ export async function previewEventConflicts(body: {
     roomTableMap.set(t.roomId, list)
   }
 
-  // `reservations` is not yet migrated (PR5) — its source of truth is still
-  // Supabase, so the count itself must be read from there.
-  const admin = getAdminDb()
-
   const resultBlocks: EventConflictBlock[] = []
   let total = 0
 
@@ -1105,18 +1020,22 @@ export async function previewEventConflicts(body: {
       continue
     }
 
-    const { count, error: countError } = await admin
-      .from('reservations')
-      .select('id', { count: 'exact', head: true })
-      .in('table_id', tableIds)
-      .eq('date', block.date)
-      .lt('start_time', block.end_time)
-      .gt('end_time', block.start_time)
-      .in('status', ['active', 'pending'])
+    const [countRow] = await runQuery(
+      drizzleDb
+        .select({ value: count() })
+        .from(reservations)
+        .where(
+          and(
+            inArray(reservations.tableId, tableIds),
+            eq(reservations.date, block.date),
+            lt(reservations.startTime, block.end_time),
+            gt(reservations.endTime, block.start_time),
+            inArray(reservations.status, ['active', 'pending']),
+          ),
+        ),
+    )
 
-    if (countError) serviceError('Internal server error', 500)
-
-    const blockCount = count ?? 0
+    const blockCount = countRow?.value ?? 0
     total += blockCount
     resultBlocks.push({ date: block.date, roomId: block.room_id, count: blockCount })
   }
