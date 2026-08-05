@@ -371,7 +371,7 @@ describe('events-service — cancelSavedGamesForBlockedRoom cascade (KIM-434 PR 
     const db = createStatefulDrizzleDb()
 
     const cancelledCount = await db.transaction((tx) =>
-      cancelSavedGamesForBlockedRoom(tx, [{ roomId: 'room-1', date: '2026-07-10' }]),
+      cancelSavedGamesForBlockedRoom(tx, [{ roomId: 'room-1', tableId: null, date: '2026-07-10' }]),
     )
 
     expect(cancelledCount).toBe(1)
@@ -395,6 +395,44 @@ describe('events-service — cancelSavedGamesForBlockedRoom cascade (KIM-434 PR 
     expect(updateIndex).toBeGreaterThan(lastExecuteIndex)
   })
 
+  it('cancels only the selected table when the event block is table-scoped', async () => {
+    seed({
+      tables: [
+        { id: 'table-A', roomId: 'room-1' },
+        { id: 'table-B', roomId: 'room-1' },
+      ],
+      saved_games: [
+        {
+          id: 'sg-blocked-table', tableId: 'table-A', userId: 'u1', status: 'active',
+          startDate: '2026-07-01', endDate: '2026-07-20',
+        },
+        {
+          id: 'sg-unrelated-table', tableId: 'table-B', userId: 'u2', status: 'active',
+          startDate: '2026-07-01', endDate: '2026-07-20',
+        },
+      ],
+    })
+
+    const { cancelSavedGamesForBlockedRoom } = await loadEventsService()
+    const db = createStatefulDrizzleDb()
+
+    const cancelledCount = await db.transaction((tx) =>
+      cancelSavedGamesForBlockedRoom(tx, [{
+        roomId: 'room-1',
+        tableId: 'table-A',
+        date: '2026-07-10',
+      }]),
+    )
+
+    expect(cancelledCount).toBe(1)
+    expect(getRows('saved_games')).toEqual([
+      expect.objectContaining({ id: 'sg-blocked-table', status: 'cancelled' }),
+      expect.objectContaining({ id: 'sg-unrelated-table', status: 'active' }),
+    ])
+    expect(executeMock).toHaveBeenCalledTimes(1)
+    expect(executeMock.mock.calls[0][0].queryChunks[1]).toBe('table-A')
+  })
+
   it('does not cancel anything when no active saved_games overlap the block', async () => {
     // Empty candidate set stands in for a DB-side WHERE clause that already
     // excluded a row for any of: a different room, a non-overlapping date
@@ -407,7 +445,7 @@ describe('events-service — cancelSavedGamesForBlockedRoom cascade (KIM-434 PR 
     const db = createStatefulDrizzleDb()
 
     const cancelledCount = await db.transaction((tx) =>
-      cancelSavedGamesForBlockedRoom(tx, [{ roomId: 'room-1', date: '2026-07-10' }]),
+      cancelSavedGamesForBlockedRoom(tx, [{ roomId: 'room-1', tableId: null, date: '2026-07-10' }]),
     )
 
     expect(cancelledCount).toBe(0)
@@ -425,7 +463,7 @@ describe('events-service — cancelSavedGamesForBlockedRoom cascade (KIM-434 PR 
     const db = createStatefulDrizzleDb()
 
     const cancelledCount = await db.transaction((tx) =>
-      cancelSavedGamesForBlockedRoom(tx, [{ roomId: 'room-empty', date: '2026-07-10' }]),
+      cancelSavedGamesForBlockedRoom(tx, [{ roomId: 'room-empty', tableId: null, date: '2026-07-10' }]),
     )
 
     expect(cancelledCount).toBe(0)
