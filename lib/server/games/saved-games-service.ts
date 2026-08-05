@@ -29,16 +29,21 @@
  * Cross-user operations (attendance recording, table/event conflict checks)
  * legitimately need to span users and therefore require the admin client.
  */
-import { and, asc, eq, gte, lte } from 'drizzle-orm'
+import { and, asc, eq, gte, lte, sql } from 'drizzle-orm'
 import type { SavedGame, SavedGameStatus } from '@/lib/types'
 import { ERROR_CODES } from '@/lib/types/error-codes'
 import type { SessionUser } from '@/lib/server/auth/auth'
 import { getCurrentClubDate, isValidDateOnlyString } from '@/lib/club-time'
-import { getAdminDb, getDrizzleAdminDb } from '@/lib/db'
+import { getAdminDb, getDrizzleAdminDb, type AdminDbClient } from '@/lib/db'
 import { rooms, savedGameAttendances, savedGames, tables } from '@/lib/db/schema'
-import { serviceError } from '@/lib/server/shared/service-error'
+import { ServiceError, serviceError } from '@/lib/server/shared/service-error'
 import { assertMemberRowsScoped } from '@/lib/server/shared/data-scoping'
 import type { Tables } from '@/lib/supabase/types'
+
+/** Same transaction-callback parameter type events-service.ts derives for its
+ * own admin-transaction helpers (see `AdminTx` there) — kept local here to
+ * avoid a cross-service type import for a one-line alias. */
+type AdminTx = Parameters<Parameters<AdminDbClient['transaction']>[0]>[0]
 
 const SAVED_GAME_JOIN_SELECTION = {
   id: savedGames.id,
@@ -156,12 +161,17 @@ function mapSavedGame(row: SavedGameJoinedRow, today = getCurrentClubDate()): Sa
   }
 }
 
-async function assertTableAndEventAvailability(tableId: string, startDate: string, endDate: string) {
+/**
+ * `tx` is always the caller's advisory-lock-guarded transaction (see
+ * `createSavedGameForSession` / `renewSavedGameForSession` below) — this
+ * function never opens its own connection for the Neon read, so the
+ * conflict check it performs is guaranteed to run after the lock is held.
+ */
+async function assertTableAndEventAvailability(tx: AdminTx, tableId: string, startDate: string, endDate: string) {
   // Drizzle/Neon read: `tables` is already migrated (tables-service.ts PR2),
   // so its source of truth lives in Neon.
-  const db = getDrizzleAdminDb()
   const [table] = await runQuery(
-    db
+    tx
       .select({ id: tables.id, roomId: tables.roomId, type: tables.type })
       .from(tables)
       .where(eq(tables.id, tableId)),
@@ -232,7 +242,6 @@ export async function createSavedGameForSession(
   const startDate = parseDate(body.startDate, 'startDate')
   const endDate = parseDate(body.endDate, 'endDate')
   validateDateRange(startDate, endDate)
-  await assertTableAndEventAvailability(tableId, startDate, endDate)
 
   // Admin client required: Neon has no RLS. Member isolation is enforced by
   // writing `userId: session.id` explicitly into the insert payload — the
@@ -240,11 +249,28 @@ export async function createSavedGameForSession(
   const db = getDrizzleAdminDb()
   let row: { id: string } | undefined
   try {
-    ;[row] = await db
-      .insert(savedGames)
-      .values({ tableId, userId: session.id, startDate, endDate })
-      .returning({ id: savedGames.id })
+    row = await db.transaction(async (tx) => {
+      // Reimplemented `pg_advisory_xact_lock` guard from the dropped
+      // `validate_saved_game` trigger
+      // (supabase/migrations/20260619000006_kim384_saved_game_validation_trigger.sql)
+      // — same lock key (`hashtextextended(table_id::text, 0)`) as the
+      // matching guard in events-service.ts's `cancelSavedGamesForBlockedRoom()`.
+      // Taken BEFORE the conflict check, inside the same transaction as the
+      // insert, so this create and a concurrent "block this room's event"
+      // transaction can't each act on a pre-commit view of the other's
+      // write (see the doc comment on `cancelSavedGamesForBlockedRoom` for
+      // the full race-condition rationale — this is the other side of it).
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${tableId}::text, 0))`)
+      await assertTableAndEventAvailability(tx, tableId, startDate, endDate)
+
+      const [inserted] = await tx
+        .insert(savedGames)
+        .values({ tableId, userId: session.id, startDate, endDate })
+        .returning({ id: savedGames.id })
+      return inserted
+    })
   } catch (err) {
+    if (err instanceof ServiceError) throw err
     const code = getPgErrorCode(err)
     if (code === '23P01') serviceError(ERROR_CODES.SAVED_GAME_CONFLICT, 409)
     if (code === '23514') serviceError((err as Error).message, 400)
@@ -286,21 +312,29 @@ export async function renewSavedGameForSession(session: SessionUser, id: string)
 
   const startDate = addDays(current.endDate, 1)
   const endDate = getMaxEndDate(startDate)
-  await assertTableAndEventAvailability(current.tableId, startDate, endDate)
 
   let row: { id: string } | undefined
   try {
-    ;[row] = await db
-      .insert(savedGames)
-      .values({
-        tableId: current.tableId,
-        userId: current.userId,
-        startDate,
-        endDate,
-        renewedFromId: current.id,
-      })
-      .returning({ id: savedGames.id })
+    row = await db.transaction(async (tx) => {
+      // Same advisory-lock guard as createSavedGameForSession above — see
+      // its doc comment for the full race-condition rationale.
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${current.tableId}::text, 0))`)
+      await assertTableAndEventAvailability(tx, current.tableId, startDate, endDate)
+
+      const [inserted] = await tx
+        .insert(savedGames)
+        .values({
+          tableId: current.tableId,
+          userId: current.userId,
+          startDate,
+          endDate,
+          renewedFromId: current.id,
+        })
+        .returning({ id: savedGames.id })
+      return inserted
+    })
   } catch (err) {
+    if (err instanceof ServiceError) throw err
     const code = getPgErrorCode(err)
     if (code === '23505') serviceError(ERROR_CODES.SAVED_GAME_ALREADY_RENEWED, 409)
     if (code === '23P01') serviceError(ERROR_CODES.SAVED_GAME_CONFLICT, 409)
@@ -313,39 +347,71 @@ export async function renewSavedGameForSession(session: SessionUser, id: string)
   return mapSavedGame(joined, today)
 }
 
-export async function recordSavedGameAttendance(playReservation: Tables<'reservations'>): Promise<void> {
+/**
+ * Only the fields this function actually reads from a reservation row — kept
+ * as a `Pick` (rather than the full `Tables<'reservations'>` shape) so
+ * callers that only have a Drizzle `reservations.$inferSelect` row (which is
+ * camelCase and lacks several legacy columns) can bridge just these six
+ * fields instead of fabricating an entire legacy Supabase row.
+ */
+type PlayReservationForAttendance = Pick<
+  Tables<'reservations'>,
+  'id' | 'table_id' | 'user_id' | 'date' | 'surface' | 'status'
+>
+
+/**
+ * Reimplements two dropped triggers together, atomically, since neither
+ * exists anymore and both used to fire off the same check-in event:
+ *   - `record_saved_game_attendance_after_activation` (AFTER UPDATE OF
+ *     status ON reservations -> records a `saved_game_attendances` row when
+ *     a reservation's top-surface play activates)
+ *   - `saved_game_attendance_count` (AFTER INSERT ON saved_game_attendances
+ *     -> increment_saved_game_attendance(), bumps the parent
+ *     `saved_games.attendance_count`)
+ * Both steps run inside one `db.transaction()` so the attendance insert and
+ * the counter increment can never diverge.
+ */
+export async function recordSavedGameAttendance(playReservation: PlayReservationForAttendance): Promise<void> {
   if (playReservation.surface !== 'top' || playReservation.status !== 'active') return
 
   // Admin client required: this function is called from a system/cron context
   // (not a user request) and intentionally reads across all users to match a
   // reservation to its saved game. No per-user scoping is appropriate here.
   const db = getDrizzleAdminDb()
-  const [savedGame] = await runQuery(
-    db
-      .select({ id: savedGames.id })
-      .from(savedGames)
-      .where(
-        and(
-          eq(savedGames.tableId, playReservation.table_id),
-          eq(savedGames.userId, playReservation.user_id),
-          eq(savedGames.status, 'active'),
-          lte(savedGames.startDate, playReservation.date),
-          gte(savedGames.endDate, playReservation.date),
-        ),
-      ),
-  )
-
-  if (!savedGame) return
 
   try {
-    await db.insert(savedGameAttendances).values({
-      savedGameId: savedGame.id,
-      playReservationId: playReservation.id,
-      attendedOn: playReservation.date,
+    await db.transaction(async (tx) => {
+      const [savedGame] = await tx
+        .select({ id: savedGames.id, attendanceCount: savedGames.attendanceCount })
+        .from(savedGames)
+        .where(
+          and(
+            eq(savedGames.tableId, playReservation.table_id),
+            eq(savedGames.userId, playReservation.user_id),
+            eq(savedGames.status, 'active'),
+            lte(savedGames.startDate, playReservation.date),
+            gte(savedGames.endDate, playReservation.date),
+          ),
+        )
+
+      if (!savedGame) return
+
+      await tx.insert(savedGameAttendances).values({
+        savedGameId: savedGame.id,
+        playReservationId: playReservation.id,
+        attendedOn: playReservation.date,
+      })
+
+      await tx
+        .update(savedGames)
+        .set({ attendanceCount: savedGame.attendanceCount + 1 })
+        .where(eq(savedGames.id, savedGame.id))
     })
   } catch (err) {
     // 23505 (unique_violation on play_reservation_id) means this reservation
     // already recorded attendance — idempotent no-op, matches prior behavior.
+    // The counter increment above is skipped too since it's in the same
+    // transaction, which rolls back entirely on any error.
     if (getPgErrorCode(err) !== '23505') serviceError('Internal server error', 500)
   }
 }
