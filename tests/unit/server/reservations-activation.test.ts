@@ -1031,6 +1031,60 @@ describe('reservations service', () => {
       // recordSavedGameAttendance should still be called (it handles the no-match case)
       expect(recordMock).toHaveBeenCalledOnce()
     })
+
+    it('rolls back activation atomically when attendance recording fails', async () => {
+      // Regression test for KIM-246: verify that a failure in attendance recording
+      // rolls back the activation UPDATE. Before the fix, two separate transactions
+      // meant a failure in attendance write left an activated reservation behind.
+      const { activateReservationByTable } = await loadReservationModules()
+      const { recordSavedGameAttendance } = await import('@/lib/server/games/saved-games-service')
+      const recordMock = vi.mocked(recordSavedGameAttendance)
+
+      // Seed a saved game so attendance recording will attempt a write
+      seedDrizzleDb({
+        saved_games: [
+          {
+            id: 'sg-atomicity',
+            tableId: 't3',
+            userId: '2',
+            startDate: '2025-06-01',
+            endDate: '2025-08-31',
+            status: 'active',
+            attendanceCount: 0,
+            renewedFromId: null,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
+        ],
+      })
+
+      seedPendingReservation({
+        id: 'r-atomicity-test',
+        table_id: 't3',
+        user_id: '2',
+        surface: 'top',
+        start_time: makeStartTime(10),
+      })
+
+      // Mock attendance recording to fail (e.g., database constraint violation)
+      const dbError = new Error('database constraint') as unknown as { code: string }
+      ;(dbError as any).code = '23505'
+      recordMock.mockRejectedValueOnce(dbError)
+
+      // Activation should fail and roll back the reservation state
+      await expect(activateReservationByTable('t3', '2', undefined)).rejects.toThrow()
+
+      // Verify the reservation is still pending (activation rolled back)
+      const reservationsInDb = getRows('reservations')
+      const reservation = reservationsInDb.find((r) => r.id === 'r-atomicity-test')
+      expect(reservation?.status).toBe('pending')
+      expect(reservation?.activatedAt).toBeNull()
+
+      // Verify the saved game counter didn't move (attendance didn't commit)
+      const savedGamesInDb = getRows('saved_games')
+      const savedGame = savedGamesInDb.find((sg) => sg.id === 'sg-atomicity')
+      expect(savedGame?.attendanceCount).toBe(0)
+    })
   })
 
 
