@@ -58,6 +58,7 @@ async function persistDrizzlePasswordHash(
         ...(fields.isActive !== undefined ? { isActive: fields.isActive } : {}),
         ...(fields.activeFrom !== undefined ? { activeFrom: fields.activeFrom } : {}),
         pswChanged: fields.pswChanged,
+        updatedAt: new Date(),
       })
       .where(eq(profiles.id, profileId))
       .returning({ id: profiles.id })
@@ -215,7 +216,7 @@ async function rollbackActivationTokenClaim(id: string, claimedAt: Date): Promis
     const db = getDrizzleAdminDb()
     await db
       .update(activationTokens)
-      .set({ usedAt: null })
+      .set({ usedAt: null, updatedAt: new Date() })
       .where(and(
         eq(activationTokens.id, id),
         eq(activationTokens.usedAt, claimedAt),
@@ -234,7 +235,7 @@ async function claimActivationToken(
     const db = getDrizzleAdminDb()
     const [row] = await db
       .update(activationTokens)
-      .set({ usedAt: claimedAt })
+      .set({ usedAt: claimedAt, updatedAt: new Date() })
       .where(and(
         eq(activationTokens.tokenHash, tokenHash),
         gt(activationTokens.expiresAt, claimedAt),
