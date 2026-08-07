@@ -10,23 +10,23 @@ describe('reservation no-show lazy evaluation', () => {
       end_time: '18:00:00',
     }
 
-    it('marks a reservation as expired when now exceeds the deadline (same as pending-reservation-expiry logic)', () => {
-      // Uses getPendingCheckInDeadline which returns start + 60min (capped at end)
-      // For this 2-hour slot: deadline is 2026-06-19T15:00:00.000Z (verified by pending-reservation-expiry.test.ts)
-      expect(isNoShowExpired(longSlot, new Date('2026-06-19T15:00:00.000Z'))).toBe(false)
-      expect(isNoShowExpired(longSlot, new Date('2026-06-19T15:00:00.001Z'))).toBe(true)
+    it('marks a reservation as expired when now exceeds the deadline (59-minute no-show threshold)', () => {
+      // Uses local getNoShowDeadline which returns start + 59min (capped at end)
+      // For this 2-hour slot: deadline is 2026-06-19T14:59:00.000Z (independent of pending-reservation-expiry logic)
+      expect(isNoShowExpired(longSlot, new Date('2026-06-19T14:59:00.000Z'))).toBe(false)
+      expect(isNoShowExpired(longSlot, new Date('2026-06-19T14:59:00.001Z'))).toBe(true)
     })
 
     it('caps the deadline at the reservation end for short slots', () => {
       const shortSlot = { ...longSlot, end_time: '16:30:00' }
-      // For short slots: deadline is 2026-06-19T14:30:00.000Z (verified by pending-reservation-expiry.test.ts)
+      // For short slots: 59min from start (14:59:00Z) exceeds end (14:30:00Z), so deadline is capped at end
       expect(isNoShowExpired(shortSlot, new Date('2026-06-19T14:30:00.000Z'))).toBe(false)
       expect(isNoShowExpired(shortSlot, new Date('2026-06-19T14:30:00.001Z'))).toBe(true)
     })
 
     it('keeps the reservation valid at the exact deadline and expires it one millisecond later', () => {
-      expect(isNoShowExpired(longSlot, new Date('2026-06-19T15:00:00.000Z'))).toBe(false)
-      expect(isNoShowExpired(longSlot, new Date('2026-06-19T15:00:00.001Z'))).toBe(true)
+      expect(isNoShowExpired(longSlot, new Date('2026-06-19T14:59:00.000Z'))).toBe(false)
+      expect(isNoShowExpired(longSlot, new Date('2026-06-19T14:59:00.001Z'))).toBe(true)
     })
   })
 
