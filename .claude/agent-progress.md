@@ -992,3 +992,14 @@ Real-time log of all agent work. Agents append entries as work progresses.
   - Ready for security-reviewer handoff on PR #159
   - pr-comment-responder to notify: commit SHA acd3b44
   - PR comments to update: #3580783193 (original), #3580943665 (follow-up)
+
+#### [297] software-engineer — Fix PR review findings
+- [22:45] Started. Worktree on feat/297-clerk-install-middleware-session at 60fd042 (matches origin tip).
+- [22:52] middleware.ts: removed auth.protect() enforcement for /reservations,/admin,/check-in,/rooms (findings 1) — Clerk gate no longer live-gates Supabase-backed routes, no redirect loop reachable.
+- [22:52] middleware.ts: restored pre-Clerk Supabase auth.getUser() cookie refresh, wrapped inside clerkMiddleware() handler (finding 2).
+- [22:53] middleware.ts: config.matcher now includes /api so clerkMiddleware() populates auth() context for Route Handlers (finding 4); handler short-circuits for /api paths before the i18n rewrite/Supabase refresh to avoid locale-rewriting API requests.
+- [22:55] app/[locale]/sign-up/[[...sign-up]]/page.tsx: replaced live <SignUp/> form with a static "registration unavailable" state (reused existing auth.registerUnavailableTitle/Body i18n keys, already present in en/es with parity) linking to sign-in (finding 3) — fails closed, no path to an orphaned Clerk-only account.
+- [22:58] pnpm typecheck: clean. pnpm build: exit 0. pnpm lint: no warnings/errors.
+- [22:59] __tests__/server/session.test.ts: 8/8 still pass (untouched). __tests__/app/middleware.test.ts: all 6 fail as expected (test mocks @clerk/nextjs/server only; needs @supabase/ssr mock + Supabase env stubs + updated redirect expectations) — left untouched for qa-engineer per test-file ownership rule.
+- [23:00] Committed and pushed to origin/feat/297-clerk-install-middleware-session.
+- [23:00] ✅ Complete — 4 findings addressed, worktree cleaned up.
