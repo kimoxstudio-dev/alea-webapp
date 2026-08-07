@@ -15,21 +15,20 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const rootDir = join(__dirname, "..");
 const schemaDir = join(rootDir, "lib", "db", "schema");
 
-// Schemas known to come from a previous/other stack (e.g. Supabase) that has
-// nothing to do with this project's own schema. Their presence means the
-// target database is not a fresh/owned-by-us database.
-const KNOWN_LEFTOVER_SCHEMAS = [
-  "auth",
-  "storage",
-  "drizzle",
-  "supabase_migrations",
-  "realtime",
-  "internal",
-  "pgbouncer",
-  "graphql",
-  "graphql_public",
-  "vault",
-];
+// Postgres-internal schemas that are always present in every database and
+// are not evidence of leftover state from another stack/project. Anything
+// else besides "public" (this project's own schema) fails the preflight
+// check — an allowlist, not a denylist of specific known-bad names, so an
+// arbitrary unlisted schema (e.g. "legacy") is caught too.
+const SYSTEM_SCHEMAS = ["pg_catalog", "information_schema", "pg_toast"];
+
+// Safely quotes a Postgres identifier for interpolation into SQL text.
+// Only ever called with table names sourced from this script's own trusted
+// inputs (pg_catalog.pg_tables query results, or names parsed out of this
+// script's own lib/db/schema/*.sql files) — never external/user input.
+function quoteIdent(name) {
+  return `"${String(name).replace(/"/g, '""')}"`;
+}
 
 function loadEnvLocal() {
   const envPath = join(rootDir, ".env.local");
@@ -129,29 +128,61 @@ async function assertDatabaseIsCleanOrOwned(sql, expectedTables) {
 
   console.log("Running preflight check (target database must be empty or already owned by this schema)...");
 
-  const leftoverSchemas = await sql.query(
-    `SELECT "nspname" FROM "pg_catalog"."pg_namespace" WHERE "nspname" = ANY($1)`,
-    [KNOWN_LEFTOVER_SCHEMAS],
+  // 1. Schema allowlist: only "public" plus Postgres-internal system schemas
+  // are acceptable. Any other schema at all — a known leftover stack schema
+  // (auth, storage, drizzle, ...) or an arbitrary one (legacy, ...) — means
+  // the target database is not a fresh/owned-by-us database.
+  const unexpectedSchemas = await sql.query(
+    `SELECT "nspname" FROM "pg_catalog"."pg_namespace"
+     WHERE "nspname" <> 'public'
+       AND "nspname" <> ALL($1)
+       AND "nspname" !~ '^pg_temp_'
+       AND "nspname" !~ '^pg_toast_temp_'`,
+    [SYSTEM_SCHEMAS],
   );
-  if (leftoverSchemas.length > 0) {
-    const names = leftoverSchemas.map((row) => row.nspname).join(", ");
+  if (unexpectedSchemas.length > 0) {
+    const names = unexpectedSchemas.map((row) => row.nspname).join(", ");
     console.error(
-      `Preflight check failed: target database has pre-existing non-Alea schema(s): ${names}.\n` +
-        "This script only replays CREATE/IF NOT EXISTS statements and does not verify a clean target on its own.\n" +
+      `Preflight check failed: target database has unexpected schema(s) not owned by this project: ${names}.\n` +
+        'Only "public" plus Postgres-internal system schemas are allowed.\n' +
         "Run it against a fresh empty database, or pass --force / set ALLOW_NON_EMPTY_DB=1 if you have already verified this is expected.",
     );
     process.exit(1);
   }
 
+  // 2. Unexpected-table check: any table in "public" whose name is not
+  // produced by this script's own schema files is a hard fail.
   const publicTables = await sql.query(
     `SELECT "tablename" FROM "pg_catalog"."pg_tables" WHERE "schemaname" = 'public'`,
   );
-  const unexpectedTables = publicTables
-    .map((row) => row.tablename)
-    .filter((name) => !expectedTables.has(name));
+  const publicTableNames = publicTables.map((row) => row.tablename);
+  const unexpectedTables = publicTableNames.filter((name) => !expectedTables.has(name));
   if (unexpectedTables.length > 0) {
     console.error(
       `Preflight check failed: "public" schema has pre-existing table(s) not defined by lib/db/schema/: ${unexpectedTables.join(", ")}.\n` +
+        "Run it against a fresh empty database, or pass --force / set ALLOW_NON_EMPTY_DB=1 if you have already verified this is expected.",
+    );
+    process.exit(1);
+  }
+
+  // 3. Row-emptiness check: an expected table that already exists must be
+  // empty — non-empty means stale/leftover data from a prior run, not a
+  // fresh database. Tables that don't exist yet (first run) have nothing to
+  // check and are skipped. Uses a cheap EXISTS/LIMIT 1 probe per table
+  // instead of COUNT(*), since expected tables could hold real data.
+  const existingExpectedTables = publicTableNames.filter((name) => expectedTables.has(name));
+  const nonEmptyTables = [];
+  for (const tableName of existingExpectedTables) {
+    const rows = await sql.query(
+      `SELECT EXISTS (SELECT 1 FROM ${quoteIdent(tableName)} LIMIT 1) AS "has_rows"`,
+    );
+    if (rows[0]?.has_rows) {
+      nonEmptyTables.push(tableName);
+    }
+  }
+  if (nonEmptyTables.length > 0) {
+    console.error(
+      `Preflight check failed: pre-existing table(s) already contain data: ${nonEmptyTables.join(", ")}.\n` +
         "Run it against a fresh empty database, or pass --force / set ALLOW_NON_EMPTY_DB=1 if you have already verified this is expected.",
     );
     process.exit(1);
