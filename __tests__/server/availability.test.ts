@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest'
 import type { GameTable } from '@/lib/types'
 import type { Tables } from '@/lib/supabase/types'
 import { resolveDate, normalizeTime, generateDaySlots, buildAvailability } from '@/lib/server/availability'
@@ -34,24 +34,34 @@ function makeGameTable(overrides?: Partial<GameTable>): GameTable {
 }
 
 describe('resolveDate', () => {
+  beforeEach(() => {
+    // Pin clock to a fixed instant within the historical flake window:
+    // 2025-06-15T23:30:00Z = June 15 23:30 UTC
+    // Atlantic/Canary is UTC+1 in June (WEST), so local time is June 16 00:30
+    // getCurrentClubDate() will return "2025-06-16" at this UTC instant
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2025-06-15T23:30:00.000Z'))
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
   it('returns today when input is null', () => {
-    const today = new Date().toISOString().split('T')[0]
-    expect(resolveDate(null)).toBe(today)
+    // At this fixed instant (2025-06-15T23:30:00Z), club-local date is 2025-06-16
+    expect(resolveDate(null)).toBe('2025-06-16')
   })
 
   it('returns today when input is undefined', () => {
-    const today = new Date().toISOString().split('T')[0]
-    expect(resolveDate(undefined)).toBe(today)
+    expect(resolveDate(undefined)).toBe('2025-06-16')
   })
 
   it('returns today when input is empty string', () => {
-    const today = new Date().toISOString().split('T')[0]
-    expect(resolveDate('')).toBe(today)
+    expect(resolveDate('')).toBe('2025-06-16')
   })
 
   it('returns today when input is whitespace only', () => {
-    const today = new Date().toISOString().split('T')[0]
-    expect(resolveDate('   ')).toBe(today)
+    expect(resolveDate('   ')).toBe('2025-06-16')
   })
 
   it('returns the date when a valid YYYY-MM-DD is provided', () => {
