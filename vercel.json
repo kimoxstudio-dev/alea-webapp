@@ -7,7 +7,7 @@
   "crons": [
     {
       "path": "/api/cron/mark-no-show",
-      "schedule": "*/15 * * * *"
+      "schedule": "0 3 * * *"
     }
   ]
 }
