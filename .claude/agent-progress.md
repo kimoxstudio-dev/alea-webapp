@@ -1001,5 +1001,6 @@ Real-time log of all agent work. Agents append entries as work progresses.
 - [22:55] app/[locale]/sign-up/[[...sign-up]]/page.tsx: replaced live <SignUp/> form with a static "registration unavailable" state (reused existing auth.registerUnavailableTitle/Body i18n keys, already present in en/es with parity) linking to sign-in (finding 3) — fails closed, no path to an orphaned Clerk-only account.
 - [22:58] pnpm typecheck: clean. pnpm build: exit 0. pnpm lint: no warnings/errors.
 - [22:59] __tests__/server/session.test.ts: 8/8 still pass (untouched). __tests__/app/middleware.test.ts: all 6 fail as expected (test mocks @clerk/nextjs/server only; needs @supabase/ssr mock + Supabase env stubs + updated redirect expectations) — left untouched for qa-engineer per test-file ownership rule.
-- [23:00] Committed and pushed to origin/feat/297-clerk-install-middleware-session.
-- [23:00] ✅ Complete — 4 findings addressed, worktree cleaned up.
+- [23:00] Committed locally (4bb0c81) on feat/297-clerk-install-middleware-session.
+- [23:01] ⚠️ BLOCKED — `git push` rejected by local pre-push hook: hook runs full test suite (979 tests) and fails on the 6 expected middleware.test.ts failures (same ones flagged above, qa-engineer's file to fix). Did not bypass with --no-verify per standing rule. Full suite otherwise green: 973/979 passed, typecheck clean, lint clean, build exit 0.
+- [23:01] Handing off to qa-engineer to update __tests__/app/middleware.test.ts (mock @supabase/ssr + stub NEXT_PUBLIC_SUPABASE_URL/PUBLISHABLE_KEY env vars, drop/replace the "protected route redirects" assertions since auth.protect() is no longer called). Once green, push should succeed and PR #317 will pick up commit 4bb0c81.
