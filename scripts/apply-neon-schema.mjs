@@ -15,6 +15,22 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const rootDir = join(__dirname, "..");
 const schemaDir = join(rootDir, "lib", "db", "schema");
 
+// Schemas known to come from a previous/other stack (e.g. Supabase) that has
+// nothing to do with this project's own schema. Their presence means the
+// target database is not a fresh/owned-by-us database.
+const KNOWN_LEFTOVER_SCHEMAS = [
+  "auth",
+  "storage",
+  "drizzle",
+  "supabase_migrations",
+  "realtime",
+  "internal",
+  "pgbouncer",
+  "graphql",
+  "graphql_public",
+  "vault",
+];
+
 function loadEnvLocal() {
   const envPath = join(rootDir, ".env.local");
   if (!existsSync(envPath)) return;
@@ -88,6 +104,62 @@ function splitStatements(sqlText) {
   return statements;
 }
 
+// Parses `CREATE TABLE [IF NOT EXISTS] "name"` out of this script's own
+// schema files, so the preflight check always stays in sync with the actual
+// schema definitions without needing a separately maintained list.
+function extractExpectedTableNames(files) {
+  const names = new Set();
+  for (const file of files) {
+    const text = readFileSync(join(schemaDir, file), "utf8");
+    for (const match of text.matchAll(/CREATE TABLE(?:\s+IF NOT EXISTS)?\s+"([^"]+)"/gi)) {
+      names.add(match[1]);
+    }
+  }
+  return names;
+}
+
+// Read-only preflight: aborts if the target database has state that did not
+// come from this script, so a "successful" run can't silently apply on top
+// of (and thereby appear to validate) an unrelated/leftover database.
+async function assertDatabaseIsCleanOrOwned(sql, expectedTables) {
+  if (process.argv.includes("--force") || process.env.ALLOW_NON_EMPTY_DB === "1") {
+    console.log("Preflight check skipped (--force / ALLOW_NON_EMPTY_DB=1).");
+    return;
+  }
+
+  console.log("Running preflight check (target database must be empty or already owned by this schema)...");
+
+  const leftoverSchemas = await sql.query(
+    `SELECT "nspname" FROM "pg_catalog"."pg_namespace" WHERE "nspname" = ANY($1)`,
+    [KNOWN_LEFTOVER_SCHEMAS],
+  );
+  if (leftoverSchemas.length > 0) {
+    const names = leftoverSchemas.map((row) => row.nspname).join(", ");
+    console.error(
+      `Preflight check failed: target database has pre-existing non-Alea schema(s): ${names}.\n` +
+        "This script only replays CREATE/IF NOT EXISTS statements and does not verify a clean target on its own.\n" +
+        "Run it against a fresh empty database, or pass --force / set ALLOW_NON_EMPTY_DB=1 if you have already verified this is expected.",
+    );
+    process.exit(1);
+  }
+
+  const publicTables = await sql.query(
+    `SELECT "tablename" FROM "pg_catalog"."pg_tables" WHERE "schemaname" = 'public'`,
+  );
+  const unexpectedTables = publicTables
+    .map((row) => row.tablename)
+    .filter((name) => !expectedTables.has(name));
+  if (unexpectedTables.length > 0) {
+    console.error(
+      `Preflight check failed: "public" schema has pre-existing table(s) not defined by lib/db/schema/: ${unexpectedTables.join(", ")}.\n` +
+        "Run it against a fresh empty database, or pass --force / set ALLOW_NON_EMPTY_DB=1 if you have already verified this is expected.",
+    );
+    process.exit(1);
+  }
+
+  console.log("Preflight check passed.");
+}
+
 async function main() {
   loadEnvLocal();
 
@@ -103,16 +175,28 @@ async function main() {
     .filter((f) => f.endsWith(".sql"))
     .sort();
 
+  await assertDatabaseIsCleanOrOwned(sql, extractExpectedTableNames(files));
+
   console.log(`Applying ${files.length} schema file(s) from lib/db/schema/ ...`);
 
+  const allStatements = [];
   for (const file of files) {
     const filePath = join(schemaDir, file);
     const text = readFileSync(filePath, "utf8");
     const statements = splitStatements(text);
     console.log(`-> ${file} (${statements.length} statement(s))`);
-    for (const stmt of statements) {
-      await sql.query(stmt);
-    }
+    allStatements.push(...statements);
+  }
+
+  // Apply every statement from every file as a single Postgres transaction
+  // (one HTTP round-trip via the neon() driver's transaction() helper), so a
+  // mid-way failure rolls back all DDL instead of leaving the database
+  // partially migrated.
+  try {
+    await sql.transaction((txn) => allStatements.map((stmt) => txn.query(stmt)));
+  } catch (err) {
+    console.error("Schema application failed — transaction rolled back, no changes were committed.");
+    throw err;
   }
 
   console.log("Schema applied successfully.");
