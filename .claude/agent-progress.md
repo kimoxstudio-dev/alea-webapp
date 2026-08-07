@@ -992,3 +992,23 @@ Real-time log of all agent work. Agents append entries as work progresses.
   - Ready for security-reviewer handoff on PR #159
   - pr-comment-responder to notify: commit SHA acd3b44
   - PR comments to update: #3580783193 (original), #3580943665 (follow-up)
+
+#### [297] software-engineer — Fix PR review findings
+- [22:45] Started. Worktree on feat/297-clerk-install-middleware-session at 60fd042 (matches origin tip).
+- [22:52] middleware.ts: removed auth.protect() enforcement for /reservations,/admin,/check-in,/rooms (findings 1) — Clerk gate no longer live-gates Supabase-backed routes, no redirect loop reachable.
+- [22:52] middleware.ts: restored pre-Clerk Supabase auth.getUser() cookie refresh, wrapped inside clerkMiddleware() handler (finding 2).
+- [22:53] middleware.ts: config.matcher now includes /api so clerkMiddleware() populates auth() context for Route Handlers (finding 4); handler short-circuits for /api paths before the i18n rewrite/Supabase refresh to avoid locale-rewriting API requests.
+- [22:55] app/[locale]/sign-up/[[...sign-up]]/page.tsx: replaced live <SignUp/> form with a static "registration unavailable" state (reused existing auth.registerUnavailableTitle/Body i18n keys, already present in en/es with parity) linking to sign-in (finding 3) — fails closed, no path to an orphaned Clerk-only account.
+- [22:58] pnpm typecheck: clean. pnpm build: exit 0. pnpm lint: no warnings/errors.
+- [22:59] __tests__/server/session.test.ts: 8/8 still pass (untouched). __tests__/app/middleware.test.ts: all 6 fail as expected (test mocks @clerk/nextjs/server only; needs @supabase/ssr mock + Supabase env stubs + updated redirect expectations) — left untouched for qa-engineer per test-file ownership rule.
+- [23:00] Committed locally (4bb0c81) on feat/297-clerk-install-middleware-session.
+- [23:01] ⚠️ BLOCKED — `git push` rejected by local pre-push hook: hook runs full test suite (979 tests) and fails on the 6 expected middleware.test.ts failures (same ones flagged above, qa-engineer's file to fix). Did not bypass with --no-verify per standing rule. Full suite otherwise green: 973/979 passed, typecheck clean, lint clean, build exit 0.
+- [23:01] Handing off to qa-engineer to update __tests__/app/middleware.test.ts (mock @supabase/ssr + stub NEXT_PUBLIC_SUPABASE_URL/PUBLISHABLE_KEY env vars, drop/replace the "protected route redirects" assertions since auth.protect() is no longer called). Once green, push should succeed and PR #317 will pick up commit 4bb0c81.
+
+#### [297] software-engineer — Fix sign-in dead-end finding
+- [23:13] Started; checked out feat/297-clerk-install-middleware-session (tip 5060250) in agent worktree
+- [23:15] Implemented Option A: replaced Clerk <SignIn /> with static 'not yet available' page (matching sign-up precedent), linking back to legacy /login. Added i18n keys auth.signInUnavailableTitle/Body to en.json + es.json (parity confirmed).
+- [23:15] pnpm typecheck: passed (route types generated, tsc --noEmit clean).
+- [23:15] pnpm build: exit 0, all 43 static pages generated successfully.
+- [23:15] ⚠️ BLOCKED — git push rejected by pre-push hook: full suite ran 980 tests, 976 passed / 4 failed, all 4 failures in __tests__/server/availability.test.ts (resolveDate 'returns today when input is X' — computed today() as 2026-08-08 vs expected 2026-08-07). This is the pre-existing documented UTC-midnight timezone flake (unrelated to this change, not a test I'm allowed to touch). middleware.test.ts (qa-engineer's prior fix) is green. Did not bypass with --no-verify per standing rule.
+- [23:16] ✅ Complete (implementation) — Option A applied, typecheck/build/lint all green. Push still blocked by pre-existing availability.test.ts UTC-midnight flake (976/980 passing, 4 fails all in that one file, unrelated to this change). Commits d8b9350 + de0e336 sitting locally on feat/297-clerk-install-middleware-session, ready to push once flake window passes or qa-engineer addresses it.

@@ -76,6 +76,8 @@
     "recoveryUsedBody": "Este enlace de recuperación ya se ha usado. Contacta con un administrador si sigues sin poder acceder.",
     "registerUnavailableTitle": "El registro está temporalmente deshabilitado",
     "registerUnavailableBody": "Hemos pausado el autoregistro mientras terminamos la migración de autenticación. Inicia sesión con una cuenta existente o contacta con la asociación para solicitar acceso.",
+    "signInUnavailableTitle": "Este método de inicio de sesión está temporalmente deshabilitado",
+    "signInUnavailableBody": "Hemos pausado este método de inicio de sesión mientras terminamos la migración de autenticación. Inicia sesión con tu cuenta de socio existente a continuación.",
     "noAccount": "¿No tienes cuenta?",
     "hasAccount": "¿Ya tienes cuenta?",
     "showPassword": "Mostrar contraseña",
