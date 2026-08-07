@@ -4,7 +4,7 @@ import { redirect } from 'next/navigation'
 import { RoomsView } from '@/components/rooms/rooms-view'
 import { getSessionFromServerCookies } from '@/lib/server/auth'
 import { getCurrentUser } from '@/lib/server/auth-service'
-import { markNoShowReservations } from '@/lib/server/reservations-service'
+import { markExpiredReservationsAsNoShow } from '@/lib/server/reservation-no-show'
 
 export async function generateMetadata(): Promise<Metadata> {
   const t = await getTranslations('rooms')
@@ -29,7 +29,7 @@ export default async function RoomsPage({ params }: RoomsPageProps) {
   }
 
   try {
-    await markNoShowReservations()
+    await markExpiredReservationsAsNoShow()
   } catch (error) {
     console.error('Failed to mark no-show reservations on rooms load', error)
   }

@@ -1,7 +1,7 @@
 import type { AvailableEquipment, Equipment, Reservation, TableSurface } from '@/lib/types'
 import { ERROR_CODES } from '@/lib/types/error-codes'
 import type { SessionUser } from '@/lib/server/auth'
-import { CLUB_TIMEZONE, getCurrentClubDate, isValidDateOnlyString, zonedDateTimeToUtc } from '@/lib/club-time'
+import { getCurrentClubDate, isValidDateOnlyString, zonedDateTimeToUtc } from '@/lib/club-time'
 import { getDatabaseNow } from '@/lib/server/database-time'
 import { serviceError } from '@/lib/server/service-error'
 import { assertMemberRowsScoped } from '@/lib/server/data-scoping'
@@ -987,17 +987,6 @@ export async function updateReservationForSession(
   }
 
   return mapReservation(data as ReservationRow)
-}
-
-export async function markNoShowReservations(): Promise<number> {
-  const admin = createSupabaseServerAdminClient()
-  const { data, error } = await (admin as unknown as {
-    rpc: (fn: string, args?: unknown) => Promise<{ data: number | null; error: unknown }>
-  }).rpc('mark_no_show_reservations', {
-    club_timezone: CLUB_TIMEZONE,
-  })
-  if (error) serviceError('Internal server error', 500)
-  return (data as number | null) ?? 0
 }
 
 type ActivationAdminQuery = {
