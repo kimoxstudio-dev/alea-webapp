@@ -1004,3 +1004,9 @@ Real-time log of all agent work. Agents append entries as work progresses.
 - [23:00] Committed locally (4bb0c81) on feat/297-clerk-install-middleware-session.
 - [23:01] ⚠️ BLOCKED — `git push` rejected by local pre-push hook: hook runs full test suite (979 tests) and fails on the 6 expected middleware.test.ts failures (same ones flagged above, qa-engineer's file to fix). Did not bypass with --no-verify per standing rule. Full suite otherwise green: 973/979 passed, typecheck clean, lint clean, build exit 0.
 - [23:01] Handing off to qa-engineer to update __tests__/app/middleware.test.ts (mock @supabase/ssr + stub NEXT_PUBLIC_SUPABASE_URL/PUBLISHABLE_KEY env vars, drop/replace the "protected route redirects" assertions since auth.protect() is no longer called). Once green, push should succeed and PR #317 will pick up commit 4bb0c81.
+
+#### [297] software-engineer — Fix sign-in dead-end finding
+- [23:13] Started; checked out feat/297-clerk-install-middleware-session (tip 5060250) in agent worktree
+- [23:15] Implemented Option A: replaced Clerk <SignIn /> with static 'not yet available' page (matching sign-up precedent), linking back to legacy /login. Added i18n keys auth.signInUnavailableTitle/Body to en.json + es.json (parity confirmed).
+- [23:15] pnpm typecheck: passed (route types generated, tsc --noEmit clean).
+- [23:15] pnpm build: exit 0, all 43 static pages generated successfully.

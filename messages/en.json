@@ -76,6 +76,8 @@
     "recoveryUsedBody": "This recovery link has already been used. Contact an administrator if you still cannot access the account.",
     "registerUnavailableTitle": "Registration is temporarily unavailable",
     "registerUnavailableBody": "We have paused self-service registration while the authentication cutover is being finalized. Please sign in with an existing account or contact the association to request access.",
+    "signInUnavailableTitle": "This sign-in method is temporarily unavailable",
+    "signInUnavailableBody": "We have paused this sign-in method while the authentication cutover is being finalized. Please sign in with your existing member account below.",
     "noAccount": "Don't have an account?",
     "hasAccount": "Already have an account?",
     "showPassword": "Show password",
