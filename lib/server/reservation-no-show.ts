@@ -1,7 +1,16 @@
 import 'server-only'
-import { getPendingCheckInDeadline } from '@/lib/server/pending-reservation-expiry'
+import { zonedDateTimeToUtc } from '@/lib/club-time'
 import { getDatabaseNow } from '@/lib/server/database-time'
 import { createSupabaseServerAdminClient } from '@/lib/supabase/server'
+
+/**
+ * No-show threshold per #318's acceptance criteria: a pending, never-activated
+ * reservation becomes a no-show once more than 59 minutes have passed since
+ * its start time. This is intentionally distinct from
+ * pending-reservation-expiry.ts's CHECK_IN_LATE_MINUTES (60), which governs a
+ * different feature (#202/#203).
+ */
+export const NO_SHOW_LATE_MINUTES = 59
 
 type NoShowCandidateSlot = {
   date: string
@@ -10,15 +19,26 @@ type NoShowCandidateSlot = {
 }
 
 /**
- * True when a pending, never-activated reservation's check-in window has
- * closed (more than CHECK_IN_LATE_MINUTES have passed since the slot's start,
- * capped at the slot's end) and it should be treated as a no-show.
- *
- * Reuses the same deadline math as pending-reservation-expiry.ts — a pending
- * reservation past its check-in deadline is, by definition, a no-show.
+ * Deadline after which a pending, never-activated reservation is treated as a
+ * no-show: start time + NO_SHOW_LATE_MINUTES, capped at the slot's end (a
+ * reservation whose slot has already ended without activation is
+ * unambiguously a no-show regardless of the 59-minute window).
+ */
+function getNoShowDeadline(reservation: NoShowCandidateSlot): Date {
+  const start = zonedDateTimeToUtc(reservation.date, reservation.start_time)
+  const end = zonedDateTimeToUtc(reservation.date, reservation.end_time)
+  const lateDeadline = new Date(start.getTime() + NO_SHOW_LATE_MINUTES * 60 * 1000)
+
+  return lateDeadline < end ? lateDeadline : end
+}
+
+/**
+ * True when a pending, never-activated reservation is past the no-show
+ * deadline (more than NO_SHOW_LATE_MINUTES have passed since the slot's
+ * start, capped at the slot's end) and should be treated as a no-show.
  */
 export function isNoShowExpired(reservation: NoShowCandidateSlot, now: Date): boolean {
-  return now.getTime() > getPendingCheckInDeadline(reservation).getTime()
+  return now.getTime() > getNoShowDeadline(reservation).getTime()
 }
 
 type NoShowReservationRow = NoShowCandidateSlot & { id: string }
