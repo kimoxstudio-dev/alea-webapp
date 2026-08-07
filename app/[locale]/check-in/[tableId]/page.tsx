@@ -4,6 +4,7 @@ import { redirect } from 'next/navigation'
 import { getSessionFromServerCookies } from '@/lib/server/auth'
 import { CheckInActivator } from '@/components/check-in/check-in-activator'
 import { locales } from '@/lib/i18n/config'
+import { markExpiredReservationsAsNoShow } from '@/lib/server/reservation-no-show'
 
 export async function generateMetadata(): Promise<Metadata> {
   const t = await getTranslations('checkin')
@@ -32,6 +33,12 @@ export default async function CheckInPage({ params, searchParams }: CheckInPageP
   const session = await getSessionFromServerCookies()
   if (!session) {
     redirect(`/${locale}/login?returnUrl=/${locale}/check-in/${tableId}${sideParam === 'inf' ? '?side=inf' : ''}`)
+  }
+
+  try {
+    await markExpiredReservationsAsNoShow()
+  } catch (error) {
+    console.error('Failed to mark no-show reservations on check-in load', error)
   }
 
   return (

@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 const redirectMock = vi.fn()
 const getSessionFromServerCookiesMock = vi.fn()
 const getCurrentUserMock = vi.fn()
-const markNoShowReservationsMock = vi.fn()
+const markExpiredReservationsAsNoShowMock = vi.fn()
 
 vi.mock('next/navigation', () => ({
   redirect: redirectMock,
@@ -21,15 +21,15 @@ vi.mock('@/lib/server/auth-service', () => ({
   getCurrentUser: getCurrentUserMock,
 }))
 
-vi.mock('@/lib/server/reservations-service', () => ({
-  markNoShowReservations: markNoShowReservationsMock,
+vi.mock('@/lib/server/reservation-no-show', () => ({
+  markExpiredReservationsAsNoShow: markExpiredReservationsAsNoShowMock,
 }))
 
 describe('auth page guards', () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
-    markNoShowReservationsMock.mockResolvedValue(0)
+    markExpiredReservationsAsNoShowMock.mockResolvedValue(0)
   })
 
   it('login page keeps stale sessions on login instead of redirecting to rooms', async () => {
@@ -60,7 +60,7 @@ describe('auth page guards', () => {
     await RoomsPage({ params: Promise.resolve({ locale: 'es' }) })
 
     expect(redirectMock).toHaveBeenCalledWith('/es/login')
-    expect(markNoShowReservationsMock).not.toHaveBeenCalled()
+    expect(markExpiredReservationsAsNoShowMock).not.toHaveBeenCalled()
   })
 
   it('rooms page skips expiry processing when there is no session', async () => {
@@ -71,7 +71,7 @@ describe('auth page guards', () => {
 
     expect(redirectMock).toHaveBeenCalledWith('/es/login')
     expect(getCurrentUserMock).not.toHaveBeenCalled()
-    expect(markNoShowReservationsMock).not.toHaveBeenCalled()
+    expect(markExpiredReservationsAsNoShowMock).not.toHaveBeenCalled()
   })
 
   it('rooms page marks expired reservations before rendering for a valid session', async () => {
@@ -81,13 +81,13 @@ describe('auth page guards', () => {
     const { default: RoomsPage } = await import('@/app/[locale]/rooms/page')
     await RoomsPage({ params: Promise.resolve({ locale: 'es' }) })
 
-    expect(markNoShowReservationsMock).toHaveBeenCalledOnce()
+    expect(markExpiredReservationsAsNoShowMock).toHaveBeenCalledOnce()
   })
 
   it('rooms page renders even when no-show expiry fails', async () => {
     getSessionFromServerCookiesMock.mockResolvedValueOnce({ id: 'session-1', role: 'member' })
     getCurrentUserMock.mockResolvedValueOnce({ id: 'user-1' })
-    markNoShowReservationsMock.mockRejectedValueOnce(new Error('RPC failed'))
+    markExpiredReservationsAsNoShowMock.mockRejectedValueOnce(new Error('RPC failed'))
 
     const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
