@@ -1,9 +1,8 @@
 import createMiddleware from 'next-intl/middleware'
-import { createServerClient, type CookieOptions } from '@supabase/ssr'
-import { type NextRequest, type NextResponse } from 'next/server'
-import { ensureCsrfCookie, getSupabaseCookieOptions } from './lib/server/security-edge'
+import { clerkMiddleware, createRouteMatcher } from '@clerk/nextjs/server'
+import type { NextRequest } from 'next/server'
+import { ensureCsrfCookie } from './lib/server/security-edge'
 import { locales, defaultLocale } from './lib/i18n/config'
-import { getSupabaseUrl, getSupabasePublishableKey } from './lib/supabase/config.client'
 
 const handleI18nRouting = createMiddleware({
   locales,
@@ -11,38 +10,36 @@ const handleI18nRouting = createMiddleware({
   localePrefix: 'always',
 })
 
-function createMiddlewareSupabaseClient(request: NextRequest, response: NextResponse) {
-  return createServerClient(
-    getSupabaseUrl(),
-    getSupabasePublishableKey(),
-    {
-      cookieOptions: getSupabaseCookieOptions(),
-      cookies: {
-        getAll() {
-          return request.cookies.getAll()
-        },
-        setAll(cookiesToSet: { name: string; value: string; options: CookieOptions }[]) {
-          cookiesToSet.forEach(({ name, value }) => {
-            request.cookies.set(name, value)
-          })
+/**
+ * Routes that require an authenticated Clerk session.
+ * Mirrors the locale-prefixed pages that already redirect unauthenticated
+ * visitors to /login via server-side checks (lib/server/auth.ts).
+ */
+const isProtectedRoute = createRouteMatcher([
+  '/(en|es)/reservations(.*)',
+  '/(en|es)/admin(.*)',
+  '/(en|es)/check-in(.*)',
+  '/(en|es)/rooms(.*)',
+])
 
-          cookiesToSet.forEach(({ name, value, options }) => {
-            response.cookies.set(name, value, options)
-          })
-        },
-      },
-    },
-  )
+function localeFromPathname(pathname: string): (typeof locales)[number] {
+  const candidate = pathname.match(/^\/([a-z]{2})(?:\/|$)/)?.[1]
+  return (locales as readonly string[]).includes(candidate ?? '')
+    ? (candidate as (typeof locales)[number])
+    : defaultLocale
 }
 
-export default async function middleware(request: NextRequest) {
+export default clerkMiddleware(async (auth, request: NextRequest) => {
+  if (isProtectedRoute(request)) {
+    const locale = localeFromPathname(request.nextUrl.pathname)
+    const signInUrl = new URL(`/${locale}/sign-in`, request.url)
+    signInUrl.searchParams.set('redirect_url', `${request.nextUrl.pathname}${request.nextUrl.search}`)
+    await auth.protect({ unauthenticatedUrl: signInUrl.toString() })
+  }
+
   const response = handleI18nRouting(request)
-  const supabase = createMiddlewareSupabaseClient(request, response)
-
-  await supabase.auth.getUser()
-
   return ensureCsrfCookie(request, response)
-}
+})
 
 export const config = {
   matcher: ['/((?!api|_next|_vercel|.*\\..*).*)'],
