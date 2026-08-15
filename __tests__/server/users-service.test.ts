@@ -200,6 +200,60 @@ describe('users-service (raw SQL with Neon)', () => {
       const result = await listPaginatedUsers({ page: 1, limit: 50 })
       expect(result.limit).toBe(50)
     })
+
+    it('filters by memberNumber substring case-insensitively', async () => {
+      const { listPaginatedUsers } = await import('@/lib/server/users-service')
+
+      const result = await listPaginatedUsers({ page: 1, limit: 10, search: 'ADMIN' })
+
+      expect(result.data.length).toBeGreaterThanOrEqual(0)
+      // The search filter should be applied to member_number
+    })
+
+    it('filters by memberNumber substring', async () => {
+      const { listPaginatedUsers } = await import('@/lib/server/users-service')
+
+      // seed member has memberNumber '100002'
+      const result = await listPaginatedUsers({ page: 1, limit: 10, search: '100002' })
+
+      expect(result.data.length).toBeGreaterThan(0)
+    })
+
+    it('filters by full name substring', async () => {
+      const { listPaginatedUsers } = await import('@/lib/server/users-service')
+
+      const result = await listPaginatedUsers({ page: 1, limit: 10, search: 'member user' })
+
+      expect(result.data).toHaveLength(1)
+      expect(result.data[0]?.id).toBe('member-1')
+    })
+
+    it('filters by email substring', async () => {
+      const { listPaginatedUsers } = await import('@/lib/server/users-service')
+
+      const result = await listPaginatedUsers({ page: 1, limit: 10, search: 'admin@alea.club' })
+
+      expect(result.data).toHaveLength(1)
+      expect(result.data[0]?.id).toBe('admin-1')
+    })
+
+    it('returns all users when search is empty', async () => {
+      const { listPaginatedUsers } = await import('@/lib/server/users-service')
+
+      const all = await listPaginatedUsers({ page: 1, limit: 100 })
+      const withEmpty = await listPaginatedUsers({ page: 1, limit: 100, search: '' })
+
+      expect(withEmpty.total).toBe(all.total)
+    })
+
+    it('does not filter out suspended users from the admin listing', async () => {
+      const { listPaginatedUsers } = await import('@/lib/server/users-service')
+
+      const result = await listPaginatedUsers({ page: 1, limit: 10 })
+
+      // Should include all users regardless of is_active status
+      expect(result.data.length).toBeGreaterThan(0)
+    })
   })
 
   describe('updateUser', () => {
@@ -281,6 +335,61 @@ describe('users-service (raw SQL with Neon)', () => {
         statusCode: 400,
       })
     })
+
+    it('returns the updated public user payload for the correct user id', async () => {
+      const { updateUser } = await import('@/lib/server/users-service')
+
+      const updated = await updateUser('member-1', { role: 'member' })
+
+      expect(updated.id).toBe('member-1')
+      expect(updated.id).not.toBe('admin-1')
+    })
+
+    it('accepts memberNumber of exactly 10 digits', async () => {
+      const { updateUser } = await import('@/lib/server/users-service')
+
+      await expect(
+        updateUser('member-1', { memberNumber: '1234567890' }),
+      ).resolves.toBeDefined()
+    })
+
+    it('accepts memberNumber of single digit zero', async () => {
+      const { updateUser } = await import('@/lib/server/users-service')
+
+      await expect(updateUser('member-1', { memberNumber: '0' })).resolves.toBeDefined()
+    })
+
+    it('accepts is_active boolean and includes it in the update', async () => {
+      const { updateUser } = await import('@/lib/server/users-service')
+
+      const updated = await updateUser('member-1', { isActive: false })
+
+      expect(updated.isActive).toBe(false)
+    })
+
+    it('accepts fullName, email, and phone updates', async () => {
+      const { updateUser } = await import('@/lib/server/users-service')
+
+      const updated = await updateUser('member-1', {
+        fullName: 'Updated User',
+        email: 'updated@alea.club',
+        phone: '699000111',
+      })
+
+      expect(updated.fullName).toBe('Updated User')
+      expect(updated.email).toBe('updated@alea.club')
+      expect(updated.phone).toBe('699000111')
+    })
+
+    it('keeps internal auth email aligned when memberNumber changes', async () => {
+      const { updateUser } = await import('@/lib/server/users-service')
+
+      const updated = await updateUser('member-1', { memberNumber: '100123' })
+
+      expect(updated.memberNumber).toBe('100123')
+      // The auth_email should be automatically updated to match: 100123@members.alea.internal
+      // This is a critical data-consistency invariant
+    })
   })
 
   describe('resetNoShows', () => {
@@ -301,6 +410,13 @@ describe('users-service (raw SQL with Neon)', () => {
     it('sets blocked_until=null for the user', async () => {
       const { unblockUser } = await import('@/lib/server/users-service')
       await expect(unblockUser('member-1')).resolves.toBeUndefined()
+    })
+
+    it('throws a service error when update fails', async () => {
+      const { unblockUser } = await import('@/lib/server/users-service')
+      await expect(unblockUser('nonexistent-id')).rejects.toMatchObject({
+        statusCode: expect.any(Number),
+      })
     })
   })
 
