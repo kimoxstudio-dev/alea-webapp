@@ -105,7 +105,43 @@ function setupSqlMock() {
       return Promise.resolve([])
     }
 
-    // UPDATE other fields
+    // UPDATE profiles: full set of fields (member_number, full_name, email, phone, role, is_active, auth_email) WHERE id
+    if (query.includes('update profiles') && query.includes('member_number') && query.includes('where id')) {
+      // Format: SET member_number = $1, full_name = $2, email = $3, phone = $4, role = $5, is_active = $6, auth_email = $7 WHERE id = $8
+      const memberNumber = values[0] as string
+      const fullName = values[1] as string
+      const email = values[2] as string | null
+      const phone = values[3] as string | null
+      const role = values[4] as string
+      const isActive = values[5] as boolean
+      const authEmail = values[6] as string
+      const id = values[7] as string
+
+      const profile = profilesStore.get(id)
+      if (!profile) {
+        return Promise.resolve([])
+      }
+
+      const updated = {
+        ...profile,
+        member_number: memberNumber,
+        full_name: fullName,
+        email: email,
+        phone: phone,
+        role: role,
+        is_active: isActive,
+        auth_email: authEmail,
+        updated_at: new Date().toISOString(),
+      }
+      profilesStore.set(id, updated)
+
+      if (query.includes('returning')) {
+        return Promise.resolve([updated])
+      }
+      return Promise.resolve([{ id }])
+    }
+
+    // UPDATE other fields (fallback for any other UPDATE)
     if (query.includes('update profiles') && query.includes('where id')) {
       const id = values[values.length - 1]
       const profile = profilesStore.get(id as string)

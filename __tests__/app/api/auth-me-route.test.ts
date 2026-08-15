@@ -3,11 +3,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { NextRequest, NextResponse } from 'next/server'
 
 const getCurrentUserMock = vi.fn()
+const resolveProfileForClerkUserMock = vi.fn()
 const routeGetUserMock = vi.fn()
 const routeProfileMaybeSingleMock = vi.fn()
 
 vi.mock('@/lib/server/auth-service', () => ({
   getCurrentUser: getCurrentUserMock,
+  resolveProfileForClerkUser: resolveProfileForClerkUserMock,
 }))
 
 vi.mock('@/lib/server/session', () => ({
@@ -59,6 +61,10 @@ describe('GET /api/auth/me', () => {
       role: 'member',
       createdAt: '2024-01-01T00:00:00.000Z',
       updatedAt: '2024-01-01T00:00:00.000Z',
+    })
+    resolveProfileForClerkUserMock.mockResolvedValue({
+      id: 'user-2',
+      role: 'member',
     })
     routeGetUserMock.mockResolvedValue({ data: { user: { id: 'user-2' } }, error: null })
     routeProfileMaybeSingleMock.mockResolvedValue({
