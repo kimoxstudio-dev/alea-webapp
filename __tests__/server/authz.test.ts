@@ -12,6 +12,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import type { SessionUser } from '@/lib/server/auth'
 import type { ServiceError } from '@/lib/server/service-error'
+import type { OwnedRow } from '@/lib/server/authz'
 
 // Mock 'server-only' (no-op)
 vi.mock('server-only', () => ({}))
@@ -385,12 +386,12 @@ describe('lib/server/authz.ts', () => {
       expect(typeof authz.assertMemberRowsScopedSql).toBe('function')
     })
 
-    it('exports OwnedRow type', async () => {
-      const authz = await import('@/lib/server/authz')
+    it('OwnedRow type shape is satisfied by a minimal fixture (compile-time check)', async () => {
+      // This test verifies at compile-time that OwnedRow type exists and has the expected shape.
+      // If OwnedRow is removed or its shape changes incompatibly, tsc --noEmit will fail.
+      const _ownedRowFixture: OwnedRow = { user_id: 'user-123' }
 
-      // Type exists in module (verifiable through TypeScript compilation)
-      // Runtime check: verify it's referenced in JSDoc or structure
-      expect(authz).toBeDefined()
+      expect(_ownedRowFixture.user_id).toBe('user-123')
     })
   })
 })
