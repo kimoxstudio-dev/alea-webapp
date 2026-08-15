@@ -1,18 +1,21 @@
 import 'server-only'
 import { NextRequest, NextResponse } from 'next/server'
 import { getClerkSession, getClerkUser } from '@/lib/server/session'
-import { resolveOrCreateProfileForClerkUser } from '@/lib/server/auth-service'
+import { resolveProfileForClerkUser } from '@/lib/server/auth-service'
 export { enforceSameOriginForMutation } from '@/lib/server/security'
 
 /**
  * Route-handler auth gates (#299).
  *
- * Session identity now comes from Clerk (`lib/server/session.ts`) instead of
+ * Session identity comes from Clerk (`lib/server/session.ts`) instead of
  * Supabase Auth cookies. The `profiles` row itself lives in Neon and is
- * resolved (or, on a member's first Clerk login, created as a pending row)
- * via `resolveOrCreateProfileForClerkUser()` in `lib/server/auth-service.ts`
- * — see that function's doc comment for the full mapping strategy and its
- * open follow-up questions.
+ * resolved via `resolveProfileForClerkUser()` in `lib/server/auth-service.ts`
+ * — READ-ONLY as of #299 pass 2 (see that function's doc comment): this club
+ * has no open self-registration (closed issue #206), so a Clerk identity
+ * with no matching, already-active `profiles` row never gets a session here,
+ * and no row is ever created as a side effect of a request. The only way a
+ * profile becomes active is `activateAccount()` in auth-service.ts, gated on
+ * an admin-issued activation token.
  *
  * `request`/`applyCookies` are kept in every signature below purely for
  * source compatibility with the ~30 existing call sites across `app/` (all
@@ -53,15 +56,11 @@ async function resolveClerkSessionUser(): Promise<SessionUser | null> {
   if (!email) {
     // No verified/primary email on the Clerk identity — cannot correlate to
     // a profiles row (email is the only correlation key today, see
-    // resolveOrCreateProfileForClerkUser). Treat as unauthenticated.
+    // resolveProfileForClerkUser). Treat as unauthenticated.
     return null
   }
 
-  return resolveOrCreateProfileForClerkUser({
-    clerkUserId: clerkSession.userId,
-    email,
-    fullName: clerkUser?.fullName ?? null,
-  })
+  return resolveProfileForClerkUser({ email })
 }
 
 export async function getSessionFromRequest(_request: NextRequest): Promise<RouteSessionResult> {

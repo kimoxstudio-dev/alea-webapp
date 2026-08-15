@@ -32,8 +32,10 @@ import {
  * Supabase Auth on `updateUser()`. Clerk now owns credentials; there is no
  * per-member identity-provider account to create/sync/delete here anymore.
  * `auth_email` remains plain data on the `profiles` row (still used as one
- * of the two correlation keys in `resolveOrCreateProfileForClerkUser()`,
- * see `lib/server/auth-service.ts`).
+ * of the two correlation keys in `resolveProfileForClerkUser()`, see
+ * `lib/server/auth-service.ts`). As of #299 pass 2, that lookup is
+ * read-only — this file (admin CSV import, etc.) is the ONLY place a
+ * `profiles` row is ever created; no self-service path creates one.
  */
 
 function normalizePage(page: number) {

@@ -2,104 +2,29 @@ import type { User } from '@/lib/types'
 import type { SessionUser } from '@/lib/server/auth'
 import { createHash, randomBytes } from 'node:crypto'
 import { serviceError } from '@/lib/server/service-error'
-import { createSupabaseServerAdminClient, createSupabaseServerClient } from '@/lib/supabase/server'
-import type { Tables } from '@/lib/supabase/types'
-import { activationServerSchema, recoveryServerSchema, registerServerSchema } from '@/lib/validations/auth'
+import { getClerkSession, getClerkUser } from '@/lib/server/session'
+import { clerkClient } from '@clerk/nextjs/server'
 import { type PublicProfileRow, toPublicUser } from '@/lib/server/profile-mappers'
 import { sql } from '@/lib/db/client'
 
-type AuthCredentialRow = Pick<Tables<'profiles'>, 'id' | 'member_number' | 'auth_email' | 'email' | 'full_name' | 'phone' | 'role' | 'is_active' | 'active_from' | 'no_show_count' | 'blocked_until' | 'created_at' | 'updated_at'>
-const PUBLIC_PROFILE_COLUMNS = 'id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at' as const
-
-// Auth-only columns: auth_email is used to resolve Supabase Auth credentials for sign-in/activation.
-// email is optional contact email; it is not part of the public user model (issue #39) but IS included for admin-facing user data.
-const AUTH_CREDENTIAL_COLUMNS = 'id, member_number, auth_email, email, full_name, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at' as const
-
-type PublicProfileLookupColumn = 'id' | 'member_number'
-type AuthCredentialLookupColumn = 'id' | 'member_number' | 'email'
-type PublicProfileMaybeSingleResult = Promise<{
-  data: PublicProfileRow | null
-  error: unknown
-}>
-type AuthCredentialMaybeSingleResult = Promise<{
-  data: AuthCredentialRow | null
-  error: unknown
-}>
-type PublicProfilesTableClient = {
-  select: (columns: typeof PUBLIC_PROFILE_COLUMNS) => {
-    eq: (column: PublicProfileLookupColumn, value: string) => {
-      maybeSingle: () => PublicProfileMaybeSingleResult
-    }
-  }
-}
-type AuthCredentialTableClient = {
-  select: (columns: typeof AUTH_CREDENTIAL_COLUMNS) => {
-    eq: (column: AuthCredentialLookupColumn, value: string) => {
-      maybeSingle: () => AuthCredentialMaybeSingleResult
-    }
-  }
-}
-type ProfileLookupClient = {
-  from: (table: 'profiles') => unknown
-}
-
-type AuthClient = {
-  auth: {
-    signInWithPassword: (credentials: { email: string; password: string }) => Promise<{
-      data: { user: { id: string } | null }
-      error: { message: string } | null
-    }>
-    signOut: () => Promise<{ error: { message: string } | null }>
-  }
-}
-
-
-function getProfilesTable(client: ProfileLookupClient) {
-  return client.from('profiles') as PublicProfilesTableClient
-}
-
-function getAuthCredentialTable(client: ProfileLookupClient) {
-  return client.from('profiles') as AuthCredentialTableClient
-}
-
-async function getPublicProfileBy(
-  client: ProfileLookupClient,
-  column: PublicProfileLookupColumn,
-  value: string,
-) {
-  const { data, error } = await getProfilesTable(client)
-    .select(PUBLIC_PROFILE_COLUMNS)
-    .eq(column, value)
-    .maybeSingle()
-
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-
-  return data
-}
-
-async function getAuthCredentialProfileBy(
-  client: ProfileLookupClient,
-  column: AuthCredentialLookupColumn,
-  value: string,
-) {
-  const { data, error } = await getAuthCredentialTable(client)
-    .select(AUTH_CREDENTIAL_COLUMNS)
-    .eq(column, value)
-    .maybeSingle()
-
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-
-  return data
-}
-
-async function getAuthCredentialByMemberNumber(memberNumber: string) {
-  const admin = createSupabaseServerAdminClient()
-  return getAuthCredentialProfileBy(admin, 'member_number', memberNumber)
-}
+/**
+ * Raw-SQL, Clerk-backed auth service (#299, pass 2).
+ *
+ * This file is now fully Supabase-free — pass 1 ported the activation/
+ * recovery token machinery to Neon; this pass closes the gap flagged in
+ * pass 1's handoff by migrating `getCurrentUser`/`logout` and by replacing
+ * `login`/`register` (see their removal note near the bottom of this file).
+ *
+ * PRODUCT CONSTRAINT this entire file is built around (closed issue #206,
+ * confirmed by reading it before writing any of this): this club has NO
+ * open self-registration. Every member must already exist as a
+ * `profiles` row (admin-imported, e.g. via `users-service.ts` CSV import)
+ * before they can ever become active. A Clerk identity — sign-up or
+ * sign-in — must NEVER by itself produce a usable/active profile. The only
+ * way an inactive, pre-registered profile becomes active is
+ * `activateAccount()` below, gated on an admin-issued, 24h, single-use
+ * token AND a matching Clerk-verified email.
+ */
 
 function hashActivationToken(token: string) {
   return createHash('sha256').update(token).digest('hex')
@@ -312,31 +237,61 @@ export async function generateRecoveryLink(input: {
   }
 }
 
+async function getVerifiedClerkEmail(): Promise<{ userId: string; email: string } | null> {
+  const clerkSession = await getClerkSession()
+  if (!clerkSession) {
+    return null
+  }
+  const clerkUser = await getClerkUser()
+  const email = clerkUser?.primaryEmailAddress?.emailAddress?.trim().toLowerCase() ?? null
+  if (!email) {
+    return null
+  }
+  return { userId: clerkSession.userId, email }
+}
+
 /**
- * Activates a member account (#299).
+ * Claims an admin-issued activation link, activating a pre-registered
+ * profile for the caller's already-authenticated Clerk identity (#299 pass
+ * 2 — replaces the pre-Clerk `{ token, password }` version).
  *
- * NOTE — credential-setting was dropped, not redesigned: the pre-Clerk
- * version of this function called Supabase Auth's `admin.updateUserById()`
- * to set the member's password here. Clerk now owns credentials entirely, so
- * there is nothing left for this function to set a password on — activating
- * an account here only flips `profiles.is_active`/`active_from`. The
- * `{ token, password }` request shape is UNCHANGED (still validated via
- * `activationServerSchema`, defined in `lib/validations/auth.ts`, out of
- * this ticket's scope) purely so the existing route handler and frontend
- * form keep compiling — `password` is accepted but intentionally unused.
- * `psw_changed` is still stamped as an audit timestamp ("account was
- * activated/recovered at X"), even though it no longer reflects an actual
- * credential change. Whether the activation UX should still collect a
- * password at all is a product/UX question for a follow-up ticket, not
- * something resolved here — see this task's handoff message.
+ * Re-expresses every gate from closed issue #206 for Clerk:
+ *   - Never creates a `profiles` row — only an already-existing,
+ *     `is_active = false` row (admin pre-registered) can be activated.
+ *   - Token must be valid, unexpired (24h — `ACTIVATION_WINDOW_MS`), and
+ *     unused; claimed atomically below so two concurrent claims cannot both
+ *     succeed.
+ *   - NEW, Clerk-specific: the caller must already hold an authenticated
+ *     Clerk session (i.e. must have completed Clerk sign-up/sign-in BEFORE
+ *     calling this — the frontend must sequence that), and that session's
+ *     verified email must case-insensitively match the target profile's
+ *     `email` or `auth_email`. This is what stands in for "type the
+ *     password the admin doesn't know" from the old flow: proof that the
+ *     caller is the person the admin pre-registered, not just someone who
+ *     obtained the token URL (e.g. a forwarded/leaked email). Without this
+ *     check, any Clerk account could claim any valid token.
+ *   - `password` is no longer part of the input — Clerk owns credentials;
+ *     "set a new password" from #206 is now "sign up with Clerk", done
+ *     before this call, not inside it.
+ *
+ * On success: `is_active = true`, `active_from`/`psw_changed` stamped, token
+ * marked used. No session is minted here — the Clerk session already
+ * exists, and the very next request will resolve a real one through
+ * `resolveProfileForClerkUser()` (lib/server/auth.ts), since the profile is
+ * now active and its email matches.
  */
-export async function activateAccount(input: { token: unknown; password: unknown }) {
-  const parsed = activationServerSchema.safeParse(input)
-  if (!parsed.success) {
+export async function activateAccount(input: { token: unknown }) {
+  const token = typeof input.token === 'string' ? input.token.trim() : ''
+  if (!token) {
     serviceError('Invalid activation link', 400)
   }
 
-  const tokenHash = hashActivationToken(parsed.data.token)
+  const clerkIdentity = await getVerifiedClerkEmail()
+  if (!clerkIdentity) {
+    serviceError('Sign in first, then open the activation link again', 401)
+  }
+
+  const tokenHash = hashActivationToken(token)
   const existingToken = await getActivationTokenByHash(tokenHash)
 
   const databaseNow = existingToken ? await getNeonDatabaseNow() : null
@@ -355,6 +310,13 @@ export async function activateAccount(input: { token: unknown; password: unknown
     serviceError('Activation link has already been used', 400)
   }
 
+  const profileEmail = profile.email?.trim().toLowerCase() ?? null
+  const profileAuthEmail = profile.auth_email?.trim().toLowerCase() ?? null
+  if (clerkIdentity.email !== profileEmail && clerkIdentity.email !== profileAuthEmail) {
+    // Generic message — do not reveal which email the token is tied to.
+    serviceError('This activation link does not match your signed-in account', 403)
+  }
+
   const activatedAt = (await getNeonDatabaseNow()).toISOString()
   const claimedRows = await sql`
     UPDATE activation_tokens
@@ -368,14 +330,9 @@ export async function activateAccount(input: { token: unknown; password: unknown
 
   if (!claimedToken) {
     const latestToken = await getActivationTokenByHash(tokenHash)
-    const latestDatabaseNow = latestToken ? await getNeonDatabaseNow() : null
-    if (!latestToken || !latestDatabaseNow || isActivationExpired(latestToken.expires_at, latestDatabaseNow)) {
-      serviceError('Activation link is invalid or has expired', 400)
-    }
-    if (latestToken.used_at) {
+    if (latestToken?.used_at) {
       serviceError('Activation link has already been used', 400)
     }
-
     serviceError('Activation link is invalid or has expired', 400)
   }
 
@@ -391,28 +348,46 @@ export async function activateAccount(input: { token: unknown; password: unknown
     serviceError('Failed to activate account', 500)
   }
 
-  return {
-    authEmail: profile.auth_email ?? profile.email ?? '',
-    user: toPublicUser(updatedProfile),
-  }
+  return { user: toPublicUser(updatedProfile) }
 }
 
 /**
- * Recovers ("resets") a member account (#299).
+ * Claims an admin-issued recovery link to RE-LINK the caller's Clerk
+ * identity/email onto an existing, already-ACTIVE profile (#299 pass 2 —
+ * replaces the pre-Clerk `{ token, password }` version).
  *
- * Same credential-setting removal as `activateAccount()` above — see its
- * doc comment. Recovering only re-stamps `profiles.psw_changed`; it no
- * longer sets any password anywhere, since Clerk owns credentials now. The
- * `{ token, password }` request shape is unchanged for the same
- * compatibility reason.
+ * DESIGN DECISION — mine, flagged for review at the same weight as
+ * activateAccount()'s email-match gate above, since it changes what
+ * "recovery" means: under Clerk, resetting a forgotten password is Clerk's
+ * own native self-service flow and needs no token from us at all. The only
+ * scenario left where an admin-issued single-use token still adds value is
+ * a member who lost access to their original email/Clerk account entirely
+ * and cannot use Clerk's own recovery — this function re-points an
+ * already-active profile's `email`/`auth_email` at a NEW Clerk-verified
+ * email. Confirm this is the intended product meaning of "recovery" before
+ * shipping the corresponding UI — it is a genuine redesign of what this
+ * mechanism does, not a mechanical port.
+ *
+ * Unlike activateAccount(), there is deliberately NO email-match check
+ * here — re-linking to a brand-new email is the entire point, so the
+ * admin-issued token itself is the sole proof of authorization (same trust
+ * level the token already carried pre-Clerk). Requires an existing Clerk
+ * session (sign up/in with the new email first — same sequencing as
+ * activation). `is_active` must already be true; this is not a
+ * first-activation path (see activateAccount() for that).
  */
-export async function recoverAccount(input: { token: unknown; password: unknown }) {
-  const parsed = recoveryServerSchema.safeParse(input)
-  if (!parsed.success) {
+export async function recoverAccount(input: { token: unknown }) {
+  const token = typeof input.token === 'string' ? input.token.trim() : ''
+  if (!token) {
     serviceError('Invalid recovery link', 400)
   }
 
-  const tokenHash = hashActivationToken(parsed.data.token)
+  const clerkIdentity = await getVerifiedClerkEmail()
+  if (!clerkIdentity) {
+    serviceError('Sign in first, then open the recovery link again', 401)
+  }
+
+  const tokenHash = hashActivationToken(token)
   const existingToken = await getActivationTokenByHash(tokenHash)
 
   const databaseNow = existingToken ? await getNeonDatabaseNow() : null
@@ -441,38 +416,32 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
 
   if (!claimedToken) {
     const latestToken = await getActivationTokenByHash(tokenHash)
-    const latestDatabaseNow = latestToken ? await getNeonDatabaseNow() : null
-    if (!latestToken || !latestDatabaseNow || isActivationExpired(latestToken.expires_at, latestDatabaseNow)) {
-      serviceError('Recovery link is invalid or has expired', 400)
-    }
-    if (latestToken.used_at) {
+    if (latestToken?.used_at) {
       serviceError('Recovery link has already been used', 400)
     }
-
     serviceError('Recovery link is invalid or has expired', 400)
   }
 
-  const updatedRows = await sql`
-    UPDATE profiles
-    SET psw_changed = ${recoveredAt}
-    WHERE id = ${profile.id}
-    RETURNING id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
-  ` as PublicProfileRow[]
+  let updatedRows: PublicProfileRow[]
+  try {
+    updatedRows = await sql`
+      UPDATE profiles
+      SET email = ${clerkIdentity.email}, auth_email = ${clerkIdentity.email}, psw_changed = ${recoveredAt}
+      WHERE id = ${profile.id}
+      RETURNING id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
+    ` as PublicProfileRow[]
+  } catch {
+    // auth_email is UNIQUE — the new Clerk email is already tied to a
+    // different profile row.
+    serviceError('This email is already associated with another account', 409)
+  }
   const updatedProfile = updatedRows[0] ?? null
 
   if (!updatedProfile) {
     serviceError('Failed to recover account', 500)
   }
 
-  return {
-    authEmail: profile.auth_email,
-    user: toPublicUser(updatedProfile),
-  }
-}
-
-function createPendingMemberNumber() {
-  // 3-char prefix + 16 hex chars = 19 chars, fits the varchar(20) column.
-  return `PND${randomBytes(8).toString('hex')}`
+  return { user: toPublicUser(updatedProfile) }
 }
 
 type ClerkProfileMatchRow = {
@@ -482,266 +451,65 @@ type ClerkProfileMatchRow = {
 }
 
 /**
- * Maps a Clerk identity to the member domain model (#299).
+ * Maps an authenticated Clerk identity to the member domain model,
+ * READ-ONLY (#299 pass 2 — renamed from `resolveOrCreateProfileForClerkUser`
+ * in pass 1, which auto-created a pending `profiles` row for any unmatched
+ * email; that behavior is REMOVED here per the explicit product constraint
+ * confirmed by reading closed issue #206: this club has no open
+ * self-registration. Only an admin-pre-registered `profiles` row (e.g. via
+ * `users-service.ts` CSV import) may ever exist, and only
+ * `activateAccount()` above — gated on an admin-issued token AND a matching
+ * Clerk-verified email — may ever flip one to active.
  *
- * Replaces the old Supabase `on_auth_user_created` trigger, which fired on
- * every new `auth.users` row and inserted a placeholder `profiles` row for
- * `register()`/CSV-import to fill in. Neon has no such trigger, so this is
- * explicit app-layer logic, called from `lib/server/auth.ts` on every
- * request that carries a Clerk session.
+ * A Clerk identity with no matching pre-existing profile now resolves to
+ * `null`, full stop: no row is created, no side effect happens at all. This
+ * is the fix for the "brand-new signup gets permanently stuck" gap flagged
+ * in pass 1's handoff — there is no longer a stuck row to begin with, since
+ * none is ever created outside the admin-import + activation-token path.
  *
- * Correlation strategy: EMAIL match against `profiles.email` /
- * `profiles.auth_email` (case-insensitive). There is no `clerk_user_id`
- * column on `profiles` — per `lib/db/schema/003_profiles.sql`'s own doc
- * comment, syncing a Clerk identity to `profiles.id` is explicitly called
- * out as "an app-layer concern... not a schema change", which this
- * implements. This also lets an admin-imported member (`users-service.ts`
- * CSV import, no Clerk account yet) transparently "become" the same profile
- * the first time they sign up in Clerk with the same email — mirroring the
- * old import -> activation-link linkage.
+ * Correlation strategy (unchanged from pass 1): EMAIL match against
+ * `profiles.email` / `profiles.auth_email` (case-insensitive). No schema
+ * change — see `lib/db/schema/003_profiles.sql`'s doc comment.
  *
- * Every request re-resolves this lookup (no persisted FK), which is an
- * accepted cost of not adding a schema column, per the same doc comment.
- *
- * SECURITY-RELEVANT UNRESOLVED GAP (flagged prominently in this task's
- * handoff — do not change this default without a product/architecture
- * decision): a brand-new email with no matching profile gets a fresh
- * `profiles` row created here, but it is deliberately created
- * `is_active = false` — i.e. self-service Clerk sign-up NEVER grants a
- * working session by itself, matching the old CSV-import default. There is
- * currently NO path to flip that row to active: the old path was the
- * admin-generated activation link, which used to *set a password*
- * (meaningless now that Clerk owns credentials — see `activateAccount()`).
- * Until a follow-up ticket redefines what "activation" means post-Clerk (an
- * admin dashboard toggle? repurposing the activation link as a pure
- * "approve" action with no password step, which is what `activateAccount()`
- * already does today after this change?), any brand-new Clerk sign-up is
- * permanently stuck pending, with no self-serve or documented admin path to
- * flip it — this needs explicit product sign-off before shipping the
- * corresponding Clerk sign-in UI (out of scope here; see `app/[locale]/sign-in`).
+ * Called from `lib/server/auth.ts` on every request carrying a Clerk
+ * session.
  */
-export async function resolveOrCreateProfileForClerkUser(input: {
-  clerkUserId: string
+export async function resolveProfileForClerkUser(input: {
   email: string
-  fullName: string | null
 }): Promise<SessionUser | null> {
   const normalizedEmail = input.email.trim().toLowerCase()
   if (!normalizedEmail) {
     return null
   }
 
-  const existingRows = await sql`
+  const rows = await sql`
     SELECT id, role, is_active
     FROM profiles
     WHERE lower(email) = ${normalizedEmail} OR lower(auth_email) = ${normalizedEmail}
     LIMIT 1
   ` as ClerkProfileMatchRow[]
-  const existing = existingRows[0]
+  const profile = rows[0]
 
-  if (existing) {
-    if (!existing.is_active) {
-      return null
-    }
-    return { id: existing.id, role: existing.role }
+  if (!profile || !profile.is_active) {
+    return null
   }
 
-  try {
-    await sql`
-      INSERT INTO profiles (id, member_number, email, auth_email, full_name, role, is_active)
-      VALUES (gen_random_uuid(), ${createPendingMemberNumber()}, ${normalizedEmail}, ${normalizedEmail}, ${input.fullName}, 'member', false)
-    `
-  } catch {
-    // Concurrent first-login race on the same email (auth_email is UNIQUE) —
-    // another request already created the row. Fall through to re-query.
-  }
-
-  // Whether created just now or by a concurrent request, the row is
-  // is_active = false either way: never return a session for a brand-new
-  // profile (see the unresolved-gap note above).
-  return null
+  return { id: profile.id, role: profile.role }
 }
 
 /**
- * UNMIGRATED — still Supabase-backed (#299 scope resolution).
- *
- * `login`, `register`, `getCurrentUser`, `logout`, `logoutWithClient` below
- * are left exactly as they were before this migration. This was a deliberate
- * choice, not an oversight — see the handoff message for task #299 for the
- * full reasoning. Summary:
- *
- * - `login()`/`logoutWithClient()` are still called live, today, by
- *   `app/api/auth/login/route.ts` and `app/api/auth/logout/route.ts`, and
- *   `getCurrentUser()` by `app/api/auth/me/route.ts` and
- *   `app/[locale]/login/page.tsx` — none of these are orphaned or dead code;
- *   the legacy member-number + password flow is the ONLY working sign-in
- *   path today, since `app/[locale]/sign-in` is still intentionally disabled
- *   pending a follow-up ticket (see #297's `middleware.ts` comment).
- * - They are, however, now DISCONNECTED from `lib/server/auth.ts`'s session
- *   gate: `requireAuth()`/`getSessionFromServerCookies()` resolve sessions
- *   via Clerk + Neon (see `resolveOrCreateProfileForClerkUser()` above), not
- *   via the Supabase Auth session `login()` produces. A user who
- *   successfully calls `login()` today gets a 200 response and a Supabase
- *   session cookie, but every protected route/page gated by
- *   `requireAuth`/`requireAdmin` will still treat them as unauthenticated,
- *   since no Clerk session exists for them. `getCurrentUser()` has the same
- *   problem in the other direction: given a Clerk-resolved `SessionUser`
- *   (whose `id` is a Neon `profiles.id`), it looks that id up against
- *   Supabase's own (now-unrelated, pre-cutover) `profiles` table and will
- *   typically find nothing.
- * - Migrating these functions to Clerk/Neon was judged out of this ticket's
- *   safe, backend-only scope: doing so coherently requires either
- *   redesigning member sign-in around Clerk's own credential UI (frontend
- *   work, `app/`, out of scope) or inventing a password-based Clerk
- *   Backend-API integration (a new architectural surface, not implied by the
- *   issue text). Rewriting or deleting them here without that design
- *   decision risked silently breaking the only currently-working sign-in
- *   path in this environment.
- *
- * Net effect: right now, in this environment, nobody can complete an
- * end-to-end authenticated session through either flow (`login()` produces a
- * session `requireAuth` won't accept; Clerk sign-in is disabled at the page
- * level). This is flagged as the top item in the handoff message.
+ * Returns the public User for a resolved session (#299 pass 2 — migrated
+ * from a Supabase `.from('profiles')` lookup to raw SQL). Session shape is
+ * unchanged (`SessionUser` from `lib/server/auth.ts`, Clerk-resolved since
+ * pass 1) — this function only had to stop querying the wrong (Supabase)
+ * database; nothing about its contract changed.
  */
-export async function login(
-  input: { identifier?: unknown; password?: unknown },
-  client?: AuthClient,
-): Promise<User> {
-  const identifier = String(input.identifier ?? '').trim()
-  const password = String(input.password ?? '')
-
-  if (!identifier || !password) {
-    serviceError('Identifier and password are required', 400)
-  }
-
-  // Resolve the auth credential profile by member number (email login not supported).
-  const credentialProfile = await getAuthCredentialByMemberNumber(identifier)
-
-  if (!credentialProfile) {
-    serviceError('Invalid credentials', 401)
-  }
-
-  const authEmail = credentialProfile.auth_email ?? credentialProfile.email
-
-  if (!authEmail) {
-    // Profile has no email set — cannot authenticate via Supabase Auth.
-    serviceError('Invalid credentials', 401)
-  }
-
-  if (credentialProfile.is_active === false) {
-    // Suspended users cannot sign in.
-    serviceError('Invalid credentials', 401)
-  }
-
-  const supabase = client ?? await createSupabaseServerClient()
-  const { data, error } = await supabase.auth.signInWithPassword({
-    email: authEmail,
-    password,
-  })
-
-  if (error || !data.user) {
-    serviceError('Invalid credentials', 401)
-  }
-
-  if (data.user.id !== credentialProfile.id) {
-    // Guard against profile/auth drift: the authenticated Supabase user must match
-    // the profile resolved by member number.
-    serviceError('Invalid credentials', 401)
-  }
-
-  return toPublicUser(credentialProfile)
-}
-
-export async function register(
-  input: unknown,
-  sessionClient?: AuthClient,
-): Promise<User> {
-  const parsed = registerServerSchema.safeParse(input)
-  if (!parsed.success) {
-    serviceError('Invalid registration details', 400)
-  }
-
-  const { memberNumber, password } = parsed.data
-
-  // Use the full admin client (ReturnType<typeof createSupabaseServerAdminClient>) so
-  // both auth.admin and .from('profiles') are available without unsafe casts.
-  const adminClient = createSupabaseServerAdminClient()
-
-  // Check whether the member number is already taken by an existing profile.
-  // Generic message to avoid user enumeration (do not confirm whether the number exists).
-  const existing = await getAuthCredentialProfileBy(adminClient, 'member_number', memberNumber)
-  if (existing) {
-    serviceError('Invalid registration details', 400)
-  }
-
-  // Derive a deterministic internal email from the member number so Supabase Auth
-  // can work with email/password credentials without exposing real emails.
-  const email = `${memberNumber}@members.alea.internal`
-
-  // Create the Supabase Auth user. The on_auth_user_created trigger will immediately
-  // INSERT a profiles row with a placeholder member_number.
-  const { data: authData, error: authError } = await adminClient.auth.admin.createUser({
-    email,
-    password,
-    email_confirm: true,
-  })
-
-  if (authError || !authData.user) {
-    serviceError('Failed to create account', 500)
-  }
-
-  const userId = authData.user.id
-
-  // UPDATE the trigger-created profile row with the real values.
-  // We use update() instead of insert() because the on_auth_user_created trigger
-  // already inserted a row for this user id with a placeholder member_number.
-  const { data: profileData, error: profileError } = await adminClient
-    .from('profiles')
-    .update({ member_number: memberNumber, auth_email: email, role: 'member', is_active: true })
-    .eq('id', userId)
-    .select(PUBLIC_PROFILE_COLUMNS)
-    .maybeSingle()
-
-  if (profileError) {
-    // Unique constraint violation on member_number — concurrent registration with the
-    // same member number; clean up the orphaned auth user.
-    if ((profileError as { code?: string }).code === '23505') {
-      await adminClient.auth.admin.deleteUser(userId)
-      serviceError('Invalid registration details', 400)
-    }
-    await adminClient.auth.admin.deleteUser(userId)
-    serviceError('Failed to create user profile', 500)
-  }
-
-  if (!profileData) {
-    await adminClient.auth.admin.deleteUser(userId)
-    serviceError('Failed to create user profile', 500)
-  }
-
-  // Sign the user in to establish a session. Registration succeeded regardless of
-  // whether auto-login works — the user can always log in manually.
-  const supabase = sessionClient ?? await createSupabaseServerClient()
-  const { error: signInError } = await supabase.auth.signInWithPassword({ email, password })
-  if (signInError) {
-    // Non-fatal: profile was created successfully. User can log in separately.
-  }
-
-  return toPublicUser(profileData)
-}
-
-async function getSessionScopedProfile(id: string, client?: ProfileLookupClient) {
-  const supabase = client ?? await createSupabaseServerClient()
-  return getPublicProfileBy(supabase, 'id', id)
-}
-
-export async function getCurrentUser(
-  session: SessionUser | null,
-  client?: ProfileLookupClient,
-): Promise<User> {
+export async function getCurrentUser(session: SessionUser | null): Promise<User> {
   if (!session) {
     serviceError('Unauthorized', 401)
   }
 
-  const profile = await getSessionScopedProfile(session.id, client)
+  const profile = await getProfileById(session.id)
   if (!profile) {
     serviceError('Unauthorized', 401)
   }
@@ -749,23 +517,61 @@ export async function getCurrentUser(
   return toPublicUser(profile)
 }
 
+/**
+ * Ends the current session (#299 pass 2 — migrated from
+ * `supabase.auth.signOut()` / `logoutWithClient()`).
+ *
+ * Clerk's own client-side SDK (`useClerk().signOut()` /
+ * `<SignOutButton/>`) is what actually clears the browser's session
+ * cookie — that must be wired by the frontend (out of scope here). This is
+ * the server-side counterpart: it revokes the current Clerk session via the
+ * Backend API (`clerkClient().sessions.revokeSession()`), so the session
+ * token cannot be reused even if the client-side cookie clear is
+ * skipped — the direct analog of the old `supabase.auth.signOut()` call
+ * this replaces.
+ *
+ * `logoutWithClient()` is REMOVED, not kept as a deprecated alias: it
+ * existed only to inject a test-double Supabase client; Clerk's `auth()`
+ * reads from the request context directly, so there is nothing analogous
+ * to inject, and no caller needs it once `logout()` takes no parameters.
+ */
 export async function logout() {
-  const supabase = await createSupabaseServerClient()
-  const { error } = await supabase.auth.signOut()
+  const clerkSession = await getClerkSession()
+  if (!clerkSession) {
+    return { success: true }
+  }
 
-  if (error) {
+  try {
+    const client = await clerkClient()
+    await client.sessions.revokeSession(clerkSession.sessionId)
+  } catch {
     serviceError('Internal server error', 500)
   }
 
   return { success: true }
 }
 
-export async function logoutWithClient(client: AuthClient) {
-  const { error } = await client.auth.signOut()
-
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-
-  return { success: true }
-}
+/**
+ * REMOVED (#299 pass 2): `login()` and `register()`.
+ *
+ * `register()` was already fully dead before this pass — confirmed by
+ * reading both call sites: `app/api/auth/register/route.ts` already returns
+ * a hardcoded `410 Gone` ("Self-registration is disabled...") without
+ * calling this file at all, and `app/[locale]/register/page.tsx` already
+ * unconditionally redirects to `/login`. Both were already disabled by
+ * closed issue #206, well before this migration. There was no live code
+ * path left to port — deleting it is not a design decision, just removing
+ * confirmed-dead code.
+ *
+ * `login()` was still LIVE (route still called it) but is deleted here as a
+ * deliberate design decision, not a dead-code removal: it verified a
+ * member-number + password pair against a Supabase Auth session
+ * (`signInWithPassword`). There is no data left anywhere for that check to
+ * run against — `profiles` has no password column, and Clerk (not this
+ * service) is now the only credential store. "Migrating" this function to
+ * raw SQL is not possible even in principle: there is nothing in Neon to
+ * check a password against. The Clerk-era replacement for "log in" is
+ * Clerk's own hosted sign-in UI (`app/[locale]/sign-in`, currently
+ * disabled — re-enabling it and wiring `app/api/auth/login/route.ts`
+ * accordingly is the next, frontend-owned step; see this task's handoff).
+ */
