@@ -1,24 +1,27 @@
 'use client'
 
 import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
 import { useRouter } from 'next/navigation'
 import { useTranslations } from 'next-intl'
-import { useAuth } from '@clerk/nextjs'
 import { DiceLoader } from '@/components/ui/dice-loader'
 import { Button } from '@/components/ui/button'
+import { Label } from '@/components/ui/label'
+import { PasswordInput } from '@/components/ui/password-input'
+import { PasswordStrengthIndicator } from '@/components/auth/password-strength-indicator'
+import { activationSchema, getPasswordRequirementChecks, type ActivationFormData } from '@/lib/validations/auth'
 import { apiClient } from '@/lib/api/client'
 import { endpoints } from '@/lib/api/endpoints'
 
 /**
  * Claims an admin-issued activation link (#299 pass 3).
  *
- * No password fields anymore — Clerk owns credentials. The caller must
- * already hold an authenticated Clerk session before this can succeed
- * (`activateAccount()` in `lib/server/auth-service.ts` enforces this and
- * matches the session's verified email against the target profile); if
- * they don't, this sends them to Clerk's hosted sign-in with a `redirect_url`
- * pointing back at this exact activation link so they land here again
- * afterwards.
+ * Collects a password (and confirmation) directly — there is no more
+ * "sign in with Clerk first, then redeem" precondition. Token possession
+ * plus a freshly chosen password is the whole flow: this both creates the
+ * member's Clerk identity and sets its password in one call
+ * (`activateAccount()` in `lib/server/auth-service.ts`).
  */
 interface ActivationFormProps {
   locale: string
@@ -28,18 +31,19 @@ interface ActivationFormProps {
 export function ActivationForm({ locale, token }: ActivationFormProps) {
   const t = useTranslations('auth')
   const router = useRouter()
-  const { isLoaded, isSignedIn } = useAuth()
-  const [isSubmitting, setIsSubmitting] = useState(false)
   const [serverError, setServerError] = useState<string | null>(null)
 
-  const returnUrl = `/${locale}/activate?token=${encodeURIComponent(token)}`
-  const signInUrl = `/${locale}/sign-in?redirect_url=${encodeURIComponent(returnUrl)}`
+  const { register, handleSubmit, watch, formState: { errors, isSubmitting } } = useForm<ActivationFormData>({
+    resolver: zodResolver(activationSchema),
+  })
 
-  const handleActivate = async () => {
+  const passwordValue = watch('password', '')
+  const allPasswordChecksPassed = getPasswordRequirementChecks(passwordValue).every((c) => c.passed)
+
+  const onSubmit = async (data: ActivationFormData) => {
     setServerError(null)
-    setIsSubmitting(true)
     try {
-      await apiClient.post(endpoints.auth.activate, { token })
+      await apiClient.post(endpoints.auth.activate, { token, password: data.password })
       router.push(`/${locale}/rooms`)
       router.refresh()
     } catch (error) {
@@ -49,38 +53,44 @@ export function ActivationForm({ locale, token }: ActivationFormProps) {
           ? error.message
           : null
       setServerError(message ?? t('activationInvalidBody'))
-      setIsSubmitting(false)
     }
   }
 
-  if (!isLoaded) {
-    return (
-      <div className="flex justify-center py-4">
-        <DiceLoader size="sm" />
-      </div>
-    )
-  }
-
-  if (!isSignedIn) {
-    return (
-      <div className="space-y-4">
-        <p className="text-sm text-muted-foreground">{t('activationSignInRequired')}</p>
-        <Button asChild className="w-full">
-          <a href={signInUrl}>{t('activationSignInAction')}</a>
-        </Button>
-      </div>
-    )
-  }
-
   return (
-    <div className="space-y-5">
+    <form onSubmit={handleSubmit(onSubmit)} noValidate className="space-y-5">
       {serverError && (
         <div role="alert" className="rounded-md border border-destructive/30 bg-destructive/15 px-4 py-3 text-sm text-destructive">
           {serverError}
         </div>
       )}
 
-      <Button type="button" className="w-full" disabled={isSubmitting} onClick={handleActivate}>
+      <div className="space-y-1.5">
+        <Label htmlFor="activation-password">{t('password')}</Label>
+        <PasswordInput
+          id="activation-password"
+          autoComplete="new-password"
+          aria-describedby="activation-password-requirements"
+          aria-invalid={!!errors.password}
+          {...register('password')}
+        />
+        <div id="activation-password-requirements"><PasswordStrengthIndicator password={passwordValue} /></div>
+        {errors.password && <p role="alert" className="text-xs text-destructive">{t(errors.password.message as Parameters<typeof t>[0])}</p>}
+      </div>
+
+      <div className="space-y-1.5">
+        <Label htmlFor="activation-confirmPassword">{t('confirmPassword')}</Label>
+        <PasswordInput
+          id="activation-confirmPassword"
+          variant="confirmation"
+          autoComplete="new-password"
+          aria-describedby={errors.confirmPassword ? 'activation-confirm-error' : undefined}
+          aria-invalid={!!errors.confirmPassword}
+          {...register('confirmPassword')}
+        />
+        {errors.confirmPassword && <p id="activation-confirm-error" role="alert" className="text-xs text-destructive">{t(errors.confirmPassword.message as Parameters<typeof t>[0])}</p>}
+      </div>
+
+      <Button type="submit" className="w-full" disabled={isSubmitting || !allPasswordChecksPassed}>
         {isSubmitting
           ? (
             <span className="inline-flex items-center gap-2">
@@ -90,6 +100,6 @@ export function ActivationForm({ locale, token }: ActivationFormProps) {
           )
           : t('activationAction')}
       </Button>
-    </div>
+    </form>
   )
 }

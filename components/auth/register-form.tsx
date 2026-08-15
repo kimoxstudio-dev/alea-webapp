@@ -5,7 +5,6 @@ import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useRouter } from 'next/navigation'
 import { useTranslations } from 'next-intl'
-import { Check, X } from 'lucide-react'
 import { DiceLoader } from '@/components/ui/dice-loader'
 import { getPasswordRequirementChecks, registerSchema, type RegisterFormData } from '@/lib/validations/auth'
 import { useAuth } from '@/lib/auth/auth-context'
@@ -13,27 +12,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { PasswordInput } from '@/components/ui/password-input'
-
-function PasswordStrengthIndicator({ password }: { password: string }) {
-  const t = useTranslations('auth.passwordRequirements')
-  const checks = getPasswordRequirementChecks(password)
-
-  return (
-    <ul className="mt-2 space-y-1" aria-label={t('title')}>
-      {checks.map((check) => (
-        <li key={check.key} className="flex items-center gap-2 text-xs">
-          {check.passed
-            ? <Check className="h-3 w-3 text-emerald-500 flex-shrink-0" aria-hidden="true" />
-            : <X className="h-3 w-3 text-muted-foreground flex-shrink-0" aria-hidden="true" />}
-          <span className={check.passed ? 'text-emerald-400' : 'text-muted-foreground'}>
-            {t(check.key)}
-          </span>
-          <span className="sr-only">{check.passed ? t('met') : t('pending')}</span>
-        </li>
-      ))}
-    </ul>
-  )
-}
+import { PasswordStrengthIndicator } from '@/components/auth/password-strength-indicator'
 
 interface RegisterFormProps { locale: string }
 

@@ -6,10 +6,10 @@ import { enforceMutationSecurity, enforceRateLimit, RATE_LIMIT_POLICIES } from '
 /**
  * Claims an admin-issued recovery link (#299 pass 3).
  *
- * Only takes `{ token }` — the pre-Clerk `{ token, password }` shape is gone.
- * The caller must already hold an authenticated Clerk session (the frontend
- * sequences Clerk sign-up/sign-in before calling this route); `recoverAccount()`
- * re-links the target profile's email to that session's verified email.
+ * Takes `{ token, password }` — the member sets a new password directly in
+ * this call, which is applied to their existing Clerk identity. There is no
+ * pre-existing Clerk session precondition; `recoverAccount()` enforces the
+ * token's validity itself.
  */
 export async function POST(request: NextRequest) {
   const securityError = enforceMutationSecurity(request)
@@ -33,7 +33,7 @@ export async function POST(request: NextRequest) {
     const requestBody = typeof body === 'object' && body !== null
       ? body as Record<string, unknown>
       : {}
-    const result = await recoverAccount({ token: requestBody.token })
+    const result = await recoverAccount({ token: requestBody.token, password: requestBody.password })
 
     return NextResponse.json(result.user)
   } catch (error) {

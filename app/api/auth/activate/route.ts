@@ -6,11 +6,10 @@ import { enforceMutationSecurity, enforceRateLimit, RATE_LIMIT_POLICIES } from '
 /**
  * Claims an admin-issued activation link (#299 pass 3).
  *
- * Only takes `{ token }` — the pre-Clerk `{ token, password }` shape is gone.
- * The caller must already hold an authenticated Clerk session (the frontend
- * sequences Clerk sign-up/sign-in before calling this route); `activateAccount()`
- * itself enforces that and matches the session's verified email against the
- * target profile.
+ * Takes `{ token, password }` — the member sets their password directly in
+ * this call, which also creates their Clerk identity. There is no
+ * pre-existing Clerk session precondition; `activateAccount()` enforces the
+ * token's validity itself.
  */
 export async function POST(request: NextRequest) {
   const securityError = enforceMutationSecurity(request)
@@ -34,7 +33,7 @@ export async function POST(request: NextRequest) {
     const requestBody = typeof body === 'object' && body !== null
       ? body as Record<string, unknown>
       : {}
-    const result = await activateAccount({ token: requestBody.token })
+    const result = await activateAccount({ token: requestBody.token, password: requestBody.password })
 
     return NextResponse.json(result.user)
   } catch (error) {
