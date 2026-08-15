@@ -17,7 +17,7 @@ export default async function ReservationsPage({ params }: ReservationsPageProps
   const { locale } = await params
   const session = await getSessionFromServerCookies()
   if (!session) {
-    redirect(`/${locale}/login`)
+    redirect(`/${locale}/sign-in`)
   }
   return <MyReservationsView />
 }

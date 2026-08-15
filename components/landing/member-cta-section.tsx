@@ -30,10 +30,10 @@ export async function MemberCtaSection({ locale }: MemberCtaSectionProps) {
             ))}
           </ul>
           <div className="mod-cta-buttons">
-            <Link className="mod-btn mod-btn-primary mod-btn-lg" href={`/${locale}/login`}>
+            <Link className="mod-btn mod-btn-primary mod-btn-lg" href={`/${locale}/sign-in`}>
               {t('cta.join')} →
             </Link>
-            <Link className="mod-btn mod-btn-ghost" href={`/${locale}/login`}>
+            <Link className="mod-btn mod-btn-ghost" href={`/${locale}/sign-in`}>
               {t('cta.members')}
             </Link>
           </div>

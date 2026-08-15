@@ -187,6 +187,14 @@ export function UsersSection() {
   async function handleCopyRecoveryLink(user: User) {
     setActivationFeedback(null)
 
+    // Recovery links are a credential, not a casual "forgot password" link:
+    // whoever opens one can re-link this profile to their own email
+    // (recoverAccount() has no email-match check — the token is the sole
+    // proof of authorization, see lib/server/auth-service.ts). Require an
+    // explicit confirmation before generating one.
+    const confirmed = window.confirm(t('recoveryLinkWarning', { memberNumber: user.memberNumber }))
+    if (!confirmed) return
+
     try {
       const result = await recoveryLinkMutation.mutateAsync({
         id: user.id,

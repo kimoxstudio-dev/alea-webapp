@@ -88,7 +88,7 @@ export function HeroSection({ locale, upcomingEvents, onPickEvent }: HeroSection
             <span className="mod-badge">{t('hero.badgeFee')}</span>
           </div>
           <div className="mod-hero-cta">
-            <Link className="mod-btn mod-btn-primary" href={`/${locale}/login`}>
+            <Link className="mod-btn mod-btn-primary" href={`/${locale}/sign-in`}>
               {t('cta.join')}
             </Link>
             <a className="mod-btn mod-btn-ghost" href="#events">
