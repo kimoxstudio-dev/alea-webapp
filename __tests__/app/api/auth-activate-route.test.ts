@@ -5,7 +5,6 @@ import { NextRequest, NextResponse } from 'next/server'
 const activateAccountMock = vi.fn()
 const enforceMutationSecurityMock = vi.fn()
 const enforceRateLimitMock = vi.fn()
-const routeSignInWithPasswordMock = vi.fn()
 
 vi.mock('@/lib/server/auth-service', () => ({
   activateAccount: activateAccountMock,
@@ -22,20 +21,6 @@ vi.mock('@/lib/server/security', async (importOriginal) => {
     },
   }
 })
-
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseRouteHandlerClient: vi.fn(() => ({
-    supabase: {
-      auth: {
-        signInWithPassword: routeSignInWithPasswordMock,
-      },
-    },
-    applyCookies: (response: NextResponse) => {
-      response.cookies.set('sb-access-token', 'test-session')
-      return response
-    },
-  })),
-}))
 
 function createJsonRequest(body?: unknown) {
   return new NextRequest('http://localhost:3000/api/auth/activate', {
@@ -76,55 +61,42 @@ describe('POST /api/auth/activate', () => {
     enforceMutationSecurityMock.mockReturnValue(null)
     enforceRateLimitMock.mockReturnValue(null)
     activateAccountMock.mockResolvedValue({
-      authEmail: '100020@members.alea.internal',
       user: {
         id: 'user-20',
         memberNumber: '100020',
+        fullName: 'Test Member',
+        email: 'contact@example.com',
+        phone: '+1234567890',
         role: 'member',
         isActive: true,
+        activeFrom: '2024-01-15T12:00:00.000Z',
+        noShowCount: 0,
+        blockedUntil: null,
         createdAt: '2024-01-01T00:00:00.000Z',
-        updatedAt: '2024-01-01T00:00:00.000Z',
+        updatedAt: '2024-01-15T12:00:00.000Z',
       },
-    })
-    routeSignInWithPasswordMock.mockResolvedValue({
-      data: { user: { id: 'user-20' } },
-      error: null,
     })
   })
 
-  it('activates account, signs member in, returns user payload and cookies', async () => {
+  it('accepts { token, password }, activates account, returns user payload', async () => {
     const { POST } = await import('@/app/api/auth/activate/route')
     const response = await POST(createJsonRequest({
-      token: 'plain-token',
+      token: 'plain-token-value',
       password: 'Password123',
     }))
 
     expect(response.status).toBe(200)
-    await expect(response.json()).resolves.toMatchObject({
+    const json = await response.json()
+    expect(json).toMatchObject({
       memberNumber: '100020',
       isActive: true,
+      role: 'member',
     })
-    expect(routeSignInWithPasswordMock).toHaveBeenCalledWith({
-      email: '100020@members.alea.internal',
+
+    // Verify activateAccount was called with both token and password
+    expect(activateAccountMock).toHaveBeenCalledWith({
+      token: 'plain-token-value',
       password: 'Password123',
-    })
-    expect(response.cookies.get('sb-access-token')?.value).toBe('test-session')
-  })
-
-  it('maps activation failures to service error responses', async () => {
-    const { ServiceError } = await import('@/lib/server/service-error')
-    activateAccountMock.mockRejectedValueOnce(new ServiceError('Activation link has already been used', 400))
-
-    const { POST } = await import('@/app/api/auth/activate/route')
-    const response = await POST(createJsonRequest({
-      token: 'used-token',
-      password: 'Password123',
-    }))
-
-    expect(response.status).toBe(400)
-    await expect(response.json()).resolves.toMatchObject({
-      message: 'Activation link has already been used',
-      statusCode: 400,
     })
   })
 
@@ -145,16 +117,16 @@ describe('POST /api/auth/activate', () => {
     }))
 
     expect(response.status).toBe(400)
-    await expect(response.json()).resolves.toMatchObject({
-      message: 'Invalid JSON request body.',
-      statusCode: 400,
-    })
+    const json = await response.json()
+    expect(json.message).toBe('Invalid JSON request body.')
     expect(activateAccountMock).not.toHaveBeenCalled()
   })
 
   it('treats valid non-object JSON bodies as empty payloads', async () => {
     const { ServiceError } = await import('@/lib/server/service-error')
-    activateAccountMock.mockRejectedValueOnce(new ServiceError('Invalid activation link', 400))
+    activateAccountMock.mockRejectedValueOnce(
+      new ServiceError('Invalid activation link', 400),
+    )
 
     const { POST } = await import('@/app/api/auth/activate/route')
     const response = await POST(createRawJsonRequest('"plain-string"'))
@@ -166,11 +138,46 @@ describe('POST /api/auth/activate', () => {
     })
   })
 
-  it('returns 500 when activation succeeds but automatic sign-in fails', async () => {
-    routeSignInWithPasswordMock.mockResolvedValueOnce({
-      data: { user: null },
-      error: { message: 'sign-in failed' },
+  it('maps activation failures to service error responses', async () => {
+    const { ServiceError } = await import('@/lib/server/service-error')
+    activateAccountMock.mockRejectedValueOnce(
+      new ServiceError('Activation link has already been used', 400),
+    )
+
+    const { POST } = await import('@/app/api/auth/activate/route')
+    const response = await POST(createJsonRequest({
+      token: 'used-token',
+      password: 'Password123',
+    }))
+
+    expect(response.status).toBe(400)
+    const json = await response.json()
+    expect(json).toMatchObject({
+      message: 'Activation link has already been used',
+      statusCode: 400,
     })
+  })
+
+  it('returns 401 for invalid/expired activation link', async () => {
+    const { ServiceError } = await import('@/lib/server/service-error')
+    activateAccountMock.mockRejectedValueOnce(
+      new ServiceError('Activation link is invalid or has expired', 400),
+    )
+
+    const { POST } = await import('@/app/api/auth/activate/route')
+    const response = await POST(createJsonRequest({
+      token: 'expired-token',
+      password: 'Password123',
+    }))
+
+    expect(response.status).toBe(400)
+  })
+
+  it('returns 500 for Clerk user creation failure', async () => {
+    const { ServiceError } = await import('@/lib/server/service-error')
+    activateAccountMock.mockRejectedValueOnce(
+      new ServiceError('Failed to create account credentials', 500),
+    )
 
     const { POST } = await import('@/app/api/auth/activate/route')
     const response = await POST(createJsonRequest({
@@ -179,13 +186,14 @@ describe('POST /api/auth/activate', () => {
     }))
 
     expect(response.status).toBe(500)
-    await expect(response.json()).resolves.toMatchObject({
-      message: 'Account activated, but automatic sign-in failed. Please sign in with your member number and new password.',
+    const json = await response.json()
+    expect(json).toMatchObject({
+      message: 'Failed to create account credentials',
       statusCode: 500,
     })
   })
 
-  it('returns the security response before touching activation logic', async () => {
+  it('returns security error before touching activation logic', async () => {
     enforceMutationSecurityMock.mockReturnValueOnce(
       NextResponse.json({ message: 'Forbidden', statusCode: 403 }, { status: 403 }),
     )
@@ -200,7 +208,7 @@ describe('POST /api/auth/activate', () => {
     expect(activateAccountMock).not.toHaveBeenCalled()
   })
 
-  it('returns the rate-limit response before touching activation logic', async () => {
+  it('returns rate-limit error before touching activation logic', async () => {
     enforceRateLimitMock.mockReturnValueOnce(
       NextResponse.json({ message: 'Too many requests', statusCode: 429 }, { status: 429 }),
     )
@@ -213,5 +221,20 @@ describe('POST /api/auth/activate', () => {
 
     expect(response.status).toBe(429)
     expect(activateAccountMock).not.toHaveBeenCalled()
+  })
+
+  it('validates password schema on the request body', async () => {
+    const { ServiceError } = await import('@/lib/server/service-error')
+    activateAccountMock.mockRejectedValueOnce(
+      new ServiceError('Invalid activation link', 400),
+    )
+
+    const { POST } = await import('@/app/api/auth/activate/route')
+    const response = await POST(createJsonRequest({
+      token: 'valid-token',
+      password: 'weak', // Too weak, missing uppercase, number
+    }))
+
+    expect(response.status).toBe(400)
   })
 })

@@ -5,7 +5,6 @@ import { NextRequest, NextResponse } from 'next/server'
 const recoverAccountMock = vi.fn()
 const enforceMutationSecurityMock = vi.fn()
 const enforceRateLimitMock = vi.fn()
-const routeSignInWithPasswordMock = vi.fn()
 
 vi.mock('@/lib/server/auth-service', () => ({
   recoverAccount: recoverAccountMock,
@@ -23,20 +22,6 @@ vi.mock('@/lib/server/security', async (importOriginal) => {
   }
 })
 
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseRouteHandlerClient: vi.fn(() => ({
-    supabase: {
-      auth: {
-        signInWithPassword: routeSignInWithPasswordMock,
-      },
-    },
-    applyCookies: (response: NextResponse) => {
-      response.cookies.set('sb-access-token', 'test-session')
-      return response
-    },
-  })),
-}))
-
 function createJsonRequest(body?: unknown) {
   return new NextRequest('http://localhost:3000/api/auth/recover', {
     method: 'POST',
@@ -53,6 +38,22 @@ function createJsonRequest(body?: unknown) {
   })
 }
 
+function createRawJsonRequest(body: string) {
+  return new NextRequest('http://localhost:3000/api/auth/recover', {
+    method: 'POST',
+    headers: {
+      host: 'localhost:3000',
+      origin: 'http://localhost:3000',
+      'x-forwarded-for': '10.0.0.1',
+      'x-real-ip': '127.0.0.1',
+      'x-csrf-token': 'test-csrf-token',
+      cookie: 'alea-csrf-token=test-csrf-token',
+      'content-type': 'application/json',
+    },
+    body,
+  })
+}
+
 describe('POST /api/auth/recover', () => {
   beforeEach(() => {
     vi.resetModules()
@@ -60,55 +61,42 @@ describe('POST /api/auth/recover', () => {
     enforceMutationSecurityMock.mockReturnValue(null)
     enforceRateLimitMock.mockReturnValue(null)
     recoverAccountMock.mockResolvedValue({
-      authEmail: '100020@members.alea.internal',
       user: {
         id: 'user-20',
         memberNumber: '100020',
+        fullName: 'Test Member',
+        email: 'contact@example.com',
+        phone: '+1234567890',
         role: 'member',
         isActive: true,
+        activeFrom: '2024-01-01T00:00:00.000Z',
+        noShowCount: 0,
+        blockedUntil: null,
         createdAt: '2024-01-01T00:00:00.000Z',
-        updatedAt: '2024-01-01T00:00:00.000Z',
+        updatedAt: '2024-01-15T12:00:00.000Z',
       },
-    })
-    routeSignInWithPasswordMock.mockResolvedValue({
-      data: { user: { id: 'user-20' } },
-      error: null,
     })
   })
 
-  it('recovers account, signs member in, returns user payload and cookies', async () => {
+  it('accepts { token, password }, recovers account, returns user payload', async () => {
     const { POST } = await import('@/app/api/auth/recover/route')
     const response = await POST(createJsonRequest({
-      token: 'plain-token',
-      password: 'Password123',
+      token: 'recovery-token-value',
+      password: 'NewPassword123',
     }))
 
     expect(response.status).toBe(200)
-    await expect(response.json()).resolves.toMatchObject({
+    const json = await response.json()
+    expect(json).toMatchObject({
       memberNumber: '100020',
       isActive: true,
+      role: 'member',
     })
-    expect(routeSignInWithPasswordMock).toHaveBeenCalledWith({
-      email: '100020@members.alea.internal',
-      password: 'Password123',
-    })
-    expect(response.cookies.get('sb-access-token')?.value).toBe('test-session')
-  })
 
-  it('maps recovery failures to service error responses', async () => {
-    const { ServiceError } = await import('@/lib/server/service-error')
-    recoverAccountMock.mockRejectedValueOnce(new ServiceError('Recovery link has already been used', 400))
-
-    const { POST } = await import('@/app/api/auth/recover/route')
-    const response = await POST(createJsonRequest({
-      token: 'used-token',
-      password: 'Password123',
-    }))
-
-    expect(response.status).toBe(400)
-    await expect(response.json()).resolves.toMatchObject({
-      message: 'Recovery link has already been used',
-      statusCode: 400,
+    // Verify recoverAccount was called with both token and password
+    expect(recoverAccountMock).toHaveBeenCalledWith({
+      token: 'recovery-token-value',
+      password: 'NewPassword123',
     })
   })
 
@@ -129,59 +117,124 @@ describe('POST /api/auth/recover', () => {
     }))
 
     expect(response.status).toBe(400)
-    await expect(response.json()).resolves.toMatchObject({
-      message: 'Invalid JSON request body.',
-      statusCode: 400,
-    })
+    const json = await response.json()
+    expect(json.message).toBe('Invalid JSON request body.')
     expect(recoverAccountMock).not.toHaveBeenCalled()
   })
 
-  it('returns 500 when recovery succeeds but automatic sign-in fails', async () => {
-    routeSignInWithPasswordMock.mockResolvedValueOnce({
-      data: { user: null },
-      error: { message: 'sign-in failed' },
+  it('treats valid non-object JSON bodies as empty payloads', async () => {
+    const { ServiceError } = await import('@/lib/server/service-error')
+    recoverAccountMock.mockRejectedValueOnce(
+      new ServiceError('Invalid recovery link', 400),
+    )
+
+    const { POST } = await import('@/app/api/auth/recover/route')
+    const response = await POST(createRawJsonRequest('"plain-string"'))
+
+    expect(response.status).toBe(400)
+    expect(recoverAccountMock).toHaveBeenCalledWith({
+      token: undefined,
+      password: undefined,
     })
+  })
+
+  it('maps recovery failures to service error responses', async () => {
+    const { ServiceError } = await import('@/lib/server/service-error')
+    recoverAccountMock.mockRejectedValueOnce(
+      new ServiceError('Recovery link has already been used', 400),
+    )
 
     const { POST } = await import('@/app/api/auth/recover/route')
     const response = await POST(createJsonRequest({
-      token: 'plain-token',
-      password: 'Password123',
+      token: 'used-token',
+      password: 'NewPassword123',
+    }))
+
+    expect(response.status).toBe(400)
+    const json = await response.json()
+    expect(json).toMatchObject({
+      message: 'Recovery link has already been used',
+      statusCode: 400,
+    })
+  })
+
+  it('returns 400 for invalid/expired recovery link', async () => {
+    const { ServiceError } = await import('@/lib/server/service-error')
+    recoverAccountMock.mockRejectedValueOnce(
+      new ServiceError('Recovery link is invalid or has expired', 400),
+    )
+
+    const { POST } = await import('@/app/api/auth/recover/route')
+    const response = await POST(createJsonRequest({
+      token: 'expired-token',
+      password: 'NewPassword123',
+    }))
+
+    expect(response.status).toBe(400)
+  })
+
+  it('returns 500 for Clerk user update failure', async () => {
+    const { ServiceError } = await import('@/lib/server/service-error')
+    recoverAccountMock.mockRejectedValueOnce(
+      new ServiceError('Failed to update account credentials', 500),
+    )
+
+    const { POST } = await import('@/app/api/auth/recover/route')
+    const response = await POST(createJsonRequest({
+      token: 'recovery-token',
+      password: 'NewPassword123',
     }))
 
     expect(response.status).toBe(500)
-    await expect(response.json()).resolves.toMatchObject({
-      message: 'Password updated, but automatic sign-in failed. Please sign in with your member number and new password.',
+    const json = await response.json()
+    expect(json).toMatchObject({
+      message: 'Failed to update account credentials',
       statusCode: 500,
     })
   })
 
-  it('returns the security response before touching recovery logic', async () => {
+  it('returns security error before touching recovery logic', async () => {
     enforceMutationSecurityMock.mockReturnValueOnce(
       NextResponse.json({ message: 'Forbidden', statusCode: 403 }, { status: 403 }),
     )
 
     const { POST } = await import('@/app/api/auth/recover/route')
     const response = await POST(createJsonRequest({
-      token: 'plain-token',
-      password: 'Password123',
+      token: 'recovery-token',
+      password: 'NewPassword123',
     }))
 
     expect(response.status).toBe(403)
     expect(recoverAccountMock).not.toHaveBeenCalled()
   })
 
-  it('returns the rate-limit response before touching recovery logic', async () => {
+  it('returns rate-limit error before touching recovery logic', async () => {
     enforceRateLimitMock.mockReturnValueOnce(
       NextResponse.json({ message: 'Too many requests', statusCode: 429 }, { status: 429 }),
     )
 
     const { POST } = await import('@/app/api/auth/recover/route')
     const response = await POST(createJsonRequest({
-      token: 'plain-token',
-      password: 'Password123',
+      token: 'recovery-token',
+      password: 'NewPassword123',
     }))
 
     expect(response.status).toBe(429)
     expect(recoverAccountMock).not.toHaveBeenCalled()
+  })
+
+  it('validates password schema on the request body', async () => {
+    const { ServiceError } = await import('@/lib/server/service-error')
+    recoverAccountMock.mockRejectedValueOnce(
+      new ServiceError('Invalid recovery link', 400),
+    )
+
+    const { POST } = await import('@/app/api/auth/recover/route')
+    const response = await POST(createJsonRequest({
+      token: 'valid-token',
+      password: 'weak', // Too weak
+    }))
+
+    expect(response.status).toBe(400)
   })
 })
