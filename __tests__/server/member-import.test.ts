@@ -2,8 +2,33 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import ExcelJS from 'exceljs'
 
-const createUserMock = vi.fn()
-const deleteUserMock = vi.fn()
+const createUserMock = vi.fn(async ({ email }: { email: string }) => {
+  const memberNumber = email.split('@')[0]
+  const userId = `user-${memberNumber}`
+  if (!profileState.has(memberNumber)) {
+    profileState.set(memberNumber, {
+      id: userId,
+      member_number: memberNumber,
+      full_name: null,
+      auth_email: email,
+      email: null,
+      phone: null,
+      role: 'member',
+      is_active: false,
+      active_from: null,
+      psw_changed: null,
+      no_show_count: 0,
+      blocked_until: null,
+      created_at: '2026-04-14T00:00:00.000Z',
+      updated_at: '2026-04-14T00:00:00.000Z',
+    })
+  }
+  return {
+    data: { user: { id: userId } },
+    error: null,
+  }
+})
+const deleteUserMock = vi.fn(async () => ({ error: null }))
 
 const profileState = new Map<string, {
   id: string
@@ -329,29 +354,6 @@ describe('importMembersFromCsv', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetProfileState()
-    createUserMock.mockImplementation(async ({ email }: { email: string }) => {
-      profileState.set('M-PLACEHOLDER-100020', {
-        id: 'user-100020',
-        member_number: 'M-PLACEHOLDER-100020',
-        full_name: null,
-        auth_email: email,
-        email: null,
-        phone: null,
-        role: 'member',
-        is_active: false,
-        active_from: null,
-        psw_changed: null,
-        no_show_count: 0,
-        blocked_until: null,
-        created_at: '2026-04-14T00:00:00.000Z',
-        updated_at: '2026-04-14T00:00:00.000Z',
-      })
-      return {
-        data: { user: { id: 'user-100020' } },
-        error: null,
-      }
-    })
-    deleteUserMock.mockResolvedValue({ error: null })
   })
 
   it('updates existing members with generated fallback email and nullable phone', async () => {
@@ -615,29 +617,6 @@ describe('importMembersFromSource', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetProfileState()
-    createUserMock.mockImplementation(async ({ email }: { email: string }) => {
-      profileState.set('M-PLACEHOLDER-100023', {
-        id: 'user-100023',
-        member_number: 'M-PLACEHOLDER-100023',
-        full_name: null,
-        auth_email: email,
-        email: null,
-        phone: null,
-        role: 'member',
-        is_active: false,
-        active_from: null,
-        psw_changed: null,
-        no_show_count: 0,
-        blocked_until: null,
-        created_at: '2026-04-14T00:00:00.000Z',
-        updated_at: '2026-04-14T00:00:00.000Z',
-      })
-      return {
-        data: { user: { id: 'user-100023' } },
-        error: null,
-      }
-    })
-    deleteUserMock.mockResolvedValue({ error: null })
   })
 
   it('imports from xlsx source files and returns normalized rows for audit', async () => {
