@@ -17,6 +17,11 @@ export { enforceSameOriginForMutation } from '@/lib/server/security'
  * profile becomes active is `activateAccount()` in auth-service.ts, gated on
  * an admin-issued activation token.
  *
+ * Correlation key (#299 pass 3): the Clerk USERNAME (`alea-<member
+ * number>`), not email — see `resolveProfileForClerkUser()`'s doc comment
+ * for the full rationale. There is no email anywhere in this identity
+ * model.
+ *
  * `request`/`applyCookies` are kept in every signature below purely for
  * source compatibility with the ~30 existing call sites across `app/` (all
  * out of scope for this backend-only change) — Clerk's `auth()`/`currentUser()`
@@ -52,15 +57,15 @@ async function resolveClerkSessionUser(): Promise<SessionUser | null> {
   }
 
   const clerkUser = await getClerkUser()
-  const email = clerkUser?.primaryEmailAddress?.emailAddress ?? null
-  if (!email) {
-    // No verified/primary email on the Clerk identity — cannot correlate to
-    // a profiles row (email is the only correlation key today, see
+  const username = clerkUser?.username ?? null
+  if (!username) {
+    // No username on the Clerk identity — cannot correlate to a profiles
+    // row (username is the only correlation key, see
     // resolveProfileForClerkUser). Treat as unauthenticated.
     return null
   }
 
-  return resolveProfileForClerkUser({ email })
+  return resolveProfileForClerkUser({ username })
 }
 
 export async function getSessionFromRequest(_request: NextRequest): Promise<RouteSessionResult> {

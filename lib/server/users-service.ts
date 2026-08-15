@@ -31,11 +31,12 @@ import {
  * user alongside each profile row, and kept `auth_email` in sync with
  * Supabase Auth on `updateUser()`. Clerk now owns credentials; there is no
  * per-member identity-provider account to create/sync/delete here anymore.
- * `auth_email` remains plain data on the `profiles` row (still used as one
- * of the two correlation keys in `resolveProfileForClerkUser()`, see
- * `lib/server/auth-service.ts`). As of #299 pass 2, that lookup is
- * read-only — this file (admin CSV import, etc.) is the ONLY place a
- * `profiles` row is ever created; no self-service path creates one.
+ * `auth_email`/`email` remain plain contact-info columns on the `profiles`
+ * row — as of #299 pass 3, `resolveProfileForClerkUser()`
+ * (`lib/server/auth-service.ts`) correlates a Clerk identity to a profile
+ * by USERNAME (`alea-<member_number>`), never by email; neither column is
+ * read there anymore. This file (admin CSV import, etc.) remains the ONLY
+ * place a `profiles` row is ever created; no self-service path creates one.
  */
 
 function normalizePage(page: number) {

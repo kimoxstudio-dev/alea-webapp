@@ -2,29 +2,66 @@ import type { User } from '@/lib/types'
 import type { SessionUser } from '@/lib/server/auth'
 import { createHash, randomBytes } from 'node:crypto'
 import { serviceError } from '@/lib/server/service-error'
-import { getClerkSession, getClerkUser } from '@/lib/server/session'
+import { getClerkSession } from '@/lib/server/session'
 import { clerkClient } from '@clerk/nextjs/server'
 import { type PublicProfileRow, toPublicUser } from '@/lib/server/profile-mappers'
 import { sql } from '@/lib/db/client'
+import { activationServerSchema, recoveryServerSchema } from '@/lib/validations/auth'
 
 /**
- * Raw-SQL, Clerk-backed auth service (#299, pass 2).
+ * Raw-SQL, Clerk-backed auth service (#299, pass 3).
  *
  * This file is now fully Supabase-free — pass 1 ported the activation/
- * recovery token machinery to Neon; this pass closes the gap flagged in
- * pass 1's handoff by migrating `getCurrentUser`/`logout` and by replacing
- * `login`/`register` (see their removal note near the bottom of this file).
+ * recovery token machinery to Neon; pass 2 migrated `getCurrentUser`/
+ * `logout` and replaced `login`/`register` (see their removal note near the
+ * bottom of this file). This pass (3) corrects a wrong premise baked into
+ * pass 2: identity is NOT email-based. Proven live against the real Clerk
+ * dev instance (issue #267): a Clerk username of the form `alea-<member
+ * number>` (e.g. `alea-100001`) can be created without any email attribute
+ * (zero emails sent) and signed in with via `identifier=alea-100001`. The
+ * `alea-` prefix exists purely because Clerk rejects all-numeric usernames
+ * (`form_username_needs_non_number_char`) — it is internal plumbing only,
+ * never shown to or typed by the member. There is NO email anywhere in the
+ * identity model, no exceptions — `profiles.email`/`profiles.auth_email`
+ * remain plain contact-info columns (used by `users-service.ts`), never
+ * used to correlate a Clerk identity to a `profiles` row.
  *
- * PRODUCT CONSTRAINT this entire file is built around (closed issue #206,
- * confirmed by reading it before writing any of this): this club has NO
- * open self-registration. Every member must already exist as a
- * `profiles` row (admin-imported, e.g. via `users-service.ts` CSV import)
- * before they can ever become active. A Clerk identity — sign-up or
- * sign-in — must NEVER by itself produce a usable/active profile. The only
- * way an inactive, pre-registered profile becomes active is
+ * PRODUCT CONSTRAINT this entire file is built around (closed issues #206,
+ * #207): this club has NO open self-registration. Every member must
+ * already exist as a `profiles` row (admin-imported, e.g. via
+ * `users-service.ts` CSV import) before they can ever become active. A
+ * Clerk identity must NEVER by itself produce a usable/active profile or a
+ * usable Clerk credential. The only way an inactive, pre-registered profile
+ * becomes active — and the only way its Clerk identity is ever created — is
  * `activateAccount()` below, gated on an admin-issued, 24h, single-use
- * token AND a matching Clerk-verified email.
+ * token. There is no public self-service registration path, under any
+ * circumstance.
  */
+
+const CLERK_USERNAME_PREFIX = 'alea-'
+
+/**
+ * Builds the Clerk username for a member number. The `alea-` prefix is
+ * internal plumbing only (Clerk rejects all-numeric usernames) — the member
+ * never sees or types it.
+ */
+function toClerkUsername(memberNumber: string): string {
+  return `${CLERK_USERNAME_PREFIX}${memberNumber}`
+}
+
+/**
+ * Strips the `alea-` prefix from a Clerk username to recover the bare
+ * member number. Returns `null` for any username that isn't shaped like one
+ * this app issued (e.g. a stray Clerk identity created outside
+ * `activateAccount()`).
+ */
+function memberNumberFromClerkUsername(username: string): string | null {
+  if (!username.startsWith(CLERK_USERNAME_PREFIX)) {
+    return null
+  }
+  const memberNumber = username.slice(CLERK_USERNAME_PREFIX.length)
+  return memberNumber.length > 0 ? memberNumber : null
+}
 
 function hashActivationToken(token: string) {
   return createHash('sha256').update(token).digest('hex')
@@ -237,61 +274,44 @@ export async function generateRecoveryLink(input: {
   }
 }
 
-async function getVerifiedClerkEmail(): Promise<{ userId: string; email: string } | null> {
-  const clerkSession = await getClerkSession()
-  if (!clerkSession) {
-    return null
-  }
-  const clerkUser = await getClerkUser()
-  const email = clerkUser?.primaryEmailAddress?.emailAddress?.trim().toLowerCase() ?? null
-  if (!email) {
-    return null
-  }
-  return { userId: clerkSession.userId, email }
-}
-
 /**
- * Claims an admin-issued activation link, activating a pre-registered
- * profile for the caller's already-authenticated Clerk identity (#299 pass
- * 2 — replaces the pre-Clerk `{ token, password }` version).
+ * Claims an admin-issued activation link, creating the member's Clerk
+ * identity and activating their pre-registered profile (#299 pass 3 —
+ * replaces pass 2's email-match-gated version; re-derived from closed
+ * issues #206/#207, which never mention email at all).
  *
- * Re-expresses every gate from closed issue #206 for Clerk:
+ * Re-expresses every gate from #206/#207:
  *   - Never creates a `profiles` row — only an already-existing,
  *     `is_active = false` row (admin pre-registered) can be activated.
  *   - Token must be valid, unexpired (24h — `ACTIVATION_WINDOW_MS`), and
- *     unused; claimed atomically below so two concurrent claims cannot both
- *     succeed.
- *   - NEW, Clerk-specific: the caller must already hold an authenticated
- *     Clerk session (i.e. must have completed Clerk sign-up/sign-in BEFORE
- *     calling this — the frontend must sequence that), and that session's
- *     verified email must case-insensitively match the target profile's
- *     `email` or `auth_email`. This is what stands in for "type the
- *     password the admin doesn't know" from the old flow: proof that the
- *     caller is the person the admin pre-registered, not just someone who
- *     obtained the token URL (e.g. a forwarded/leaked email). Without this
- *     check, any Clerk account could claim any valid token.
- *   - `password` is no longer part of the input — Clerk owns credentials;
- *     "set a new password" from #206 is now "sign up with Clerk", done
- *     before this call, not inside it.
+ *     unused; claimed atomically below (`UPDATE ... WHERE used_at IS NULL
+ *     ... RETURNING`) so two concurrent claims cannot both succeed. This is
+ *     the load-bearing security property: activation is impossible without
+ *     a valid, unexpired, unused, admin-issued token — full stop.
+ *   - `{ token, password }` is the request shape (`activationServerSchema`,
+ *     `lib/validations/auth.ts`) — same shape as the pre-Clerk design.
+ *     "Set a new password" from #206 happens right here: the member's Clerk
+ *     identity does not exist yet (no self-service sign-up path exists), so
+ *     this call both creates it AND sets its password in one step, via the
+ *     Backend API (`users.createUser`).
+ *   - The Clerk username is `alea-<member_number>` (`toClerkUsername()`).
+ *     No email attribute is ever set — proven live against the real Clerk
+ *     dev instance (issue #267) to create the identity with zero emails
+ *     sent.
  *
  * On success: `is_active = true`, `active_from`/`psw_changed` stamped, token
- * marked used. No session is minted here — the Clerk session already
- * exists, and the very next request will resolve a real one through
- * `resolveProfileForClerkUser()` (lib/server/auth.ts), since the profile is
- * now active and its email matches.
+ * marked used, Clerk identity created. No session is minted here — the very
+ * next sign-in (`identifier=alea-<member_number>`) resolves a real one
+ * through `resolveProfileForClerkUser()` (lib/server/auth.ts), since the
+ * profile is now active.
  */
-export async function activateAccount(input: { token: unknown }) {
-  const token = typeof input.token === 'string' ? input.token.trim() : ''
-  if (!token) {
+export async function activateAccount(input: { token: unknown; password: unknown }) {
+  const parsed = activationServerSchema.safeParse(input)
+  if (!parsed.success) {
     serviceError('Invalid activation link', 400)
   }
 
-  const clerkIdentity = await getVerifiedClerkEmail()
-  if (!clerkIdentity) {
-    serviceError('Sign in first, then open the activation link again', 401)
-  }
-
-  const tokenHash = hashActivationToken(token)
+  const tokenHash = hashActivationToken(parsed.data.token)
   const existingToken = await getActivationTokenByHash(tokenHash)
 
   const databaseNow = existingToken ? await getNeonDatabaseNow() : null
@@ -308,13 +328,6 @@ export async function activateAccount(input: { token: unknown }) {
   }
   if (profile.is_active) {
     serviceError('Activation link has already been used', 400)
-  }
-
-  const profileEmail = profile.email?.trim().toLowerCase() ?? null
-  const profileAuthEmail = profile.auth_email?.trim().toLowerCase() ?? null
-  if (clerkIdentity.email !== profileEmail && clerkIdentity.email !== profileAuthEmail) {
-    // Generic message — do not reveal which email the token is tied to.
-    serviceError('This activation link does not match your signed-in account', 403)
   }
 
   const activatedAt = (await getNeonDatabaseNow()).toISOString()
@@ -336,6 +349,18 @@ export async function activateAccount(input: { token: unknown }) {
     serviceError('Activation link is invalid or has expired', 400)
   }
 
+  // Token is now spent (single-use, claimed above) — create the Clerk
+  // identity. No email attribute, ever.
+  try {
+    const client = await clerkClient()
+    await client.users.createUser({
+      username: toClerkUsername(profile.member_number),
+      password: parsed.data.password,
+    })
+  } catch {
+    serviceError('Failed to create account credentials', 500)
+  }
+
   const updatedRows = await sql`
     UPDATE profiles
     SET is_active = true, active_from = ${activatedAt}, psw_changed = ${activatedAt}
@@ -352,42 +377,34 @@ export async function activateAccount(input: { token: unknown }) {
 }
 
 /**
- * Claims an admin-issued recovery link to RE-LINK the caller's Clerk
- * identity/email onto an existing, already-ACTIVE profile (#299 pass 2 —
- * replaces the pre-Clerk `{ token, password }` version).
+ * Claims an admin-issued recovery link, setting a NEW password on the
+ * member's EXISTING Clerk identity (#299 pass 3 — replaces pass 2's
+ * email-relink redesign, fully discarded per this task's instructions; not
+ * a mechanical port of it).
  *
- * DESIGN DECISION — mine, flagged for review at the same weight as
- * activateAccount()'s email-match gate above, since it changes what
- * "recovery" means: under Clerk, resetting a forgotten password is Clerk's
- * own native self-service flow and needs no token from us at all. The only
- * scenario left where an admin-issued single-use token still adds value is
- * a member who lost access to their original email/Clerk account entirely
- * and cannot use Clerk's own recovery — this function re-points an
- * already-active profile's `email`/`auth_email` at a NEW Clerk-verified
- * email. Confirm this is the intended product meaning of "recovery" before
- * shipping the corresponding UI — it is a genuine redesign of what this
- * mechanism does, not a mechanical port.
- *
- * Unlike activateAccount(), there is deliberately NO email-match check
- * here — re-linking to a brand-new email is the entire point, so the
- * admin-issued token itself is the sole proof of authorization (same trust
- * level the token already carried pre-Clerk). Requires an existing Clerk
- * session (sign up/in with the new email first — same sequencing as
- * activation). `is_active` must already be true; this is not a
- * first-activation path (see activateAccount() for that).
+ * Re-derived directly from closed issues #206/#207, not carried forward
+ * from pass 2: #207 states plainly that self-service "forgot password" is
+ * replaced by an admin-mediated flow — "Allow administrators to generate a
+ * password recovery link ... Force the user to set a new password through
+ * that link ... Store the last password change timestamp in `psw_changed`."
+ * Neither issue mentions email or a pre-existing Clerk session as part of
+ * this flow. Accordingly, unlike activateAccount() there is no email
+ * involved at all: the admin-issued, single-use, 24h token is the sole
+ * proof of authorization (same token mechanics as activation — atomic
+ * claim via `UPDATE ... WHERE used_at IS NULL ... RETURNING`), and it
+ * updates the password on the Clerk identity that already exists from
+ * activation — this is not identity creation. `is_active` must already be
+ * true; this is not a first-activation path (see activateAccount() for
+ * that). The Clerk identity is looked up by username (`alea-<member
+ * number>`) since no Clerk user id is persisted on `profiles`.
  */
-export async function recoverAccount(input: { token: unknown }) {
-  const token = typeof input.token === 'string' ? input.token.trim() : ''
-  if (!token) {
+export async function recoverAccount(input: { token: unknown; password: unknown }) {
+  const parsed = recoveryServerSchema.safeParse(input)
+  if (!parsed.success) {
     serviceError('Invalid recovery link', 400)
   }
 
-  const clerkIdentity = await getVerifiedClerkEmail()
-  if (!clerkIdentity) {
-    serviceError('Sign in first, then open the recovery link again', 401)
-  }
-
-  const tokenHash = hashActivationToken(token)
+  const tokenHash = hashActivationToken(parsed.data.token)
   const existingToken = await getActivationTokenByHash(tokenHash)
 
   const databaseNow = existingToken ? await getNeonDatabaseNow() : null
@@ -422,19 +439,35 @@ export async function recoverAccount(input: { token: unknown }) {
     serviceError('Recovery link is invalid or has expired', 400)
   }
 
-  let updatedRows: PublicProfileRow[]
+  // Token is now spent — find the existing Clerk identity by username (no
+  // Clerk user id is persisted on `profiles`) and set its new password.
+  const client = await clerkClient()
+  let clerkUser: { id: string } | undefined
   try {
-    updatedRows = await sql`
-      UPDATE profiles
-      SET email = ${clerkIdentity.email}, auth_email = ${clerkIdentity.email}, psw_changed = ${recoveredAt}
-      WHERE id = ${profile.id}
-      RETURNING id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
-    ` as PublicProfileRow[]
+    const { data } = await client.users.getUserList({ username: [toClerkUsername(profile.member_number)] })
+    clerkUser = data[0]
   } catch {
-    // auth_email is UNIQUE — the new Clerk email is already tied to a
-    // different profile row.
-    serviceError('This email is already associated with another account', 409)
+    serviceError('Internal server error', 500)
   }
+  if (!clerkUser) {
+    serviceError('Internal server error', 500)
+  }
+
+  try {
+    await client.users.updateUser(clerkUser.id, {
+      password: parsed.data.password,
+      signOutOfOtherSessions: true,
+    })
+  } catch {
+    serviceError('Failed to update account credentials', 500)
+  }
+
+  const updatedRows = await sql`
+    UPDATE profiles
+    SET psw_changed = ${recoveredAt}
+    WHERE id = ${profile.id}
+    RETURNING id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
+  ` as PublicProfileRow[]
   const updatedProfile = updatedRows[0] ?? null
 
   if (!updatedProfile) {
@@ -452,40 +485,38 @@ type ClerkProfileMatchRow = {
 
 /**
  * Maps an authenticated Clerk identity to the member domain model,
- * READ-ONLY (#299 pass 2 — renamed from `resolveOrCreateProfileForClerkUser`
- * in pass 1, which auto-created a pending `profiles` row for any unmatched
- * email; that behavior is REMOVED here per the explicit product constraint
- * confirmed by reading closed issue #206: this club has no open
- * self-registration. Only an admin-pre-registered `profiles` row (e.g. via
- * `users-service.ts` CSV import) may ever exist, and only
- * `activateAccount()` above — gated on an admin-issued token AND a matching
- * Clerk-verified email — may ever flip one to active.
+ * READ-ONLY (#299 pass 3 — correlation strategy corrected from pass 2's
+ * wrong premise that email would be the login identifier; that premise is
+ * fully discarded, not adjusted).
  *
- * A Clerk identity with no matching pre-existing profile now resolves to
- * `null`, full stop: no row is created, no side effect happens at all. This
- * is the fix for the "brand-new signup gets permanently stuck" gap flagged
- * in pass 1's handoff — there is no longer a stuck row to begin with, since
- * none is ever created outside the admin-import + activation-token path.
+ * Never creates a `profiles` row — only an admin-pre-registered row (e.g.
+ * via `users-service.ts` CSV import) may ever exist, and only
+ * `activateAccount()` above — gated on an admin-issued token — may ever
+ * flip one to active (and only there is a Clerk identity ever created). A
+ * Clerk identity with no matching pre-existing, active profile resolves to
+ * `null`, full stop: no row is created, no side effect happens at all.
  *
- * Correlation strategy (unchanged from pass 1): EMAIL match against
- * `profiles.email` / `profiles.auth_email` (case-insensitive). No schema
- * change — see `lib/db/schema/003_profiles.sql`'s doc comment.
+ * Correlation strategy (#299 pass 3): the Clerk USERNAME is `alea-<member
+ * number>` (see `toClerkUsername()`/`memberNumberFromClerkUsername()`
+ * above) — strip the `alea-` prefix to recover the bare member number, then
+ * look up `profiles` by `member_number`. No email involved anywhere in this
+ * lookup.
  *
  * Called from `lib/server/auth.ts` on every request carrying a Clerk
  * session.
  */
 export async function resolveProfileForClerkUser(input: {
-  email: string
+  username: string
 }): Promise<SessionUser | null> {
-  const normalizedEmail = input.email.trim().toLowerCase()
-  if (!normalizedEmail) {
+  const memberNumber = memberNumberFromClerkUsername(input.username.trim())
+  if (!memberNumber) {
     return null
   }
 
   const rows = await sql`
     SELECT id, role, is_active
     FROM profiles
-    WHERE lower(email) = ${normalizedEmail} OR lower(auth_email) = ${normalizedEmail}
+    WHERE member_number = ${memberNumber}
     LIMIT 1
   ` as ClerkProfileMatchRow[]
   const profile = rows[0]
