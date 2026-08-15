@@ -56,3 +56,7 @@ qa/e2e/*.pdf
 
 # Local-only working docs
 docs/AUDIT-*.md
+.vercel
+
+# Agent progress log (local-only, no longer tracked in git — see CLAUDE.md)
+.claude/agent-progress.md

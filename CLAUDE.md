@@ -44,6 +44,12 @@ The user may write prompts in any language; replies to the user are in their lan
 
 ---
 
+## Commit identity
+
+This repo is owned by `KimoxStudio` and deploys to Vercel (`kimox-studio` team, Hobby plan) — the global commit-identity rule (`~/.claude/CLAUDE.md`) applies: commits authored as `kimoxstudio-dev <kimoxstudio@gmail.com>`, message ends with `(Oiranca)` instead of the default `Co-Authored-By` trailer. This isn't just a preference — Vercel Hobby rejects deploys whose commit author isn't the project owner, so a wrong-author commit blocks the build. Identity setup (`~/.gitconfig-kimoxstudio` + conditional include) is done locally by the user, not by Claude — see the global rule for the exact steps and for the fix procedure if a wrong-author commit slips through.
+
+---
+
 ## Key conventions
 
 - Admin write operations use `createSupabaseServerAdminClient()` (bypasses RLS)
@@ -86,6 +92,8 @@ If this field is missing, product-manager will ask you where issues are tracked.
 ## Agent Logging for Alea Webapp
 
 Progress logging (per `~/.claude/CLAUDE.md` Agent Progress Logging) applies here. Agents append to `.claude/agent-progress.md`.
+
+**Local-only, gitignored (as of #324):** `.claude/agent-progress.md` is no longer tracked in git — it is gitignored and lives only on disk in the main repo checkout. Tracking it in git caused a merge conflict on every branch and left the shared checkout permanently dirty, since every worktree agent appended to its own copy and those copies diverged. Agents must always append to the log using the **absolute path of the MAIN repo checkout**: `/Users/samuelromeroarbelo/Projects/Alea/alea-webapp/.claude/agent-progress.md` — never a worktree-relative copy (e.g. never `.claude/agent-progress.md` resolved from inside `.claude/worktrees/agent-*/`). This ensures the main session's `Monitor` on that file keeps seeing live progress from every agent, and no worktree branch ever re-commits log lines into git.
 
 **What to log:**
 - product-manager: Linear issue fetch, branch creation, team-lead spawn, completion
