@@ -1,9 +1,8 @@
 import type { MemberImportIssue, MemberImportResult, MemberImportRow, PaginatedResponse, User } from '@/lib/types'
-import { createSupabaseServerAdminClient } from '@/lib/supabase/server'
 import { serviceError } from '@/lib/server/service-error'
-import type { TablesUpdate } from '@/lib/supabase/types'
 import { memberNumberSchema } from '@/lib/validations/auth'
 import { type PublicProfileRow, toPublicUser } from '@/lib/server/profile-mappers'
+import { sql } from '@/lib/db/client'
 import {
   type MemberImportOptionalColumnPresence,
   MEMBER_IMPORT_PREVIEW_LIMIT,
@@ -12,56 +11,30 @@ import {
   pushImportIssue,
 } from '@/lib/server/member-import'
 
-type ProfilesQuery = {
-  eq: (column: string, value: unknown) => ProfilesQuery
-  or: (filter: string) => ProfilesQuery
-  maybeSingle: () => Promise<{ data: PublicProfileRow | null; error: unknown }>
-  order: (column: string, options: { ascending: boolean }) => {
-    range: (from: number, to: number) => Promise<{
-      data: PublicProfileRow[] | null
-      error: unknown
-      count: number | null
-    }>
-  }
-}
-type ProfilesTableClient = {
-  select: (columns: string, options?: { count?: 'exact' }) => ProfilesQuery
-  update: (updates: TablesUpdate<'profiles'>) => {
-    eq: (column: 'id', value: string) => {
-      select: (columns: string) => {
-        maybeSingle: () => Promise<{ data: PublicProfileRow | null; error: unknown }>
-      }
-    }
-  }
-}
-type AdminProfilesTableClient = {
-  select: (columns: string) => {
-    eq: (column: 'id', value: string) => {
-      maybeSingle: () => Promise<{ data: { id: string } | null; error: unknown }>
-    }
-  }
-}
-
-type ProfileImportLookupResult = Promise<{ data: PublicProfileRow | null; error: unknown }>
-type ProfilesImportTableClient = {
-  select: (columns: string) => {
-    eq: (column: 'member_number' | 'id', value: string) => {
-      maybeSingle: () => ProfileImportLookupResult
-    }
-  }
-  update: (updates: TablesUpdate<'profiles'>) => {
-    eq: (column: 'id', value: string) => {
-      select: (columns: string) => {
-        maybeSingle: () => ProfileImportLookupResult
-      }
-    }
-  }
-}
-type AuthAdminClient = {
-  updateUserById: (id: string, attributes: { email: string }) => Promise<{ error: unknown | null }>
-}
-
-const PROFILE_COLUMNS = 'id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at'
+/**
+ * Raw-SQL Neon port of the admin user-lifecycle service (#299).
+ *
+ * Admin-only role gating for every exported function here still happens at
+ * the route layer (`app/api/users/**`, via `requireAdmin()` in
+ * `lib/server/auth.ts`) exactly as before this migration — these functions
+ * do not additionally call `lib/server/authz.ts`'s `requireAdminRole()`
+ * themselves. Threading a `SessionUser` through would require changing the
+ * exported signatures here AND their call sites in `app/api/users/**`,
+ * which is outside this ticket's backend-only scope (`app/` is off limits —
+ * see this task's hard constraints). Flagged explicitly in the handoff
+ * message as a small, well-scoped follow-up. There are no member-scoped
+ * reads in this file (everything here is admin-lifecycle, operating across
+ * all members by design), so `assertMemberRowsScopedSql()` does not apply.
+ *
+ * Credential/identity-provider coupling was also removed, not replaced:
+ * the pre-migration version of this file created/deleted a Supabase Auth
+ * user alongside each profile row, and kept `auth_email` in sync with
+ * Supabase Auth on `updateUser()`. Clerk now owns credentials; there is no
+ * per-member identity-provider account to create/sync/delete here anymore.
+ * `auth_email` remains plain data on the `profiles` row (still used as one
+ * of the two correlation keys in `resolveOrCreateProfileForClerkUser()`,
+ * see `lib/server/auth-service.ts`).
+ */
 
 function normalizePage(page: number) {
   return Math.max(1, Math.floor(Number(page)) || 1)
@@ -95,6 +68,26 @@ function createInternalAuthEmail(memberNumber: string) {
   return `${memberNumber}@members.alea.internal`
 }
 
+async function getProfileById(id: string): Promise<PublicProfileRow | null> {
+  const rows = await sql`
+    SELECT id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
+    FROM profiles
+    WHERE id = ${id}
+    LIMIT 1
+  ` as PublicProfileRow[]
+  return rows[0] ?? null
+}
+
+async function getProfileByMemberNumber(memberNumber: string): Promise<PublicProfileRow | null> {
+  const rows = await sql`
+    SELECT id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
+    FROM profiles
+    WHERE member_number = ${memberNumber}
+    LIMIT 1
+  ` as PublicProfileRow[]
+  return rows[0] ?? null
+}
+
 async function importMembersFromNormalizedRows(input: {
   totalRows: number
   normalizedRows: MemberImportRow[]
@@ -104,18 +97,13 @@ async function importMembersFromNormalizedRows(input: {
   const { totalRows, normalizedRows } = input
   const issues = [...input.issues]
   const auditedRows: MemberImportRow[] = []
-  const admin = createSupabaseServerAdminClient()
-  const profiles = admin.from('profiles') as unknown as ProfilesImportTableClient
-  const authAdmin = admin.auth.admin as AuthAdminClient
   const concurrencyLimit = 10
 
   async function processImportRow(row: MemberImportRow) {
-    const { data: existing, error: selectError } = await profiles
-      .select(PROFILE_COLUMNS)
-      .eq('member_number', row.memberNumber)
-      .maybeSingle()
-
-    if (selectError) {
+    let existing: PublicProfileRow | null
+    try {
+      existing = await getProfileByMemberNumber(row.memberNumber)
+    } catch {
       return {
         created: 0,
         updated: 0,
@@ -126,30 +114,22 @@ async function importMembersFromNormalizedRows(input: {
 
     if (existing) {
       const resolvedEmail = row.email ?? createInternalAuthEmail(row.memberNumber)
-      const updatePayload: TablesUpdate<'profiles'> = {
-        full_name: row.fullName,
-      }
-      const normalizedRow: MemberImportRow = { ...row }
-
-      if (input.optionalColumnPresence.email) {
-        updatePayload.email = resolvedEmail
-        normalizedRow.email = resolvedEmail
-      } else {
-        normalizedRow.email = existing.email ?? null
-      }
-      if (input.optionalColumnPresence.phone) {
-        updatePayload.phone = row.phone
-      } else {
-        normalizedRow.phone = existing.phone ?? null
+      const nextFullName = row.fullName
+      const nextEmail = input.optionalColumnPresence.email ? resolvedEmail : existing.email
+      const nextPhone = input.optionalColumnPresence.phone ? row.phone : existing.phone
+      const normalizedRow: MemberImportRow = {
+        ...row,
+        email: input.optionalColumnPresence.email ? resolvedEmail : (existing.email ?? null),
+        phone: input.optionalColumnPresence.phone ? row.phone : (existing.phone ?? null),
       }
 
-      const { error: updateError } = await profiles
-        .update(updatePayload)
-        .eq('id', existing.id)
-        .select(PROFILE_COLUMNS)
-        .maybeSingle()
-
-      if (updateError) {
+      try {
+        await sql`
+          UPDATE profiles
+          SET full_name = ${nextFullName}, email = ${nextEmail}, phone = ${nextPhone}
+          WHERE id = ${existing.id}
+        `
+      } catch {
         return {
           created: 0,
           updated: 0,
@@ -168,40 +148,13 @@ async function importMembersFromNormalizedRows(input: {
 
     const authEmail = createInternalAuthEmail(row.memberNumber)
     const contactEmail = row.email ?? authEmail
-    const temporaryPassword = `Temp${crypto.randomUUID().replace(/-/g, '')}Aa1`
-    const { data: authData, error: createAuthError } = await admin.auth.admin.createUser({
-      email: authEmail,
-      password: temporaryPassword,
-      email_confirm: true,
-    })
 
-    if (createAuthError || !authData.user) {
-      return {
-        created: 0,
-        updated: 0,
-        normalizedRow: null,
-        issue: { rowNumber: row.rowNumber, memberNumber: row.memberNumber, code: 'create_auth_failed' as const },
-      }
-    }
-
-    const { data: persistedProfile, error: updateProfileError } = await profiles
-      .update({
-        member_number: row.memberNumber,
-        full_name: row.fullName,
-        auth_email: authEmail,
-        email: contactEmail,
-        phone: row.phone,
-        role: 'member',
-        is_active: false,
-        active_from: null,
-        psw_changed: null,
-      })
-      .eq('id', authData.user.id)
-      .select(PROFILE_COLUMNS)
-      .maybeSingle()
-
-    if (updateProfileError || !persistedProfile) {
-      await admin.auth.admin.deleteUser(authData.user.id)
+    try {
+      await sql`
+        INSERT INTO profiles (id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, psw_changed)
+        VALUES (gen_random_uuid(), ${row.memberNumber}, ${row.fullName}, ${authEmail}, ${contactEmail}, ${row.phone}, 'member', false, NULL, NULL)
+      `
+    } catch {
       return {
         created: 0,
         updated: 0,
@@ -272,28 +225,48 @@ export async function listPaginatedUsers(input: {
   const page = normalizePage(input.page)
   const limit = normalizeLimit(input.limit)
   const search = input.search?.trim() ?? ''
-  const supabase = createSupabaseServerAdminClient()
-  const profiles = supabase.from('profiles') as unknown as ProfilesTableClient
-  let query = profiles.select(PROFILE_COLUMNS, { count: 'exact' })
+  const offset = (page - 1) * limit
 
+  let pattern: string | null = null
   if (search) {
     const sanitized = sanitizeSearchTerm(search)
     if (sanitized) {
-      const escaped = escapeLikeWildcards(sanitized)
-      query = query.or(`member_number.ilike.%${escaped}%,full_name.ilike.%${escaped}%,email.ilike.%${escaped}%`)
+      pattern = `%${escapeLikeWildcards(sanitized)}%`
     }
   }
 
-  const { data, error, count } = await query
-    .order('created_at', { ascending: true })
-    .range((page - 1) * limit, page * limit - 1)
-  if (error) {
-    serviceError('Internal server error', 500)
+  let total: number
+  let rows: PublicProfileRow[]
+
+  if (pattern) {
+    const countRows = await sql`
+      SELECT COUNT(*)::int AS count
+      FROM profiles
+      WHERE member_number ILIKE ${pattern} OR full_name ILIKE ${pattern} OR email ILIKE ${pattern}
+    ` as { count: number }[]
+    total = countRows[0]?.count ?? 0
+
+    rows = await sql`
+      SELECT id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
+      FROM profiles
+      WHERE member_number ILIKE ${pattern} OR full_name ILIKE ${pattern} OR email ILIKE ${pattern}
+      ORDER BY created_at ASC
+      LIMIT ${limit} OFFSET ${offset}
+    ` as PublicProfileRow[]
+  } else {
+    const countRows = await sql`SELECT COUNT(*)::int AS count FROM profiles` as { count: number }[]
+    total = countRows[0]?.count ?? 0
+
+    rows = await sql`
+      SELECT id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
+      FROM profiles
+      ORDER BY created_at ASC
+      LIMIT ${limit} OFFSET ${offset}
+    ` as PublicProfileRow[]
   }
 
-  const total = count ?? 0
   return {
-    data: ((data ?? []) as PublicProfileRow[]).map(toPublicUser),
+    data: rows.map(toPublicUser),
     total,
     page,
     limit,
@@ -305,145 +278,137 @@ export async function updateUser(
   id: string,
   body: { memberNumber?: unknown; fullName?: unknown; email?: unknown; phone?: unknown; role?: unknown; is_active?: unknown }
 ) {
-  const updates: TablesUpdate<'profiles'> = {}
-  let nextMemberNumber: string | null = null
+  let nextMemberNumberInput: string | undefined
+  let nextFullNameInput: string | undefined
+  let emailProvided = false
+  let nextEmailInput: string | null = null
+  let phoneProvided = false
+  let nextPhoneInput: string | null = null
+  let nextRoleInput: 'admin' | 'member' | undefined
+  let nextIsActiveInput: boolean | undefined
+
   if (body.memberNumber !== undefined) {
     const parsed = memberNumberSchema.safeParse(String(body.memberNumber))
     if (!parsed.success) {
       serviceError('Invalid member number format', 400)
     }
-    updates.member_number = parsed.data
-    nextMemberNumber = parsed.data
+    nextMemberNumberInput = parsed.data
   }
   if (body.fullName !== undefined) {
     const fullName = String(body.fullName).trim()
     if (!fullName) {
       serviceError('Full name is required', 400)
     }
-    updates.full_name = fullName
+    nextFullNameInput = fullName
   }
   if (body.email !== undefined) {
     assertNullableStringField(body.email, 'Email')
-    updates.email = sanitizeOptionalUpdateValue(body.email)
+    emailProvided = true
+    nextEmailInput = sanitizeOptionalUpdateValue(body.email)
   }
   if (body.phone !== undefined) {
     assertNullableStringField(body.phone, 'Phone')
-    updates.phone = sanitizeOptionalUpdateValue(body.phone)
+    phoneProvided = true
+    nextPhoneInput = sanitizeOptionalUpdateValue(body.phone)
   }
-  if (body.role === 'admin' || body.role === 'member') updates.role = body.role
-  if (typeof body.is_active === 'boolean') updates.is_active = body.is_active
+  if (body.role === 'admin' || body.role === 'member') nextRoleInput = body.role
+  if (typeof body.is_active === 'boolean') nextIsActiveInput = body.is_active
 
-  if (Object.keys(updates).length === 0) {
+  if (
+    nextMemberNumberInput === undefined
+    && nextFullNameInput === undefined
+    && !emailProvided
+    && !phoneProvided
+    && nextRoleInput === undefined
+    && nextIsActiveInput === undefined
+  ) {
     serviceError('No updatable fields provided', 400)
   }
 
-  const supabase = createSupabaseServerAdminClient()
-  const profiles = supabase.from('profiles') as unknown as ProfilesTableClient
-  const authAdmin = supabase.auth.admin as AuthAdminClient
-  const { data: existingProfile, error: existingProfileError } = await profiles
-    .select(PROFILE_COLUMNS)
-    .eq('id', id)
-    .maybeSingle()
-
-  if (existingProfileError) {
-    serviceError('Internal server error', 500)
-  }
+  const existingProfile = await getProfileById(id)
   if (!existingProfile) {
     serviceError('User not found', 404)
   }
 
+  const nextMemberNumber = nextMemberNumberInput ?? existingProfile.member_number
+  const nextFullName = nextFullNameInput ?? existingProfile.full_name
+  const nextEmail = emailProvided ? nextEmailInput : existingProfile.email
+  const nextPhone = phoneProvided ? nextPhoneInput : existingProfile.phone
+  const nextRole = nextRoleInput ?? existingProfile.role
+  const nextIsActive = nextIsActiveInput ?? existingProfile.is_active
+
   const existingInternalAuthEmail = createInternalAuthEmail(existingProfile.member_number)
+  let nextAuthEmail = existingProfile.auth_email
   if (
-    nextMemberNumber !== null
-    && nextMemberNumber !== existingProfile.member_number
+    nextMemberNumberInput !== undefined
+    && nextMemberNumberInput !== existingProfile.member_number
     && existingProfile.auth_email === existingInternalAuthEmail
   ) {
-    updates.auth_email = createInternalAuthEmail(nextMemberNumber)
+    nextAuthEmail = createInternalAuthEmail(nextMemberNumberInput)
   }
 
-  const previousMemberNumber = existingProfile.member_number
-  const previousAuthEmail = existingProfile.auth_email
-  const { data, error } = await profiles
-    .update(updates)
-    .eq('id', id)
-    .select(PROFILE_COLUMNS)
-    .maybeSingle()
-
-  if (error) {
+  let updatedRows: PublicProfileRow[]
+  try {
+    updatedRows = await sql`
+      UPDATE profiles
+      SET member_number = ${nextMemberNumber},
+          full_name = ${nextFullName},
+          email = ${nextEmail},
+          phone = ${nextPhone},
+          role = ${nextRole},
+          is_active = ${nextIsActive},
+          auth_email = ${nextAuthEmail}
+      WHERE id = ${id}
+      RETURNING id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
+    ` as PublicProfileRow[]
+  } catch {
     serviceError('Internal server error', 500)
   }
+
+  const data = updatedRows[0]
   if (!data) {
     serviceError('User not found', 404)
   }
 
-  if (typeof updates.auth_email === 'string') {
-    const { error: authUpdateError } = await authAdmin.updateUserById(id, { email: updates.auth_email })
-
-    if (authUpdateError) {
-      await profiles
-        .update({
-          member_number: previousMemberNumber,
-          auth_email: previousAuthEmail,
-        })
-        .eq('id', id)
-      serviceError('Failed to keep auth credentials aligned', 500)
-    }
-  }
-
-  return toPublicUser(data as PublicProfileRow)
+  return toPublicUser(data)
 }
 
 export async function resetNoShows(id: string) {
-  const admin = createSupabaseServerAdminClient()
-  const profiles = admin.from('profiles') as unknown as AdminProfilesTableClient
-  const { data: existing, error: selectError } = await profiles
-    .select('id')
-    .eq('id', id)
-    .maybeSingle()
-  if (selectError) serviceError('Internal server error', 500)
-  if (!existing) serviceError('User not found', 404)
+  const rows = await sql`
+    UPDATE profiles
+    SET no_show_count = 0, blocked_until = NULL
+    WHERE id = ${id}
+    RETURNING id
+  ` as { id: string }[]
 
-  const { error } = await admin
-    .from('profiles')
-    .update({ no_show_count: 0, blocked_until: null })
-    .eq('id', id)
-  if (error) serviceError('Internal server error', 500)
+  if (!rows[0]) {
+    serviceError('User not found', 404)
+  }
 }
 
 export async function unblockUser(id: string) {
-  const admin = createSupabaseServerAdminClient()
-  const profiles = admin.from('profiles') as unknown as AdminProfilesTableClient
-  const { data: existing, error: selectError } = await profiles
-    .select('id')
-    .eq('id', id)
-    .maybeSingle()
-  if (selectError) serviceError('Internal server error', 500)
-  if (!existing) serviceError('User not found', 404)
+  const rows = await sql`
+    UPDATE profiles
+    SET blocked_until = NULL
+    WHERE id = ${id}
+    RETURNING id
+  ` as { id: string }[]
 
-  const { error } = await admin
-    .from('profiles')
-    .update({ blocked_until: null })
-    .eq('id', id)
-  if (error) serviceError('Internal server error', 500)
+  if (!rows[0]) {
+    serviceError('User not found', 404)
+  }
 }
 
 export async function deleteUser(id: string) {
-  const admin = createSupabaseServerAdminClient()
-  const profiles = admin.from('profiles') as unknown as AdminProfilesTableClient
-  const { data, error } = await profiles
-    .select('id')
-    .eq('id', id)
-    .maybeSingle()
+  // ON DELETE CASCADE on activation_tokens.profile_id (lib/db/schema/013_activation_tokens.sql)
+  // removes any pending activation/recovery token for this profile automatically.
+  const rows = await sql`
+    DELETE FROM profiles
+    WHERE id = ${id}
+    RETURNING id
+  ` as { id: string }[]
 
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-  if (!data) {
+  if (!rows[0]) {
     serviceError('User not found', 404)
-  }
-
-  const { error: deleteError } = await admin.auth.admin.deleteUser(id)
-  if (deleteError) {
-    serviceError('Internal server error', 500)
   }
 }
