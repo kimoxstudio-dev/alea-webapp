@@ -4,12 +4,19 @@ import { NextRequest, NextResponse } from 'next/server'
 
 const getCurrentUserMock = vi.fn()
 const resolveProfileForClerkUserMock = vi.fn()
+const getClerkSessionMock = vi.fn()
+const getClerkUserMock = vi.fn()
 const routeGetUserMock = vi.fn()
 const routeProfileMaybeSingleMock = vi.fn()
 
 vi.mock('@/lib/server/auth-service', () => ({
   getCurrentUser: getCurrentUserMock,
   resolveProfileForClerkUser: resolveProfileForClerkUserMock,
+}))
+
+vi.mock('@/lib/server/session', () => ({
+  getClerkSession: getClerkSessionMock,
+  getClerkUser: getClerkUserMock,
 }))
 
 vi.mock('@/lib/server/session', () => ({
@@ -55,6 +62,9 @@ describe('GET /api/auth/me', () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
+    // Default: authenticated session
+    getClerkSessionMock.mockResolvedValue({ sessionId: 'session-123', userId: 'clerk-user-2' })
+    getClerkUserMock.mockResolvedValue({ id: 'clerk-user-2', username: 'alea-100099' })
     getCurrentUserMock.mockResolvedValue({
       id: 'user-2',
       memberNumber: '100099',
@@ -98,7 +108,8 @@ describe('GET /api/auth/me', () => {
 
   it('returns 401 when there is no authenticated session', async () => {
     const { GET } = await import('@/app/api/auth/me/route')
-    routeGetUserMock.mockResolvedValueOnce({ data: { user: null }, error: null })
+    // No profile for Clerk user
+    resolveProfileForClerkUserMock.mockResolvedValueOnce(null)
 
     const response = await GET(createJsonRequest())
 
