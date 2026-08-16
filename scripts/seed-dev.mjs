@@ -46,10 +46,10 @@
  * either value. `CLERK_SECRET_KEY` must be a test-mode key (`sk_test_...`)
  * — the script refuses to run against a live key (`sk_live_...`).
  *
- * The admin fixture's initial password is read from `SEED_ADMIN_PASSWORD`
- * if set; otherwise it falls back to a clearly-labeled, dev-only default
- * (see ADMIN_PASSWORD below). Set `SEED_ADMIN_PASSWORD` for anything beyond
- * a disposable local run.
+ * The admin fixture's initial password MUST be provided via
+ * `SEED_ADMIN_PASSWORD` — there is no default and none is hardcoded in this
+ * file. The script refuses to run (exits non-zero) if it is unset or empty;
+ * see `assertAdminPasswordProvided` below.
  */
 import { readFileSync, existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
@@ -138,6 +138,21 @@ function assertClerkKeyIsDev(clerkSecretKey) {
   }
 }
 
+// Fails closed: the admin fixture's password must be supplied explicitly via
+// SEED_ADMIN_PASSWORD (e.g. sourced from .env.local). No default/fallback
+// value is used here — a hardcoded literal in source is a committed
+// credential regardless of how "dev-only" it's labeled, so this guard
+// refuses to run rather than silently reusing one.
+function assertAdminPasswordProvided(adminPassword) {
+  if (!adminPassword || adminPassword.trim() === '') {
+    console.error(
+      '[seed] Refusing to run: SEED_ADMIN_PASSWORD is not set. Choose a password and set it ' +
+        '(e.g. in .env.local) before running this script — no default value is provided.'
+    )
+    process.exit(1)
+  }
+}
+
 // --- Synthetic fixture data -------------------------------------------------
 // Deliberately out of any plausible real member-number range and tagged in
 // full_name/email so nothing here can be mistaken for a real club member.
@@ -146,11 +161,6 @@ const CLERK_USERNAME_PREFIX = 'alea-'
 
 const ADMIN_MEMBER_NUMBER = '900000'
 const ADMIN_FULL_NAME = '[SEED FIXTURE] Dev Admin (not a real member)'
-// Read from env so no real/reusable credential is hardcoded in source. The
-// fallback is a dev-only convenience default, not a real credential — it
-// only ever seeds a throwaway local/dev database (see assertDevSeedAllowed)
-// and should be overridden via SEED_ADMIN_PASSWORD for anything else.
-const ADMIN_PASSWORD = process.env.SEED_ADMIN_PASSWORD ?? 'DevSeedAdmin2026'
 
 const MEMBER_MEMBER_NUMBER = '900001'
 const MEMBER_FULL_NAME = '[SEED FIXTURE] Dev Member One (not a real member, pending activation)'
@@ -218,9 +228,10 @@ async function clerkFetch(path, options = {}) {
  * Creates the admin's real, working Clerk identity if one doesn't already
  * exist for `alea-<ADMIN_MEMBER_NUMBER>`. No email attribute, per the
  * locked identity model. Idempotent: never resets the password on an
- * existing identity.
+ * existing identity. `adminPassword` must already have been validated by
+ * `assertAdminPasswordProvided`.
  */
-async function ensureAdminClerkIdentity() {
+async function ensureAdminClerkIdentity(adminPassword) {
   const username = toClerkUsername(ADMIN_MEMBER_NUMBER)
 
   const listRes = await clerkFetch(`/users?username=${encodeURIComponent(username)}`)
@@ -237,7 +248,7 @@ async function ensureAdminClerkIdentity() {
     method: 'POST',
     body: JSON.stringify({
       username,
-      password: ADMIN_PASSWORD,
+      password: adminPassword,
       skip_password_checks: false,
     }),
   })
@@ -260,13 +271,14 @@ async function main() {
 
   assertDevSeedAllowed(databaseUrl)
   assertClerkKeyIsDev(process.env.CLERK_SECRET_KEY)
+  assertAdminPasswordProvided(process.env.SEED_ADMIN_PASSWORD)
 
   const sql = neon(databaseUrl)
 
   const admin = await upsertAdminProfile(sql)
   console.log(`[seed] admin profile ready — member_number=${admin.member_number}`)
 
-  await ensureAdminClerkIdentity()
+  await ensureAdminClerkIdentity(process.env.SEED_ADMIN_PASSWORD)
 
   const member = await upsertPendingMemberProfile(sql)
   console.log(
