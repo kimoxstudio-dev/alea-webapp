@@ -1,0 +1,41 @@
+-- Drops the leftover "profiles_id_fkey" FOREIGN KEY constraint
+-- ("profiles"."id" -> "auth"."users"("id") ON DELETE CASCADE) that still
+-- exists on the live Neon development database from the old Supabase
+-- baseline (declared in supabase/migrations/20260417000003_baseline.sql,
+-- line ~680: ADD CONSTRAINT "profiles_id_fkey" FOREIGN KEY ("id")
+-- REFERENCES "auth"."users"("id") ON DELETE CASCADE). Constraint name
+-- verified against that declaration, not assumed.
+--
+-- 003_profiles.sql's header comment already states this FK is
+-- "intentionally dropped" as part of the Supabase -> Neon + Clerk cutover
+-- (#296), and 003_profiles.sql's own CREATE TABLE statement never declares
+-- it. But that was only ever true of the declarative schema *file* — on a
+-- database where "profiles" already existed (i.e. the live Neon dev
+-- database, seeded before this constraint was known to still be present),
+-- the constraint was never actually dropped, because 003_profiles.sql only
+-- contains "CREATE TABLE IF NOT EXISTS", which no-ops entirely on a table
+-- that already exists. It does not run any ALTER on it. So the intended
+-- drop described in 003_profiles.sql's comment never reached the live
+-- database.
+--
+-- Root cause / gap in scripts/apply-neon-schema.mjs: this script's only
+-- unit of change detection is "does this table exist yet" (via
+-- CREATE TABLE IF NOT EXISTS and the preflight's expected-table check) —
+-- it has no mechanism to detect or apply an ALTER against a table that
+-- already exists. That means any future schema drift between
+-- lib/db/schema/*.sql and a live database that was seeded before the
+-- drift was introduced will be silently invisible to this script, exactly
+-- like this FK was. This migration file (a plain, idempotent ALTER,
+-- appended as the next file in file-sort order so it always runs after
+-- 003_profiles.sql's CREATE TABLE) is a point fix for this one constraint,
+-- not a fix for that gap. The gap itself still needs a follow-up fix to
+-- apply-neon-schema.mjs (e.g. detecting and applying pending ALTERs
+-- against already-existing tables, or some other drift-detection
+-- mechanism) — intentionally NOT implemented here; out of scope for this
+-- file, needs its own follow-up.
+--
+-- IF EXISTS makes this safe to run against a database that never had the
+-- constraint in the first place (e.g. a genuinely fresh database created
+-- straight from 001-017, which never adds this FK to begin with).
+
+ALTER TABLE "profiles" DROP CONSTRAINT IF EXISTS "profiles_id_fkey";
