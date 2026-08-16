@@ -48,6 +48,7 @@ let tokenIdCounter = 1
 // Test failure injection points
 let shouldFailProfileUpdate = false
 let shouldFailProfileUpdateWithZeroRows = false
+let shouldFailRestoreUpdate = false
 let injectTokenReplacementOnClerkCreate = null as { tokenToRemoveHash: string; tokenToInject: ActivationTokenRow } | null
 
 function createTestProfile(overrides?: Partial<ProfileRow>): ProfileRow {
@@ -170,6 +171,11 @@ function setupSqlMock() {
     // that are actually present in the query (not all conditions every time). This tests the
     // fix by allowing the mock to correctly apply id-only WHERE when the code is broken.
     if (query.includes('update activation_tokens') && query.includes('set used_at') && query.includes('where id')) {
+      // Test failure injection: make restore UPDATE throw
+      if (shouldFailRestoreUpdate) {
+        throw new Error('Database error during token restoration')
+      }
+
       // Determine which conditions are in the WHERE clause by examining the query string
       const hasTokenHashCondition = query.includes('token_hash');
       const hasUsedAtCondition = query.includes('and used_at');
@@ -280,6 +286,7 @@ describe('auth service (alea- username model)', () => {
     mockDatabaseTime = new Date('2024-01-15T12:00:00.000Z')
     shouldFailProfileUpdate = false
     shouldFailProfileUpdateWithZeroRows = false
+    shouldFailRestoreUpdate = false
     injectTokenReplacementOnClerkCreate = null
 
     // Setup default test data
@@ -1633,14 +1640,12 @@ describe('auth service (alea- username model)', () => {
   })
 
   describe('Codex review finding 4 — double-failure guard (safeRestoreClaimedToken)', () => {
-    it('swallows restoreClaimedToken failure and returns original error in activateAccount', async () => {
+    it('swallows restore failure and returns original error in activateAccount (BOTH failures injected)', async () => {
       // Finding 4: safeRestoreClaimedToken wraps restoreClaimedToken to catch its
-      // failures and log them, without propagating them. This prevents the compensation
-      // failure from overwriting the ORIGINAL error that triggered the compensation.
-      //
-      // Scenario: Clerk createUser succeeds, profiles UPDATE throws (original error),
-      // and the compensation (restoreClaimedToken) ALSO throws. The service returns
-      // the original error "Failed to activate account" (500), not the compensation error.
+      // failures. When BOTH fail (profile UPDATE + restore UPDATE), the guard ensures
+      // the intended "Failed to activate account" ServiceError is returned, not the
+      // compensation's thrown exception. This test injects both failures simultaneously
+      // and verifies the guard is working by the error that reaches the caller.
 
       const { activateAccount } = (await loadService()) as any
       const plainToken = createActivationToken()
@@ -1654,11 +1659,12 @@ describe('auth service (alea- username model)', () => {
       })
       tokensStore.set(tokenHash, token)
 
-      // Clerk createUser succeeds
-      clerkCreateUserMock.mockResolvedValueOnce({ id: 'clerk-user-double-fail' })
+      // Clerk createUser succeeds (so compensation is triggered)
+      clerkCreateUserMock.mockResolvedValueOnce({ id: 'clerk-user-guard-test' })
 
-      // Profiles UPDATE fails (original error)
+      // BOTH failures: profile UPDATE fails, AND restore UPDATE fails
       shouldFailProfileUpdate = true
+      shouldFailRestoreUpdate = true
 
       try {
         await activateAccount({
@@ -1667,14 +1673,20 @@ describe('auth service (alea- username model)', () => {
         })
         throw new Error('Should have thrown')
       } catch (e) {
-        // Should get a 500 error from the profile UPDATE failure
-        expect(e).toMatchObject({ statusCode: 500 })
+        // With guard working: get the INTENDED "Failed to activate account" error
+        // Without guard: would get the restore's "Database error during token restoration"
+        expect(e).toMatchObject({
+          message: expect.stringContaining('Failed'),
+          statusCode: 500,
+        })
+        // Verify it's the RIGHT error, not the compensation's
+        expect((e as any).message).toContain('activate')
       }
     })
 
-    it('swallows restoreClaimedToken failure and returns original error in recoverAccount', async () => {
-      // Same guard in recoverAccount: if token restore fails during recovery
-      // compensation, the original recovery error is returned, not the compensation error.
+    it('swallows restore failure and returns original error in recoverAccount (BOTH failures injected)', async () => {
+      // Same guard in recoverAccount: injecting both profile UPDATE failure
+      // and restore UPDATE failure, verify the original recovery error is returned.
 
       const { recoverAccount } = (await loadService()) as any
       const plainToken = createActivationToken()
@@ -1688,11 +1700,12 @@ describe('auth service (alea- username model)', () => {
       })
       tokensStore.set(tokenHash, token)
 
-      // Clerk updateUser succeeds
-      clerkUpdateUserMock.mockResolvedValueOnce({ id: 'clerk-user-recover' })
+      // Clerk updateUser succeeds (so compensation is triggered)
+      clerkUpdateUserMock.mockResolvedValueOnce({ id: 'clerk-user-recover-guard' })
 
-      // Profiles UPDATE fails (original error)
+      // BOTH failures
       shouldFailProfileUpdate = true
+      shouldFailRestoreUpdate = true
 
       try {
         await recoverAccount({
@@ -1701,8 +1714,14 @@ describe('auth service (alea- username model)', () => {
         })
         throw new Error('Should have thrown')
       } catch (e) {
-        // Should get a 500 error from the profile UPDATE failure
-        expect(e).toMatchObject({ statusCode: 500 })
+        // With guard: get the intended "Failed to recover account" error
+        // Without guard: would get the restore's "Database error..."
+        expect(e).toMatchObject({
+          message: expect.stringContaining('Failed'),
+          statusCode: 500,
+        })
+        // Verify it's the RIGHT error
+        expect((e as any).message).toContain('recover')
       }
     })
 
@@ -1725,9 +1744,10 @@ describe('auth service (alea- username model)', () => {
       })
       tokensStore.set(tokenHash, token)
 
-      // Clerk succeeds, profiles UPDATE fails (to trigger compensation)
+      // Clerk succeeds, both UPDATE operations fail (to trigger compensation)
       clerkCreateUserMock.mockResolvedValueOnce({ id: 'clerk-logging-test' })
       shouldFailProfileUpdate = true
+      shouldFailRestoreUpdate = true
 
       try {
         await activateAccount({
