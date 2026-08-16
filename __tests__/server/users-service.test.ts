@@ -8,38 +8,6 @@ const clerkUpdateUserMock = vi.fn()
 // In-memory store for test data
 const profilesStore = new Map<string, any>()
 
-const testProfiles = {
-  admin: {
-    id: 'admin-1',
-    member_number: '100001',
-    full_name: 'Admin User',
-    auth_email: '100001@members.alea.internal',
-    email: 'admin@alea.club',
-    phone: '600000001',
-    role: 'admin' as const,
-    is_active: true,
-    active_from: '2024-01-01T00:00:00.000Z',
-    no_show_count: 0,
-    blocked_until: null,
-    created_at: '2024-01-01T00:00:00.000Z',
-    updated_at: '2024-01-01T00:00:00.000Z',
-  },
-  member: {
-    id: 'member-1',
-    member_number: '100002',
-    full_name: 'Member User',
-    auth_email: '100002@members.alea.internal',
-    email: 'member@alea.club',
-    phone: '600000002',
-    role: 'member' as const,
-    is_active: true,
-    active_from: '2024-01-02T00:00:00.000Z',
-    no_show_count: 0,
-    blocked_until: null,
-    created_at: '2024-01-02T00:00:00.000Z',
-    updated_at: '2024-01-02T00:00:00.000Z',
-  },
-}
 
 vi.mock('@/lib/db/client', () => ({
   sql: sqlQueryMock,
@@ -71,10 +39,13 @@ function setupSqlMock() {
     }
 
     // SELECT by id (WHERE id = $1)
-    if (query.includes('where id =') && !query.includes('ilike')) {
-      const id = values[0]
-      const profile = profilesStore.get(id as string)
-      return Promise.resolve(profile ? [profile] : [])
+    if (query.includes('where id =') && !query.includes('ilike') && !query.includes('update')) {
+      const id = values[0] as string
+      const profile = profilesStore.get(id)
+      if (profile) {
+        return Promise.resolve([profile])
+      }
+      return Promise.resolve([])
     }
 
     // SELECT by member_number (WHERE member_number =)
@@ -88,71 +59,8 @@ function setupSqlMock() {
       return Promise.resolve([])
     }
 
-    // SELECT COUNT with search filter (ILIKE) - must come before generic COUNT
-    if (query.includes('count') && query.includes('ilike')) {
-      const pattern = values[0] as string
-      const profiles = Array.from(profilesStore.values()).filter((p) => {
-        return (
-          matchesPattern(p.member_number, pattern) ||
-          matchesPattern(p.full_name, pattern) ||
-          matchesPattern(p.email, pattern)
-        )
-      })
-      return Promise.resolve([{ count: profiles.length }])
-    }
-
-    // SELECT with ILIKE search filter
-    if (query.includes('ilike') && query.includes('order by')) {
-      const pattern = values[0] as string
-      let filtered = Array.from(profilesStore.values()).filter((p) => {
-        return (
-          matchesPattern(p.member_number, pattern) ||
-          matchesPattern(p.full_name, pattern) ||
-          matchesPattern(p.email, pattern)
-        )
-      })
-      // Apply ordering
-      filtered = filtered.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
-      return Promise.resolve(filtered)
-    }
-
-    // SELECT COUNT (no search) - generic COUNT query
-    if (query.includes('count') && !query.includes('ilike')) {
-      return Promise.resolve([{ count: profilesStore.size }])
-    }
-
-    // SELECT with ORDER/LIMIT/OFFSET (no search)
-    if (query.includes('order by') && !query.includes('ilike')) {
-      const profiles = Array.from(profilesStore.values()).sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
-      return Promise.resolve(profiles)
-    }
-
-    // UPDATE no_show_count/blocked_until
-    if (query.includes('update profiles') && query.includes('no_show_count')) {
-      const id = values.find((v) => typeof v === 'string' && v.startsWith('admin-')) || values.find((v) => typeof v === 'string' && v.startsWith('member-'))
-      const profile = profilesStore.get(id as string)
-      if (profile) {
-        const updated = { ...profile, no_show_count: 0, blocked_until: null }
-        profilesStore.set(id as string, updated)
-        return Promise.resolve([{ id }])
-      }
-      return Promise.resolve([])
-    }
-
-    // UPDATE blocked_until
-    if (query.includes('update profiles') && query.includes('blocked_until')) {
-      const id = values[values.length - 1]
-      const profile = profilesStore.get(id as string)
-      if (profile) {
-        const updated = { ...profile, blocked_until: null }
-        profilesStore.set(id as string, updated)
-        return Promise.resolve([{ id }])
-      }
-      return Promise.resolve([])
-    }
-
-    // UPDATE profiles with specific fields (member_number, full_name, email, phone, role, is_active, auth_email)
-    if (query.includes('update profiles') && query.includes('where id') && query.includes('member_number')) {
+    // UPDATE profiles with all 7 fields (member_number, full_name, email, phone, role, is_active, auth_email)
+    if (query.includes('update profiles') && query.includes('set member_number')) {
       // Format: SET member_number = $1, full_name = $2, email = $3, phone = $4, role = $5, is_active = $6, auth_email = $7 WHERE id = $8
       const memberNumber = values[0] as string
       const fullName = values[1] as string
@@ -187,15 +95,13 @@ function setupSqlMock() {
       return Promise.resolve([{ id }])
     }
 
-    // UPDATE other fields (fallback for any other UPDATE) - match on WHERE id
-    if (query.includes('update profiles') && query.includes('where id')) {
-      // Find the id (usually the last value)
-      const id = values[values.length - 1] as string
-      const profile = profilesStore.get(id)
+    // UPDATE no_show_count/blocked_until
+    if (query.includes('update profiles') && query.includes('no_show_count')) {
+      const id = values.find((v) => typeof v === 'string' && v.startsWith('admin-')) || values.find((v) => typeof v === 'string' && v.startsWith('member-'))
+      const profile = profilesStore.get(id as string)
       if (profile) {
-        // Extract updated fields from values (handle different structures)
-        const updated = { ...profile, updated_at: new Date().toISOString() }
-        profilesStore.set(id, updated)
+        const updated = { ...profile, no_show_count: 0, blocked_until: null }
+        profilesStore.set(id as string, updated)
         if (query.includes('returning')) {
           return Promise.resolve([updated])
         }
@@ -204,10 +110,89 @@ function setupSqlMock() {
       return Promise.resolve([])
     }
 
+    // UPDATE blocked_until
+    if (query.includes('update profiles') && query.includes('blocked_until')) {
+      const id = values[values.length - 1]
+      const profile = profilesStore.get(id as string)
+      if (profile) {
+        const updated = { ...profile, blocked_until: null }
+        profilesStore.set(id as string, updated)
+        if (query.includes('returning')) {
+          return Promise.resolve([updated])
+        }
+        return Promise.resolve([{ id }])
+      }
+      return Promise.resolve([])
+    }
+
+    // SELECT COUNT with search filter (ILIKE) - must come before generic COUNT
+    if (query.includes('count') && query.includes('ilike')) {
+      const pattern = values[0] as string
+      const profiles = Array.from(profilesStore.values()).filter((p) => {
+        return (
+          matchesPattern(p.member_number, pattern) ||
+          matchesPattern(p.full_name, pattern) ||
+          matchesPattern(p.email, pattern)
+        )
+      })
+      return Promise.resolve([{ count: profiles.length }])
+    }
+
+    // SELECT with ILIKE search filter - extract limit and offset from values carefully
+    if (query.includes('ilike') && query.includes('order by') && query.includes('limit')) {
+      const pattern = values[0] as string
+      let filtered = Array.from(profilesStore.values()).filter((p) => {
+        return (
+          matchesPattern(p.member_number, pattern) ||
+          matchesPattern(p.full_name, pattern) ||
+          matchesPattern(p.email, pattern)
+        )
+      })
+
+      // Apply ordering by created_at
+      filtered = filtered.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+
+      // Extract LIMIT and OFFSET from values
+      // For query with 3 ilike patterns, values is: [pattern, pattern, pattern, limit, offset]
+      // But we only have one pattern value in values[0], so we need to count numeric values
+      const numericValues = values.filter((v) => typeof v === 'number')
+      const limit = numericValues[0] as number
+      const offset = numericValues[1] as number
+
+      if (limit !== undefined && offset !== undefined) {
+        filtered = filtered.slice(offset, offset + limit)
+      }
+
+      return Promise.resolve(filtered)
+    }
+
+    // SELECT COUNT (no search) - generic COUNT query
+    if (query.includes('count') && !query.includes('ilike')) {
+      return Promise.resolve([{ count: profilesStore.size }])
+    }
+
+    // SELECT with ORDER/LIMIT/OFFSET (no search)
+    if (query.includes('order by') && !query.includes('ilike')) {
+      let profiles = Array.from(profilesStore.values()).sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+
+      // Extract numeric values for LIMIT and OFFSET
+      const numericValues = values.filter((v) => typeof v === 'number')
+      if (numericValues.length >= 2) {
+        const limit = numericValues[0] as number
+        const offset = numericValues[1] as number
+        profiles = profiles.slice(offset, offset + limit)
+      }
+
+      return Promise.resolve(profiles)
+    }
+
     // DELETE
     if (query.includes('delete from profiles')) {
       const id = values[0]
       profilesStore.delete(id as string)
+      if (query.includes('returning')) {
+        return Promise.resolve([{ id }])
+      }
       return Promise.resolve([{ id }])
     }
 
@@ -243,8 +228,38 @@ describe('users-service (raw SQL with Neon)', () => {
     profilesStore.clear()
 
     // Load test data
-    profilesStore.set(testProfiles.admin.id, testProfiles.admin)
-    profilesStore.set(testProfiles.member.id, testProfiles.member)
+    const adminProfile = {
+      id: 'admin-1',
+      member_number: '100001',
+      full_name: 'Admin User',
+      auth_email: '100001@members.alea.internal',
+      email: 'admin@alea.club',
+      phone: '600000001',
+      role: 'admin' as const,
+      is_active: true,
+      active_from: '2024-01-01T00:00:00.000Z',
+      no_show_count: 0,
+      blocked_until: null,
+      created_at: '2024-01-01T00:00:00.000Z',
+      updated_at: '2024-01-01T00:00:00.000Z',
+    }
+    const memberProfile = {
+      id: 'member-1',
+      member_number: '100002',
+      full_name: 'Member User',
+      auth_email: '100002@members.alea.internal',
+      email: 'member@alea.club',
+      phone: '600000002',
+      role: 'member' as const,
+      is_active: true,
+      active_from: '2024-01-02T00:00:00.000Z',
+      no_show_count: 0,
+      blocked_until: null,
+      created_at: '2024-01-02T00:00:00.000Z',
+      updated_at: '2024-01-02T00:00:00.000Z',
+    }
+    profilesStore.set(adminProfile.id, adminProfile)
+    profilesStore.set(memberProfile.id, memberProfile)
 
     setupSqlMock()
 
