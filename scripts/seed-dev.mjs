@@ -43,7 +43,13 @@
  *
  * Requires `DATABASE_URL` and `CLERK_SECRET_KEY` in the environment (e.g.
  * sourced from `.env.local`). Never logs, prints, or otherwise surfaces
- * either value.
+ * either value. `CLERK_SECRET_KEY` must be a test-mode key (`sk_test_...`)
+ * — the script refuses to run against a live key (`sk_live_...`).
+ *
+ * The admin fixture's initial password is read from `SEED_ADMIN_PASSWORD`
+ * if set; otherwise it falls back to a clearly-labeled, dev-only default
+ * (see ADMIN_PASSWORD below). Set `SEED_ADMIN_PASSWORD` for anything beyond
+ * a disposable local run.
  */
 import { readFileSync, existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
@@ -115,6 +121,23 @@ function assertDevSeedAllowed(databaseUrl) {
   }
 }
 
+// Heuristic-only defense in depth, mirroring the DATABASE_URL "prod" check
+// above: Clerk secret keys are prefixed by mode (`sk_live_...` vs
+// `sk_test_...`), so refusing on a live-key prefix catches the common
+// mistake of `.env.local` accidentally pointing at the production Clerk
+// instance. Only runs the check when the key is actually set — a missing
+// key is already handled separately in clerkFetch().
+function assertClerkKeyIsDev(clerkSecretKey) {
+  if (clerkSecretKey && /^sk_live_/i.test(clerkSecretKey)) {
+    console.error(
+      '[seed] Refusing to run: CLERK_SECRET_KEY looks like a live/production Clerk key ' +
+        '(starts with "sk_live_"). This script must only run against a test-mode Clerk ' +
+        'instance (key prefix "sk_test_"). Check .env.local.'
+    )
+    process.exit(1)
+  }
+}
+
 // --- Synthetic fixture data -------------------------------------------------
 // Deliberately out of any plausible real member-number range and tagged in
 // full_name/email so nothing here can be mistaken for a real club member.
@@ -123,7 +146,11 @@ const CLERK_USERNAME_PREFIX = 'alea-'
 
 const ADMIN_MEMBER_NUMBER = '900000'
 const ADMIN_FULL_NAME = '[SEED FIXTURE] Dev Admin (not a real member)'
-const ADMIN_PASSWORD = 'DevSeedAdmin2026'
+// Read from env so no real/reusable credential is hardcoded in source. The
+// fallback is a dev-only convenience default, not a real credential — it
+// only ever seeds a throwaway local/dev database (see assertDevSeedAllowed)
+// and should be overridden via SEED_ADMIN_PASSWORD for anything else.
+const ADMIN_PASSWORD = process.env.SEED_ADMIN_PASSWORD ?? 'DevSeedAdmin2026'
 
 const MEMBER_MEMBER_NUMBER = '900001'
 const MEMBER_FULL_NAME = '[SEED FIXTURE] Dev Member One (not a real member, pending activation)'
@@ -232,6 +259,7 @@ async function main() {
   }
 
   assertDevSeedAllowed(databaseUrl)
+  assertClerkKeyIsDev(process.env.CLERK_SECRET_KEY)
 
   const sql = neon(databaseUrl)
 
