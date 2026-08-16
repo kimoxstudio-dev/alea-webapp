@@ -81,14 +81,26 @@ function isActivationExpired(expiresAt: string, currentTime: Date) {
  * then failed (#299 Codex review finding 1). Without this, a Clerk outage or
  * a rejected password after the claim permanently burns an otherwise-valid,
  * unexpired, admin-issued link even though the member was never actually
- * activated/recovered. Matched by id (not by hash/used_at) since the caller
- * already holds the exact row it just claimed.
+ * activated/recovered.
+ *
+ * Scoped by `id` AND `token_hash` AND `used_at` together (#299 Codex review
+ * finding 5 — matching by `id` alone was wrong): link generation upserts one
+ * row per profile (`ON CONFLICT (profile_id) DO UPDATE ...`), so the same
+ * row id can be reissued with a brand-new hash after the caller claimed it.
+ * Under interleaving, an id-only restore can clear `used_at` on a row that
+ * has since been replaced and legitimately consumed by someone else,
+ * un-consuming a spent single-use credential that isn't the caller's. Matching
+ * all three means the UPDATE only ever matches the exact claim the caller
+ * made; if the row has since been replaced or reused, it matches zero rows
+ * and nothing gets incorrectly restored.
  */
-async function restoreClaimedToken(tokenId: string) {
+async function restoreClaimedToken(claim: { id: string; tokenHash: string; usedAt: string }) {
   await sql`
     UPDATE activation_tokens
     SET used_at = NULL
-    WHERE id = ${tokenId}
+    WHERE id = ${claim.id}
+      AND token_hash = ${claim.tokenHash}
+      AND used_at = ${claim.usedAt}
   `
 }
 
@@ -378,7 +390,7 @@ export async function activateAccount(input: { token: unknown; password: unknown
     // Clerk failure after the claim above (#299 Codex review finding 1): the
     // member was never actually activated, so the token must not stay
     // burned — restore it so the same admin-issued link can be retried.
-    await restoreClaimedToken(claimedToken.id)
+    await restoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: activatedAt })
     serviceError('Failed to create account credentials', 500)
   }
 
@@ -473,11 +485,11 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
     const { data } = await client.users.getUserList({ username: [toClerkUsername(profile.member_number)] })
     clerkUser = data[0]
   } catch {
-    await restoreClaimedToken(claimedToken.id)
+    await restoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: recoveredAt })
     serviceError('Internal server error', 500)
   }
   if (!clerkUser) {
-    await restoreClaimedToken(claimedToken.id)
+    await restoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: recoveredAt })
     serviceError('Internal server error', 500)
   }
 
@@ -487,7 +499,7 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
       signOutOfOtherSessions: true,
     })
   } catch {
-    await restoreClaimedToken(claimedToken.id)
+    await restoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: recoveredAt })
     serviceError('Failed to update account credentials', 500)
   }
 
