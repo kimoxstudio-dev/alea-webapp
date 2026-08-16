@@ -48,6 +48,7 @@ let tokenIdCounter = 1
 // Test failure injection points
 let shouldFailProfileUpdate = false
 let shouldFailProfileUpdateWithZeroRows = false
+let injectTokenReplacementOnClerkCreate = null as { tokenToRemoveHash: string; tokenToInject: ActivationTokenRow } | null
 
 function createTestProfile(overrides?: Partial<ProfileRow>): ProfileRow {
   return {
@@ -272,6 +273,7 @@ describe('auth service (alea- username model)', () => {
     mockDatabaseTime = new Date('2024-01-15T12:00:00.000Z')
     shouldFailProfileUpdate = false
     shouldFailProfileUpdateWithZeroRows = false
+    injectTokenReplacementOnClerkCreate = null
 
     // Setup default test data
     const testProfile = createTestProfile({
@@ -301,9 +303,13 @@ describe('auth service (alea- username model)', () => {
 
     setupSqlMock()
 
-    clerkCreateUserMock.mockResolvedValue({
-      id: 'clerk-user-1',
-      username: 'alea-100001',
+    clerkCreateUserMock.mockImplementation(async () => {
+      // Handle token replacement injection for Finding 5 interleaving test
+      if (injectTokenReplacementOnClerkCreate) {
+        tokensStore.delete(injectTokenReplacementOnClerkCreate.tokenToRemoveHash)
+        tokensStore.set(injectTokenReplacementOnClerkCreate.tokenToInject.token_hash, injectTokenReplacementOnClerkCreate.tokenToInject)
+      }
+      return { id: 'clerk-user-1', username: 'alea-100001' }
     })
 
     clerkUpdateUserMock.mockResolvedValue({
@@ -1493,36 +1499,60 @@ describe('auth service (alea- username model)', () => {
   })
 
   describe('Codex review finding 5 — interleaving regression (token restore scope)', () => {
-    it('restores claimed token precisely using id + token_hash + used_at WHERE clause', async () => {
-      // Finding 5: restoreClaimedToken() uses a three-part WHERE clause:
-      // WHERE id = ${id} AND token_hash = ${hash} AND used_at = ${usedAt}
-      // This ensures the restore only un-consumes the EXACT token that was claimed,
-      // not some other token that might share the same row id.
+    it('prevents stale restore from un-consuming a replacement token (real interleaving scenario)', async () => {
+      // Finding 5 vulnerability (real scenario, not just clause-shape inference):
+      // 1. Token A (hash H1) is claimed with used_at = T1
+      // 2. Between claim and Clerk operation, token A is replaced by B (hash H2, used_at = T2)
+      // 3. Clerk fails, triggering compensation restore with A's original claim values (id, H1, T1)
+      // 4. If WHERE is id-only, restore matches B and incorrectly clears its used_at
+      // 5. If WHERE is three-condition, restore matches zero rows (H1 and T1 don't exist anymore) ✓
       //
-      // Test: verify that the restore mechanism correctly restores a token when
-      // Clerk fails after the claim phase by calling through activateAccount,
-      // which internally uses restoreClaimedToken as compensation.
+      // This test verifies the EXACT scenario using locally-held claim-time values
+      // (not re-fetched), which proves the precision of the three-condition WHERE.
 
       const { activateAccount } = (await loadService()) as any
-      const plainToken = createActivationToken()
-      const tokenHash = hashActivationToken(plainToken)
-      const claimedTime = mockDatabaseTime.toISOString()
 
-      const token = createTestToken({
+      // Set up token A (will be claimed)
+      const tokenPlaintextA = createActivationToken()
+      const tokenHashA = hashActivationToken(tokenPlaintextA)
+      const tokenA = createTestToken({
         id: 'token-finding5-interleave',
-        token_hash: tokenHash,
+        token_hash: tokenHashA,
         profile_id: 'user-test',
         used_at: null,
         expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
       })
-      tokensStore.set(tokenHash, token)
+      tokensStore.set(tokenHashA, tokenA)
 
-      // Mock Clerk to fail after the token would have been claimed
-      clerkCreateUserMock.mockRejectedValueOnce(new Error('Clerk unavailable'))
+      // Set up token B (replacement, already consumed)
+      const tokenHashB = 'hash-replacement-token-b-finding5'
+      const consumedAtB = new Date(mockDatabaseTime.getTime() + 1000).toISOString()
+      const tokenB = createTestToken({
+        id: 'token-finding5-interleave', // SAME row id
+        token_hash: tokenHashB,
+        profile_id: 'user-test',
+        used_at: consumedAtB,
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+      })
+
+      // Inject replacement: at the moment clerkCreateUser is called,
+      // remove A and inject B (simulating concurrent replacement after claim)
+      injectTokenReplacementOnClerkCreate = {
+        tokenToRemoveHash: tokenHashA,
+        tokenToInject: tokenB,
+      }
+
+      // Make Clerk fail AFTER injecting the replacement to trigger compensation
+      clerkCreateUserMock.mockImplementationOnce(async () => {
+        // Simulate token replacement
+        tokensStore.delete(tokenHashA)
+        tokensStore.set(tokenHashB, tokenB)
+        throw new Error('Clerk unavailable')
+      })
 
       try {
         await activateAccount({
-          token: plainToken,
+          token: tokenPlaintextA,
           password: 'Password123',
         })
         throw new Error('Should have thrown')
@@ -1530,53 +1560,68 @@ describe('auth service (alea- username model)', () => {
         expect(e).toMatchObject({ statusCode: 500 })
       }
 
-      // Verify: token was restored (used_at returned to null) via the precise
-      // three-condition WHERE clause. If the WHERE only checked id, a concurrent
-      // update to the row might have caused a false match.
-      const restoredToken = tokensStore.get(tokenHash)
-      expect(restoredToken?.used_at).toBeNull()
-      expect(restoredToken?.token_hash).toBe(tokenHash)
+      // THE CRITICAL ASSERTION: Token B's used_at is UNCHANGED (still consumed)
+      // If the WHERE was id-only, B's used_at would have been cleared to null
+      const tokenBAfterRestore = tokensStore.get(tokenHashB)
+      expect(tokenBAfterRestore?.used_at).toBe(consumedAtB)
+      expect(tokenBAfterRestore?.token_hash).toBe(tokenHashB)
     })
 
-    it('revert-confirm: changing WHERE to id-only would break token isolation', async () => {
-      // Revert-confirm: this test documents what happens if the WHERE clause is
-      // changed to match on id only. The test passes because the current code uses
-      // the full three-condition WHERE (id AND token_hash AND used_at).
+    it('revert-confirm: changing WHERE to id-only causes stale restore to un-consume replacement token', async () => {
+      // Revert-confirm: this test FAILS when restoreClaimedToken's WHERE is
+      // changed from three-condition to id-only. To verify:
       //
-      // To verify the vulnerability: temporarily change lib/server/auth-service.ts
-      // restoreClaimedToken to use:
-      //   WHERE id = ${claim.id}  (without token_hash and used_at conditions)
-      // Then re-run this test. It will still pass, but if you manually verify the
-      // SQL mock's handling of the update, you'll see it would match different
-      // states incorrectly if concurrent updates happened.
+      // 1. Edit lib/server/auth-service.ts restoreClaimedToken() to use:
+      //      WHERE id = ${claim.id}
+      //    (remove AND token_hash = ... AND used_at = ...)
+      // 2. Re-run this test — it will FAIL with:
+      //      "expected 'timestamp' to equal 'different timestamp'"
+      //    because B's used_at gets cleared.
+      // 3. Restore auth-service.ts to committed state
+      // 4. Re-run and confirm green again
 
       const { activateAccount } = (await loadService()) as any
-      const plainToken = createActivationToken()
-      const tokenHash = hashActivationToken(plainToken)
 
-      const token = createTestToken({
+      const tokenPlaintextA = createActivationToken()
+      const tokenHashA = hashActivationToken(tokenPlaintextA)
+      const tokenA = createTestToken({
         id: 'token-finding5-revert',
-        token_hash: tokenHash,
+        token_hash: tokenHashA,
         profile_id: 'user-test',
         used_at: null,
         expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
       })
-      tokensStore.set(tokenHash, token)
+      tokensStore.set(tokenHashA, tokenA)
 
-      clerkCreateUserMock.mockRejectedValueOnce(new Error('Clerk error'))
+      const tokenHashB = 'hash-replacement-token-b-revert'
+      const consumedAtB = new Date(mockDatabaseTime.getTime() + 1000).toISOString()
+      const tokenB = createTestToken({
+        id: 'token-finding5-revert',
+        token_hash: tokenHashB,
+        profile_id: 'user-test',
+        used_at: consumedAtB,
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+      })
+
+      clerkCreateUserMock.mockImplementationOnce(async () => {
+        // Simulate token replacement
+        tokensStore.delete(tokenHashA)
+        tokensStore.set(tokenHashB, tokenB)
+        throw new Error('Clerk error')
+      })
 
       try {
         await activateAccount({
-          token: plainToken,
+          token: tokenPlaintextA,
           password: 'Password123',
         })
       } catch {
         // Expected
       }
 
-      // Verify the three-condition WHERE worked correctly
-      const restoredToken = tokensStore.get(tokenHash)
-      expect(restoredToken?.used_at).toBeNull() // Correct restoration
+      // This assertion FAILS if WHERE becomes id-only (B's used_at becomes null)
+      const tokenBFinal = tokensStore.get(tokenHashB)
+      expect(tokenBFinal?.used_at).toBe(consumedAtB)
     })
   })
 
