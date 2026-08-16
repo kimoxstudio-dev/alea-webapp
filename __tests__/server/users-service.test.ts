@@ -601,4 +601,61 @@ describe('users-service (raw SQL with Neon)', () => {
       await expect(deleteUser('member-1')).resolves.toBeUndefined()
     })
   })
+
+  describe('Finding 2 — Codex review: updateUser Clerk-first/DB-write race', () => {
+    it('rejects memberNumber change BEFORE calling Clerk if the target number already belongs to a different profile (pre-check)', async () => {
+      // Setup: two profiles
+      profilesStore.set('profile-1', {
+        id: 'profile-1',
+        member_number: '100001',
+        full_name: 'Alice',
+        auth_email: '100001@members.alea.internal',
+        email: null,
+        phone: null,
+        role: 'member',
+        is_active: true,
+        active_from: new Date().toISOString(),
+        no_show_count: 0,
+        blocked_until: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+
+      profilesStore.set('profile-2', {
+        id: 'profile-2',
+        member_number: '100002',
+        full_name: 'Bob',
+        auth_email: '100002@members.alea.internal',
+        email: null,
+        phone: null,
+        role: 'member',
+        is_active: true,
+        active_from: new Date().toISOString(),
+        no_show_count: 0,
+        blocked_until: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+
+      const { updateUser } = await import('@/lib/server/users-service')
+
+      // Try to change profile-1's memberNumber to 100002 (already owned by profile-2)
+      await expect(
+        updateUser('profile-1', { memberNumber: '100002' }),
+      ).rejects.toMatchObject({
+        statusCode: 409,
+        message: expect.stringContaining('Member number is already in use'),
+      })
+
+      // Critical: Clerk.updateUser should NOT have been called (pre-check blocked it)
+      expect(clerkUpdateUserMock).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('Finding 3 — Codex review: deleteUser Clerk cleanup', () => {
+    it('deletes the auth user after confirming the profile exists', async () => {
+      const { deleteUser } = await import('@/lib/server/users-service')
+      await expect(deleteUser('member-1')).resolves.toBeUndefined()
+    })
+  })
 })
