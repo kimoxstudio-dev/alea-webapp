@@ -167,7 +167,7 @@ function setupSqlMock() {
     }
 
     // SELECT with ILIKE search filter - extract limit and offset from values carefully
-    if (query.includes('ilike') && query.includes('order by') && query.includes('limit')) {
+    if (query.includes('select') && query.includes('ilike') && query.includes('order by') && query.includes('limit')) {
       const pattern = values[0] as string
       let filtered = Array.from(profilesStore.values()).filter((p) => {
         return (
