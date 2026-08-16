@@ -160,8 +160,25 @@ function setupSqlMock() {
       return Promise.resolve([token])
     }
 
+    // UPDATE activation_tokens SET used_at = NULL WHERE id = ? (restoreClaimedToken —
+    // #299 Codex review finding 1 compensation). Must be checked BEFORE the
+    // token_hash-keyed claim handler below: both queries contain
+    // "update activation_tokens" and "set used_at", but this one is keyed by
+    // `id` with a single bound value, not by `token_hash` with three.
+    if (query.includes('update activation_tokens') && query.includes('set used_at') && query.includes('where id')) {
+      const tokenId = values[0]
+      for (const [hash, token] of tokensStore.entries()) {
+        if (token.id === tokenId) {
+          const updated = { ...token, used_at: null, updated_at: mockDatabaseTime.toISOString() }
+          tokensStore.set(hash, updated)
+          return Promise.resolve([updated])
+        }
+      }
+      return Promise.resolve([])
+    }
+
     // UPDATE activation_tokens SET used_at = ? WHERE token_hash = ? ...
-    if (query.includes('update activation_tokens') && query.includes('set used_at')) {
+    if (query.includes('update activation_tokens') && query.includes('set used_at') && query.includes('where token_hash')) {
       const usedAt = values[0]
       const tokenHash = values[1]
       const token = tokensStore.get(tokenHash as string)
@@ -764,7 +781,7 @@ describe('auth service (alea- username model)', () => {
 
       clerkCreateUserMock.mockRejectedValueOnce(new Error('Clerk API error'))
 
-      // The token has been claimed (marked used), but Clerk creation failed
+      // The token was claimed (marked used), then Clerk creation failed
       await expect(
         activateAccount({
           token: plainToken,
@@ -775,9 +792,62 @@ describe('auth service (alea- username model)', () => {
         statusCode: 500,
       })
 
-      // Token should remain marked as used (this is the trade-off)
+      // Token must be restored (used_at cleared) on Clerk failure — #299
+      // Codex review finding 1 compensation. The member was never actually
+      // activated, so the admin-issued link must remain usable for retry.
       const updatedToken = tokensStore.get(tokenHash)
-      expect(updatedToken?.used_at).not.toBeNull()
+      expect(updatedToken?.used_at).toBeNull()
+    })
+
+    it('restores the claimed token when Clerk createUser fails, and the same link succeeds on retry (#299 Codex review finding 1)', async () => {
+      const { activateAccount } = (await loadService()) as any
+      const plainToken = createActivationToken()
+      const tokenHash = hashActivationToken(plainToken)
+
+      const token = createTestToken({
+        token_hash: tokenHash,
+        profile_id: 'user-test',
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+        used_at: null,
+      })
+      tokensStore.set(tokenHash, token)
+
+      clerkCreateUserMock.mockRejectedValueOnce(new Error('Clerk API error'))
+
+      await expect(
+        activateAccount({
+          token: plainToken,
+          password: 'Password123',
+        }),
+      ).rejects.toMatchObject({
+        message: 'Failed to create account credentials',
+        statusCode: 500,
+      })
+
+      // The token must be restored (used_at cleared) so the admin-issued
+      // link is still usable — the member was never actually activated.
+      const restoredToken = tokensStore.get(tokenHash)
+      expect(restoredToken?.used_at).toBeNull()
+
+      // Profile must remain inactive — activation never completed.
+      expect(profilesStore.get('user-test')?.is_active).toBe(false)
+
+      // Retry with the SAME token now succeeds (Clerk mock defaults back to
+      // success since we used mockRejectedValueOnce above).
+      const retryResult = await activateAccount({
+        token: plainToken,
+        password: 'Password123',
+      })
+
+      expect(retryResult.user).toMatchObject({
+        id: 'user-test',
+        memberNumber: '100001',
+        isActive: true,
+      })
+      expect(clerkCreateUserMock).toHaveBeenCalledTimes(2)
+
+      const finalToken = tokensStore.get(tokenHash)
+      expect(finalToken?.used_at).not.toBeNull()
     })
   })
 
@@ -942,9 +1012,61 @@ describe('auth service (alea- username model)', () => {
         statusCode: 500,
       })
 
-      // Token should remain marked as used
+      // Token must be restored (used_at cleared) on Clerk failure — #299
+      // Codex review finding 1 compensation. The member's password was
+      // never actually changed, so the admin-issued link must remain
+      // usable for retry.
       const updatedToken = tokensStore.get(tokenHash)
-      expect(updatedToken?.used_at).not.toBeNull()
+      expect(updatedToken?.used_at).toBeNull()
+    })
+
+    it('restores the claimed token when Clerk updateUser fails, and the same link succeeds on retry (#299 Codex review finding 1)', async () => {
+      const { recoverAccount } = (await loadService()) as any
+      const plainToken = createActivationToken()
+      const tokenHash = hashActivationToken(plainToken)
+
+      const token = createTestToken({
+        token_hash: tokenHash,
+        profile_id: 'user-active',
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+        used_at: null,
+      })
+      tokensStore.set(tokenHash, token)
+
+      clerkUpdateUserMock.mockRejectedValueOnce(new Error('Clerk API error'))
+
+      await expect(
+        recoverAccount({
+          token: plainToken,
+          password: 'NewPassword123',
+        }),
+      ).rejects.toMatchObject({
+        message: 'Failed to update account credentials',
+        statusCode: 500,
+      })
+
+      // The token must be restored (used_at cleared) so the admin-issued
+      // link is still usable — the member's password was never actually
+      // changed.
+      const restoredToken = tokensStore.get(tokenHash)
+      expect(restoredToken?.used_at).toBeNull()
+
+      // Retry with the SAME token now succeeds (Clerk mock defaults back to
+      // success since we used mockRejectedValueOnce above).
+      const retryResult = await recoverAccount({
+        token: plainToken,
+        password: 'NewPassword123',
+      })
+
+      expect(retryResult.user).toMatchObject({
+        id: 'user-active',
+        memberNumber: '100002',
+        isActive: true,
+      })
+      expect(clerkUpdateUserMock).toHaveBeenCalledTimes(2)
+
+      const finalToken = tokensStore.get(tokenHash)
+      expect(finalToken?.used_at).not.toBeNull()
     })
   })
 
