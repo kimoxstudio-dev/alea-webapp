@@ -39,7 +39,7 @@ function setupSqlMock() {
     }
 
     // SELECT by id (WHERE id = $1)
-    if (query.includes('where id =') && !query.includes('ilike') && !query.includes('update')) {
+    if (query.includes('from profiles') && query.includes('where id =') && !query.includes('ilike')) {
       const id = values[0] as string
       const profile = profilesStore.get(id)
       if (profile) {
@@ -126,7 +126,7 @@ function setupSqlMock() {
     }
 
     // SELECT COUNT with search filter (ILIKE) - must come before generic COUNT
-    if (query.includes('count') && query.includes('ilike')) {
+    if (query.includes('select count') && query.includes('ilike')) {
       const pattern = values[0] as string
       const profiles = Array.from(profilesStore.values()).filter((p) => {
         return (
@@ -167,7 +167,7 @@ function setupSqlMock() {
     }
 
     // SELECT COUNT (no search) - generic COUNT query
-    if (query.includes('count') && !query.includes('ilike')) {
+    if (query.includes('select count') && !query.includes('ilike')) {
       return Promise.resolve([{ count: profilesStore.size }])
     }
 
