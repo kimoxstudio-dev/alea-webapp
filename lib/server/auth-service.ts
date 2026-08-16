@@ -76,6 +76,23 @@ function isActivationExpired(expiresAt: string, currentTime: Date) {
 }
 
 /**
+ * Restores a token that was already atomically claimed (`used_at` set) by
+ * `activateAccount()`/`recoverAccount()`, but whose paired Clerk operation
+ * then failed (#299 Codex review finding 1). Without this, a Clerk outage or
+ * a rejected password after the claim permanently burns an otherwise-valid,
+ * unexpired, admin-issued link even though the member was never actually
+ * activated/recovered. Matched by id (not by hash/used_at) since the caller
+ * already holds the exact row it just claimed.
+ */
+async function restoreClaimedToken(tokenId: string) {
+  await sql`
+    UPDATE activation_tokens
+    SET used_at = NULL
+    WHERE id = ${tokenId}
+  `
+}
+
+/**
  * Neon-backed "database now" helper, local to this file (#299).
  *
  * `lib/server/database-time.ts` is Supabase-RPC-backed (`get_database_time`)
@@ -358,6 +375,10 @@ export async function activateAccount(input: { token: unknown; password: unknown
       password: parsed.data.password,
     })
   } catch {
+    // Clerk failure after the claim above (#299 Codex review finding 1): the
+    // member was never actually activated, so the token must not stay
+    // burned — restore it so the same admin-issued link can be retried.
+    await restoreClaimedToken(claimedToken.id)
     serviceError('Failed to create account credentials', 500)
   }
 
@@ -441,15 +462,22 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
 
   // Token is now spent — find the existing Clerk identity by username (no
   // Clerk user id is persisted on `profiles`) and set its new password.
+  //
+  // Every failure branch below (#299 Codex review finding 1) restores the
+  // just-claimed token before returning: the recovery never actually
+  // succeeded, so burning the token permanently would strand the member on a
+  // link an admin has to reissue for no reason.
   const client = await clerkClient()
   let clerkUser: { id: string } | undefined
   try {
     const { data } = await client.users.getUserList({ username: [toClerkUsername(profile.member_number)] })
     clerkUser = data[0]
   } catch {
+    await restoreClaimedToken(claimedToken.id)
     serviceError('Internal server error', 500)
   }
   if (!clerkUser) {
+    await restoreClaimedToken(claimedToken.id)
     serviceError('Internal server error', 500)
   }
 
@@ -459,6 +487,7 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
       signOutOfOtherSessions: true,
     })
   } catch {
+    await restoreClaimedToken(claimedToken.id)
     serviceError('Failed to update account credentials', 500)
   }
 
