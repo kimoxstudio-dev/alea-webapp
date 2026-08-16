@@ -4,6 +4,7 @@ import { memberNumberSchema } from '@/lib/validations/auth'
 import { type PublicProfileRow, toPublicUser } from '@/lib/server/profile-mappers'
 import { sql } from '@/lib/db/client'
 import { clerkClient } from '@clerk/nextjs/server'
+import { NeonDbError } from '@neondatabase/serverless'
 import {
   type MemberImportOptionalColumnPresence,
   MEMBER_IMPORT_PREVIEW_LIMIT,
@@ -380,7 +381,30 @@ export async function updateUser(
   // means that on ANY failure mid-operation, both sides stay consistent on
   // the OLD member_number and the member can still sign in. DO NOT reorder
   // this to write the database first — that reproduces the lockout bug.
+  //
+  // That "Clerk-first" ordering has its own mirror failure mode (#299 Codex
+  // review finding 2): Clerk can rename successfully and the SQL write below
+  // can still fail (e.g. a `member_number` unique-constraint collision) —
+  // that would leave Clerk on the NEW username while `profiles` still has
+  // the OLD one, locking the member out via the same identity-resolution
+  // path this comment just described. Two mitigations, both required:
+  //   1. A pre-check below rejects the whole operation up front (no Clerk
+  //      call at all) if `nextMemberNumberInput` already belongs to a
+  //      different profile row.
+  //   2. Because that pre-check can't close a TOCTOU race against a
+  //      concurrent update claiming the same number, `renamedClerkUserId` is
+  //      tracked so the DB-write catch block below can roll Clerk back to
+  //      the OLD username if the write still fails despite the pre-check.
+  let renamedClerkUserId: string | null = null
+
   if (memberNumberIsChanging) {
+    const conflictingRows = await sql`
+      SELECT id FROM profiles WHERE member_number = ${nextMemberNumberInput} AND id <> ${id} LIMIT 1
+    ` as { id: string }[]
+    if (conflictingRows[0]) {
+      serviceError('Member number is already in use', 409)
+    }
+
     const client = await clerkClient()
     let existingClerkUser: { id: string } | undefined
     try {
@@ -400,6 +424,7 @@ export async function updateUser(
         await client.users.updateUser(existingClerkUser.id, {
           username: toClerkUsername(nextMemberNumberInput as string),
         })
+        renamedClerkUserId = existingClerkUser.id
       } catch {
         serviceError('Failed to update account credentials', 500)
       }
@@ -420,7 +445,35 @@ export async function updateUser(
       WHERE id = ${id}
       RETURNING id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
     ` as PublicProfileRow[]
-  } catch {
+  } catch (err) {
+    // TOCTOU (#299 Codex review finding 2): the pre-check above passed, but
+    // a concurrent update could still have claimed `nextMemberNumberInput`
+    // between that check and this write. If Clerk was already renamed to
+    // the new username, roll it back to the OLD one so Clerk and the
+    // (unchanged) `profiles` row stay consistent and the member isn't
+    // locked out of their existing credentials.
+    if (renamedClerkUserId) {
+      try {
+        const client = await clerkClient()
+        await client.users.updateUser(renamedClerkUserId, {
+          username: toClerkUsername(existingProfile.member_number),
+        })
+      } catch (rollbackErr) {
+        // Do NOT swallow this — the rollback failing means Clerk is left on
+        // the NEW username while `profiles` still has the OLD member_number,
+        // an inconsistent state that needs manual intervention. Log it
+        // server-side; only a generic message goes to the client below.
+        console.error(
+          '[users-service] Clerk username rollback failed after DB write failure — Clerk/DB are now inconsistent for profile',
+          id,
+          rollbackErr,
+        )
+      }
+    }
+
+    if (err instanceof NeonDbError && err.code === '23505') {
+      serviceError('Member number is already in use', 409)
+    }
     serviceError('Internal server error', 500)
   }
 
