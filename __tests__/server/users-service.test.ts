@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const sqlQueryMock = vi.fn()
 const clerkGetUserListMock = vi.fn()
 const clerkUpdateUserMock = vi.fn()
+const clerkDeleteUserMock = vi.fn()
 
 // In-memory store for test data
 const profilesStore = new Map<string, any>()
@@ -18,6 +19,7 @@ vi.mock('@clerk/nextjs/server', () => ({
     users: {
       getUserList: clerkGetUserListMock,
       updateUser: clerkUpdateUserMock,
+      deleteUser: clerkDeleteUserMock,
     },
   })),
 }))
@@ -650,12 +652,151 @@ describe('users-service (raw SQL with Neon)', () => {
       // Critical: Clerk.updateUser should NOT have been called (pre-check blocked it)
       expect(clerkUpdateUserMock).not.toHaveBeenCalled()
     })
+
+    it('rolls back Clerk username to old value when DB write fails after Clerk rename (TOCTOU)', async () => {
+      // Setup profile with Clerk identity
+      profilesStore.set('toctou-profile', {
+        id: 'toctou-profile',
+        member_number: '100011',
+        full_name: 'TOCTOU Test',
+        auth_email: '100011@members.alea.internal',
+        email: null,
+        phone: null,
+        role: 'member',
+        is_active: true,
+        active_from: new Date().toISOString(),
+        no_show_count: 0,
+        blocked_until: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+
+      // Pre-check: no conflicting member_number
+      clerkGetUserListMock.mockResolvedValueOnce({
+        data: [{ id: 'clerk-toctou' }],
+      })
+
+      // Clerk rename succeeds
+      clerkUpdateUserMock.mockResolvedValueOnce({
+        id: 'clerk-toctou',
+        username: 'alea-100099',
+      })
+
+      // Mock DB write to fail with unique constraint (23505)
+      sqlQueryMock.mockImplementation(async (strings: TemplateStringsArray | string, ...values: unknown[]) => {
+        const queryStr = typeof strings === 'string'
+          ? strings
+          : strings.reduce((acc, str, i) => acc + str + (i < values.length ? `$${i + 1}` : ''), '')
+        const query = queryStr.toLowerCase()
+
+        // SELECT id from profiles
+        if (query.includes('from profiles') && query.includes('where id') && !query.includes('and')) {
+          return Promise.resolve([profilesStore.get(values[0] as string)])
+        }
+
+        // UPDATE member_number check
+        if (query.includes('where member_number') && query.includes('and id <>')) {
+          return Promise.resolve([]) // Pre-check passes
+        }
+
+        // UPDATE profiles for member_number change fails
+        if (query.includes('update profiles') && query.includes('set member_number')) {
+          const { NeonDbError } = await import('@neondatabase/serverless')
+          const error = new NeonDbError('unique constraint violation')
+          ;(error as any).code = '23505'
+          throw error
+        }
+
+        return Promise.resolve([])
+      })
+
+      const { updateUser } = await import('@/lib/server/users-service')
+
+      // Attempt: should fail and rollback
+      await expect(
+        updateUser('toctou-profile', { memberNumber: '100099' }),
+      ).rejects.toMatchObject({ statusCode: 409 })
+
+      // Verify: Clerk.updateUser was called twice (rename + rollback)
+      expect(clerkUpdateUserMock).toHaveBeenCalledTimes(2)
+
+      // First call: rename to new
+      expect(clerkUpdateUserMock).toHaveBeenNthCalledWith(1, 'clerk-toctou', {
+        username: 'alea-100099',
+      })
+
+      // Second call: rollback to old
+      expect(clerkUpdateUserMock).toHaveBeenNthCalledWith(2, 'clerk-toctou', {
+        username: 'alea-100011',
+      })
+    })
   })
 
   describe('Finding 3 — Codex review: deleteUser Clerk cleanup', () => {
-    it('deletes the auth user after confirming the profile exists', async () => {
+    it('calls Clerk.deleteUser when profile has Clerk identity (Clerk-first principle)', async () => {
+      profilesStore.set('delete-test', {
+        id: 'delete-test',
+        member_number: '100012',
+        full_name: 'Delete Test',
+        auth_email: '100012@members.alea.internal',
+        email: null,
+        phone: null,
+        role: 'member',
+        is_active: true,
+        active_from: new Date().toISOString(),
+        no_show_count: 0,
+        blocked_until: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+
+      clerkGetUserListMock.mockResolvedValueOnce({
+        data: [{ id: 'clerk-delete-test' }],
+      })
+      clerkDeleteUserMock.mockResolvedValueOnce({
+        id: 'clerk-delete-test',
+      })
+
       const { deleteUser } = await import('@/lib/server/users-service')
-      await expect(deleteUser('member-1')).resolves.toBeUndefined()
+      await deleteUser('delete-test')
+
+      // Verify: Clerk.getUserList was called with alea-<member_number> format
+      expect(clerkGetUserListMock).toHaveBeenCalledWith({
+        username: ['alea-100012'],
+      })
+
+      // Verify: Clerk.deleteUser was called with the Clerk user id
+      // This proves Clerk cleanup happens as part of the delete flow
+      expect(clerkDeleteUserMock).toHaveBeenCalledWith('clerk-delete-test')
+    })
+
+    it('does NOT call Clerk.deleteUser if user was never activated (no Clerk identity)', async () => {
+      profilesStore.set('delete-no-clerk', {
+        id: 'delete-no-clerk',
+        member_number: '100099',
+        full_name: 'No Clerk',
+        auth_email: '100099@members.alea.internal',
+        email: null,
+        phone: null,
+        role: 'member',
+        is_active: false,
+        active_from: null,
+        no_show_count: 0,
+        blocked_until: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+
+      // Clerk lookup returns empty
+      clerkGetUserListMock.mockResolvedValueOnce({
+        data: [],
+      })
+
+      const { deleteUser } = await import('@/lib/server/users-service')
+      await deleteUser('delete-no-clerk')
+
+      // Verify: Clerk.deleteUser was NOT called (no identity to delete)
+      expect(clerkDeleteUserMock).not.toHaveBeenCalled()
     })
   })
 })
