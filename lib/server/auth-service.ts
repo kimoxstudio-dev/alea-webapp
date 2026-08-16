@@ -527,15 +527,38 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
     serviceError('Failed to update account credentials', 500)
   }
 
-  const updatedRows = await sql`
-    UPDATE profiles
-    SET psw_changed = ${recoveredAt}
-    WHERE id = ${profile.id}
-    RETURNING id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
-  ` as PublicProfileRow[]
-  const updatedProfile = updatedRows[0] ?? null
+  // Clerk succeeded, but the DB profile update itself can still fail — a
+  // thrown SQL error, or (silently, no exception) a zero-rows UPDATE whose
+  // WHERE clause no longer matches (#299 review finding 6, recoverAccount()
+  // symmetry). On either outcome the just-claimed token must be restored via
+  // the precise, scoped mechanism from finding 5 — never id-only — so the
+  // member/admin can retry.
+  //
+  // Unlike activateAccount(), there is no Clerk-side compensation here: that
+  // path creates a brand-new Clerk user, which can simply be deleted to
+  // fully undo the Clerk side. This path calls updateUser() to change the
+  // password on an EXISTING Clerk identity — Clerk has no "revert to
+  // previous password" operation, and the old password isn't held anywhere
+  // in memory at this point to reapply even if it did. That password change
+  // is deliberately left in place, not rolled back: restoring the token lets
+  // the member/admin retry — either a fresh sign-in with the NEW
+  // (already-changed) password once the DB catches up, or a newly issued
+  // recovery link if needed — but the Clerk password itself is not reverted.
+  let updatedProfile: PublicProfileRow | null
+  try {
+    const updatedRows = await sql`
+      UPDATE profiles
+      SET psw_changed = ${recoveredAt}
+      WHERE id = ${profile.id}
+      RETURNING id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
+    ` as PublicProfileRow[]
+    updatedProfile = updatedRows[0] ?? null
+  } catch {
+    updatedProfile = null
+  }
 
   if (!updatedProfile) {
+    await restoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: recoveredAt })
     serviceError('Failed to recover account', 500)
   }
 
