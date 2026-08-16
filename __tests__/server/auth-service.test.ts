@@ -165,21 +165,28 @@ function setupSqlMock() {
       return Promise.resolve([token])
     }
 
-    // UPDATE activation_tokens SET used_at = NULL WHERE id = ? AND token_hash = ? AND used_at = ?
-    // (restoreClaimedToken — #299 Codex review finding 5). Must be checked BEFORE the
-    // token_hash-keyed claim handler below: both queries contain
-    // "update activation_tokens" and "set used_at", but this one is keyed by
-    // `id` with three bound values (id, token_hash, used_at), not by `token_hash` alone.
-    // Finding 5 ensures all three conditions are checked: if the row has been replaced
-    // with a new token_hash or used_at since the caller claimed it, the UPDATE matches
-    // zero rows and nothing gets incorrectly un-consumed.
+    // UPDATE activation_tokens SET used_at = NULL WHERE id [AND token_hash] [AND used_at]
+    // (restoreClaimedToken — #299 Codex review finding 5). Apply ONLY the WHERE conditions
+    // that are actually present in the query (not all conditions every time). This tests the
+    // fix by allowing the mock to correctly apply id-only WHERE when the code is broken.
     if (query.includes('update activation_tokens') && query.includes('set used_at') && query.includes('where id')) {
+      // Determine which conditions are in the WHERE clause by examining the query string
+      const hasTokenHashCondition = query.includes('token_hash');
+      const hasUsedAtCondition = query.includes('and used_at');
+
+      // Extract bound values in order they appear in template
       const tokenId = values[0]
-      const tokenHash = values[1]
-      const usedAt = values[2]
+      let valueIndex = 1;
+      const tokenHash = hasTokenHashCondition ? values[valueIndex++] : undefined;
+      const usedAt = hasUsedAtCondition ? values[valueIndex++] : undefined;
+
       for (const [hash, token] of tokensStore.entries()) {
-        // Match ONLY if all three conditions are satisfied
-        if (token.id === tokenId && token.token_hash === tokenHash && token.used_at === usedAt) {
+        // Apply only the conditions that are in the WHERE clause
+        let matches = (token.id === tokenId);
+        if (hasTokenHashCondition) matches = matches && (token.token_hash === tokenHash);
+        if (hasUsedAtCondition) matches = matches && (token.used_at === usedAt);
+
+        if (matches) {
           const updated = { ...token, used_at: null, updated_at: mockDatabaseTime.toISOString() }
           tokensStore.set(hash, updated)
           return Promise.resolve([updated])
