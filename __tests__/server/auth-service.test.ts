@@ -1333,12 +1333,24 @@ describe('auth service (alea- username model)', () => {
       // The compensation (finding 6): same as the error path — delete Clerk user and
       // restore token via precise mechanism.
       const { activateAccount } = (await loadService()) as any
+
+      // Explicit fixture setup: ensure the profile exists (not relying on implicit
+      // beforeEach state). This test exercises the zero-rows path by forcing
+      // shouldFailProfileUpdateWithZeroRows = true (below), not by the profile
+      // being missing from the store.
+      const userZeroRowsProfile = createTestProfile({
+        id: 'user-zero-rows',
+        member_number: '100003',
+        is_active: false,
+      })
+      profilesStore.set('user-zero-rows', userZeroRowsProfile)
+
       const plainToken = createActivationToken()
       const tokenHash = hashActivationToken(plainToken)
 
       const token = createTestToken({
         token_hash: tokenHash,
-        profile_id: 'user-test',
+        profile_id: 'user-zero-rows',
         expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
         used_at: null,
       })
@@ -1362,7 +1374,7 @@ describe('auth service (alea- username model)', () => {
 
       // 1. Verify Clerk createUser was called
       expect(clerkCreateUserMock).toHaveBeenCalledWith({
-        username: 'alea-100001',
+        username: 'alea-100003',
         password: 'Password123',
       })
 
@@ -1371,22 +1383,15 @@ describe('auth service (alea- username model)', () => {
       expect(restoredToken?.used_at).toBeNull() // Should be un-consumed
 
       // 3. Verify profile remains inactive
-      expect(profilesStore.get('user-test')?.is_active).toBe(false)
+      expect(profilesStore.get('user-zero-rows')?.is_active).toBe(false)
     })
 
-    it('recoverAccount — profiles UPDATE failure handling (current behavior check)', async () => {
-      // This test verifies current behavior: what happens in recoverAccount() if
-      // the profiles UPDATE fails AFTER Clerk updateUser succeeds. Unlike
-      // activateAccount() which has explicit compensation (Clerk user delete +
-      // token restore), recoverAccount() simply throws without special handling.
-      //
-      // The structure differs because:
-      // - activateAccount creates a NEW Clerk user and must clean it up if DB fails
-      // - recoverAccount updates an EXISTING Clerk user (password already changed)
-      // - Can't undo a Clerk password change, so the question is: restore the token?
-      //
-      // This documents the actual behavior for future audit.
-
+    it('restores token when profiles UPDATE throws (SQL error) in recoverAccount (#299 Codex review finding 6)', async () => {
+      // Scenario: Clerk updateUser succeeds (password already changed), but the
+      // subsequent profiles UPDATE throws a SQL error. Unlike activateAccount,
+      // there's no Clerk user to delete (we're updating an existing one), but the
+      // token MUST still be restored (finding 6 symmetry): the recovery never
+      // actually succeeded, so the admin-issued link should remain usable for retry.
       const { recoverAccount } = (await loadService()) as any
       const plainToken = createActivationToken()
       const tokenHash = hashActivationToken(plainToken)
@@ -1402,7 +1407,64 @@ describe('auth service (alea- username model)', () => {
       // Mock Clerk updateUser to succeed
       clerkUpdateUserMock.mockResolvedValueOnce({ id: 'clerk-user-active' })
 
-      // Enable zero-rows failure injection for profiles UPDATE in recoverAccount
+      // Enable SQL error injection for profiles UPDATE
+      shouldFailProfileUpdate = true
+
+      try {
+        await recoverAccount({
+          token: plainToken,
+          password: 'NewPassword123',
+        })
+        throw new Error('Should have thrown')
+      } catch (e) {
+        expect(e).toMatchObject({ statusCode: 500 })
+      }
+
+      // Verify Clerk updateUser was called (password change committed)
+      expect(clerkUpdateUserMock).toHaveBeenCalledWith(
+        expect.any(String),
+        {
+          password: 'NewPassword123',
+          signOutOfOtherSessions: true,
+        },
+      )
+
+      // Verify token was restored (used_at cleared) on DB failure
+      const restoredToken = tokensStore.get(tokenHash)
+      expect(restoredToken?.used_at).toBeNull()
+    })
+
+    it('restores token when profiles UPDATE returns zero rows (silent failure) in recoverAccount (#299 Codex review finding 6)', async () => {
+      // Scenario: Clerk updateUser succeeds, but the subsequent profiles UPDATE
+      // matches zero rows without throwing (silent failure — WHERE clause no longer matches).
+      // Same compensation as the error path: restore the token so the admin-issued link
+      // remains usable for retry.
+      const { recoverAccount } = (await loadService()) as any
+
+      // Explicit fixture: ensure the profile exists (not relying on implicit beforeEach state)
+      const recoverZeroRowsProfile = createTestProfile({
+        id: 'user-recover-zero-rows',
+        member_number: '100004',
+        is_active: true,
+        active_from: '2024-01-01T00:00:00.000Z',
+      })
+      profilesStore.set('user-recover-zero-rows', recoverZeroRowsProfile)
+
+      const plainToken = createActivationToken()
+      const tokenHash = hashActivationToken(plainToken)
+
+      const token = createTestToken({
+        token_hash: tokenHash,
+        profile_id: 'user-recover-zero-rows',
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+        used_at: null,
+      })
+      tokensStore.set(tokenHash, token)
+
+      // Mock Clerk updateUser to succeed
+      clerkUpdateUserMock.mockResolvedValueOnce({ id: 'clerk-user-recover-zero-rows' })
+
+      // Enable zero-rows failure injection for profiles UPDATE
       shouldFailProfileUpdateWithZeroRows = true
 
       try {
@@ -1415,17 +1477,18 @@ describe('auth service (alea- username model)', () => {
         expect(e).toMatchObject({ statusCode: 500 })
       }
 
-      // Current behavior check: what actually happens to the token?
-      const tokenAfter = tokensStore.get(tokenHash)
-      // The actual behavior will be either restored (null) or burned (not null)
-      // Document whichever it actually is for audit purposes
-      if (tokenAfter?.used_at === null) {
-        // Token WAS restored — this would mean compensation IS happening
-        expect(tokenAfter?.used_at).toBeNull() // Document it
-      } else {
-        // Token is still burned — no automatic restore
-        expect(tokenAfter?.used_at).not.toBeNull() // Document it
-      }
+      // Verify Clerk updateUser was called
+      expect(clerkUpdateUserMock).toHaveBeenCalledWith(
+        expect.any(String),
+        {
+          password: 'NewPassword123',
+          signOutOfOtherSessions: true,
+        },
+      )
+
+      // Verify token was restored (used_at cleared) on zero-rows failure
+      const restoredToken = tokensStore.get(tokenHash)
+      expect(restoredToken?.used_at).toBeNull()
     })
   })
 
