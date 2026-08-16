@@ -105,6 +105,32 @@ async function restoreClaimedToken(claim: { id: string; tokenHash: string; usedA
 }
 
 /**
+ * Guards every `restoreClaimedToken()` call site (security-review follow-up,
+ * #299 PR #327): the compensation exists precisely for when the database
+ * misbehaves, so it can fail hardest exactly when it's needed most (e.g. the
+ * same systemic DB outage that caused the original failure). Without its own
+ * try/catch, a throw here would propagate and replace the caller's intended,
+ * specific `serviceError(...)` with an anonymous unhandled error — the worst
+ * possible outcome, since members have no email and an admin would have no
+ * way to know a link needs manual reissue.
+ *
+ * Swallows the failure after logging it with identifiers only (token id,
+ * token hash) so the originally-intended `serviceError(...)` that follows
+ * each call site still executes/propagates unchanged. Never logs the raw
+ * pre-hash token — that is a credential, not an identifier.
+ */
+async function safeRestoreClaimedToken(claim: { id: string; tokenHash: string; usedAt: string }) {
+  try {
+    await restoreClaimedToken(claim)
+  } catch (restoreError) {
+    console.error(
+      '[auth-service] restoreClaimedToken failed after an earlier activation/recovery failure — token may need manual reissue by an admin',
+      { tokenId: claim.id, tokenHash: claim.tokenHash, restoreError }
+    )
+  }
+}
+
+/**
  * Neon-backed "database now" helper, local to this file (#299).
  *
  * `lib/server/database-time.ts` is Supabase-RPC-backed (`get_database_time`)
@@ -391,7 +417,7 @@ export async function activateAccount(input: { token: unknown; password: unknown
     // Clerk failure after the claim above (#299 Codex review finding 1): the
     // member was never actually activated, so the token must not stay
     // burned — restore it so the same admin-issued link can be retried.
-    await restoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: activatedAt })
+    await safeRestoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: activatedAt })
     serviceError('Failed to create account credentials', 500)
   }
 
@@ -426,7 +452,7 @@ export async function activateAccount(input: { token: unknown; password: unknown
       // over a secondary Clerk cleanup error. The orphaned Clerk user is a
       // known, admin-recoverable state; a silently-un-restored token is not.
     }
-    await restoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: activatedAt })
+    await safeRestoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: activatedAt })
     serviceError('Failed to activate account', 500)
   }
 
@@ -509,11 +535,11 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
     const { data } = await client.users.getUserList({ username: [toClerkUsername(profile.member_number)] })
     clerkUser = data[0]
   } catch {
-    await restoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: recoveredAt })
+    await safeRestoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: recoveredAt })
     serviceError('Internal server error', 500)
   }
   if (!clerkUser) {
-    await restoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: recoveredAt })
+    await safeRestoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: recoveredAt })
     serviceError('Internal server error', 500)
   }
 
@@ -523,7 +549,7 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
       signOutOfOtherSessions: true,
     })
   } catch {
-    await restoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: recoveredAt })
+    await safeRestoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: recoveredAt })
     serviceError('Failed to update account credentials', 500)
   }
 
@@ -558,7 +584,7 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
   }
 
   if (!updatedProfile) {
-    await restoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: recoveredAt })
+    await safeRestoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: recoveredAt })
     serviceError('Failed to recover account', 500)
   }
 
