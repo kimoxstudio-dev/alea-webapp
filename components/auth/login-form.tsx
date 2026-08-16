@@ -8,6 +8,7 @@ import { useTranslations } from 'next-intl'
 import { useSignIn } from '@clerk/nextjs/legacy'
 import { DiceLoader } from '@/components/ui/dice-loader'
 import { loginSchema, type LoginFormData } from '@/lib/validations/auth'
+import { resolveSafeRedirect } from '@/lib/safe-redirect'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { PasswordInput } from '@/components/ui/password-input'
@@ -91,7 +92,7 @@ export function LoginForm({ locale, redirectUrl }: LoginFormProps) {
       }
 
       await setActive({ session: attempt.createdSessionId })
-      const target = redirectUrl && redirectUrl.startsWith('/') ? redirectUrl : `/${locale}/rooms`
+      const target = resolveSafeRedirect(redirectUrl, `/${locale}/rooms`)
       router.push(target)
     } catch {
       setServerError(t('errors.invalidCredentials'))

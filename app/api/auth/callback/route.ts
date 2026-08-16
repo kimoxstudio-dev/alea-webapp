@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createSupabaseRouteHandlerClient } from '@/lib/supabase/server'
+import { resolveSafeRedirect } from '@/lib/safe-redirect'
 
 /**
  * Supabase PKCE auth callback handler.
@@ -11,26 +12,13 @@ import { createSupabaseRouteHandlerClient } from '@/lib/supabase/server'
 export async function GET(request: NextRequest) {
   const requestUrl = new URL(request.url)
   const code = requestUrl.searchParams.get('code')
-  const raw = requestUrl.searchParams.get('next') ?? '/'
+  const raw = requestUrl.searchParams.get('next')
   const callbackErrorRedirect = new URL('/', requestUrl.origin)
   callbackErrorRedirect.searchParams.set('authError', 'callback')
 
-  // Reject control characters that can bypass path validation (e.g. %0A → \n)
-  const sanitized = /[\x00-\x1f]/.test(raw) ? '/' : raw
-
-  // Regex requires /X where X is not / or \. Bare "/" falls through to the default fallback.
-  const isRelative = /^\/[^/\\]/.test(sanitized)
-  let finalRedirect = isRelative ? sanitized : '/'
-
-  // Same-origin verification to prevent open redirect after URL resolution
-  try {
-    const resolved = new URL(finalRedirect, requestUrl.origin)
-    if (resolved.origin !== requestUrl.origin) {
-      finalRedirect = '/'
-    }
-  } catch {
-    finalRedirect = '/'
-  }
+  // Same-origin, relative-path validation (#299 review finding 4) — see
+  // lib/safe-redirect.ts for what this rejects/accepts.
+  const finalRedirect = resolveSafeRedirect(raw, '/')
 
   if (code) {
     const client = createSupabaseRouteHandlerClient(request)

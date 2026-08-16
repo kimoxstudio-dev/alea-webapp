@@ -5,6 +5,7 @@ import Image from 'next/image'
 import { LoginForm } from '@/components/auth/login-form'
 import { getSessionFromServerCookies } from '@/lib/server/auth'
 import { getCurrentUser } from '@/lib/server/auth-service'
+import { resolveSafeRedirect } from '@/lib/safe-redirect'
 
 /**
  * Alea's own sign-in screen (#299 pass 3 frontend rework).
@@ -48,7 +49,7 @@ export default async function SignInPage({ params, searchParams }: SignInPagePro
       // ignore stale/invalid session, render sign-in form
     }
     if (authenticated) {
-      redirect(redirectUrl && redirectUrl.startsWith('/') ? redirectUrl : `/${locale}/rooms`)
+      redirect(resolveSafeRedirect(redirectUrl, `/${locale}/rooms`))
     }
   }
 
