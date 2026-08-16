@@ -43,7 +43,7 @@ function setupSqlMock() {
     }
 
     // SELECT by id (WHERE id = $1)
-    if (query.includes('from profiles') && query.includes('where id =') && !query.includes('ilike')) {
+    if (query.includes('select') && query.includes('from profiles') && query.includes('where id =') && !query.includes('ilike')) {
       const id = values[0] as string
       const profile = profilesStore.get(id)
       if (profile) {
@@ -971,12 +971,14 @@ describe('users-service (raw SQL with Neon)', () => {
       // Then it deletes the Clerk user
       expect(clerkDeleteUserMock).toHaveBeenCalledWith('clerk-find8')
 
-      // Verify: profile was deactivated first (the critical property for Finding 8)
-      // Before any Clerk/DB delete happens, the profile should be deactivated to block sign-in immediately
-      const deactivatedProfile = profilesStore.get('find8-delete')
-      expect(deactivatedProfile).toBeDefined()
-      // The profile is deactivated even if DELETE fails later (safe to retry)
-      expect(deactivatedProfile?.is_active).toBe(false)
+      // Verify: On the happy path, the profile row was completely deleted (not just deactivated)
+      // The three phases are:
+      // 1. Deactivate (is_active = false) — blocks sign-in immediately
+      // 2. Delete Clerk identity
+      // 3. Delete profile row completely
+      // If DELETE succeeded (happy path), the row should not exist in the store anymore
+      const deletedProfile = profilesStore.get('find8-delete')
+      expect(deletedProfile).toBeUndefined()
     })
 
     it('Clerk delete failure leaves profile deactivated (no live-access risk)', async () => {
