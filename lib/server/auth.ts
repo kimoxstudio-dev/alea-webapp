@@ -1,24 +1,39 @@
 import 'server-only'
 import { NextRequest, NextResponse } from 'next/server'
-import { createSupabaseRouteHandlerClient, createSupabaseServerClient } from '@/lib/supabase/server'
+import { getClerkSession, getClerkUser } from '@/lib/server/session'
+import { resolveProfileForClerkUser } from '@/lib/server/auth-service'
 export { enforceSameOriginForMutation } from '@/lib/server/security'
+
+/**
+ * Route-handler auth gates (#299).
+ *
+ * Session identity comes from Clerk (`lib/server/session.ts`) instead of
+ * Supabase Auth cookies. The `profiles` row itself lives in Neon and is
+ * resolved via `resolveProfileForClerkUser()` in `lib/server/auth-service.ts`
+ * — READ-ONLY as of #299 pass 2 (see that function's doc comment): this club
+ * has no open self-registration (closed issue #206), so a Clerk identity
+ * with no matching, already-active `profiles` row never gets a session here,
+ * and no row is ever created as a side effect of a request. The only way a
+ * profile becomes active is `activateAccount()` in auth-service.ts, gated on
+ * an admin-issued activation token.
+ *
+ * Correlation key (#299 pass 3): the Clerk USERNAME (`alea-<member
+ * number>`), not email — see `resolveProfileForClerkUser()`'s doc comment
+ * for the full rationale. There is no email anywhere in this identity
+ * model.
+ *
+ * `request`/`applyCookies` are kept in every signature below purely for
+ * source compatibility with the ~30 existing call sites across `app/` (all
+ * out of scope for this backend-only change) — Clerk's `auth()`/`currentUser()`
+ * read the session from Next.js's request context directly and do not need
+ * an explicit `NextRequest`, and cookie refresh is handled by
+ * `clerkMiddleware()` in `middleware.ts`, not here. `applyCookies` is now a
+ * no-op passthrough.
+ */
 
 export type SessionUser = {
   id: string
   role: 'member' | 'admin'
-}
-
-type SessionClient = {
-  auth: {
-    getUser: () => Promise<{ data: { user: { id: string } | null }, error: unknown }>
-  }
-  from: (...args: unknown[]) => {
-    select: (...args: unknown[]) => {
-      eq: (...args: unknown[]) => {
-        maybeSingle: () => Promise<{ data: { id: string; role: 'member' | 'admin'; is_active: boolean } | null, error: unknown }>
-      }
-    }
-  }
 }
 
 type RouteSessionResult = {
@@ -31,40 +46,37 @@ type AuthContext = {
   applyCookies: (response: NextResponse) => NextResponse
 }
 
-async function getSessionUser(client: SessionClient) {
-  const { data: authData, error: authError } = await client.auth.getUser()
-
-  if (authError || !authData.user) {
-    return null
-  }
-
-  const { data: profile, error: profileError } = await client
-    .from('profiles')
-    .select('id, role, is_active')
-    .eq('id', authData.user.id)
-    .maybeSingle()
-
-  if (profileError || !profile || !profile.is_active) {
-    return null
-  }
-
-  return {
-    id: profile.id,
-    role: profile.role,
-  } satisfies SessionUser
+function passthroughApplyCookies(response: NextResponse): NextResponse {
+  return response
 }
 
-export async function getSessionFromRequest(request: NextRequest): Promise<RouteSessionResult> {
-  const { supabase, applyCookies } = createSupabaseRouteHandlerClient(request)
+async function resolveClerkSessionUser(): Promise<SessionUser | null> {
+  const clerkSession = await getClerkSession()
+  if (!clerkSession) {
+    return null
+  }
+
+  const clerkUser = await getClerkUser()
+  const username = clerkUser?.username ?? null
+  if (!username) {
+    // No username on the Clerk identity — cannot correlate to a profiles
+    // row (username is the only correlation key, see
+    // resolveProfileForClerkUser). Treat as unauthenticated.
+    return null
+  }
+
+  return resolveProfileForClerkUser({ username })
+}
+
+export async function getSessionFromRequest(_request: NextRequest): Promise<RouteSessionResult> {
   return {
-    session: await getSessionUser(supabase as unknown as SessionClient),
-    applyCookies,
+    session: await resolveClerkSessionUser(),
+    applyCookies: passthroughApplyCookies,
   }
 }
 
 export async function getSessionFromServerCookies(): Promise<SessionUser | null> {
-  const supabase = await createSupabaseServerClient()
-  return getSessionUser(supabase as unknown as SessionClient)
+  return resolveClerkSessionUser()
 }
 
 export async function requireAuth(request: NextRequest): Promise<AuthContext | NextResponse> {

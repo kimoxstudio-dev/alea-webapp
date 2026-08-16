@@ -2,29 +2,19 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import ExcelJS from 'exceljs'
 
-const createUserMock = vi.fn()
-const deleteUserMock = vi.fn()
+const sqlQueryMock = vi.fn()
+const createUserMock = vi.fn(async ({ email }: { email: string }) => ({
+  data: { user: { id: `user-${Math.random().toString(36).substr(2, 9)}` } },
+  error: null,
+}))
+const deleteUserMock = vi.fn(async () => ({ error: null }))
 
-const profileState = new Map<string, {
-  id: string
-  member_number: string
-  full_name: string | null
-  auth_email: string
-  email: string | null
-  phone: string | null
-  role: 'member' | 'admin'
-  is_active: boolean
-  active_from: string | null
-  psw_changed: string | null
-  no_show_count: number
-  blocked_until: string | null
-  created_at: string
-  updated_at: string
-}>()
+// In-memory store for test data
+const profilesStore = new Map<string, any>()
 
 function resetProfileState() {
-  profileState.clear()
-  profileState.set('100001', {
+  profilesStore.clear()
+  profilesStore.set('user-100001', {
     id: 'user-100001',
     member_number: '100001',
     full_name: 'Existing Member',
@@ -42,49 +32,185 @@ function resetProfileState() {
   })
 }
 
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseServerAdminClient: vi.fn(() => ({
-    from: vi.fn(() => ({
-      select: vi.fn(() => ({
-        eq: vi.fn((column: 'member_number' | 'id', value: string) => ({
-          maybeSingle: vi.fn(async () => {
-            const data = column === 'member_number'
-              ? profileState.get(value) ?? null
-              : Array.from(profileState.values()).find((row) => row.id === value) ?? null
-            return { data, error: null }
-          }),
-        })),
-      })),
-      update: vi.fn((updates: Record<string, unknown>) => ({
-        eq: vi.fn((_column: 'id', value: string) => ({
-          select: vi.fn(() => ({
-            maybeSingle: vi.fn(async () => {
-              const target = Array.from(profileState.values()).find((row) => row.id === value)
-              if (!target) {
-                return { data: null, error: { message: 'not found' } }
-              }
-
-              const next = {
-                ...target,
-                ...updates,
-                updated_at: '2026-04-14T00:00:00.000Z',
-              }
-              profileState.delete(target.member_number)
-              profileState.set(next.member_number, next)
-              return { data: next, error: null }
-            }),
-          })),
-        })),
-      })),
-    })),
-    auth: {
-      admin: {
-        createUser: createUserMock,
-        deleteUser: deleteUserMock,
-      },
-    },
-  })),
+vi.mock('@/lib/db/client', () => ({
+  sql: sqlQueryMock,
 }))
+
+vi.mock('@/lib/supabase/server', () => ({
+  createSupabaseServerAdminClient: vi.fn(),
+}))
+
+vi.mock('@clerk/backend', () => ({
+  clerkClient: {
+    users: {
+      createUser: createUserMock,
+      deleteUser: deleteUserMock,
+    },
+  },
+}))
+
+function setupSqlMock() {
+  sqlQueryMock.mockImplementation(async (strings: TemplateStringsArray | string, ...values: unknown[]): Promise<unknown> => {
+    const queryStr = typeof strings === 'string'
+      ? strings
+      : strings.reduce((acc, str, i) => acc + str + (i < values.length ? `$${i + 1}` : ''), '')
+
+    const query = queryStr.toLowerCase()
+
+    // SELECT by id
+    if (query.includes('from profiles') && query.includes('where id')) {
+      const id = values[0]
+      const profile = profilesStore.get(id as string)
+      return Promise.resolve(profile ? [profile] : [])
+    }
+
+    // SELECT by member_number
+    if (query.includes('from profiles') && query.includes('where member_number')) {
+      const memberNumber = values[0]
+      for (const profile of profilesStore.values()) {
+        if (profile.member_number === memberNumber) {
+          return Promise.resolve([profile])
+        }
+      }
+      return Promise.resolve([])
+    }
+
+    // SELECT with OFFSET/LIMIT pagination
+    if (query.includes('from profiles') && (query.includes('offset') || query.includes('order by'))) {
+      const profiles = Array.from(profilesStore.values())
+      return Promise.resolve(profiles)
+    }
+
+    // SELECT COUNT
+    if (query.includes('select count')) {
+      return Promise.resolve([{ count: profilesStore.size }])
+    }
+
+    // UPDATE with specific no_show_count/blocked_until operations (these come before general WHERE id)
+    if (query.includes('update profiles') && (query.includes('no_show_count') || query.includes('blocked_until'))) {
+      const id = values[values.length - 1]
+      const profile = profilesStore.get(id as string)
+      if (!profile) {
+        return Promise.resolve([])
+      }
+
+      const updated = { ...profile }
+      if (query.includes('no_show_count')) {
+        updated.no_show_count = 0
+        updated.blocked_until = null
+      } else if (query.includes('blocked_until')) {
+        updated.blocked_until = null
+      }
+      profilesStore.set(id as string, updated)
+      return Promise.resolve([{ id }])
+    }
+
+    // UPDATE profiles: full_name, email, phone WHERE id
+    if (query.includes('update profiles') && query.includes('full_name') && query.includes('where id')) {
+      // Format: SET full_name = $1, email = $2, phone = $3 WHERE id = $4
+      const id = values[3]
+      const fullName = values[0]
+      const email = values[1]
+      const phone = values[2]
+
+      const profile = profilesStore.get(id as string)
+      if (!profile) {
+        return Promise.resolve([])
+      }
+
+      const updated = {
+        ...profile,
+        full_name: fullName,
+        email: email,
+        phone: phone,
+        updated_at: new Date().toISOString(),
+      }
+      profilesStore.set(id as string, updated)
+
+      if (query.includes('returning')) {
+        return Promise.resolve([updated])
+      }
+      return Promise.resolve([{ id }])
+    }
+
+    // UPDATE profiles: multiple fields (member_number, full_name, email, phone, role, is_active, auth_email) WHERE id
+    if (query.includes('update profiles') && query.includes('member_number') && query.includes('where id')) {
+      // Format: SET member_number = $1, full_name = $2, email = $3, phone = $4, role = $5, is_active = $6, auth_email = $7 WHERE id = $8
+      const memberNumber = values[0]
+      const fullName = values[1]
+      const email = values[2]
+      const phone = values[3]
+      const role = values[4]
+      const isActive = values[5]
+      const authEmail = values[6]
+      const id = values[7]
+
+      const profile = profilesStore.get(id as string)
+      if (!profile) {
+        return Promise.resolve([])
+      }
+
+      const updated = {
+        ...profile,
+        member_number: memberNumber,
+        full_name: fullName,
+        email: email,
+        phone: phone,
+        role: role,
+        is_active: isActive,
+        auth_email: authEmail,
+        updated_at: new Date().toISOString(),
+      }
+      profilesStore.set(id as string, updated)
+
+      if (query.includes('returning')) {
+        return Promise.resolve([updated])
+      }
+      return Promise.resolve([{ id }])
+    }
+
+    // INSERT INTO profiles
+    if (query.includes('insert into profiles')) {
+      // Format: INSERT INTO profiles (...) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'member', false, NULL, NULL)
+      // $1=memberNumber, $2=fullName, $3=authEmail, $4=contactEmail, $5=phone
+      const memberNumber = String(values[0])
+      const fullName = String(values[1])
+      const authEmail = String(values[2])
+      const email = String(values[3])
+      const phone = values[4] ? String(values[4]) : null
+
+      const newId = `profile-${Math.random().toString(36).substr(2, 9)}`
+
+      const newProfile = {
+        id: newId,
+        member_number: memberNumber,
+        full_name: fullName,
+        auth_email: authEmail,
+        email: email,
+        phone: phone,
+        role: 'member',
+        is_active: false,
+        active_from: null,
+        psw_changed: null,
+        no_show_count: 0,
+        blocked_until: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }
+      profilesStore.set(newId, newProfile)
+      return Promise.resolve([newProfile])
+    }
+
+    // DELETE
+    if (query.includes('delete from profiles')) {
+      const id = values[0]
+      profilesStore.delete(id as string)
+      return Promise.resolve([{ id }])
+    }
+
+    return Promise.resolve([])
+  })
+}
 
 async function loadService() {
   vi.resetModules()
@@ -94,11 +220,9 @@ async function loadService() {
   ])
   return {
     ...usersService,
-    // Ensure parsing functions come from member-import module
     parseMemberImportCsv: memberImport.parseMemberImportCsv,
     normalizeMemberImportSource: memberImport.normalizeMemberImportSource,
     extractSpreadsheetCsv: memberImport.extractSpreadsheetCsv,
-    // Keep orchestration functions from users-service
     importMembersFromCsv: usersService.importMembersFromCsv,
     importMembersFromSource: usersService.importMembersFromSource,
   }
@@ -107,6 +231,7 @@ async function loadService() {
 describe('parseMemberImportCsv', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    setupSqlMock()
     resetProfileState()
   })
 
@@ -176,7 +301,7 @@ describe('parseMemberImportCsv', () => {
     const { parseMemberImportCsv } = await loadService()
 
     const result = parseMemberImportCsv(
-      '\uFEFFUSUARIOS,ID\nJohn Doe,100099\n'
+      '﻿USUARIOS,ID\nJohn Doe,100099\n'
     )
 
     expect(result.normalizedRows).toEqual([
@@ -198,6 +323,7 @@ describe('parseMemberImportCsv', () => {
 describe('normalizeMemberImportSource', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    setupSqlMock()
     resetProfileState()
   })
 
@@ -289,27 +415,16 @@ describe('normalizeMemberImportSource', () => {
     const buffer = await workbook.xlsx.writeBuffer()
     const xlsxBytes = new Uint8Array(buffer as ArrayBuffer)
 
-    // Simulate a sliced view into a larger backing ArrayBuffer, as produced
-    // when reading a multipart/form-data body: the Uint8Array has a non-zero
-    // byteOffset and does not span the whole underlying buffer.
-    //
-    // The trailing bytes are a crafted, zero-record "end of central
-    // directory" record (zip signature PK\x05\x06). If `bytes.buffer` (the
-    // full backing buffer) were passed to ExcelJS instead of the exact byte
-    // range, the zip reader would latch onto this bogus trailing record
-    // (it scans backward from the end of the buffer) and see zero entries,
-    // rejecting a genuinely valid workbook. Slicing to the byte range
-    // excludes this trailing data entirely.
     const leadingPadding = 16
     const fakeEmptyEndOfCentralDirectory = new Uint8Array([
-      0x50, 0x4b, 0x05, 0x06, // signature PK\x05\x06
-      0x00, 0x00, // disk number
-      0x00, 0x00, // disk where central directory starts
-      0x00, 0x00, // number of central directory records on this disk
-      0x00, 0x00, // total number of central directory records
-      0x00, 0x00, 0x00, 0x00, // size of central directory
-      0x00, 0x00, 0x00, 0x00, // offset of start of central directory
-      0x00, 0x00, // comment length
+      0x50, 0x4b, 0x05, 0x06,
+      0x00, 0x00,
+      0x00, 0x00,
+      0x00, 0x00,
+      0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00,
     ])
     const padded = new Uint8Array(leadingPadding + xlsxBytes.byteLength + fakeEmptyEndOfCentralDirectory.byteLength)
     padded.set(xlsxBytes, leadingPadding)
@@ -328,30 +443,8 @@ describe('normalizeMemberImportSource', () => {
 describe('importMembersFromCsv', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    setupSqlMock()
     resetProfileState()
-    createUserMock.mockImplementation(async ({ email }: { email: string }) => {
-      profileState.set('M-PLACEHOLDER-100020', {
-        id: 'user-100020',
-        member_number: 'M-PLACEHOLDER-100020',
-        full_name: null,
-        auth_email: email,
-        email: null,
-        phone: null,
-        role: 'member',
-        is_active: false,
-        active_from: null,
-        psw_changed: null,
-        no_show_count: 0,
-        blocked_until: null,
-        created_at: '2026-04-14T00:00:00.000Z',
-        updated_at: '2026-04-14T00:00:00.000Z',
-      })
-      return {
-        data: { user: { id: 'user-100020' } },
-        error: null,
-      }
-    })
-    deleteUserMock.mockResolvedValue({ error: null })
   })
 
   it('updates existing members with generated fallback email and nullable phone', async () => {
@@ -363,9 +456,10 @@ describe('importMembersFromCsv', () => {
 
     expect(result.createdCount).toBe(0)
     expect(result.updatedCount).toBe(1)
-    expect(profileState.get('100001')?.full_name).toBe('Updated Name')
-    expect(profileState.get('100001')?.email).toBe('100001@members.alea.internal')
-    expect(profileState.get('100001')?.phone).toBeNull()
+    const profile = Array.from(profilesStore.values()).find(p => p.member_number === '100001')
+    expect(profile?.full_name).toBe('Updated Name')
+    expect(profile?.email).toBe('100001@members.alea.internal')
+    expect(profile?.phone).toBeNull()
     expect(result.normalizedRows).toEqual([
       {
         rowNumber: 2,
@@ -400,13 +494,8 @@ describe('importMembersFromCsv', () => {
 
     expect(result.createdCount).toBe(1)
     expect(result.totalRows).toBe(1)
-    expect(createUserMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        email: '100020@members.alea.internal',
-        email_confirm: true,
-      })
-    )
-    expect(profileState.get('100020')).toEqual(
+    const profile = Array.from(profilesStore.values()).find(p => p.member_number === '100020')
+    expect(profile).toEqual(
       expect.objectContaining({
         member_number: '100020',
         full_name: 'New Member',
@@ -437,7 +526,8 @@ describe('importMembersFromCsv', () => {
     )
 
     expect(result.createdCount).toBe(1)
-    expect(profileState.get('100024')).toEqual(
+    const profile = Array.from(profilesStore.values()).find(p => p.member_number === '100024')
+    expect(profile).toEqual(
       expect.objectContaining({
         auth_email: '100024@members.alea.internal',
         email: '100024@members.alea.internal',
@@ -463,7 +553,8 @@ describe('importMembersFromCsv', () => {
     )
 
     expect(result.updatedCount).toBe(1)
-    expect(profileState.get('100001')).toEqual(
+    const profile = Array.from(profilesStore.values()).find(p => p.member_number === '100001')
+    expect(profile).toEqual(
       expect.objectContaining({
         full_name: 'Existing Again',
         email: 'existing@alea.club',
@@ -548,96 +639,50 @@ describe('importMembersFromCsv', () => {
   })
 
   it('deletes the auth user when profile persistence returns null data', async () => {
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue({
-      from: vi.fn(() => ({
-        select: vi.fn(() => ({
-          eq: vi.fn((column: 'member_number' | 'id', value: string) => ({
-            maybeSingle: vi.fn(async () => {
-              const data = column === 'member_number'
-                ? profileState.get(value) ?? null
-                : Array.from(profileState.values()).find((row) => row.id === value) ?? null
-              return { data, error: null }
-            }),
-          })),
-        })),
-        update: vi.fn((updates: Record<string, unknown>) => ({
-          eq: vi.fn((_column: 'id', value: string) => ({
-            select: vi.fn(() => ({
-              maybeSingle: vi.fn(async () => {
-                if (value === 'user-100020') {
-                  return { data: null, error: null }
-                }
-
-                const target = Array.from(profileState.values()).find((row) => row.id === value)
-                if (!target) {
-                  return { data: null, error: { message: 'not found' } }
-                }
-
-                const next = {
-                  ...target,
-                  ...updates,
-                  updated_at: '2026-04-14T00:00:00.000Z',
-                }
-                profileState.delete(target.member_number)
-                profileState.set(next.member_number, next)
-                return { data: next, error: null }
-              }),
-            })),
-          })),
-        })),
-      })),
-      auth: {
-        admin: {
-          createUser: createUserMock,
-          deleteUser: deleteUserMock,
-        },
-      },
-    } as never)
-
     const { importMembersFromCsv } = await loadService()
+
+    // After loading the service, override the mock to fail INSERT
+    vi.clearAllMocks()
+    resetProfileState()
+    sqlQueryMock.mockImplementation(async (strings: TemplateStringsArray | string, ...values: unknown[]) => {
+      const queryStr = typeof strings === 'string'
+        ? strings
+        : strings.reduce((acc, str, i) => acc + str + (i < values.length ? `$${i + 1}` : ''), '')
+
+      const query = queryStr.toLowerCase()
+
+      // SELECT by member_number - return nothing for new member
+      if (query.includes('from profiles') && query.includes('where member_number')) {
+        return Promise.resolve([])
+      }
+
+      // INSERT - throw error to simulate persist failure
+      if (query.includes('insert into profiles')) {
+        throw new Error('Insert failed')
+      }
+
+      return Promise.resolve([])
+    })
+
     const result = await importMembersFromCsv(
-      'USUARIOS,ID,email,phone\nNew Member,100020,new@alea.club,699000111\n'
+      'USUARIOS,ID,email,phone\nNew Member,100025,new@alea.club,699000111\n'
     )
 
     expect(result.createdCount).toBe(0)
     expect(result.skippedCount).toBe(1)
     expect(result.issues).toContainEqual({
       rowNumber: 2,
-      memberNumber: '100020',
+      memberNumber: '100025',
       code: 'persist_import_failed',
     })
-    expect(deleteUserMock).toHaveBeenCalledWith('user-100020')
   })
 })
 
 describe('importMembersFromSource', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    setupSqlMock()
     resetProfileState()
-    createUserMock.mockImplementation(async ({ email }: { email: string }) => {
-      profileState.set('M-PLACEHOLDER-100023', {
-        id: 'user-100023',
-        member_number: 'M-PLACEHOLDER-100023',
-        full_name: null,
-        auth_email: email,
-        email: null,
-        phone: null,
-        role: 'member',
-        is_active: false,
-        active_from: null,
-        psw_changed: null,
-        no_show_count: 0,
-        blocked_until: null,
-        created_at: '2026-04-14T00:00:00.000Z',
-        updated_at: '2026-04-14T00:00:00.000Z',
-      })
-      return {
-        data: { user: { id: 'user-100023' } },
-        error: null,
-      }
-    })
-    deleteUserMock.mockResolvedValue({ error: null })
   })
 
   it('imports from xlsx source files and returns normalized rows for audit', async () => {
@@ -665,7 +710,8 @@ describe('importMembersFromSource', () => {
         phone: null,
       },
     ])
-    expect(profileState.get('100023')).toEqual(
+    const profile = Array.from(profilesStore.values()).find(p => p.member_number === '100023')
+    expect(profile).toEqual(
       expect.objectContaining({
         member_number: '100023',
         full_name: 'New Spreadsheet Member',

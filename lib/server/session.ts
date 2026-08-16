@@ -14,18 +14,25 @@ import { auth, currentUser } from '@clerk/nextjs/server'
 
 export type ClerkSession = {
   userId: string
+  sessionId: string
 }
 
 /**
  * Returns the current Clerk session, or null if the request is unauthenticated.
  * Safe to call from Route Handlers and Server Components.
+ *
+ * `sessionId` (added #299 pass 2) is needed for server-side session
+ * revocation (see `lib/server/auth-service.ts`'s `logout()`) — Clerk's own
+ * client SDK sign-out clears the client-side cookie, but revoking the
+ * session server-side too is the direct analog of the old
+ * `supabase.auth.signOut()` call it replaces.
  */
 export async function getClerkSession(): Promise<ClerkSession | null> {
-  const { userId } = await auth()
-  if (!userId) {
+  const { userId, sessionId } = await auth()
+  if (!userId || !sessionId) {
     return null
   }
-  return { userId }
+  return { userId, sessionId }
 }
 
 /**

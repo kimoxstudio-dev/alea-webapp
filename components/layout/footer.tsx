@@ -97,7 +97,7 @@ export function Footer({ locale }: FooterProps) {
             <ul className="space-y-2">
               <li>
                 <Link
-                  href={`/${locale}/login`}
+                  href={`/${locale}/sign-in`}
                   className="text-sm text-muted-foreground hover:text-foreground transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded"
                 >
                   {tAuth('login')}

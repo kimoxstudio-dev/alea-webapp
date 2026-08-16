@@ -74,7 +74,7 @@ export function LandingNav({ locale }: LandingNavProps) {
           ))}
         </nav>
 
-        <Link className="mod-cta" href={`/${locale}/login`}>
+        <Link className="mod-cta" href={`/${locale}/sign-in`}>
           {t('cta.join')} →
         </Link>
 

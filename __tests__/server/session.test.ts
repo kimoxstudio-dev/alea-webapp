@@ -8,14 +8,18 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
  * behave correctly for both authenticated and unauthenticated cases.
  */
 
-vi.mock('@clerk/nextjs/server', () => {
-  const authMock = vi.fn()
-  const currentUserMock = vi.fn()
-  return {
-    auth: authMock,
-    currentUser: currentUserMock,
-  }
-})
+// Mock server-only to allow testing server components
+vi.mock('server-only', () => ({}))
+
+const { authMock, currentUserMock } = vi.hoisted(() => ({
+  authMock: vi.fn(),
+  currentUserMock: vi.fn(),
+}))
+
+vi.mock('@clerk/nextjs/server', () => ({
+  auth: authMock,
+  currentUser: currentUserMock,
+}))
 
 import {
   getClerkSession,
@@ -23,10 +27,6 @@ import {
   requireClerkSession,
   type ClerkSession,
 } from '@/lib/server/session'
-import { auth, currentUser } from '@clerk/nextjs/server'
-
-const authMock = auth as any
-const currentUserMock = currentUser as any
 
 describe('Clerk session helpers', () => {
   beforeEach(() => {
@@ -35,12 +35,12 @@ describe('Clerk session helpers', () => {
 
   describe('getClerkSession', () => {
     it('returns session object when user is authenticated', async () => {
-      authMock.mockResolvedValue({ userId: 'user_123' })
+      authMock.mockResolvedValue({ userId: 'user_123', sessionId: 'sess_123' })
 
       const session = await getClerkSession()
 
       expect(session).not.toBeNull()
-      expect(session).toEqual({ userId: 'user_123' })
+      expect(session).toEqual({ userId: 'user_123', sessionId: 'sess_123' })
     })
 
     it('returns null when user is not authenticated', async () => {
@@ -62,11 +62,11 @@ describe('Clerk session helpers', () => {
 
   describe('requireClerkSession', () => {
     it('returns session object when user is authenticated', async () => {
-      authMock.mockResolvedValue({ userId: 'user_456' })
+      authMock.mockResolvedValue({ userId: 'user_456', sessionId: 'sess_456' })
 
       const session = await requireClerkSession()
 
-      expect(session).toEqual({ userId: 'user_456' })
+      expect(session).toEqual({ userId: 'user_456', sessionId: 'sess_456' })
     })
 
     it('throws error when user is not authenticated', async () => {

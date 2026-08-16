@@ -1,162 +1,20 @@
-import type { Metadata } from 'next'
-import { getTranslations } from 'next-intl/server'
 import { redirect } from 'next/navigation'
-import Image from 'next/image'
-import { LoginForm } from '@/components/auth/login-form'
-import { getSessionFromServerCookies } from '@/lib/server/auth'
-import { getCurrentUser } from '@/lib/server/auth-service'
 
-export async function generateMetadata(): Promise<Metadata> {
-  const t = await getTranslations('auth')
-  return { title: `${t('login')} — Alea` }
-}
-
+/**
+ * Legacy Supabase-password login route (#299 pass 3).
+ *
+ * The bespoke `LoginForm` UI it used to render posted to
+ * `app/api/auth/login/route.ts`, which called `login()` from
+ * `lib/server/auth-service.ts` — deleted in pass 2 (no password column left
+ * to check against; Clerk is now the only credential store). This page is
+ * kept only as a redirect so any stale bookmark/link to `/login` still lands
+ * somewhere useful, mirroring how `/register` redirects post-#206.
+ */
 interface LoginPageProps {
   params: Promise<{ locale: string }>
 }
 
 export default async function LoginPage({ params }: LoginPageProps) {
   const { locale } = await params
-  const session = await getSessionFromServerCookies()
-  if (session) {
-    let authenticated = false
-    try {
-      await getCurrentUser(session)
-      authenticated = true
-    } catch {
-      // ignore stale/invalid session, render login form
-    }
-    if (authenticated) {
-      redirect(`/${locale}/rooms`)
-    }
-  }
-  const t = await getTranslations('auth')
-
-  return (
-    <div className="h-dvh flex flex-col lg:flex-row overflow-hidden">
-      {/* LEFT ZONE — atmosphere and brand */}
-      <div className="relative hidden lg:flex lg:w-[45%] xl:w-[50%] flex-col items-center justify-center p-14 overflow-hidden">
-        {/* Ember radial glow centred on the logo */}
-        <div
-          className="absolute inset-0 pointer-events-none"
-          style={{
-            background:
-              'radial-gradient(ellipse 60% 55% at 50% 50%, rgba(255, 183, 123, 0.04) 0%, transparent 65%)',
-          }}
-          aria-hidden="true"
-        />
-
-        {/* Corner ornaments — absolute */}
-        <div aria-hidden="true" className="absolute top-10 left-10 w-8 h-8 border-l border-t"
-          style={{ borderColor: 'color-mix(in srgb, var(--primary) 22%, transparent)' }} />
-        <div aria-hidden="true" className="absolute top-10 right-10 w-8 h-8 border-r border-t"
-          style={{ borderColor: 'color-mix(in srgb, var(--primary) 22%, transparent)' }} />
-        <div aria-hidden="true" className="absolute bottom-10 left-10 w-8 h-8 border-l border-b"
-          style={{ borderColor: 'color-mix(in srgb, var(--primary) 22%, transparent)' }} />
-        <div aria-hidden="true" className="absolute bottom-10 right-10 w-8 h-8 border-r border-b"
-          style={{ borderColor: 'color-mix(in srgb, var(--primary) 22%, transparent)' }} />
-
-        {/* Identity block — centred medallion */}
-        <div className="relative z-10 flex flex-col items-center text-center gap-6">
-          {/* Logo */}
-          <Image
-            src="/alea-logo.png"
-            alt="Alea"
-            width={180}
-            height={180}
-            className="w-[clamp(130px,14vw,180px)] h-auto drop-shadow-[0_0_24px_rgba(255,183,123,0.12)]"
-            priority
-          />
-
-          {/* Overline */}
-          <p
-            className="text-[9px] tracking-[0.4em] uppercase font-medium"
-            style={{ color: 'color-mix(in srgb, var(--primary) 55%, transparent)' }}
-          >
-            Asociación Cultural
-          </p>
-
-          {/* Rule */}
-          <div
-            className="w-10 h-px"
-            style={{ background: 'color-mix(in srgb, var(--primary) 35%, transparent)' }}
-          />
-
-          {/* Subtitle */}
-          <p className="text-sm text-muted-foreground leading-relaxed max-w-[18rem]">
-            {t('loginSubtitle')}
-          </p>
-        </div>
-      </div>
-
-      {/* VERTICAL DIVIDER */}
-      <div
-        className="hidden lg:block w-px self-stretch"
-        style={{ background: 'color-mix(in srgb, var(--border) 55%, transparent)' }}
-        aria-hidden="true"
-      />
-
-      {/* RIGHT ZONE — sign-in panel */}
-      <div
-        className="flex-1 flex items-center justify-center p-8 lg:p-14 relative overflow-y-auto"
-        style={{
-          background:
-            'color-mix(in srgb, var(--background-secondary) 55%, var(--background))',
-        }}
-      >
-        {/* Subtle ember glow centre */}
-        <div
-          className="absolute inset-0 pointer-events-none"
-          style={{
-            background:
-              'radial-gradient(ellipse 55% 50% at 50% 50%, rgba(255, 183, 123, 0.022) 0%, transparent 65%)',
-          }}
-          aria-hidden="true"
-        />
-
-        <div className="relative z-10 w-full max-w-[22rem]">
-          {/* Mobile brand header — hidden on lg+ */}
-          <div className="lg:hidden flex flex-col items-center text-center mb-10 gap-4">
-            <Image
-              src="/alea-logo.png"
-              alt="Alea"
-              width={120}
-              height={120}
-              className="w-[100px] h-auto drop-shadow-[0_0_16px_rgba(255,183,123,0.12)]"
-              priority
-            />
-            <p
-              className="text-[9px] tracking-[0.4em] uppercase font-medium"
-              style={{ color: 'color-mix(in srgb, var(--primary) 55%, transparent)' }}
-            >
-              Asociación Cultural
-            </p>
-            <div
-              className="w-8 h-px"
-              style={{ background: 'color-mix(in srgb, var(--primary) 35%, transparent)' }}
-            />
-            <p className="text-sm text-muted-foreground leading-relaxed">
-              {t('loginSubtitle')}
-            </p>
-          </div>
-
-          {/* Desktop form label */}
-          <div className="hidden lg:block mb-8">
-            <p
-              className="text-[10px] tracking-[0.35em] uppercase font-medium"
-              style={{ color: 'color-mix(in srgb, var(--primary) 55%, transparent)' }}
-            >
-              {t('login')}
-            </p>
-          </div>
-
-          <LoginForm locale={locale} />
-
-          <p className="mt-7 text-center text-xs text-muted-foreground/60">
-            {t('loginHelp')}
-          </p>
-        </div>
-      </div>
-    </div>
-  )
+  redirect(`/${locale}/sign-in`)
 }

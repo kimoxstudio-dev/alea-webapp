@@ -1,9 +1,10 @@
 import type { MemberImportIssue, MemberImportResult, MemberImportRow, PaginatedResponse, User } from '@/lib/types'
-import { createSupabaseServerAdminClient } from '@/lib/supabase/server'
 import { serviceError } from '@/lib/server/service-error'
-import type { TablesUpdate } from '@/lib/supabase/types'
 import { memberNumberSchema } from '@/lib/validations/auth'
 import { type PublicProfileRow, toPublicUser } from '@/lib/server/profile-mappers'
+import { sql } from '@/lib/db/client'
+import { clerkClient } from '@clerk/nextjs/server'
+import { NeonDbError } from '@neondatabase/serverless'
 import {
   type MemberImportOptionalColumnPresence,
   MEMBER_IMPORT_PREVIEW_LIMIT,
@@ -12,56 +13,33 @@ import {
   pushImportIssue,
 } from '@/lib/server/member-import'
 
-type ProfilesQuery = {
-  eq: (column: string, value: unknown) => ProfilesQuery
-  or: (filter: string) => ProfilesQuery
-  maybeSingle: () => Promise<{ data: PublicProfileRow | null; error: unknown }>
-  order: (column: string, options: { ascending: boolean }) => {
-    range: (from: number, to: number) => Promise<{
-      data: PublicProfileRow[] | null
-      error: unknown
-      count: number | null
-    }>
-  }
-}
-type ProfilesTableClient = {
-  select: (columns: string, options?: { count?: 'exact' }) => ProfilesQuery
-  update: (updates: TablesUpdate<'profiles'>) => {
-    eq: (column: 'id', value: string) => {
-      select: (columns: string) => {
-        maybeSingle: () => Promise<{ data: PublicProfileRow | null; error: unknown }>
-      }
-    }
-  }
-}
-type AdminProfilesTableClient = {
-  select: (columns: string) => {
-    eq: (column: 'id', value: string) => {
-      maybeSingle: () => Promise<{ data: { id: string } | null; error: unknown }>
-    }
-  }
-}
-
-type ProfileImportLookupResult = Promise<{ data: PublicProfileRow | null; error: unknown }>
-type ProfilesImportTableClient = {
-  select: (columns: string) => {
-    eq: (column: 'member_number' | 'id', value: string) => {
-      maybeSingle: () => ProfileImportLookupResult
-    }
-  }
-  update: (updates: TablesUpdate<'profiles'>) => {
-    eq: (column: 'id', value: string) => {
-      select: (columns: string) => {
-        maybeSingle: () => ProfileImportLookupResult
-      }
-    }
-  }
-}
-type AuthAdminClient = {
-  updateUserById: (id: string, attributes: { email: string }) => Promise<{ error: unknown | null }>
-}
-
-const PROFILE_COLUMNS = 'id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at'
+/**
+ * Raw-SQL Neon port of the admin user-lifecycle service (#299).
+ *
+ * Admin-only role gating for every exported function here still happens at
+ * the route layer (`app/api/users/**`, via `requireAdmin()` in
+ * `lib/server/auth.ts`) exactly as before this migration — these functions
+ * do not additionally call `lib/server/authz.ts`'s `requireAdminRole()`
+ * themselves. Threading a `SessionUser` through would require changing the
+ * exported signatures here AND their call sites in `app/api/users/**`,
+ * which is outside this ticket's backend-only scope (`app/` is off limits —
+ * see this task's hard constraints). Flagged explicitly in the handoff
+ * message as a small, well-scoped follow-up. There are no member-scoped
+ * reads in this file (everything here is admin-lifecycle, operating across
+ * all members by design), so `assertMemberRowsScopedSql()` does not apply.
+ *
+ * Credential/identity-provider coupling was also removed, not replaced:
+ * the pre-migration version of this file created/deleted a Supabase Auth
+ * user alongside each profile row, and kept `auth_email` in sync with
+ * Supabase Auth on `updateUser()`. Clerk now owns credentials; there is no
+ * per-member identity-provider account to create/sync/delete here anymore.
+ * `auth_email`/`email` remain plain contact-info columns on the `profiles`
+ * row — as of #299 pass 3, `resolveProfileForClerkUser()`
+ * (`lib/server/auth-service.ts`) correlates a Clerk identity to a profile
+ * by USERNAME (`alea-<member_number>`), never by email; neither column is
+ * read there anymore. This file (admin CSV import, etc.) remains the ONLY
+ * place a `profiles` row is ever created; no self-service path creates one.
+ */
 
 function normalizePage(page: number) {
   return Math.max(1, Math.floor(Number(page)) || 1)
@@ -95,6 +73,38 @@ function createInternalAuthEmail(memberNumber: string) {
   return `${memberNumber}@members.alea.internal`
 }
 
+const CLERK_USERNAME_PREFIX = 'alea-'
+
+/**
+ * Builds the Clerk username for a member number. Mirrors
+ * `toClerkUsername()` in `lib/server/auth-service.ts` (not exported from
+ * there, so duplicated locally per this file's established pattern of
+ * standalone helpers — see `createInternalAuthEmail()` above).
+ */
+function toClerkUsername(memberNumber: string): string {
+  return `${CLERK_USERNAME_PREFIX}${memberNumber}`
+}
+
+async function getProfileById(id: string): Promise<PublicProfileRow | null> {
+  const rows = await sql`
+    SELECT id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
+    FROM profiles
+    WHERE id = ${id}
+    LIMIT 1
+  ` as PublicProfileRow[]
+  return rows[0] ?? null
+}
+
+async function getProfileByMemberNumber(memberNumber: string): Promise<PublicProfileRow | null> {
+  const rows = await sql`
+    SELECT id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
+    FROM profiles
+    WHERE member_number = ${memberNumber}
+    LIMIT 1
+  ` as PublicProfileRow[]
+  return rows[0] ?? null
+}
+
 async function importMembersFromNormalizedRows(input: {
   totalRows: number
   normalizedRows: MemberImportRow[]
@@ -104,18 +114,13 @@ async function importMembersFromNormalizedRows(input: {
   const { totalRows, normalizedRows } = input
   const issues = [...input.issues]
   const auditedRows: MemberImportRow[] = []
-  const admin = createSupabaseServerAdminClient()
-  const profiles = admin.from('profiles') as unknown as ProfilesImportTableClient
-  const authAdmin = admin.auth.admin as AuthAdminClient
   const concurrencyLimit = 10
 
   async function processImportRow(row: MemberImportRow) {
-    const { data: existing, error: selectError } = await profiles
-      .select(PROFILE_COLUMNS)
-      .eq('member_number', row.memberNumber)
-      .maybeSingle()
-
-    if (selectError) {
+    let existing: PublicProfileRow | null
+    try {
+      existing = await getProfileByMemberNumber(row.memberNumber)
+    } catch {
       return {
         created: 0,
         updated: 0,
@@ -126,30 +131,22 @@ async function importMembersFromNormalizedRows(input: {
 
     if (existing) {
       const resolvedEmail = row.email ?? createInternalAuthEmail(row.memberNumber)
-      const updatePayload: TablesUpdate<'profiles'> = {
-        full_name: row.fullName,
-      }
-      const normalizedRow: MemberImportRow = { ...row }
-
-      if (input.optionalColumnPresence.email) {
-        updatePayload.email = resolvedEmail
-        normalizedRow.email = resolvedEmail
-      } else {
-        normalizedRow.email = existing.email ?? null
-      }
-      if (input.optionalColumnPresence.phone) {
-        updatePayload.phone = row.phone
-      } else {
-        normalizedRow.phone = existing.phone ?? null
+      const nextFullName = row.fullName
+      const nextEmail = input.optionalColumnPresence.email ? resolvedEmail : existing.email
+      const nextPhone = input.optionalColumnPresence.phone ? row.phone : existing.phone
+      const normalizedRow: MemberImportRow = {
+        ...row,
+        email: input.optionalColumnPresence.email ? resolvedEmail : (existing.email ?? null),
+        phone: input.optionalColumnPresence.phone ? row.phone : (existing.phone ?? null),
       }
 
-      const { error: updateError } = await profiles
-        .update(updatePayload)
-        .eq('id', existing.id)
-        .select(PROFILE_COLUMNS)
-        .maybeSingle()
-
-      if (updateError) {
+      try {
+        await sql`
+          UPDATE profiles
+          SET full_name = ${nextFullName}, email = ${nextEmail}, phone = ${nextPhone}
+          WHERE id = ${existing.id}
+        `
+      } catch {
         return {
           created: 0,
           updated: 0,
@@ -168,40 +165,13 @@ async function importMembersFromNormalizedRows(input: {
 
     const authEmail = createInternalAuthEmail(row.memberNumber)
     const contactEmail = row.email ?? authEmail
-    const temporaryPassword = `Temp${crypto.randomUUID().replace(/-/g, '')}Aa1`
-    const { data: authData, error: createAuthError } = await admin.auth.admin.createUser({
-      email: authEmail,
-      password: temporaryPassword,
-      email_confirm: true,
-    })
 
-    if (createAuthError || !authData.user) {
-      return {
-        created: 0,
-        updated: 0,
-        normalizedRow: null,
-        issue: { rowNumber: row.rowNumber, memberNumber: row.memberNumber, code: 'create_auth_failed' as const },
-      }
-    }
-
-    const { data: persistedProfile, error: updateProfileError } = await profiles
-      .update({
-        member_number: row.memberNumber,
-        full_name: row.fullName,
-        auth_email: authEmail,
-        email: contactEmail,
-        phone: row.phone,
-        role: 'member',
-        is_active: false,
-        active_from: null,
-        psw_changed: null,
-      })
-      .eq('id', authData.user.id)
-      .select(PROFILE_COLUMNS)
-      .maybeSingle()
-
-    if (updateProfileError || !persistedProfile) {
-      await admin.auth.admin.deleteUser(authData.user.id)
+    try {
+      await sql`
+        INSERT INTO profiles (id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, psw_changed)
+        VALUES (gen_random_uuid(), ${row.memberNumber}, ${row.fullName}, ${authEmail}, ${contactEmail}, ${row.phone}, 'member', false, NULL, NULL)
+      `
+    } catch {
       return {
         created: 0,
         updated: 0,
@@ -272,28 +242,48 @@ export async function listPaginatedUsers(input: {
   const page = normalizePage(input.page)
   const limit = normalizeLimit(input.limit)
   const search = input.search?.trim() ?? ''
-  const supabase = createSupabaseServerAdminClient()
-  const profiles = supabase.from('profiles') as unknown as ProfilesTableClient
-  let query = profiles.select(PROFILE_COLUMNS, { count: 'exact' })
+  const offset = (page - 1) * limit
 
+  let pattern: string | null = null
   if (search) {
     const sanitized = sanitizeSearchTerm(search)
     if (sanitized) {
-      const escaped = escapeLikeWildcards(sanitized)
-      query = query.or(`member_number.ilike.%${escaped}%,full_name.ilike.%${escaped}%,email.ilike.%${escaped}%`)
+      pattern = `%${escapeLikeWildcards(sanitized)}%`
     }
   }
 
-  const { data, error, count } = await query
-    .order('created_at', { ascending: true })
-    .range((page - 1) * limit, page * limit - 1)
-  if (error) {
-    serviceError('Internal server error', 500)
+  let total: number
+  let rows: PublicProfileRow[]
+
+  if (pattern) {
+    const countRows = await sql`
+      SELECT COUNT(*)::int AS count
+      FROM profiles
+      WHERE member_number ILIKE ${pattern} OR full_name ILIKE ${pattern} OR email ILIKE ${pattern}
+    ` as { count: number }[]
+    total = countRows[0]?.count ?? 0
+
+    rows = await sql`
+      SELECT id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
+      FROM profiles
+      WHERE member_number ILIKE ${pattern} OR full_name ILIKE ${pattern} OR email ILIKE ${pattern}
+      ORDER BY created_at ASC
+      LIMIT ${limit} OFFSET ${offset}
+    ` as PublicProfileRow[]
+  } else {
+    const countRows = await sql`SELECT COUNT(*)::int AS count FROM profiles` as { count: number }[]
+    total = countRows[0]?.count ?? 0
+
+    rows = await sql`
+      SELECT id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
+      FROM profiles
+      ORDER BY created_at ASC
+      LIMIT ${limit} OFFSET ${offset}
+    ` as PublicProfileRow[]
   }
 
-  const total = count ?? 0
   return {
-    data: ((data ?? []) as PublicProfileRow[]).map(toPublicUser),
+    data: rows.map(toPublicUser),
     total,
     page,
     limit,
@@ -305,145 +295,343 @@ export async function updateUser(
   id: string,
   body: { memberNumber?: unknown; fullName?: unknown; email?: unknown; phone?: unknown; role?: unknown; is_active?: unknown }
 ) {
-  const updates: TablesUpdate<'profiles'> = {}
-  let nextMemberNumber: string | null = null
+  let nextMemberNumberInput: string | undefined
+  let nextFullNameInput: string | undefined
+  let emailProvided = false
+  let nextEmailInput: string | null = null
+  let phoneProvided = false
+  let nextPhoneInput: string | null = null
+  let nextRoleInput: 'admin' | 'member' | undefined
+  let nextIsActiveInput: boolean | undefined
+
   if (body.memberNumber !== undefined) {
     const parsed = memberNumberSchema.safeParse(String(body.memberNumber))
     if (!parsed.success) {
       serviceError('Invalid member number format', 400)
     }
-    updates.member_number = parsed.data
-    nextMemberNumber = parsed.data
+    nextMemberNumberInput = parsed.data
   }
   if (body.fullName !== undefined) {
     const fullName = String(body.fullName).trim()
     if (!fullName) {
       serviceError('Full name is required', 400)
     }
-    updates.full_name = fullName
+    nextFullNameInput = fullName
   }
   if (body.email !== undefined) {
     assertNullableStringField(body.email, 'Email')
-    updates.email = sanitizeOptionalUpdateValue(body.email)
+    emailProvided = true
+    nextEmailInput = sanitizeOptionalUpdateValue(body.email)
   }
   if (body.phone !== undefined) {
     assertNullableStringField(body.phone, 'Phone')
-    updates.phone = sanitizeOptionalUpdateValue(body.phone)
+    phoneProvided = true
+    nextPhoneInput = sanitizeOptionalUpdateValue(body.phone)
   }
-  if (body.role === 'admin' || body.role === 'member') updates.role = body.role
-  if (typeof body.is_active === 'boolean') updates.is_active = body.is_active
+  if (body.role === 'admin' || body.role === 'member') nextRoleInput = body.role
+  if (typeof body.is_active === 'boolean') nextIsActiveInput = body.is_active
 
-  if (Object.keys(updates).length === 0) {
+  if (
+    nextMemberNumberInput === undefined
+    && nextFullNameInput === undefined
+    && !emailProvided
+    && !phoneProvided
+    && nextRoleInput === undefined
+    && nextIsActiveInput === undefined
+  ) {
     serviceError('No updatable fields provided', 400)
   }
 
-  const supabase = createSupabaseServerAdminClient()
-  const profiles = supabase.from('profiles') as unknown as ProfilesTableClient
-  const authAdmin = supabase.auth.admin as AuthAdminClient
-  const { data: existingProfile, error: existingProfileError } = await profiles
-    .select(PROFILE_COLUMNS)
-    .eq('id', id)
-    .maybeSingle()
-
-  if (existingProfileError) {
-    serviceError('Internal server error', 500)
-  }
+  const existingProfile = await getProfileById(id)
   if (!existingProfile) {
     serviceError('User not found', 404)
   }
 
+  const nextMemberNumber = nextMemberNumberInput ?? existingProfile.member_number
+  const nextFullName = nextFullNameInput ?? existingProfile.full_name
+  const nextEmail = emailProvided ? nextEmailInput : existingProfile.email
+  const nextPhone = phoneProvided ? nextPhoneInput : existingProfile.phone
+  const nextRole = nextRoleInput ?? existingProfile.role
+  const nextIsActive = nextIsActiveInput ?? existingProfile.is_active
+
   const existingInternalAuthEmail = createInternalAuthEmail(existingProfile.member_number)
+  let nextAuthEmail = existingProfile.auth_email
   if (
-    nextMemberNumber !== null
-    && nextMemberNumber !== existingProfile.member_number
+    nextMemberNumberInput !== undefined
+    && nextMemberNumberInput !== existingProfile.member_number
     && existingProfile.auth_email === existingInternalAuthEmail
   ) {
-    updates.auth_email = createInternalAuthEmail(nextMemberNumber)
+    nextAuthEmail = createInternalAuthEmail(nextMemberNumberInput)
   }
 
-  const previousMemberNumber = existingProfile.member_number
-  const previousAuthEmail = existingProfile.auth_email
-  const { data, error } = await profiles
-    .update(updates)
-    .eq('id', id)
-    .select(PROFILE_COLUMNS)
-    .maybeSingle()
+  const memberNumberIsChanging = nextMemberNumberInput !== undefined
+    && nextMemberNumberInput !== existingProfile.member_number
 
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-  if (!data) {
-    serviceError('User not found', 404)
-  }
+  // Clerk-first, DB-second when member_number changes (production lockout
+  // defect fix — #299). Sign-in identity resolution keys off the Clerk
+  // USERNAME `alea-<member_number>` (see `resolveProfileForClerkUser()` in
+  // `lib/server/auth-service.ts`), not off any id persisted on `profiles`.
+  // If the DATABASE were updated first and the Clerk rename below then
+  // failed for any reason (network blip, Clerk outage, username already
+  // taken, etc.), the two systems would go out of sync: the DB row would
+  // carry the NEW member_number while the Clerk account would still answer
+  // to the OLD username — so login resolution would find no matching
+  // profile and the member would be locked out of their own account.
+  // Doing the Clerk rename FIRST and gating the DB write on its success
+  // means that on ANY failure mid-operation, both sides stay consistent on
+  // the OLD member_number and the member can still sign in. DO NOT reorder
+  // this to write the database first — that reproduces the lockout bug.
+  //
+  // That "Clerk-first" ordering has its own mirror failure mode (#299 Codex
+  // review finding 2): Clerk can rename successfully and the SQL write below
+  // can still fail (e.g. a `member_number` unique-constraint collision) —
+  // that would leave Clerk on the NEW username while `profiles` still has
+  // the OLD one, locking the member out via the same identity-resolution
+  // path this comment just described. Two mitigations, both required:
+  //   1. A pre-check below rejects the whole operation up front (no Clerk
+  //      call at all) if `nextMemberNumberInput` already belongs to a
+  //      different profile row.
+  //   2. Because that pre-check can't close a TOCTOU race against a
+  //      concurrent update claiming the same number, `renamedClerkUserId` is
+  //      tracked so the DB-write catch block below can roll Clerk back to
+  //      the OLD username if the write still fails despite the pre-check.
+  let renamedClerkUserId: string | null = null
 
-  if (typeof updates.auth_email === 'string') {
-    const { error: authUpdateError } = await authAdmin.updateUserById(id, { email: updates.auth_email })
+  if (memberNumberIsChanging) {
+    const conflictingRows = await sql`
+      SELECT id FROM profiles WHERE member_number = ${nextMemberNumberInput} AND id <> ${id} LIMIT 1
+    ` as { id: string }[]
+    if (conflictingRows[0]) {
+      serviceError('Member number is already in use', 409)
+    }
 
-    if (authUpdateError) {
-      await profiles
-        .update({
-          member_number: previousMemberNumber,
-          auth_email: previousAuthEmail,
+    const client = await clerkClient()
+    let existingClerkUser: { id: string } | undefined
+    try {
+      const { data } = await client.users.getUserList({
+        username: [toClerkUsername(existingProfile.member_number)],
+      })
+      existingClerkUser = data[0]
+    } catch {
+      serviceError('Internal server error', 500)
+    }
+
+    // A member who has never activated their account has no Clerk identity
+    // yet — there is nothing to rename, so it's safe to proceed straight to
+    // the database write in that case.
+    if (existingClerkUser) {
+      try {
+        await client.users.updateUser(existingClerkUser.id, {
+          username: toClerkUsername(nextMemberNumberInput as string),
         })
-        .eq('id', id)
-      serviceError('Failed to keep auth credentials aligned', 500)
+        renamedClerkUserId = existingClerkUser.id
+      } catch {
+        serviceError('Failed to update account credentials', 500)
+      }
     }
   }
 
-  return toPublicUser(data as PublicProfileRow)
-}
+  let updatedRows: PublicProfileRow[]
+  try {
+    updatedRows = await sql`
+      UPDATE profiles
+      SET member_number = ${nextMemberNumber},
+          full_name = ${nextFullName},
+          email = ${nextEmail},
+          phone = ${nextPhone},
+          role = ${nextRole},
+          is_active = ${nextIsActive},
+          auth_email = ${nextAuthEmail}
+      WHERE id = ${id}
+      RETURNING id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
+    ` as PublicProfileRow[]
+  } catch (err) {
+    // TOCTOU (#299 Codex review finding 2): the pre-check above passed, but
+    // a concurrent update could still have claimed `nextMemberNumberInput`
+    // between that check and this write. If Clerk was already renamed to
+    // the new username, roll it back to the OLD one so Clerk and the
+    // (unchanged) `profiles` row stay consistent and the member isn't
+    // locked out of their existing credentials.
+    if (renamedClerkUserId) {
+      try {
+        const client = await clerkClient()
+        await client.users.updateUser(renamedClerkUserId, {
+          username: toClerkUsername(existingProfile.member_number),
+        })
+      } catch (rollbackErr) {
+        // Do NOT swallow this — the rollback failing means Clerk is left on
+        // the NEW username while `profiles` still has the OLD member_number,
+        // an inconsistent state that needs manual intervention. Log it
+        // server-side; only a generic message goes to the client below.
+        console.error(
+          '[users-service] Clerk username rollback failed after DB write failure — Clerk/DB are now inconsistent for profile',
+          id,
+          rollbackErr,
+        )
+      }
+    }
 
-export async function resetNoShows(id: string) {
-  const admin = createSupabaseServerAdminClient()
-  const profiles = admin.from('profiles') as unknown as AdminProfilesTableClient
-  const { data: existing, error: selectError } = await profiles
-    .select('id')
-    .eq('id', id)
-    .maybeSingle()
-  if (selectError) serviceError('Internal server error', 500)
-  if (!existing) serviceError('User not found', 404)
-
-  const { error } = await admin
-    .from('profiles')
-    .update({ no_show_count: 0, blocked_until: null })
-    .eq('id', id)
-  if (error) serviceError('Internal server error', 500)
-}
-
-export async function unblockUser(id: string) {
-  const admin = createSupabaseServerAdminClient()
-  const profiles = admin.from('profiles') as unknown as AdminProfilesTableClient
-  const { data: existing, error: selectError } = await profiles
-    .select('id')
-    .eq('id', id)
-    .maybeSingle()
-  if (selectError) serviceError('Internal server error', 500)
-  if (!existing) serviceError('User not found', 404)
-
-  const { error } = await admin
-    .from('profiles')
-    .update({ blocked_until: null })
-    .eq('id', id)
-  if (error) serviceError('Internal server error', 500)
-}
-
-export async function deleteUser(id: string) {
-  const admin = createSupabaseServerAdminClient()
-  const profiles = admin.from('profiles') as unknown as AdminProfilesTableClient
-  const { data, error } = await profiles
-    .select('id')
-    .eq('id', id)
-    .maybeSingle()
-
-  if (error) {
+    if (err instanceof NeonDbError && err.code === '23505') {
+      serviceError('Member number is already in use', 409)
+    }
     serviceError('Internal server error', 500)
   }
+
+  const data = updatedRows[0]
   if (!data) {
+    // Zero-row race (#299 Codex review finding 7): `UPDATE ... RETURNING`
+    // can resolve successfully with an EMPTY array — rather than throwing —
+    // if the profile row was concurrently deleted between the initial
+    // lookup/pre-check above and this UPDATE. That's a different failure
+    // shape than the thrown-error path above, but the same consistency
+    // hazard: if Clerk was already renamed to the new username, it must be
+    // rolled back here too, or Clerk is left on the new username forever
+    // while there is no longer any profile row to reconcile it with.
+    if (renamedClerkUserId) {
+      try {
+        const client = await clerkClient()
+        await client.users.updateUser(renamedClerkUserId, {
+          username: toClerkUsername(existingProfile.member_number),
+        })
+      } catch (rollbackErr) {
+        // Do NOT swallow this — same reasoning as the catch-block rollback
+        // above: a failed rollback here leaves Clerk on the NEW username
+        // with no profile row at all, which needs manual intervention.
+        console.error(
+          '[users-service] Clerk username rollback failed after zero-row update (profile deleted concurrently) — Clerk is now inconsistent for profile',
+          id,
+          rollbackErr,
+        )
+      }
+    }
+
     serviceError('User not found', 404)
   }
 
-  const { error: deleteError } = await admin.auth.admin.deleteUser(id)
-  if (deleteError) {
+  return toPublicUser(data)
+}
+
+export async function resetNoShows(id: string) {
+  const rows = await sql`
+    UPDATE profiles
+    SET no_show_count = 0, blocked_until = NULL
+    WHERE id = ${id}
+    RETURNING id
+  ` as { id: string }[]
+
+  if (!rows[0]) {
+    serviceError('User not found', 404)
+  }
+}
+
+export async function unblockUser(id: string) {
+  const rows = await sql`
+    UPDATE profiles
+    SET blocked_until = NULL
+    WHERE id = ${id}
+    RETURNING id
+  ` as { id: string }[]
+
+  if (!rows[0]) {
+    serviceError('User not found', 404)
+  }
+}
+
+export async function deleteUser(id: string) {
+  const existingProfile = await getProfileById(id)
+  if (!existingProfile) {
+    serviceError('User not found', 404)
+  }
+
+  // Three-phase, deactivate-first (#299 Codex review finding 8 — supersedes
+  // finding 3's Clerk-first/DB-second ordering below). Finding 3's own
+  // comment used to claim "a failure here always leaves BOTH sides intact" —
+  // that claim was FALSE for one real case: if `client.users.deleteUser()`
+  // succeeded but the subsequent `DELETE FROM profiles` threw, the Clerk
+  // credential and all its sessions were already, irreversibly gone, while
+  // the profile row survived looking exactly as if it were still active.
+  // Clerk deletion has no "undelete", so a rollback-on-DB-failure pattern
+  // (like updateUser()'s Clerk-rename rollback above) does not apply here —
+  // there is nothing to roll Clerk back TO.
+  //
+  // Instead of trying to make the operation reversible, this ordering keeps
+  // every INTERMEDIATE state safe:
+  //   1. Deactivate the profile FIRST (`is_active = false`). This alone
+  //      already blocks sign-in: `resolveProfileForClerkUser()`
+  //      (`lib/server/auth-service.ts`) refuses any profile whose
+  //      `is_active` is false, regardless of whether a live Clerk
+  //      credential still exists for it.
+  //   2. Delete the Clerk identity.
+  //   3. Delete the `profiles` row.
+  // If the process fails or crashes between any two of these steps, there
+  // is never a window where a member holds both a live Clerk credential AND
+  // an active-looking profile — the security property that actually
+  // matters. A row left behind after step 1 or step 2 fails is just
+  // retryable cleanup debt (already deactivated, no live-access risk), not
+  // an orphaned-but-active account. Every step is safe to retry with the
+  // same `id`: step 1 is idempotent, step 2 re-resolves the Clerk user by
+  // username each call (a no-op once already deleted), and step 3 only
+  // runs after steps 1-2 have both succeeded.
+  const deactivatedRows = await sql`
+    UPDATE profiles
+    SET is_active = false
+    WHERE id = ${id}
+    RETURNING id
+  ` as { id: string }[]
+
+  if (!deactivatedRows[0]) {
+    // Concurrent delete beat this request to the row entirely — nothing to
+    // deactivate, delete, or compensate; "no row" is already the desired
+    // end state.
+    serviceError('User not found', 404)
+  }
+
+  const client = await clerkClient()
+  let existingClerkUser: { id: string } | undefined
+  try {
+    const { data } = await client.users.getUserList({
+      username: [toClerkUsername(existingProfile.member_number)],
+    })
+    existingClerkUser = data[0]
+  } catch {
     serviceError('Internal server error', 500)
+  }
+
+  // A member who never activated their account has no Clerk identity yet —
+  // there is nothing to delete, so it's safe to proceed straight to the
+  // database delete in that case. The profile is already deactivated above
+  // either way.
+  if (existingClerkUser) {
+    try {
+      // `deleteUser()` removes the Clerk user resource outright, which also
+      // invalidates all of its sessions — the SDK exposes no separate
+      // "revoke sessions" step beyond this for a user being deleted.
+      await client.users.deleteUser(existingClerkUser.id)
+    } catch (err) {
+      // Do NOT silently swallow: surface a clear error. The profile stays
+      // deactivated (is_active=false) but not deleted — safe to retry, not
+      // an orphaned-but-active account.
+      console.error('[users-service] Clerk identity deletion failed — profile left deactivated (is_active=false), NOT deleted, for', id, err)
+      serviceError('Failed to delete account credentials', 500)
+    }
+  }
+
+  // ON DELETE CASCADE on activation_tokens.profile_id (lib/db/schema/013_activation_tokens.sql)
+  // removes any pending activation/recovery token for this profile automatically.
+  const rows = await sql`
+    DELETE FROM profiles
+    WHERE id = ${id}
+    RETURNING id
+  ` as { id: string }[]
+
+  if (!rows[0]) {
+    // The Clerk identity (if any) is already gone at this point, and the
+    // profile was already deactivated in step 1 — reaching here means the
+    // row disappeared between step 1 and this delete (a concurrent delete).
+    // Not a live-access risk (the row was already inactive), but still
+    // worth a clear log since the Clerk deletion above, if it ran, cannot
+    // be un-done.
+    console.error('[users-service] profile row disappeared between Clerk deletion and DB delete for', id)
+    serviceError('User not found', 404)
   }
 }

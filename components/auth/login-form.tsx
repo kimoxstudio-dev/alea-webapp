@@ -5,9 +5,10 @@ import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useRouter } from 'next/navigation'
 import { useTranslations } from 'next-intl'
+import { useSignIn } from '@clerk/nextjs/legacy'
 import { DiceLoader } from '@/components/ui/dice-loader'
 import { loginSchema, type LoginFormData } from '@/lib/validations/auth'
-import { useAuth } from '@/lib/auth/auth-context'
+import { resolveSafeRedirect } from '@/lib/safe-redirect'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { PasswordInput } from '@/components/ui/password-input'
@@ -20,6 +21,23 @@ import {
   useFormField,
 } from '@/components/ui/form'
 
+/**
+ * Custom, Alea-branded sign-in form backed by Clerk's headless `useSignIn()`
+ * hook (#299 pass 3 frontend rework).
+ *
+ * Clerk's prebuilt `<SignIn/>` widget manages its own internal form state
+ * and has no clean way to transform whatever the member types before
+ * calling Clerk — but the member must only ever see/type their bare member
+ * number, never the `alea-` prefix that the Clerk username is actually
+ * built from (`toClerkUsername()` in `lib/server/auth-service.ts`). So this
+ * form collects the member number + password with this app's own styling
+ * (mirrors `register-form.tsx`'s conventions) and prepends the prefix only
+ * right before calling `signIn.create()` — the prefix never reaches the DOM,
+ * clipboard, or browser autofill under any other value than what Clerk
+ * itself is given.
+ */
+const CLERK_USERNAME_PREFIX = 'alea-'
+
 function TranslatedFormMessage({ message }: { message: string | undefined }) {
   const { formMessageId } = useFormField()
   const tField = useTranslations('auth')
@@ -31,12 +49,15 @@ function TranslatedFormMessage({ message }: { message: string | undefined }) {
   )
 }
 
-interface LoginFormProps { locale: string }
+interface LoginFormProps {
+  locale: string
+  redirectUrl?: string
+}
 
-export function LoginForm({ locale }: LoginFormProps) {
+export function LoginForm({ locale, redirectUrl }: LoginFormProps) {
   const t = useTranslations('auth')
-  const { login } = useAuth()
   const router = useRouter()
+  const { isLoaded, signIn, setActive } = useSignIn()
   const [serverError, setServerError] = useState<string | null>(null)
   const [recoveryHelpVisible, setRecoveryHelpVisible] = useState(false)
 
@@ -53,9 +74,26 @@ export function LoginForm({ locale }: LoginFormProps) {
   const onSubmit = async (data: LoginFormData) => {
     setServerError(null)
     setRecoveryHelpVisible(false)
+
+    if (!isLoaded || !signIn || !setActive) {
+      setServerError(t('errors.invalidCredentials'))
+      return
+    }
+
     try {
-      await login(data.identifier, data.password)
-      router.push(`/${locale}/rooms`)
+      const attempt = await signIn.create({
+        identifier: `${CLERK_USERNAME_PREFIX}${data.identifier.trim()}`,
+        password: data.password,
+      })
+
+      if (attempt.status !== 'complete' || !attempt.createdSessionId) {
+        setServerError(t('errors.invalidCredentials'))
+        return
+      }
+
+      await setActive({ session: attempt.createdSessionId })
+      const target = resolveSafeRedirect(redirectUrl, `/${locale}/rooms`)
+      router.push(target)
     } catch {
       setServerError(t('errors.invalidCredentials'))
     }
@@ -129,7 +167,7 @@ export function LoginForm({ locale }: LoginFormProps) {
         <Button
           type="submit"
           className="w-full h-11 font-cinzel tracking-widest text-xs mt-2"
-          disabled={isSubmitting}
+          disabled={isSubmitting || !isLoaded}
         >
           {isSubmitting ? (
             <span className="inline-flex items-center gap-2.5">

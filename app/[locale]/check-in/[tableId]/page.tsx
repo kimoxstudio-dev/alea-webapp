@@ -32,7 +32,7 @@ export default async function CheckInPage({ params, searchParams }: CheckInPageP
 
   const session = await getSessionFromServerCookies()
   if (!session) {
-    redirect(`/${locale}/login?returnUrl=/${locale}/check-in/${tableId}${sideParam === 'inf' ? '?side=inf' : ''}`)
+    redirect(`/${locale}/sign-in?redirect_url=/${locale}/check-in/${tableId}${sideParam === 'inf' ? '?side=inf' : ''}`)
   }
 
   try {

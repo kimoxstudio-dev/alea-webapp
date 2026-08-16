@@ -73,7 +73,7 @@ export async function LandingFooterSection({ locale }: LandingFooterSectionProps
       </div>
       <div className="mod-foot-bottom" style={{ display: 'flex', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap', alignItems: 'center' }}>
         <span>{t('footer.rights')}</span>
-        <Link href={`/${locale}/login`} style={{ color: 'inherit', textDecoration: 'none', borderBottom: '1px dotted rgba(244,234,213,0.3)' }}>
+        <Link href={`/${locale}/sign-in`} style={{ color: 'inherit', textDecoration: 'none', borderBottom: '1px dotted rgba(244,234,213,0.3)' }}>
           {t('footer.admin')}
         </Link>
       </div>

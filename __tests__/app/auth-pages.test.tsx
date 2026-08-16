@@ -32,45 +32,33 @@ describe('auth page guards', () => {
     markExpiredReservationsAsNoShowMock.mockResolvedValue(0)
   })
 
-  it('login page keeps stale sessions on login instead of redirecting to rooms', async () => {
-    getSessionFromServerCookiesMock.mockResolvedValueOnce({ id: 'session-1', role: 'member' })
-    getCurrentUserMock.mockRejectedValueOnce(new Error('stale'))
-
+  it('login page redirects to sign-in (legacy shim)', async () => {
     const { default: LoginPage } = await import('@/app/[locale]/login/page')
     await LoginPage({ params: Promise.resolve({ locale: 'es' }) })
 
-    expect(redirectMock).not.toHaveBeenCalledWith('/es/rooms')
+    // /login is a legacy redirect to /sign-in (same pattern as /register post-#206)
+    expect(redirectMock).toHaveBeenCalledWith('/es/sign-in')
   })
 
-  it('login page redirects valid sessions to rooms', async () => {
-    getSessionFromServerCookiesMock.mockResolvedValueOnce({ id: 'session-1', role: 'member' })
-    getCurrentUserMock.mockResolvedValueOnce({ id: 'user-1' })
-
-    const { default: LoginPage } = await import('@/app/[locale]/login/page')
-    await LoginPage({ params: Promise.resolve({ locale: 'es' }) })
-
-    expect(redirectMock).toHaveBeenCalledWith('/es/rooms')
-  })
-
-  it('rooms page redirects stale sessions to login', async () => {
-    getSessionFromServerCookiesMock.mockResolvedValueOnce({ id: 'session-1', role: 'member' })
-    getCurrentUserMock.mockRejectedValueOnce(new Error('stale'))
-
-    const { default: RoomsPage } = await import('@/app/[locale]/rooms/page')
-    await RoomsPage({ params: Promise.resolve({ locale: 'es' }) })
-
-    expect(redirectMock).toHaveBeenCalledWith('/es/login')
-    expect(markExpiredReservationsAsNoShowMock).not.toHaveBeenCalled()
-  })
-
-  it('rooms page skips expiry processing when there is no session', async () => {
+  it('rooms page redirects unauthenticated users to sign-in', async () => {
     getSessionFromServerCookiesMock.mockResolvedValueOnce(null)
 
     const { default: RoomsPage } = await import('@/app/[locale]/rooms/page')
     await RoomsPage({ params: Promise.resolve({ locale: 'es' }) })
 
-    expect(redirectMock).toHaveBeenCalledWith('/es/login')
+    expect(redirectMock).toHaveBeenCalledWith('/es/sign-in')
     expect(getCurrentUserMock).not.toHaveBeenCalled()
+    expect(markExpiredReservationsAsNoShowMock).not.toHaveBeenCalled()
+  })
+
+  it('rooms page redirects stale sessions to sign-in', async () => {
+    getSessionFromServerCookiesMock.mockResolvedValueOnce({ id: 'session-1', role: 'member' })
+    getCurrentUserMock.mockRejectedValueOnce(new Error('stale'))
+
+    const { default: RoomsPage } = await import('@/app/[locale]/rooms/page')
+    await RoomsPage({ params: Promise.resolve({ locale: 'es' }) })
+
+    expect(redirectMock).toHaveBeenCalledWith('/es/sign-in')
     expect(markExpiredReservationsAsNoShowMock).not.toHaveBeenCalled()
   })
 

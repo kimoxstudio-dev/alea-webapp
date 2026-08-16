@@ -18,7 +18,7 @@ export default async function AdminPage({ params }: AdminPageProps) {
   const session = await getSessionFromServerCookies()
 
   if (!session) {
-    redirect(`/${locale}/login`)
+    redirect(`/${locale}/sign-in`)
   }
 
   if (session.role !== 'admin') {

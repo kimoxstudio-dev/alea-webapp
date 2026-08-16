@@ -158,11 +158,29 @@ Agents MAY, against the **development database only**:
 - Run read-only `SELECT` inspection (table listings, row counts, contents).
 - Insert, update, and delete **synthetic** test data — a seeded admin profile and fictional member profiles.
 
+Agents MAY also execute **DDL against the development database only** — but ONLY when the user grants permission for that specific migration, in the current turn. See "DDL on the development database" below for the exact conditions.
+
 Still forbidden, without exception:
-- Schema migrations and any DDL — `CREATE`, `ALTER`, `DROP`, `TRUNCATE`. These remain user-only; agents may prepare and commit migration SQL, but the user applies it.
-- Any database that is not the development one.
+- Any database that is not the development one — this is a blanket prohibition, not narrowed by statement type. DDL against staging or production is not a special case of it; it's the same rule. Staging and production migrations remain user-only, always, with no equivalent exception.
+- `TRUNCATE`, anywhere, including the development database.
 - Loading real member data. The club's actual membership file never enters a development database, an agent worktree, or a log. All test data used by agents is invented/synthetic.
 
 **Required before the first write, every time:** a read-only inspection of the target database (list tables, row counts), reported. If it contains anything resembling real membership data, STOP and report instead of seeding on top. The local connection string carries no environment marker in its name, so nothing in the environment proves which database it is — the inspection is what proves it.
 
 Why this exception exists: without a seeded admin account to issue activation links and a pre-registered member profile to redeem them, the [N1] auth migration work (issue #299) cannot be verified end to end, and shipping unverifiable auth changes is exactly what this exception exists to prevent.
+
+### DDL on the development database — permission-gated
+
+Agents MAY write **and execute** schema migrations (`CREATE`, `ALTER`, `DROP`) against the **development** database, but every execution requires the user's explicit permission for that specific migration, given in the current turn.
+
+**Conditions — all of them, every time:**
+1. **The user grants permission in the current turn, for that migration.** Not inferred from a previous approval, not from general enthusiasm ("dale", "adelante"), not from the fact that a similar migration was approved earlier. A permission granted for one migration does not carry to the next one — ask again, every time. This mirrors the develop/main merge exceptions in `~/.claude/CLAUDE.md`, deliberately.
+2. **The SQL is written and committed to the branch first, and shown to the user**, so they are approving a specific statement rather than an intention.
+3. **Development database only.** Confirm the target before executing. Staging and production have no equivalent exception and never will.
+4. **Never `TRUNCATE`.** Still forbidden everywhere, no exception.
+5. **Destructive DDL is reported before and after** — what it drops, what it changes, and the verified state afterwards.
+6. If the migration fails partway, **stop and report**. Do not improvise a repair or a rollback against the live database.
+
+**Why this exists:** added 2026-08-16 during #299. The live development database had drifted from schema-as-code — `profiles.id` still carried a `FOREIGN KEY (id) REFERENCES auth.users(id)` from the Supabase baseline that `003_profiles.sql` claimed was dropped, because `apply-neon-schema.mjs` uses `CREATE TABLE IF NOT EXISTS` and no-ops on an existing table. That single stale constraint made **every** insert into `profiles` fail, blocking both the seed and the real CSV member-import path, and therefore blocking any end-to-end verification of the auth migration. Fixing drift like this is routine migration work on a throwaway dev database, and routing every instance through the user was slowing the migration down for no safety gain.
+
+**Why it is still permission-gated rather than blanket:** the user's standing principle is that exceptions must be written down rather than granted verbally in the moment (established 2026-07-14). The value of the DDL prohibition is that schema changes stay deliberate. Requiring per-migration permission keeps that deliberateness while removing the flat "agents never run DDL" blocker that no longer matched the work. The user asked for exactly this shape: "escríbelo, pero pon también si yo doy permiso."

@@ -19,13 +19,13 @@ export default async function RoomsPage({ params }: RoomsPageProps) {
   const { locale } = await params
   const session = await getSessionFromServerCookies()
   if (!session) {
-    return redirect(`/${locale}/login`)
+    return redirect(`/${locale}/sign-in`)
   }
 
   try {
     await getCurrentUser(session)
   } catch {
-    return redirect(`/${locale}/login`)
+    return redirect(`/${locale}/sign-in`)
   }
 
   try {
