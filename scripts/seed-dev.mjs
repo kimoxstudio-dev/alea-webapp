@@ -278,6 +278,9 @@ async function ensureAdminClerkIdentity(adminPassword) {
   return { created: true, username }
 }
 
+// Export for testing
+export { ensureAdminClerkIdentity, clerkFetch, toClerkUsername, ADMIN_MEMBER_NUMBER }
+
 async function main() {
   loadEnvLocal()
 
@@ -308,7 +311,10 @@ async function main() {
   console.log(`[seed] Pending member fixture (needs an admin-issued activation link): ${MEMBER_MEMBER_NUMBER}`)
 }
 
-main().catch((error) => {
-  console.error('[seed] failed:', error instanceof Error ? error.message : error)
-  process.exit(1)
-})
+// Only run main() if this script is executed directly, not when imported for testing
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((error) => {
+    console.error('[seed] failed:', error instanceof Error ? error.message : error)
+    process.exit(1)
+  })
+}
