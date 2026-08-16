@@ -60,3 +60,6 @@ docs/AUDIT-*.md
 
 # Agent progress log (local-only, no longer tracked in git — see CLAUDE.md)
 .claude/agent-progress.md
+
+# Per-developer Claude settings (personal, never shared — .claude/settings.json stays tracked)
+.claude/settings.local.json
