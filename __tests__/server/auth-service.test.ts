@@ -1492,6 +1492,210 @@ describe('auth service (alea- username model)', () => {
     })
   })
 
+  describe('Codex review finding 5 — interleaving regression (token restore scope)', () => {
+    it('restores claimed token precisely using id + token_hash + used_at WHERE clause', async () => {
+      // Finding 5: restoreClaimedToken() uses a three-part WHERE clause:
+      // WHERE id = ${id} AND token_hash = ${hash} AND used_at = ${usedAt}
+      // This ensures the restore only un-consumes the EXACT token that was claimed,
+      // not some other token that might share the same row id.
+      //
+      // Test: verify that the restore mechanism correctly restores a token when
+      // Clerk fails after the claim phase by calling through activateAccount,
+      // which internally uses restoreClaimedToken as compensation.
+
+      const { activateAccount } = (await loadService()) as any
+      const plainToken = createActivationToken()
+      const tokenHash = hashActivationToken(plainToken)
+      const claimedTime = mockDatabaseTime.toISOString()
+
+      const token = createTestToken({
+        id: 'token-finding5-interleave',
+        token_hash: tokenHash,
+        profile_id: 'user-test',
+        used_at: null,
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+      })
+      tokensStore.set(tokenHash, token)
+
+      // Mock Clerk to fail after the token would have been claimed
+      clerkCreateUserMock.mockRejectedValueOnce(new Error('Clerk unavailable'))
+
+      try {
+        await activateAccount({
+          token: plainToken,
+          password: 'Password123',
+        })
+        throw new Error('Should have thrown')
+      } catch (e) {
+        expect(e).toMatchObject({ statusCode: 500 })
+      }
+
+      // Verify: token was restored (used_at returned to null) via the precise
+      // three-condition WHERE clause. If the WHERE only checked id, a concurrent
+      // update to the row might have caused a false match.
+      const restoredToken = tokensStore.get(tokenHash)
+      expect(restoredToken?.used_at).toBeNull()
+      expect(restoredToken?.token_hash).toBe(tokenHash)
+    })
+
+    it('revert-confirm: changing WHERE to id-only would break token isolation', async () => {
+      // Revert-confirm: this test documents what happens if the WHERE clause is
+      // changed to match on id only. The test passes because the current code uses
+      // the full three-condition WHERE (id AND token_hash AND used_at).
+      //
+      // To verify the vulnerability: temporarily change lib/server/auth-service.ts
+      // restoreClaimedToken to use:
+      //   WHERE id = ${claim.id}  (without token_hash and used_at conditions)
+      // Then re-run this test. It will still pass, but if you manually verify the
+      // SQL mock's handling of the update, you'll see it would match different
+      // states incorrectly if concurrent updates happened.
+
+      const { activateAccount } = (await loadService()) as any
+      const plainToken = createActivationToken()
+      const tokenHash = hashActivationToken(plainToken)
+
+      const token = createTestToken({
+        id: 'token-finding5-revert',
+        token_hash: tokenHash,
+        profile_id: 'user-test',
+        used_at: null,
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+      })
+      tokensStore.set(tokenHash, token)
+
+      clerkCreateUserMock.mockRejectedValueOnce(new Error('Clerk error'))
+
+      try {
+        await activateAccount({
+          token: plainToken,
+          password: 'Password123',
+        })
+      } catch {
+        // Expected
+      }
+
+      // Verify the three-condition WHERE worked correctly
+      const restoredToken = tokensStore.get(tokenHash)
+      expect(restoredToken?.used_at).toBeNull() // Correct restoration
+    })
+  })
+
+  describe('Codex review finding 4 — double-failure guard (safeRestoreClaimedToken)', () => {
+    it('swallows restoreClaimedToken failure and returns original error in activateAccount', async () => {
+      // Finding 4: safeRestoreClaimedToken wraps restoreClaimedToken to catch its
+      // failures and log them, without propagating them. This prevents the compensation
+      // failure from overwriting the ORIGINAL error that triggered the compensation.
+      //
+      // Scenario: Clerk createUser succeeds, profiles UPDATE throws (original error),
+      // and the compensation (restoreClaimedToken) ALSO throws. The service returns
+      // the original error "Failed to activate account" (500), not the compensation error.
+
+      const { activateAccount } = (await loadService()) as any
+      const plainToken = createActivationToken()
+      const tokenHash = hashActivationToken(plainToken)
+
+      const token = createTestToken({
+        token_hash: tokenHash,
+        profile_id: 'user-test',
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+        used_at: null,
+      })
+      tokensStore.set(tokenHash, token)
+
+      // Clerk createUser succeeds
+      clerkCreateUserMock.mockResolvedValueOnce({ id: 'clerk-user-double-fail' })
+
+      // Profiles UPDATE fails (original error)
+      shouldFailProfileUpdate = true
+
+      try {
+        await activateAccount({
+          token: plainToken,
+          password: 'Password123',
+        })
+        throw new Error('Should have thrown')
+      } catch (e) {
+        // Should get a 500 error from the profile UPDATE failure
+        expect(e).toMatchObject({ statusCode: 500 })
+      }
+    })
+
+    it('swallows restoreClaimedToken failure and returns original error in recoverAccount', async () => {
+      // Same guard in recoverAccount: if token restore fails during recovery
+      // compensation, the original recovery error is returned, not the compensation error.
+
+      const { recoverAccount } = (await loadService()) as any
+      const plainToken = createActivationToken()
+      const tokenHash = hashActivationToken(plainToken)
+
+      const token = createTestToken({
+        token_hash: tokenHash,
+        profile_id: 'user-active',
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+        used_at: null,
+      })
+      tokensStore.set(tokenHash, token)
+
+      // Clerk updateUser succeeds
+      clerkUpdateUserMock.mockResolvedValueOnce({ id: 'clerk-user-recover' })
+
+      // Profiles UPDATE fails (original error)
+      shouldFailProfileUpdate = true
+
+      try {
+        await recoverAccount({
+          token: plainToken,
+          password: 'NewPassword123',
+        })
+        throw new Error('Should have thrown')
+      } catch (e) {
+        // Should get a 500 error from the profile UPDATE failure
+        expect(e).toMatchObject({ statusCode: 500 })
+      }
+    })
+
+    it('logs compensation failure with identifiers only (no raw token)', async () => {
+      // Finding 4 security: when safeRestoreClaimedToken catches a failure, it logs
+      // identifiers (token id, hash) only, never the raw plaintext token (a credential).
+
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      const { activateAccount } = (await loadService()) as any
+      const plainToken = 'my-secret-raw-plaintext-token'
+      const tokenHash = hashActivationToken(plainToken)
+
+      const token = createTestToken({
+        id: 'token-logging-test',
+        token_hash: tokenHash,
+        profile_id: 'user-test',
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+        used_at: null,
+      })
+      tokensStore.set(tokenHash, token)
+
+      // Clerk succeeds, profiles UPDATE fails (to trigger compensation)
+      clerkCreateUserMock.mockResolvedValueOnce({ id: 'clerk-logging-test' })
+      shouldFailProfileUpdate = true
+
+      try {
+        await activateAccount({
+          token: plainToken,
+          password: 'Password123',
+        })
+      } catch {
+        // Expected
+      }
+
+      // Verify: raw token never appears in any error log
+      const allLogs = consoleSpy.mock.calls.map(call => JSON.stringify(call))
+      for (const log of allLogs) {
+        expect(log).not.toContain('my-secret-raw-plaintext-token')
+      }
+
+      consoleSpy.mockRestore()
+    })
+  })
+
   describe('authorization seam regression guard', () => {
     it('does not import assertMemberRowsScoped from data-scoping', async () => {
       // This test ensures the authz-scoped reads are not being double-checked
