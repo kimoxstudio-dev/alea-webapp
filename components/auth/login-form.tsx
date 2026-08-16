@@ -93,7 +93,6 @@ export function LoginForm({ locale, redirectUrl }: LoginFormProps) {
       await setActive({ session: attempt.createdSessionId })
       const target = redirectUrl && redirectUrl.startsWith('/') ? redirectUrl : `/${locale}/rooms`
       router.push(target)
-      router.refresh()
     } catch {
       setServerError(t('errors.invalidCredentials'))
     }
