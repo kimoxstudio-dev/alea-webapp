@@ -3,6 +3,7 @@ import { serviceError } from '@/lib/server/service-error'
 import { memberNumberSchema } from '@/lib/validations/auth'
 import { type PublicProfileRow, toPublicUser } from '@/lib/server/profile-mappers'
 import { sql } from '@/lib/db/client'
+import { clerkClient } from '@clerk/nextjs/server'
 import {
   type MemberImportOptionalColumnPresence,
   MEMBER_IMPORT_PREVIEW_LIMIT,
@@ -69,6 +70,18 @@ function assertNullableStringField(value: unknown, fieldName: string) {
 
 function createInternalAuthEmail(memberNumber: string) {
   return `${memberNumber}@members.alea.internal`
+}
+
+const CLERK_USERNAME_PREFIX = 'alea-'
+
+/**
+ * Builds the Clerk username for a member number. Mirrors
+ * `toClerkUsername()` in `lib/server/auth-service.ts` (not exported from
+ * there, so duplicated locally per this file's established pattern of
+ * standalone helpers — see `createInternalAuthEmail()` above).
+ */
+function toClerkUsername(memberNumber: string): string {
+  return `${CLERK_USERNAME_PREFIX}${memberNumber}`
 }
 
 async function getProfileById(id: string): Promise<PublicProfileRow | null> {
@@ -348,6 +361,49 @@ export async function updateUser(
     && existingProfile.auth_email === existingInternalAuthEmail
   ) {
     nextAuthEmail = createInternalAuthEmail(nextMemberNumberInput)
+  }
+
+  const memberNumberIsChanging = nextMemberNumberInput !== undefined
+    && nextMemberNumberInput !== existingProfile.member_number
+
+  // Clerk-first, DB-second when member_number changes (production lockout
+  // defect fix — #299). Sign-in identity resolution keys off the Clerk
+  // USERNAME `alea-<member_number>` (see `resolveProfileForClerkUser()` in
+  // `lib/server/auth-service.ts`), not off any id persisted on `profiles`.
+  // If the DATABASE were updated first and the Clerk rename below then
+  // failed for any reason (network blip, Clerk outage, username already
+  // taken, etc.), the two systems would go out of sync: the DB row would
+  // carry the NEW member_number while the Clerk account would still answer
+  // to the OLD username — so login resolution would find no matching
+  // profile and the member would be locked out of their own account.
+  // Doing the Clerk rename FIRST and gating the DB write on its success
+  // means that on ANY failure mid-operation, both sides stay consistent on
+  // the OLD member_number and the member can still sign in. DO NOT reorder
+  // this to write the database first — that reproduces the lockout bug.
+  if (memberNumberIsChanging) {
+    const client = await clerkClient()
+    let existingClerkUser: { id: string } | undefined
+    try {
+      const { data } = await client.users.getUserList({
+        username: [toClerkUsername(existingProfile.member_number)],
+      })
+      existingClerkUser = data[0]
+    } catch {
+      serviceError('Internal server error', 500)
+    }
+
+    // A member who has never activated their account has no Clerk identity
+    // yet — there is nothing to rename, so it's safe to proceed straight to
+    // the database write in that case.
+    if (existingClerkUser) {
+      try {
+        await client.users.updateUser(existingClerkUser.id, {
+          username: toClerkUsername(nextMemberNumberInput as string),
+        })
+      } catch {
+        serviceError('Failed to update account credentials', 500)
+      }
+    }
   }
 
   let updatedRows: PublicProfileRow[]
