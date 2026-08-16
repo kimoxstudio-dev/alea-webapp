@@ -34,9 +34,11 @@
  * are deliberately left untouched on conflict, so re-running this script
  * after the member has been activated through the real flow does not
  * silently revert their activation state back to pending. The admin
- * fixture's Clerk identity is only created if no Clerk user with that
- * username already exists (checked via a GET before the POST); its password
- * is never reset on a later run.
+ * fixture's Clerk identity is created if no Clerk user with that username
+ * already exists (checked via a GET before the POST); if one already exists,
+ * its password is updated (PATCH) to whatever `SEED_ADMIN_PASSWORD` is
+ * currently configured, so rotating that env var and re-running this script
+ * actually changes what the operator can sign in with.
  *
  * Usage:
  *   DEV_SEED_CONFIRM=YES_SEED_NEON_DEV_DB node scripts/seed-dev.mjs
@@ -227,9 +229,13 @@ async function clerkFetch(path, options = {}) {
 /**
  * Creates the admin's real, working Clerk identity if one doesn't already
  * exist for `alea-<ADMIN_MEMBER_NUMBER>`. No email attribute, per the
- * locked identity model. Idempotent: never resets the password on an
- * existing identity. `adminPassword` must already have been validated by
- * `assertAdminPasswordProvided`.
+ * locked identity model. Idempotent for the profile row, but the Clerk
+ * credential is kept in sync with `SEED_ADMIN_PASSWORD` on every run: if the
+ * identity already exists, its password is updated to whatever is currently
+ * configured, so re-running this script after rotating `SEED_ADMIN_PASSWORD`
+ * actually lets the operator sign in with the new value instead of silently
+ * leaving the old Clerk credential in place. `adminPassword` must already
+ * have been validated by `assertAdminPasswordProvided`.
  */
 async function ensureAdminClerkIdentity(adminPassword) {
   const username = toClerkUsername(ADMIN_MEMBER_NUMBER)
@@ -240,7 +246,19 @@ async function ensureAdminClerkIdentity(adminPassword) {
   }
   const existing = await listRes.json()
   if (Array.isArray(existing) && existing.length > 0) {
-    console.log(`[seed] Clerk identity ${username} already exists — leaving password untouched.`)
+    const userId = existing[0].id
+    const updateRes = await clerkFetch(`/users/${userId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        password: adminPassword,
+        skip_password_checks: false,
+      }),
+    })
+    if (!updateRes.ok) {
+      const text = await updateRes.text()
+      throw new Error(`[seed] Failed to update password for Clerk identity ${username}: ${updateRes.status} ${text}`)
+    }
+    console.log(`[seed] Clerk identity ${username} already exists — password synced to configured SEED_ADMIN_PASSWORD.`)
     return { created: false, username }
   }
 
