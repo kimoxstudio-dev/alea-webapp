@@ -53,7 +53,7 @@ function setupSqlMock() {
     }
 
     // SELECT by member_number (WHERE member_number =)
-    if (query.includes('where member_number =') && !query.includes('ilike')) {
+    if (query.includes('select') && query.includes('where member_number =') && !query.includes('ilike')) {
       const memberNumber = values[0]
       for (const profile of profilesStore.values()) {
         if (profile.member_number === memberNumber) {
@@ -200,7 +200,7 @@ function setupSqlMock() {
     }
 
     // SELECT with ORDER/LIMIT/OFFSET (no search)
-    if (query.includes('order by') && !query.includes('ilike')) {
+    if (query.includes('select') && query.includes('order by') && !query.includes('ilike')) {
       let profiles = Array.from(profilesStore.values()).sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
 
       // Extract numeric values for LIMIT and OFFSET
@@ -718,12 +718,12 @@ describe('users-service (raw SQL with Neon)', () => {
         const query = queryStr.toLowerCase()
 
         // SELECT id from profiles
-        if (query.includes('from profiles') && query.includes('where id') && !query.includes('and')) {
+        if (query.includes('select') && query.includes('from profiles') && query.includes('where id') && !query.includes('and')) {
           return Promise.resolve([profilesStore.get(values[0] as string)])
         }
 
-        // UPDATE member_number check
-        if (query.includes('where member_number') && query.includes('and id <>')) {
+        // SELECT for member_number duplicate check
+        if (query.includes('select') && query.includes('where member_number') && query.includes('and id <>')) {
           return Promise.resolve([]) // Pre-check passes
         }
 
@@ -936,6 +936,8 @@ describe('users-service (raw SQL with Neon)', () => {
       // 2. Delete Clerk identity
       // 3. Delete profile row
       // If any step fails, the profile is already deactivated (safe).
+
+      expect.assertions(3) // Guard against dead callbacks: Clerk getUserList, Clerk deleteUser, and profile deletion
 
       profilesStore.set('find8-delete', {
         id: 'find8-delete',
