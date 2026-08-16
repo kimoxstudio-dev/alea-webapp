@@ -479,6 +479,32 @@ export async function updateUser(
 
   const data = updatedRows[0]
   if (!data) {
+    // Zero-row race (#299 Codex review finding 7): `UPDATE ... RETURNING`
+    // can resolve successfully with an EMPTY array — rather than throwing —
+    // if the profile row was concurrently deleted between the initial
+    // lookup/pre-check above and this UPDATE. That's a different failure
+    // shape than the thrown-error path above, but the same consistency
+    // hazard: if Clerk was already renamed to the new username, it must be
+    // rolled back here too, or Clerk is left on the new username forever
+    // while there is no longer any profile row to reconcile it with.
+    if (renamedClerkUserId) {
+      try {
+        const client = await clerkClient()
+        await client.users.updateUser(renamedClerkUserId, {
+          username: toClerkUsername(existingProfile.member_number),
+        })
+      } catch (rollbackErr) {
+        // Do NOT swallow this — same reasoning as the catch-block rollback
+        // above: a failed rollback here leaves Clerk on the NEW username
+        // with no profile row at all, which needs manual intervention.
+        console.error(
+          '[users-service] Clerk username rollback failed after zero-row update (profile deleted concurrently) — Clerk is now inconsistent for profile',
+          id,
+          rollbackErr,
+        )
+      }
+    }
+
     serviceError('User not found', 404)
   }
 
