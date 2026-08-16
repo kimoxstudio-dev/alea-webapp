@@ -151,3 +151,18 @@ This is the standard workflow — no exceptions.
 4. User verifies in Supabase dashboard
 
 Agent prepares + validates. User applies.
+
+### Narrow exception — development database
+
+Agents MAY, against the **development database only**:
+- Run read-only `SELECT` inspection (table listings, row counts, contents).
+- Insert, update, and delete **synthetic** test data — a seeded admin profile and fictional member profiles.
+
+Still forbidden, without exception:
+- Schema migrations and any DDL — `CREATE`, `ALTER`, `DROP`, `TRUNCATE`. These remain user-only; agents may prepare and commit migration SQL, but the user applies it.
+- Any database that is not the development one.
+- Loading real member data. The club's actual membership file never enters a development database, an agent worktree, or a log. All test data used by agents is invented/synthetic.
+
+**Required before the first write, every time:** a read-only inspection of the target database (list tables, row counts), reported. If it contains anything resembling real membership data, STOP and report instead of seeding on top. The local connection string carries no environment marker in its name, so nothing in the environment proves which database it is — the inspection is what proves it.
+
+Why this exception exists: without a seeded admin account to issue activation links and a pre-registered member profile to redeem them, the [N1] auth migration work (issue #299) cannot be verified end to end, and shipping unverifiable auth changes is exactly what this exception exists to prevent.
