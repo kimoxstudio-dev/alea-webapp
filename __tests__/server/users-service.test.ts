@@ -2,6 +2,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const sqlQueryMock = vi.fn()
+const clerkGetUserListMock = vi.fn()
+const clerkUpdateUserMock = vi.fn()
 
 // In-memory store for test data
 const profilesStore = new Map<string, any>()
@@ -43,6 +45,15 @@ vi.mock('@/lib/db/client', () => ({
   sql: sqlQueryMock,
 }))
 
+vi.mock('@clerk/nextjs/server', () => ({
+  clerkClient: vi.fn(async () => ({
+    users: {
+      getUserList: clerkGetUserListMock,
+      updateUser: clerkUpdateUserMock,
+    },
+  })),
+}))
+
 function setupSqlMock() {
   sqlQueryMock.mockImplementation(async (strings: TemplateStringsArray | string, ...values: unknown[]): Promise<unknown> => {
     const queryStr = typeof strings === 'string'
@@ -51,15 +62,23 @@ function setupSqlMock() {
 
     const query = queryStr.toLowerCase()
 
-    // SELECT by id
-    if (query.includes('from profiles') && query.includes('where id')) {
+    // Helper to match ILIKE pattern (case-insensitive substring)
+    function matchesPattern(text: string | null | undefined, pattern: string | null | undefined): boolean {
+      if (!pattern || !text) return false
+      // Pattern is in format %search% — extract the search term
+      const searchTerm = pattern.replace(/%/g, '').toLowerCase()
+      return text.toLowerCase().includes(searchTerm)
+    }
+
+    // SELECT by id (WHERE id = $1)
+    if (query.includes('where id =') && !query.includes('ilike')) {
       const id = values[0]
       const profile = profilesStore.get(id as string)
       return Promise.resolve(profile ? [profile] : [])
     }
 
-    // SELECT by member_number
-    if (query.includes('from profiles') && query.includes('where member_number')) {
+    // SELECT by member_number (WHERE member_number =)
+    if (query.includes('where member_number =') && !query.includes('ilike')) {
       const memberNumber = values[0]
       for (const profile of profilesStore.values()) {
         if (profile.member_number === memberNumber) {
@@ -69,16 +88,43 @@ function setupSqlMock() {
       return Promise.resolve([])
     }
 
-    // SELECT with OFFSET/LIMIT pagination
-    if (query.includes('from profiles') && (query.includes('offset') || query.includes('order by'))) {
-      // Return all profiles (simplified for test)
-      const profiles = Array.from(profilesStore.values())
-      return Promise.resolve(profiles)
+    // SELECT COUNT with search filter (ILIKE) - must come before generic COUNT
+    if (query.includes('count') && query.includes('ilike')) {
+      const pattern = values[0] as string
+      const profiles = Array.from(profilesStore.values()).filter((p) => {
+        return (
+          matchesPattern(p.member_number, pattern) ||
+          matchesPattern(p.full_name, pattern) ||
+          matchesPattern(p.email, pattern)
+        )
+      })
+      return Promise.resolve([{ count: profiles.length }])
     }
 
-    // SELECT COUNT
-    if (query.includes('select count')) {
+    // SELECT with ILIKE search filter
+    if (query.includes('ilike') && query.includes('order by')) {
+      const pattern = values[0] as string
+      let filtered = Array.from(profilesStore.values()).filter((p) => {
+        return (
+          matchesPattern(p.member_number, pattern) ||
+          matchesPattern(p.full_name, pattern) ||
+          matchesPattern(p.email, pattern)
+        )
+      })
+      // Apply ordering
+      filtered = filtered.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+      return Promise.resolve(filtered)
+    }
+
+    // SELECT COUNT (no search) - generic COUNT query
+    if (query.includes('count') && !query.includes('ilike')) {
       return Promise.resolve([{ count: profilesStore.size }])
+    }
+
+    // SELECT with ORDER/LIMIT/OFFSET (no search)
+    if (query.includes('order by') && !query.includes('ilike')) {
+      const profiles = Array.from(profilesStore.values()).sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+      return Promise.resolve(profiles)
     }
 
     // UPDATE no_show_count/blocked_until
@@ -105,8 +151,8 @@ function setupSqlMock() {
       return Promise.resolve([])
     }
 
-    // UPDATE profiles: full set of fields (member_number, full_name, email, phone, role, is_active, auth_email) WHERE id
-    if (query.includes('update profiles') && query.includes('member_number') && query.includes('where id')) {
+    // UPDATE profiles with specific fields (member_number, full_name, email, phone, role, is_active, auth_email)
+    if (query.includes('update profiles') && query.includes('where id') && query.includes('member_number')) {
       // Format: SET member_number = $1, full_name = $2, email = $3, phone = $4, role = $5, is_active = $6, auth_email = $7 WHERE id = $8
       const memberNumber = values[0] as string
       const fullName = values[1] as string
@@ -141,15 +187,19 @@ function setupSqlMock() {
       return Promise.resolve([{ id }])
     }
 
-    // UPDATE other fields (fallback for any other UPDATE)
+    // UPDATE other fields (fallback for any other UPDATE) - match on WHERE id
     if (query.includes('update profiles') && query.includes('where id')) {
-      const id = values[values.length - 1]
-      const profile = profilesStore.get(id as string)
+      // Find the id (usually the last value)
+      const id = values[values.length - 1] as string
+      const profile = profilesStore.get(id)
       if (profile) {
-        // Extract updated fields from values
+        // Extract updated fields from values (handle different structures)
         const updated = { ...profile, updated_at: new Date().toISOString() }
-        profilesStore.set(id as string, updated)
-        return Promise.resolve([updated])
+        profilesStore.set(id, updated)
+        if (query.includes('returning')) {
+          return Promise.resolve([updated])
+        }
+        return Promise.resolve([{ id }])
       }
       return Promise.resolve([])
     }
@@ -197,6 +247,12 @@ describe('users-service (raw SQL with Neon)', () => {
     profilesStore.set(testProfiles.member.id, testProfiles.member)
 
     setupSqlMock()
+
+    // Reset Clerk mocks with default behavior (succeed)
+    clerkGetUserListMock.mockReset()
+    clerkGetUserListMock.mockResolvedValue({ data: [] })
+    clerkUpdateUserMock.mockReset()
+    clerkUpdateUserMock.mockResolvedValue({ id: 'clerk-user-1' })
   })
 
   describe('listPaginatedUsers', () => {
@@ -398,7 +454,7 @@ describe('users-service (raw SQL with Neon)', () => {
     it('accepts is_active boolean and includes it in the update', async () => {
       const { updateUser } = await import('@/lib/server/users-service')
 
-      const updated = await updateUser('member-1', { isActive: false })
+      const updated = await updateUser('member-1', { is_active: false })
 
       expect(updated.isActive).toBe(false)
     })
@@ -425,6 +481,74 @@ describe('users-service (raw SQL with Neon)', () => {
       expect(updated.memberNumber).toBe('100123')
       // The auth_email should be automatically updated to match: 100123@members.alea.internal
       // This is a critical data-consistency invariant
+    })
+
+    it('[Clerk-first invariant] does NOT write to DB when Clerk username rename fails', async () => {
+      const { updateUser } = await import('@/lib/server/users-service')
+      const { clerkClient } = await import('@clerk/nextjs/server')
+
+      // Mock Clerk to return an existing user but then fail on update
+      clerkGetUserListMock.mockResolvedValueOnce({
+        data: [{ id: 'clerk-user-1' }],
+      })
+      clerkUpdateUserMock.mockRejectedValueOnce(new Error('Username already taken'))
+
+      // This should throw because Clerk rename failed
+      await expect(
+        updateUser('member-1', { memberNumber: '100456' }),
+      ).rejects.toMatchObject({
+        statusCode: 500,
+      })
+
+      // Verify the member_number in the DB was NOT updated (stayed at original)
+      const stored = profilesStore.get('member-1')
+      expect(stored.member_number).toBe('100002')
+
+      // Verify auth_email was also NOT updated
+      expect(stored.auth_email).toBe('100002@members.alea.internal')
+    })
+
+    it('[Clerk-first invariant] succeeds when Clerk username rename succeeds', async () => {
+      const { updateUser } = await import('@/lib/server/users-service')
+
+      // Mock Clerk to return an existing user and succeed on update
+      clerkGetUserListMock.mockResolvedValueOnce({
+        data: [{ id: 'clerk-user-1' }],
+      })
+      clerkUpdateUserMock.mockResolvedValueOnce({
+        id: 'clerk-user-1',
+        username: 'alea-100789',
+      })
+
+      const updated = await updateUser('member-1', { memberNumber: '100789' })
+
+      // Verify the update succeeded
+      expect(updated.memberNumber).toBe('100789')
+
+      // Verify clerkClient was called with the right arguments
+      expect(clerkGetUserListMock).toHaveBeenCalledWith({
+        username: ['alea-100002'],
+      })
+      expect(clerkUpdateUserMock).toHaveBeenCalledWith('clerk-user-1', {
+        username: 'alea-100789',
+      })
+    })
+
+    it('[Clerk-first invariant] skips Clerk rename if user has no Clerk identity yet', async () => {
+      const { updateUser } = await import('@/lib/server/users-service')
+
+      // Mock Clerk to return empty list (user has no Clerk identity)
+      clerkGetUserListMock.mockResolvedValueOnce({
+        data: [],
+      })
+
+      const updated = await updateUser('member-1', { memberNumber: '100999' })
+
+      // Verify the update succeeded (because we skip Clerk rename when no identity exists)
+      expect(updated.memberNumber).toBe('100999')
+
+      // Verify clerkUpdateUserMock was NOT called (because no Clerk identity existed)
+      expect(clerkUpdateUserMock).not.toHaveBeenCalled()
     })
   })
 
