@@ -543,16 +543,49 @@ export async function deleteUser(id: string) {
     serviceError('User not found', 404)
   }
 
-  // Clerk-first, DB-second (#299 Codex review finding 3 — same consistency
-  // principle as the `memberNumberIsChanging` block in updateUser() above).
-  // Deleting the `profiles` row before the Clerk credential would (and,
-  // before this fix, DID) leave an orphaned Clerk identity for
-  // `alea-<member_number>` behind: it can later resolve to a NEW profile
-  // that reuses the same member_number (identity confusion), and it blocks
-  // that username from ever being reissued via a fresh activation. Deleting
-  // the Clerk identity first and gating the DB delete on its success means
-  // a failure here always leaves BOTH sides intact (nothing deleted, safe
-  // to retry) instead of orphaning Clerk.
+  // Three-phase, deactivate-first (#299 Codex review finding 8 — supersedes
+  // finding 3's Clerk-first/DB-second ordering below). Finding 3's own
+  // comment used to claim "a failure here always leaves BOTH sides intact" —
+  // that claim was FALSE for one real case: if `client.users.deleteUser()`
+  // succeeded but the subsequent `DELETE FROM profiles` threw, the Clerk
+  // credential and all its sessions were already, irreversibly gone, while
+  // the profile row survived looking exactly as if it were still active.
+  // Clerk deletion has no "undelete", so a rollback-on-DB-failure pattern
+  // (like updateUser()'s Clerk-rename rollback above) does not apply here —
+  // there is nothing to roll Clerk back TO.
+  //
+  // Instead of trying to make the operation reversible, this ordering keeps
+  // every INTERMEDIATE state safe:
+  //   1. Deactivate the profile FIRST (`is_active = false`). This alone
+  //      already blocks sign-in: `resolveProfileForClerkUser()`
+  //      (`lib/server/auth-service.ts`) refuses any profile whose
+  //      `is_active` is false, regardless of whether a live Clerk
+  //      credential still exists for it.
+  //   2. Delete the Clerk identity.
+  //   3. Delete the `profiles` row.
+  // If the process fails or crashes between any two of these steps, there
+  // is never a window where a member holds both a live Clerk credential AND
+  // an active-looking profile — the security property that actually
+  // matters. A row left behind after step 1 or step 2 fails is just
+  // retryable cleanup debt (already deactivated, no live-access risk), not
+  // an orphaned-but-active account. Every step is safe to retry with the
+  // same `id`: step 1 is idempotent, step 2 re-resolves the Clerk user by
+  // username each call (a no-op once already deleted), and step 3 only
+  // runs after steps 1-2 have both succeeded.
+  const deactivatedRows = await sql`
+    UPDATE profiles
+    SET is_active = false
+    WHERE id = ${id}
+    RETURNING id
+  ` as { id: string }[]
+
+  if (!deactivatedRows[0]) {
+    // Concurrent delete beat this request to the row entirely — nothing to
+    // deactivate, delete, or compensate; "no row" is already the desired
+    // end state.
+    serviceError('User not found', 404)
+  }
+
   const client = await clerkClient()
   let existingClerkUser: { id: string } | undefined
   try {
@@ -566,7 +599,8 @@ export async function deleteUser(id: string) {
 
   // A member who never activated their account has no Clerk identity yet —
   // there is nothing to delete, so it's safe to proceed straight to the
-  // database delete in that case.
+  // database delete in that case. The profile is already deactivated above
+  // either way.
   if (existingClerkUser) {
     try {
       // `deleteUser()` removes the Clerk user resource outright, which also
@@ -574,10 +608,10 @@ export async function deleteUser(id: string) {
       // "revoke sessions" step beyond this for a user being deleted.
       await client.users.deleteUser(existingClerkUser.id)
     } catch (err) {
-      // Do NOT silently swallow: surface a clear error instead of deleting
-      // the profile row and reporting success while an orphaned Clerk
-      // identity is left behind.
-      console.error('[users-service] Clerk identity deletion failed — profile NOT deleted for', id, err)
+      // Do NOT silently swallow: surface a clear error. The profile stays
+      // deactivated (is_active=false) but not deleted — safe to retry, not
+      // an orphaned-but-active account.
+      console.error('[users-service] Clerk identity deletion failed — profile left deactivated (is_active=false), NOT deleted, for', id, err)
       serviceError('Failed to delete account credentials', 500)
     }
   }
@@ -591,11 +625,12 @@ export async function deleteUser(id: string) {
   ` as { id: string }[]
 
   if (!rows[0]) {
-    // The Clerk identity (if any) is already gone at this point. Reaching
-    // here means the profile row disappeared between the check above and
-    // this delete (a concurrent delete) — not the orphan case this fix
-    // targets, but still worth a clear log since the Clerk deletion above,
-    // if it ran, cannot be un-done.
+    // The Clerk identity (if any) is already gone at this point, and the
+    // profile was already deactivated in step 1 — reaching here means the
+    // row disappeared between step 1 and this delete (a concurrent delete).
+    // Not a live-access risk (the row was already inactive), but still
+    // worth a clear log since the Clerk deletion above, if it ran, cannot
+    // be un-done.
     console.error('[users-service] profile row disappeared between Clerk deletion and DB delete for', id)
     serviceError('User not found', 404)
   }
