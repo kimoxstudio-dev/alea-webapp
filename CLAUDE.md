@@ -161,9 +161,8 @@ Agents MAY, against the **development database only**:
 Agents MAY also execute **DDL against the development database only** — but ONLY when the user grants permission for that specific migration, in the current turn. See "DDL on the development database" below for the exact conditions.
 
 Still forbidden, without exception:
-- DDL against any database that is not the development one. Staging and production migrations remain user-only, always, with no equivalent exception.
+- Any database that is not the development one — this is a blanket prohibition, not narrowed by statement type. DDL against staging or production is not a special case of it; it's the same rule. Staging and production migrations remain user-only, always, with no equivalent exception.
 - `TRUNCATE`, anywhere, including the development database.
-- Any database that is not the development one.
 - Loading real member data. The club's actual membership file never enters a development database, an agent worktree, or a log. All test data used by agents is invented/synthetic.
 
 **Required before the first write, every time:** a read-only inspection of the target database (list tables, row counts), reported. If it contains anything resembling real membership data, STOP and report instead of seeding on top. The local connection string carries no environment marker in its name, so nothing in the environment proves which database it is — the inspection is what proves it.
