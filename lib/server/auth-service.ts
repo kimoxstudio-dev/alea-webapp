@@ -78,10 +78,10 @@ function isActivationExpired(expiresAt: string, currentTime: Date) {
 /**
  * Restores a token that was already atomically claimed (`used_at` set) by
  * `activateAccount()`/`recoverAccount()`, but whose paired Clerk operation
- * then failed (#299 Codex review finding 1). Without this, a Clerk outage or
- * a rejected password after the claim permanently burns an otherwise-valid,
- * unexpired, admin-issued link even though the member was never actually
- * activated/recovered.
+ * (or, per #299 Codex review finding 6, the DB write that follows it) then
+ * failed. Without this, a Clerk outage or a rejected password after the
+ * claim permanently burns an otherwise-valid, unexpired, admin-issued link
+ * even though the member was never actually activated/recovered.
  *
  * Scoped by `id` AND `token_hash` AND `used_at` together (#299 Codex review
  * finding 5 — matching by `id` alone was wrong): link generation upserts one
@@ -380,9 +380,10 @@ export async function activateAccount(input: { token: unknown; password: unknown
 
   // Token is now spent (single-use, claimed above) — create the Clerk
   // identity. No email attribute, ever.
+  let clerkUser: { id: string }
   try {
     const client = await clerkClient()
-    await client.users.createUser({
+    clerkUser = await client.users.createUser({
       username: toClerkUsername(profile.member_number),
       password: parsed.data.password,
     })
@@ -394,15 +395,38 @@ export async function activateAccount(input: { token: unknown; password: unknown
     serviceError('Failed to create account credentials', 500)
   }
 
-  const updatedRows = await sql`
-    UPDATE profiles
-    SET is_active = true, active_from = ${activatedAt}, psw_changed = ${activatedAt}
-    WHERE id = ${profile.id}
-    RETURNING id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
-  ` as PublicProfileRow[]
-  const updatedProfile = updatedRows[0] ?? null
+  // Clerk succeeded, but the DB profile update itself can still fail — a
+  // thrown SQL error, or (silently, no exception) a zero-rows UPDATE whose
+  // WHERE clause no longer matches (#299 Codex review finding 6). Either way
+  // the just-created Clerk identity must not be left standing bound to a
+  // profile that was never actually activated: the member couldn't sign in
+  // (DB state wrong) and couldn't simply retry either (the Clerk username is
+  // already taken by the orphaned identity). Compensate by deleting the
+  // just-created Clerk user and restoring the exact token claim via the
+  // precise, scoped mechanism from finding 5 — never the id-only version.
+  let updatedProfile: PublicProfileRow | null
+  try {
+    const updatedRows = await sql`
+      UPDATE profiles
+      SET is_active = true, active_from = ${activatedAt}, psw_changed = ${activatedAt}
+      WHERE id = ${profile.id}
+      RETURNING id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at
+    ` as PublicProfileRow[]
+    updatedProfile = updatedRows[0] ?? null
+  } catch {
+    updatedProfile = null
+  }
 
   if (!updatedProfile) {
+    try {
+      const client = await clerkClient()
+      await client.users.deleteUser(clerkUser.id)
+    } catch {
+      // Best-effort: surfacing the activation failure below takes priority
+      // over a secondary Clerk cleanup error. The orphaned Clerk user is a
+      // known, admin-recoverable state; a silently-un-restored token is not.
+    }
+    await restoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: activatedAt })
     serviceError('Failed to activate account', 500)
   }
 
