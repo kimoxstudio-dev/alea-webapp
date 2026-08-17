@@ -180,6 +180,15 @@ export function hasColumn(stmt: ParsedStatement, column: string): boolean {
  * - "A = $1 AND B = $2" → 2 conditions
  * - "A ILIKE $1 OR B ILIKE $2 OR C ILIKE $3" → 3 conditions
  *
+ * **LIMITATION — Parenthesis Grouping Not Supported:**
+ * This function does NOT handle parenthesized/grouped conditions correctly.
+ * A WHERE clause like "(A = $1 OR B = $2) AND C = $3" will be incorrectly
+ * counted as 3 conditions instead of the semantically correct 2 top-level conditions.
+ * If future SQL migrations use WHERE grouping (e.g., for complex authorization rules),
+ * this function must be updated to track parenthesis depth, or handlers must use
+ * explicit column checks (e.g., whereHasColumn() + whereColumnHasOperator()) instead
+ * of relying on whereConditionCount() for semantic accuracy.
+ *
  * This ensures that weakening a WHERE clause (fewer actual conditions)
  * produces an observably different result, preventing silent mismatches
  * where a handler written for 3 conditions accidentally matches a 1-condition

@@ -145,14 +145,16 @@ function setupSqlMock() {
 
   // UPDATE profiles SET no_show_count, blocked_until
   // Verb-anchored to update, scoped by no_show_count column in SET (NOT substring match)
-  // Positive assertion: must have BOTH columns (not just one)
+  // Positive assertion: must have BOTH columns (not just one), and WHERE id is required
   sqlMock.addHandler({
     name: 'UPDATE profiles reset no_show_count/blocked_until',
     verb: 'update',
     match: (stmt) =>
       stmt.table === 'profiles' &&
       hasColumn(stmt, 'no_show_count') &&
-      hasColumn(stmt, 'blocked_until'),
+      hasColumn(stmt, 'blocked_until') &&
+      whereHasColumn(stmt, 'id') &&
+      whereConditionCount(stmt) === 1,
     respond: (stmt) => {
       const id = stmt.values[0]
       const profile = profilesStore.get(id as string)
@@ -169,14 +171,16 @@ function setupSqlMock() {
   })
 
   // UPDATE profiles SET blocked_until (clearing it)
-  // Verb-anchored to update, scoped by blocked_until column (NOT substring match)
+  // Verb-anchored to update, scoped by blocked_until column (NOT substring match), WHERE id required
   sqlMock.addHandler({
     name: 'UPDATE profiles clear blocked_until',
     verb: 'update',
     match: (stmt) =>
       stmt.table === 'profiles' &&
       hasColumn(stmt, 'blocked_until') &&
-      !hasColumn(stmt, 'no_show_count'), // Differentiate from the above handler
+      !hasColumn(stmt, 'no_show_count') && // Differentiate from the above handler
+      whereHasColumn(stmt, 'id') &&
+      whereConditionCount(stmt) === 1,
     respond: (stmt) => {
       const id = stmt.values[stmt.values.length - 1]
       const profile = profilesStore.get(id as string)
@@ -232,7 +236,7 @@ function setupSqlMock() {
   })
 
   // UPDATE profiles SET is_active = false (for deleteUser deactivation step)
-  // Verb-anchored to update, scoped by is_active column in SET
+  // Verb-anchored to update, scoped by is_active column in SET, WHERE id required
   sqlMock.addHandler({
     name: 'UPDATE profiles deactivate',
     verb: 'update',
@@ -240,7 +244,9 @@ function setupSqlMock() {
       stmt.table === 'profiles' &&
       hasColumn(stmt, 'is_active') &&
       !hasColumn(stmt, 'member_number') && // Differentiate from full-update handler
-      !hasColumn(stmt, 'no_show_count'), // Differentiate from reset handlers
+      !hasColumn(stmt, 'no_show_count') && // Differentiate from reset handlers
+      whereHasColumn(stmt, 'id') &&
+      whereConditionCount(stmt) === 1,
     respond: (stmt) => {
       const id = stmt.values[0] as string
       const profile = profilesStore.get(id)
@@ -312,15 +318,18 @@ function setupSqlMock() {
       // Must be a profiles SELECT (not COUNT)
       if (stmt.table !== 'profiles' || stmt.isCountSelect) return false
 
-      // Must have the specific columns (at least id, member_number, full_name to differentiate from other queries)
-      if (!stmt.text.includes('id,') && !stmt.text.includes('id ,')) return false
-      if (!stmt.text.includes('member_number') || !stmt.text.includes('full_name')) return false
+      // Must have the specific columns: id, member_number, full_name, etc. (all pagination query columns)
+      // Check via hasColumn (before-WHERE part of statement) using word boundaries
+      if (!hasColumn(stmt, 'id')) return false
+      if (!hasColumn(stmt, 'member_number') || !hasColumn(stmt, 'full_name')) return false
 
-      // Must have ORDER BY created_at ASC specifically (not any other column order)
+      // Must have ORDER BY created_at ASC specifically (literal check, minimal risk for this specific phrase)
+      // Production query is: ORDER BY created_at ASC (nothing else)
       if (!stmt.text.includes('order by created_at asc')) return false
 
-      // Must have BOTH LIMIT and OFFSET (not just LIMIT) for pagination
-      if (!stmt.text.includes('limit') || !stmt.text.includes('offset')) return false
+      // Must have BOTH LIMIT and OFFSET for pagination (these are syntactic, not WHERE clauses)
+      // Use word-boundary anchored checks to avoid substring collisions
+      if (!/\blimit\b/.test(stmt.text) || !/\boffset\b/.test(stmt.text)) return false
 
       // WHERE clause, if present, must contain ONLY ILIKE conditions on search columns
       // (member_number, full_name, email) — no other WHERE conditions allowed
@@ -814,37 +823,25 @@ describe('users-service (raw SQL with Neon)', () => {
   describe('Finding 2 — Codex review: updateUser Clerk-first/DB-write race', () => {
     it('rejects memberNumber change BEFORE calling Clerk if the target number already belongs to a different profile (pre-check)', async () => {
       // Setup: two profiles
-      profilesStore.set('profile-1', {
+      profilesStore.set('profile-1', createTestProfile({
         id: 'profile-1',
         member_number: '100001',
         full_name: 'Alice',
         auth_email: '100001@members.alea.internal',
         email: null,
         phone: null,
-        role: 'member',
         is_active: true,
         active_from: new Date().toISOString(),
-        no_show_count: 0,
-        blocked_until: null,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
+      }))
 
-      profilesStore.set('profile-2', {
+      profilesStore.set('profile-2', createTestProfile({
         id: 'profile-2',
         member_number: '100002',
         full_name: 'Bob',
         auth_email: '100002@members.alea.internal',
-        email: null,
-        phone: null,
-        role: 'member',
         is_active: true,
         active_from: new Date().toISOString(),
-        no_show_count: 0,
-        blocked_until: null,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
+      }))
 
       const { updateUser } = await import('@/lib/server/users-service')
 
@@ -862,21 +859,14 @@ describe('users-service (raw SQL with Neon)', () => {
 
     it('rolls back Clerk username to old value when DB write fails after Clerk rename (TOCTOU)', async () => {
       // Setup profile with Clerk identity
-      profilesStore.set('toctou-profile', {
+      profilesStore.set('toctou-profile', createTestProfile({
         id: 'toctou-profile',
         member_number: '100011',
         full_name: 'TOCTOU Test',
         auth_email: '100011@members.alea.internal',
-        email: null,
-        phone: null,
-        role: 'member',
         is_active: true,
         active_from: new Date().toISOString(),
-        no_show_count: 0,
-        blocked_until: null,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
+      }))
 
       // Pre-check: no conflicting member_number
       clerkGetUserListMock.mockResolvedValueOnce({
@@ -935,21 +925,18 @@ describe('users-service (raw SQL with Neon)', () => {
       const { importMembersFromCsv } = await import('@/lib/server/users-service')
 
       // Setup: existing member to update via CSV import
-      profilesStore.set('csv-member', {
+      profilesStore.set('csv-member', createTestProfile({
         id: 'csv-member',
         member_number: '100003',
         full_name: 'Old Name',
         auth_email: '100003@members.alea.internal',
         email: 'old@example.com',
         phone: '600000003',
-        role: 'member' as const,
         is_active: false,
         active_from: null,
-        no_show_count: 0,
-        blocked_until: null,
         created_at: '2024-01-03T00:00:00.000Z',
         updated_at: '2024-01-03T00:00:00.000Z',
-      })
+      }))
 
       // CSV import with updated member data
       // Format: headers + data rows (member_number,full_name,email,phone)
