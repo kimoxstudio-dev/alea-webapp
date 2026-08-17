@@ -161,19 +161,24 @@ export function hasColumn(stmt: ParsedStatement, column: string): boolean {
 }
 
 /**
- * Number of top-level AND-joined conditions in the WHERE clause (0 if there
- * is no WHERE clause). Lets a handler assert that a statement carries as
- * many — or as few — conditions as it expects, instead of assuming a fixed
- * shape regardless of what the statement actually contains.
+ * Number of top-level conditions in the WHERE clause (0 if there is no WHERE
+ * clause), separated by AND or OR. Lets a handler assert that a statement
+ * carries as many — or as few — conditions as it expects, instead of
+ * assuming a fixed shape regardless of what the statement actually contains.
  *
- * NOTE: This counts AND-joined conditions only. An OR-joined group (e.g.,
- * "A ILIKE $1 OR B ILIKE $2 OR C ILIKE $3") counts as 1, indistinguishable
- * from a genuine single-condition WHERE. Use whereColumnHasOperator() for
- * per-column operator detection instead.
+ * Counts both AND-joined and OR-joined conditions. For example:
+ * - "A = $1" → 1 condition
+ * - "A = $1 AND B = $2" → 2 conditions
+ * - "A ILIKE $1 OR B ILIKE $2 OR C ILIKE $3" → 3 conditions
+ *
+ * This ensures that weakening a WHERE clause (fewer actual conditions)
+ * produces an observably different result, preventing silent mismatches
+ * where a handler written for 3 conditions accidentally matches a 1-condition
+ * query and reads non-existent bound values.
  */
 export function whereConditionCount(stmt: ParsedStatement): number {
   if (!stmt.whereClause) return 0
-  return stmt.whereClause.split(/\band\b/i).filter((part) => part.trim().length > 0).length
+  return stmt.whereClause.split(/\b(?:and|or)\b/i).filter((part) => part.trim().length > 0).length
 }
 
 /**
