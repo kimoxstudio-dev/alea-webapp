@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSqlMock, whereHasColumn, hasColumn, whereConditionCount, whereColumnHasOperator, matchesIlikePattern } from '../helpers/sql-mock'
+import { createTestProfile } from '../helpers/test-factories'
 
 const clerkGetUserListMock = vi.fn()
 const clerkUpdateUserMock = vi.fn()
@@ -257,26 +258,42 @@ function setupSqlMock() {
 
   // SELECT COUNT (any profiles count query) — verb-anchored, isCountSelect check
   sqlMock.addHandler({
-    name: 'SELECT COUNT profiles',
+    name: 'SELECT COUNT profiles (with optional search filter)',
     verb: 'select',
-    match: (stmt) =>
-      stmt.table === 'profiles' &&
-      stmt.isCountSelect,
+    match: (stmt) => {
+      if (stmt.table !== 'profiles' || !stmt.isCountSelect) return false
+      // If there's a WHERE clause, it must contain only ILIKE conditions on search columns
+      if (stmt.whereClause) {
+        const allowedColumns = ['member_number', 'full_name', 'email']
+        // Check that at least one ILIKE condition exists on these columns
+        let hasIlike = false
+        for (const col of allowedColumns) {
+          if (whereColumnHasOperator(stmt, col, 'ilike')) {
+            hasIlike = true
+            break
+          }
+        }
+        return hasIlike
+      }
+      // No WHERE clause means count all
+      return whereConditionCount(stmt) === 0
+    },
     respond: (stmt) => {
-      // If there are string values, assume they're filter patterns
-      const stringValues = stmt.values.filter((v) => typeof v === 'string') as string[]
-      const pattern = stringValues[0] || ''
-
-      if (pattern) {
+      if (stmt.whereClause && whereConditionCount(stmt) > 0) {
         // Search with filter
-        const filtered = Array.from(profilesStore.values()).filter((p) => {
-          return (
-            matchesIlikePattern(p.member_number, pattern) ||
-            matchesIlikePattern(p.full_name, pattern) ||
-            matchesIlikePattern(p.email, pattern)
-          )
-        })
-        return [{ count: filtered.length }]
+        const stringValues = stmt.values.filter((v) => typeof v === 'string') as string[]
+        const pattern = stringValues[0] || ''
+
+        if (pattern) {
+          const filtered = Array.from(profilesStore.values()).filter((p) => {
+            return (
+              matchesIlikePattern(p.member_number, pattern) ||
+              matchesIlikePattern(p.full_name, pattern) ||
+              matchesIlikePattern(p.email, pattern)
+            )
+          })
+          return [{ count: filtered.length }]
+        }
       }
 
       // No filter, count all
@@ -286,8 +303,8 @@ function setupSqlMock() {
 
   // SELECT profiles with ORDER/LIMIT/OFFSET — matches both search and non-search queries
   // This handler must not be so broad that it silently absorbs future SELECT queries that
-  // don't match more specific handlers. Require ORDER BY/LIMIT/OFFSET present to ensure
-  // only this specific query shape matches, not any future accidental query.
+  // don't match more specific handlers. Require ORDER BY/LIMIT/OFFSET present and check
+  // that WHERE contains only ILIKE on search columns, not just that it mentions them.
   sqlMock.addHandler({
     name: 'SELECT profiles with ORDER/LIMIT (fallback)',
     verb: 'select',
@@ -305,20 +322,27 @@ function setupSqlMock() {
       // Must have BOTH LIMIT and OFFSET (not just LIMIT) for pagination
       if (!stmt.text.includes('limit') || !stmt.text.includes('offset')) return false
 
-      // WHERE clause, if present, must contain only ILIKE conditions on the search columns
+      // WHERE clause, if present, must contain ONLY ILIKE conditions on search columns
       // (member_number, full_name, email) — no other WHERE conditions allowed
       if (stmt.whereClause) {
-        // Allow only ILIKE conditions on these specific columns
         const allowedColumns = ['member_number', 'full_name', 'email']
-        // Remove all ILIKE conditions to see if anything remains
+        // Verify all columns in WHERE are ILIKE on search columns
+        let hasAnyCondition = false
+        for (const col of allowedColumns) {
+          if (whereColumnHasOperator(stmt, col, 'ilike')) {
+            hasAnyCondition = true
+          }
+        }
+        if (!hasAnyCondition) return false // WHERE exists but has no ILIKE on search columns
+
+        // Verify no unexpected conditions remain (strict check)
+        // Remove all ILIKE conditions and check nothing else is there
         let remaining = stmt.whereClause
         for (const col of allowedColumns) {
           remaining = remaining.replace(new RegExp(`\\b${col}\\b\\s+ilike\\s+[^\\s]+`, 'gi'), '')
         }
-        // Remove OR operators that connected the conditions
         remaining = remaining.replace(/\bor\b/gi, '')
-        // If anything meaningful remains, this isn't the search query we expect
-        if (remaining.trim()) return false
+        if (remaining.trim()) return false // Something unexpected in WHERE clause
       }
 
       return true
@@ -326,20 +350,23 @@ function setupSqlMock() {
     respond: (stmt) => {
       // If we reach this handler, assume it's a generic select (possibly with search)
       // that wasn't caught by the more specific handlers
-      const stringValues = stmt.values.filter((v) => typeof v === 'string') as string[]
-      const maybePattern = stringValues[0] || ''
 
       let profiles = Array.from(profilesStore.values())
 
-      // If there's a pattern value, attempt filtering with it
-      if (maybePattern) {
-        profiles = profiles.filter((p) => {
-          return (
-            matchesIlikePattern(p.member_number, maybePattern) ||
-            matchesIlikePattern(p.full_name, maybePattern) ||
-            matchesIlikePattern(p.email, maybePattern)
-          )
-        })
+      // If there's a WHERE clause with ILIKE conditions, filter by pattern
+      if (stmt.whereClause && whereConditionCount(stmt) > 0) {
+        const stringValues = stmt.values.filter((v) => typeof v === 'string') as string[]
+        const maybePattern = stringValues[0] || ''
+
+        if (maybePattern) {
+          profiles = profiles.filter((p) => {
+            return (
+              matchesIlikePattern(p.member_number, maybePattern) ||
+              matchesIlikePattern(p.full_name, maybePattern) ||
+              matchesIlikePattern(p.email, maybePattern)
+            )
+          })
+        }
       }
 
       // Sort by created_at
@@ -368,9 +395,6 @@ function setupSqlMock() {
       const id = stmt.values[0]
       const deletedProfile = profilesStore.get(id as string)
       profilesStore.delete(id as string)
-      if (stmt.returning) {
-        return deletedProfile ? [{ id }] : []
-      }
       return deletedProfile ? [{ id }] : []
     },
   })
@@ -1293,6 +1317,46 @@ describe('users-service (raw SQL with Neon)', () => {
       expect(profile).toBeDefined()
       expect(profile?.is_active).toBe(false) // Already deactivated, so safe to retry
       // (Clerk identity is definitely gone, so no live-access risk)
+    })
+  })
+
+  describe('Finding A — Codex review: fallback handler narrowing', () => {
+    it('revert-confirm: fallback handler rejects differently-shaped SELECT with ORDER/LIMIT but different WHERE/projection', async () => {
+      // Finding A: The fallback SELECT handler must not be so loose that it silently absorbs
+      // future SELECT queries that happen to have ORDER BY + LIMIT but different semantics.
+      // It should only match the exact pagination query shape it's named for.
+
+      // Test 1: Try a differently-shaped SELECT that has ORDER BY + LIMIT but different WHERE/projection
+      // This simulates a future regression where someone adds a new query with different semantics
+      // The fallback handler should NOT match this — it should throw "no handler matched"
+      try {
+        await sqlMock.sql`SELECT id, phone FROM profiles WHERE status = ${'active'} ORDER BY updated_at DESC LIMIT ${10} OFFSET ${0}`
+        throw new Error('TEST FAILED: Fallback handler matched a differently-shaped SELECT (different columns, WHERE, ORDER BY)')
+      } catch (err: any) {
+        if (err.message.includes('TEST FAILED')) throw err
+        // Expected: handler should reject this query
+        expect(err.message).toContain('no handler matched')
+      }
+
+      // Test 2: Missing OFFSET (has LIMIT but no OFFSET) — fallback handler should reject
+      try {
+        await sqlMock.sql`SELECT id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at FROM profiles ORDER BY created_at ASC LIMIT ${10}`
+        throw new Error('TEST FAILED: Fallback handler matched a query with LIMIT but no OFFSET')
+      } catch (err: any) {
+        if (err.message.includes('TEST FAILED')) throw err
+        // Expected: no handler matched because OFFSET is missing
+        expect(err.message).toContain('no handler matched')
+      }
+
+      // Test 3: ORDER BY wrong column (has LIMIT/OFFSET but ORDER BY different column)
+      try {
+        await sqlMock.sql`SELECT id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at FROM profiles ORDER BY updated_at ASC LIMIT ${10} OFFSET ${0}`
+        throw new Error('TEST FAILED: Fallback handler matched a query with ORDER BY wrong column')
+      } catch (err: any) {
+        if (err.message.includes('TEST FAILED')) throw err
+        // Expected: no handler matched because ORDER BY updated_at is not ORDER BY created_at
+        expect(err.message).toContain('no handler matched')
+      }
     })
   })
 })
