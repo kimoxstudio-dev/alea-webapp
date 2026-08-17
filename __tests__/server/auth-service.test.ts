@@ -1950,59 +1950,70 @@ describe('auth service (alea- username model)', () => {
       })
     })
 
-    it('revert-confirm: UPDATE WHERE predicates are necessary for single-use enforcement', async () => {
+    it('revert-confirm: claim UPDATE WHERE predicates block a token used/expired between read-check and claim (TOCTOU)', async () => {
       // Finding C: The UPDATE activation_tokens uses WHERE expires_at > NOW() AND used_at IS NULL.
-      // These predicates enforce single-use semantics. This test demonstrates they're load-bearing
-      // by showing: (1) the UPDATE's WHERE match() correctly validates the predicates exist, and
-      // (2) removing them causes a test that should fail to incorrectly pass.
+      // These predicates exist to defend against a TOCTOU race: if another request claims the token
+      // between activateAccount's read-check (getActivationTokenByHash) and the claim UPDATE,
+      // the UPDATE's WHERE clause will fail to match any rows, and the retry-check will correctly
+      // reject with "already been used". This test simulates that race with a real activateAccount() call.
 
-      // This proves the handlers' match() logic is essential, not just cosmetic.
+      const { activateAccount } = (await loadService()) as any
+      const plainToken = createActivationToken()
+      const tokenHash = hashActivationToken(plainToken)
+      const profileId = 'profile-toctou-race'
 
-      // Test the ACTUAL handler's WHERE predicate validation
-      const correctUpdateStmt = parseStatement(
-        `UPDATE activation_tokens SET used_at = $1 WHERE token_hash = $2 AND expires_at > $3 AND used_at IS NULL RETURNING id`,
-        ['2024-01-02', 'hash', '2024-01-02'],
-      )
+      // Seed a token that looks valid right now (not expired, not used yet)
+      const token = createTestToken({
+        token_hash: tokenHash,
+        profile_id: profileId,
+        used_at: null,
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+      })
+      tokensStore.set(tokenHash, token)
 
-      // The real handler must validate BOTH predicates with exact operators
-      const realHandlerMatches =
-        correctUpdateStmt.table === 'activation_tokens' &&
-        whereHasColumn(correctUpdateStmt, 'token_hash') &&
-        !whereHasColumn(correctUpdateStmt, 'id') &&
-        whereColumnHasOperator(correctUpdateStmt, 'expires_at', '>') &&
-        whereColumnHasNullCheck(correctUpdateStmt, 'used_at', 'IS NULL')
+      // Seed the matching profile as inactive, as activateAccount() requires
+      const profile = createTestProfile({ id: profileId })
+      profilesStore.set(profileId, profile)
 
-      expect(realHandlerMatches).toBe(true)
+      // Simulate a concurrent claim: the FIRST read (getActivationTokenByHash inside
+      // activateAccount()) returns a valid-looking snapshot, but as a SIDE EFFECT of
+      // answering that read, we mutate the live store so the token is already used
+      // by the time the claim UPDATE actually runs. This reproduces the real TOCTOU race
+      // the production UPDATE's WHERE predicates exist to close.
+      let readCount = 0
+      sqlMock.prependHandler({
+        name: 'TOCTOU: concurrent claim between read and update',
+        verb: 'select',
+        match: (stmt) =>
+          stmt.table === 'activation_tokens' &&
+          whereColumnHasOperator(stmt, 'token_hash', '=') &&
+          whereConditionCount(stmt) === 1,
+        respond: (stmt) => {
+          readCount++
+          const snapshotTokenHash = stmt.values[0] as string
+          const snapshot = tokensStore.get(snapshotTokenHash)
 
-      // Now demonstrate that if EITHER predicate is removed, the handler correctly rejects it
+          // On the FIRST read (the one inside activateAccount's initial check),
+          // return the snapshot but simulate a concurrent claim
+          if (readCount === 1 && snapshot) {
+            // Concurrent claim lands: mutate the live store to mark it used
+            tokensStore.set(snapshotTokenHash, { ...snapshot, used_at: mockDatabaseTime.toISOString() })
+            // Return the snapshot so the caller's read-check sees valid state
+            return [snapshot]
+          }
 
-      // Scenario 1: expires_at predicate missing (token could be claimed if expired)
-      const missingExpiryStmt = parseStatement(
-        `UPDATE activation_tokens SET used_at = $1 WHERE token_hash = $2 AND used_at IS NULL RETURNING id`,
-        ['2024-01-02', 'hash'],
-      )
-      const missingExpiryMatches =
-        missingExpiryStmt.table === 'activation_tokens' &&
-        whereHasColumn(missingExpiryStmt, 'token_hash') &&
-        !whereHasColumn(missingExpiryStmt, 'id') &&
-        whereColumnHasOperator(missingExpiryStmt, 'expires_at', '>') && // Will fail — expires_at is absent
-        whereColumnHasNullCheck(missingExpiryStmt, 'used_at', 'IS NULL')
+          // Subsequent reads return whatever is in the store (used by retry-check)
+          return snapshot ? [snapshot] : []
+        },
+      })
 
-      expect(missingExpiryMatches).toBe(false)
-
-      // Scenario 2: used_at predicate missing (token could be claimed if already used)
-      const missingUsedAtStmt = parseStatement(
-        `UPDATE activation_tokens SET used_at = $1 WHERE token_hash = $2 AND expires_at > $3 RETURNING id`,
-        ['2024-01-02', 'hash', '2024-01-02'],
-      )
-      const missingUsedAtMatches =
-        missingUsedAtStmt.table === 'activation_tokens' &&
-        whereHasColumn(missingUsedAtStmt, 'token_hash') &&
-        !whereHasColumn(missingUsedAtStmt, 'id') &&
-        whereColumnHasOperator(missingUsedAtStmt, 'expires_at', '>') &&
-        whereColumnHasNullCheck(missingUsedAtStmt, 'used_at', 'IS NULL') // Will fail — used_at IS NULL is absent
-
-      expect(missingUsedAtMatches).toBe(false)
+      // Real production code path: activateAccount() reads, sees valid token, tries to UPDATE,
+      // but the UPDATE's WHERE (used_at IS NULL) blocks because the concurrent claim marked it used.
+      // The retry-check at auth-service.ts:400-403 finds it now used and rejects correctly.
+      // This proves the UPDATE's WHERE predicates (not the earlier read-check) are what actually
+      // blocks the race condition: if they were missing, the UPDATE would succeed and the test
+      // would incorrectly pass.
+      await expect(activateAccount({ token: plainToken })).rejects.toThrow()
     })
   })
 
