@@ -294,9 +294,34 @@ function setupSqlMock() {
     match: (stmt) => {
       // Must be a profiles SELECT (not COUNT)
       if (stmt.table !== 'profiles' || stmt.isCountSelect) return false
-      // Must have ORDER BY, LIMIT, and at least one OFFSET condition
-      // This ensures the handler is specific to the pagination + sort query it's named for
-      return /\border\s+by\b/i.test(stmt.text) && /\blimit\b/i.test(stmt.text)
+
+      // Must have the specific columns (at least id, member_number, full_name to differentiate from other queries)
+      if (!stmt.text.includes('id,') && !stmt.text.includes('id ,')) return false
+      if (!stmt.text.includes('member_number') || !stmt.text.includes('full_name')) return false
+
+      // Must have ORDER BY created_at ASC specifically (not any other column order)
+      if (!stmt.text.includes('order by created_at asc')) return false
+
+      // Must have BOTH LIMIT and OFFSET (not just LIMIT) for pagination
+      if (!stmt.text.includes('limit') || !stmt.text.includes('offset')) return false
+
+      // WHERE clause, if present, must contain only ILIKE conditions on the search columns
+      // (member_number, full_name, email) — no other WHERE conditions allowed
+      if (stmt.whereClause) {
+        // Allow only ILIKE conditions on these specific columns
+        const allowedColumns = ['member_number', 'full_name', 'email']
+        // Remove all ILIKE conditions to see if anything remains
+        let remaining = stmt.whereClause
+        for (const col of allowedColumns) {
+          remaining = remaining.replace(new RegExp(`\\b${col}\\b\\s+ilike\\s+[^\\s]+`, 'gi'), '')
+        }
+        // Remove OR operators that connected the conditions
+        remaining = remaining.replace(/\bor\b/gi, '')
+        // If anything meaningful remains, this isn't the search query we expect
+        if (remaining.trim()) return false
+      }
+
+      return true
     },
     respond: (stmt) => {
       // If we reach this handler, assume it's a generic select (possibly with search)

@@ -213,6 +213,28 @@ export function whereColumnHasOperator(
   return pattern.test(stmt.whereClause)
 }
 
+/**
+ * Whether a specific column uses an IS NULL or IS NOT NULL predicate in the WHERE clause.
+ * Specialized version for null checks, since those end with a word boundary, not a space.
+ * Examples: `WHERE used_at IS NULL` or `WHERE expires_at IS NOT NULL`.
+ */
+export function whereColumnHasNullCheck(
+  stmt: ParsedStatement,
+  column: string,
+  nullCheck: 'IS NULL' | 'IS NOT NULL',
+): boolean {
+  if (!stmt.whereClause) return false
+  const escapedColumn = escapeRegExp(column)
+  const escapedCheck = escapeRegExp(nullCheck)
+  // Match: word boundary, column name, word boundary, whitespace, null check, word boundary
+  // This avoids matching "used_at_backup IS NULL" for column "used_at"
+  const pattern = new RegExp(
+    `\\b${escapedColumn}\\b\\s+${escapedCheck}\\b`,
+    'i',
+  )
+  return pattern.test(stmt.whereClause)
+}
+
 /** Case-insensitive `%term%` ILIKE pattern match against a nullable column value. */
 export function matchesIlikePattern(
   text: string | null | undefined,
