@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createHash } from 'node:crypto'
+import { createSqlMock, whereHasColumn, hasColumn, whereConditionCount } from '../helpers/sql-mock'
 
 type ProfileRow = {
   id: string
@@ -29,7 +30,6 @@ type ActivationTokenRow = {
   updated_at: string
 }
 
-const sqlQueryMock = vi.fn()
 const clerkCreateUserMock = vi.fn()
 const clerkUpdateUserMock = vi.fn()
 const clerkRevokeSessionMock = vi.fn()
@@ -50,6 +50,8 @@ let shouldFailProfileUpdate = false
 let shouldFailProfileUpdateWithZeroRows = false
 let shouldFailRestoreUpdate = false
 let injectTokenReplacementOnClerkCreate = null as { tokenToRemoveHash: string; tokenToInject: ActivationTokenRow } | null
+
+const sqlMock = createSqlMock()
 
 function createTestProfile(overrides?: Partial<ProfileRow>): ProfileRow {
   return {
@@ -85,7 +87,7 @@ function createTestToken(overrides?: Partial<ActivationTokenRow>): ActivationTok
 }
 
 vi.mock('@/lib/db/client', () => ({
-  sql: sqlQueryMock,
+  sql: sqlMock.sql,
 }))
 
 vi.mock('@clerk/nextjs/server', () => ({
@@ -109,52 +111,75 @@ vi.mock('@/lib/server/session', () => ({
 /**
  * Mock sql template function to handle raw SQL queries.
  * In tests, we intercept queries and return from our in-memory store.
+ * Uses the shared SQL mock helper with verb anchoring (#332).
  */
 function setupSqlMock() {
-  sqlQueryMock.mockImplementation(async (strings: TemplateStringsArray | string, ...values: unknown[]): Promise<unknown> => {
-    // Handle both tagged template and direct string calls
-    const queryStr = typeof strings === 'string'
-      ? strings
-      : strings.reduce((acc, str, i) => acc + str + (i < values.length ? `$${i + 1}` : ''), '')
+  sqlMock.reset()
 
-    const query = queryStr.toLowerCase()
+  // SELECT now() — used to get current database time
+  sqlMock.addHandler({
+    name: 'SELECT now()',
+    verb: 'select',
+    match: (stmt) => stmt.text.includes('now()'),
+    respond: () => [{ now: mockDatabaseTime.toISOString() }],
+  })
 
-    // SELECT now()
-    if (query.includes('select now()')) {
-      return Promise.resolve([{ now: mockDatabaseTime.toISOString() }])
-    }
-
-    // SELECT ... FROM profiles WHERE id = ?
-    if (query.includes('from profiles') && query.includes('where id')) {
-      const profileId = values[0]
+  // SELECT profiles by id — verb-anchored to select, id-scoped
+  sqlMock.addHandler({
+    name: 'SELECT profiles by id',
+    verb: 'select',
+    match: (stmt) =>
+      stmt.table === 'profiles' &&
+      whereHasColumn(stmt, 'id'),
+    respond: (stmt) => {
+      const profileId = stmt.values[0]
       const profile = profilesStore.get(profileId as string)
-      return Promise.resolve(profile ? [profile] : [])
-    }
+      return profile ? [profile] : []
+    },
+  })
 
-    // SELECT ... FROM profiles WHERE member_number = ?
-    if (query.includes('from profiles') && query.includes('where member_number')) {
-      const memberNumber = values[0]
+  // SELECT profiles by member_number — verb-anchored to select, member_number-scoped
+  sqlMock.addHandler({
+    name: 'SELECT profiles by member_number',
+    verb: 'select',
+    match: (stmt) =>
+      stmt.table === 'profiles' &&
+      whereHasColumn(stmt, 'member_number'),
+    respond: (stmt) => {
+      const memberNumber = stmt.values[0]
       for (const profile of profilesStore.values()) {
         if (profile.member_number === memberNumber) {
-          return Promise.resolve([profile])
+          return [profile]
         }
       }
-      return Promise.resolve([])
-    }
+      return []
+    },
+  })
 
-    // SELECT ... FROM activation_tokens WHERE token_hash = ?
-    if (query.includes('from activation_tokens') && query.includes('where token_hash')) {
-      const tokenHash = values[0]
+  // SELECT activation_tokens by token_hash — verb-anchored to select, token_hash-scoped
+  sqlMock.addHandler({
+    name: 'SELECT activation_tokens by token_hash',
+    verb: 'select',
+    match: (stmt) =>
+      stmt.table === 'activation_tokens' &&
+      whereHasColumn(stmt, 'token_hash'),
+    respond: (stmt) => {
+      const tokenHash = stmt.values[0]
       const token = tokensStore.get(tokenHash as string)
-      return Promise.resolve(token ? [token] : [])
-    }
+      return token ? [token] : []
+    },
+  })
 
-    // INSERT INTO activation_tokens
-    if (query.includes('insert into activation_tokens')) {
-      const profileId = values[0]
-      const tokenHash = values[1]
-      const expiresAt = values[2]
-      const createdBy = values[3]
+  // INSERT INTO activation_tokens — verb-anchored to insert
+  sqlMock.addHandler({
+    name: 'INSERT activation_tokens',
+    verb: 'insert',
+    match: (stmt) => stmt.table === 'activation_tokens',
+    respond: (stmt) => {
+      const profileId = stmt.values[0]
+      const tokenHash = stmt.values[1]
+      const expiresAt = stmt.values[2]
+      const createdBy = stmt.values[3]
 
       const token = createTestToken({
         profile_id: profileId as string,
@@ -163,72 +188,94 @@ function setupSqlMock() {
         created_by: createdBy as string,
       })
       tokensStore.set(tokenHash as string, token)
-      return Promise.resolve([token])
-    }
+      return [token]
+    },
+  })
 
-    // UPDATE activation_tokens SET used_at = NULL WHERE id [AND token_hash] [AND used_at]
-    // (restoreClaimedToken — #299 Codex review finding 5). Apply ONLY the WHERE conditions
-    // that are actually present in the query (not all conditions every time). This tests the
-    // fix by allowing the mock to correctly apply id-only WHERE when the code is broken.
-    if (query.includes('update activation_tokens') && query.includes('set used_at') && query.includes('where id')) {
+  // UPDATE activation_tokens SET used_at = NULL WHERE id [AND token_hash] [AND used_at]
+  // (#299 Codex review finding 5) — verb-anchored to update, id+WHERE scoped. Applies ONLY
+  // the WHERE conditions that are actually present in the query, not all conditions unconditionally.
+  sqlMock.addHandler({
+    name: 'UPDATE activation_tokens restore claimed (id + hash + used_at scope)',
+    verb: 'update',
+    match: (stmt) =>
+      stmt.table === 'activation_tokens' &&
+      whereHasColumn(stmt, 'id'),
+    respond: (stmt) => {
       // Test failure injection: make restore UPDATE throw
       if (shouldFailRestoreUpdate) {
         throw new Error('Database error during token restoration')
       }
 
-      // Determine which conditions are in the WHERE clause by examining the query string
-      const hasTokenHashCondition = query.includes('token_hash');
-      const hasUsedAtCondition = query.includes('and used_at');
+      // Determine which conditions are in the WHERE clause
+      const hasTokenHashCondition = whereHasColumn(stmt, 'token_hash')
+      const hasUsedAtCondition = whereHasColumn(stmt, 'used_at')
 
-      // Extract bound values in order they appear in template
-      const tokenId = values[0]
-      let valueIndex = 1;
-      const tokenHash = hasTokenHashCondition ? values[valueIndex++] : undefined;
-      const usedAt = hasUsedAtCondition ? values[valueIndex++] : undefined;
+      // Extract bound values in order they appear
+      const tokenId = stmt.values[0]
+      let valueIndex = 1
+      const tokenHash = hasTokenHashCondition ? stmt.values[valueIndex++] : undefined
+      const usedAt = hasUsedAtCondition ? stmt.values[valueIndex++] : undefined
 
       for (const [hash, token] of tokensStore.entries()) {
         // Apply only the conditions that are in the WHERE clause
-        let matches = (token.id === tokenId);
-        if (hasTokenHashCondition) matches = matches && (token.token_hash === tokenHash);
-        if (hasUsedAtCondition) matches = matches && (token.used_at === usedAt);
+        let matches = token.id === tokenId
+        if (hasTokenHashCondition) matches = matches && token.token_hash === tokenHash
+        if (hasUsedAtCondition) matches = matches && token.used_at === usedAt
 
         if (matches) {
           const updated = { ...token, used_at: null, updated_at: mockDatabaseTime.toISOString() }
           tokensStore.set(hash, updated)
-          return Promise.resolve([updated])
+          return [updated]
         }
       }
-      return Promise.resolve([])
-    }
+      return []
+    },
+  })
 
-    // UPDATE activation_tokens SET used_at = ? WHERE token_hash = ? ...
-    if (query.includes('update activation_tokens') && query.includes('set used_at') && query.includes('where token_hash')) {
-      const usedAt = values[0]
-      const tokenHash = values[1]
+  // UPDATE activation_tokens SET used_at (claim token) — verb-anchored to update, token_hash-scoped
+  sqlMock.addHandler({
+    name: 'UPDATE activation_tokens mark used',
+    verb: 'update',
+    match: (stmt) =>
+      stmt.table === 'activation_tokens' &&
+      whereHasColumn(stmt, 'token_hash') &&
+      !whereHasColumn(stmt, 'id'), // Differentiate from restore handler (which has id in WHERE)
+    respond: (stmt) => {
+      const usedAt = stmt.values[0]
+      const tokenHash = stmt.values[1]
       const token = tokensStore.get(tokenHash as string)
       if (token) {
         const updated = { ...token, used_at: usedAt as string, updated_at: usedAt as string }
         tokensStore.set(tokenHash as string, updated)
-        return Promise.resolve([updated])
+        return [updated]
       }
-      return Promise.resolve([])
-    }
+      return []
+    },
+  })
 
-    // UPDATE profiles SET is_active = true, active_from = ?, psw_changed = ? WHERE id = ?
-    if (query.includes('update profiles') && query.includes('set is_active')) {
-      const activeFrom = values[0]
-      const pswChanged = values[1]
-      const profileId = values[2]
-
+  // UPDATE profiles SET is_active = true (activation path) — verb-anchored to update, is_active-scoped
+  sqlMock.addHandler({
+    name: 'UPDATE profiles activate',
+    verb: 'update',
+    match: (stmt) =>
+      stmt.table === 'profiles' &&
+      hasColumn(stmt, 'is_active') &&
+      hasColumn(stmt, 'active_from'),
+    respond: (stmt) => {
       // Test failure injection for finding 6 (zero-rows path)
       if (shouldFailProfileUpdateWithZeroRows) {
-        return Promise.resolve([]) // Silent failure: no rows matched
+        return []
       }
 
       // Test failure injection for finding 6 (error path)
       if (shouldFailProfileUpdate) {
         throw new Error('Simulated database connection error')
       }
+
+      const activeFrom = stmt.values[0]
+      const pswChanged = stmt.values[1]
+      const profileId = stmt.values[2]
 
       const profile = profilesStore.get(profileId as string)
       if (profile) {
@@ -239,19 +286,23 @@ function setupSqlMock() {
           updated_at: activeFrom as string,
         }
         profilesStore.set(profileId as string, updated)
-        return Promise.resolve([updated])
+        return [updated]
       }
-      return Promise.resolve([])
-    }
+      return []
+    },
+  })
 
-    // UPDATE profiles SET psw_changed = ? WHERE id = ?
-    if (query.includes('update profiles') && query.includes('set psw_changed')) {
-      const pswChanged = values[0]
-      const profileId = values[1]
-
+  // UPDATE profiles SET psw_changed (recovery path) — verb-anchored to update, psw_changed-scoped
+  sqlMock.addHandler({
+    name: 'UPDATE profiles mark password changed',
+    verb: 'update',
+    match: (stmt) =>
+      stmt.table === 'profiles' &&
+      hasColumn(stmt, 'psw_changed'),
+    respond: (stmt) => {
       // Test failure injection for finding 6 (zero-rows path in recoverAccount)
       if (shouldFailProfileUpdateWithZeroRows) {
-        return Promise.resolve([]) // Silent failure: no rows matched
+        return []
       }
 
       // Test failure injection for finding 6 (error path in recoverAccount)
@@ -259,16 +310,17 @@ function setupSqlMock() {
         throw new Error('Simulated database error')
       }
 
+      const pswChanged = stmt.values[0]
+      const profileId = stmt.values[1]
+
       const profile = profilesStore.get(profileId as string)
       if (profile) {
         const updated = { ...profile, updated_at: pswChanged as string }
         profilesStore.set(profileId as string, updated)
-        return Promise.resolve([updated])
+        return [updated]
       }
-      return Promise.resolve([])
-    }
-
-    return Promise.resolve([])
+      return []
+    },
   })
 }
 
@@ -288,6 +340,8 @@ describe('auth service (alea- username model)', () => {
     shouldFailProfileUpdateWithZeroRows = false
     shouldFailRestoreUpdate = false
     injectTokenReplacementOnClerkCreate = null
+
+    setupSqlMock()
 
     // Setup default test data
     const testProfile = createTestProfile({
@@ -314,8 +368,6 @@ describe('auth service (alea- username model)', () => {
       is_active: true,
     })
     profilesStore.set('admin-test', adminProfile)
-
-    setupSqlMock()
 
     clerkCreateUserMock.mockImplementation(async () => {
       // Handle token replacement injection for Finding 5 interleaving test

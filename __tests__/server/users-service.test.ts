@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { createSqlMock, whereHasColumn, hasColumn, whereConditionCount } from '../helpers/sql-mock'
 
-const sqlQueryMock = vi.fn()
 const clerkGetUserListMock = vi.fn()
 const clerkUpdateUserMock = vi.fn()
 const clerkDeleteUserMock = vi.fn()
@@ -12,8 +12,10 @@ const profilesStore = new Map<string, any>()
 // Test failure injection points
 let shouldFailUpdateWithZeroRows = false
 
+const sqlMock = createSqlMock()
+
 vi.mock('@/lib/db/client', () => ({
-  sql: sqlQueryMock,
+  sql: sqlMock.sql,
 }))
 
 vi.mock('@clerk/nextjs/server', () => ({
@@ -27,65 +29,100 @@ vi.mock('@clerk/nextjs/server', () => ({
 }))
 
 function setupSqlMock() {
-  sqlQueryMock.mockImplementation(async (strings: TemplateStringsArray | string, ...values: unknown[]): Promise<unknown> => {
-    const queryStr = typeof strings === 'string'
-      ? strings
-      : strings.reduce((acc, str, i) => acc + str + (i < values.length ? `$${i + 1}` : ''), '')
+  sqlMock.reset()
 
-    const query = queryStr.toLowerCase()
+  // Helper to match ILIKE pattern (case-insensitive substring)
+  function matchesPattern(text: string | null | undefined, pattern: string | null | undefined): boolean {
+    if (!pattern || !text) return false
+    // Pattern is in format %search% — extract the search term
+    const searchTerm = pattern.replace(/%/g, '').toLowerCase()
+    return text.toLowerCase().includes(searchTerm)
+  }
 
-    // Helper to match ILIKE pattern (case-insensitive substring)
-    function matchesPattern(text: string | null | undefined, pattern: string | null | undefined): boolean {
-      if (!pattern || !text) return false
-      // Pattern is in format %search% — extract the search term
-      const searchTerm = pattern.replace(/%/g, '').toLowerCase()
-      return text.toLowerCase().includes(searchTerm)
-    }
-
-    // SELECT by id (WHERE id = $1)
-    if (query.includes('select') && query.includes('from profiles') && query.includes('where id =') && !query.includes('ilike')) {
-      const id = values[0] as string
+  // SELECT by id (WHERE id = $1) — verb-anchored, id-column scoped
+  sqlMock.addHandler({
+    name: 'SELECT profiles by id',
+    verb: 'select',
+    match: (stmt) =>
+      stmt.table === 'profiles' &&
+      whereHasColumn(stmt, 'id') &&
+      whereConditionCount(stmt) === 1,
+    respond: (stmt) => {
+      const id = stmt.values[0] as string
       const profile = profilesStore.get(id)
-      if (profile) {
-        return Promise.resolve([profile])
-      }
-      return Promise.resolve([])
-    }
+      return profile ? [profile] : []
+    },
+  })
 
-    // SELECT by member_number (WHERE member_number =)
-    if (query.includes('select') && query.includes('where member_number =') && !query.includes('ilike')) {
-      const memberNumber = values[0]
+  // SELECT by member_number (WHERE member_number = $1) — verb-anchored, member_number-column scoped
+  sqlMock.addHandler({
+    name: 'SELECT profiles by member_number',
+    verb: 'select',
+    match: (stmt) =>
+      stmt.table === 'profiles' &&
+      whereHasColumn(stmt, 'member_number') &&
+      !whereHasColumn(stmt, 'id') && // Differentiate from pre-check query
+      whereConditionCount(stmt) === 1,
+    respond: (stmt) => {
+      const memberNumber = stmt.values[0]
       for (const profile of profilesStore.values()) {
         if (profile.member_number === memberNumber) {
-          return Promise.resolve([profile])
+          return [profile]
         }
       }
-      return Promise.resolve([])
-    }
+      return []
+    },
+  })
 
-    // UPDATE profiles with all 7 fields (member_number, full_name, email, phone, role, is_active, auth_email)
-    if (query.includes('update profiles') && query.includes('set member_number')) {
-      // Format: SET member_number = $1, full_name = $2, email = $3, phone = $4, role = $5, is_active = $6, auth_email = $7 WHERE id = $8
-      const memberNumber = values[0] as string
-      const fullName = values[1] as string
-      const email = values[2] as string | null
-      const phone = values[3] as string | null
-      const role = values[4] as string
-      const isActive = values[5] as boolean
-      const authEmail = values[6] as string
-      const id = values[7] as string
+  // SELECT for pre-check (WHERE member_number = ? AND id <> ?) — verb-anchored, two-condition scoped
+  sqlMock.addHandler({
+    name: 'SELECT profiles pre-check (member_number duplicate check)',
+    verb: 'select',
+    match: (stmt) =>
+      stmt.table === 'profiles' &&
+      whereHasColumn(stmt, 'member_number') &&
+      whereHasColumn(stmt, 'id') &&
+      whereConditionCount(stmt) === 2,
+    respond: (stmt) => {
+      const memberNumber = stmt.values[0]
+      const excludeId = stmt.values[1]
+      for (const profile of profilesStore.values()) {
+        if (profile.member_number === memberNumber && profile.id !== excludeId) {
+          return [profile]
+        }
+      }
+      return []
+    },
+  })
 
+  // UPDATE profiles with all 7 fields (member_number, full_name, email, phone, role, is_active, auth_email)
+  // Verb-anchored to update, scoped by column names in SET and WHERE id clause
+  sqlMock.addHandler({
+    name: 'UPDATE profiles with all 7 fields',
+    verb: 'update',
+    match: (stmt) =>
+      stmt.table === 'profiles' &&
+      hasColumn(stmt, 'member_number') &&
+      whereHasColumn(stmt, 'id'),
+    respond: (stmt) => {
       // Test failure injection for finding 7 (zero-rows path)
       if (shouldFailUpdateWithZeroRows) {
-        if (query.includes('returning')) {
-          return Promise.resolve([]) // Silent failure: no rows matched
-        }
-        return Promise.resolve([])
+        return []
       }
+
+      // Extract values in order
+      const memberNumber = stmt.values[0] as string
+      const fullName = stmt.values[1] as string
+      const email = stmt.values[2] as string | null
+      const phone = stmt.values[3] as string | null
+      const role = stmt.values[4] as string
+      const isActive = stmt.values[5] as boolean
+      const authEmail = stmt.values[6] as string
+      const id = stmt.values[7] as string
 
       const profile = profilesStore.get(id)
       if (!profile) {
-        return Promise.resolve([])
+        return []
       }
 
       const updated = {
@@ -101,61 +138,98 @@ function setupSqlMock() {
       }
       profilesStore.set(id, updated)
 
-      if (query.includes('returning')) {
-        return Promise.resolve([updated])
+      if (stmt.returning) {
+        return [updated]
       }
-      return Promise.resolve([{ id }])
-    }
+      return [{ id }]
+    },
+  })
 
-    // UPDATE no_show_count/blocked_until
-    if (query.includes('update profiles') && query.includes('no_show_count')) {
-      const id = values.find((v) => typeof v === 'string' && v.startsWith('admin-')) || values.find((v) => typeof v === 'string' && v.startsWith('member-'))
+  // UPDATE profiles SET no_show_count, blocked_until
+  // Verb-anchored to update, scoped by no_show_count column in SET (NOT substring match)
+  sqlMock.addHandler({
+    name: 'UPDATE profiles reset no_show_count/blocked_until',
+    verb: 'update',
+    match: (stmt) =>
+      stmt.table === 'profiles' &&
+      hasColumn(stmt, 'no_show_count'),
+    respond: (stmt) => {
+      const id = stmt.values[0]
       const profile = profilesStore.get(id as string)
       if (profile) {
         const updated = { ...profile, no_show_count: 0, blocked_until: null }
         profilesStore.set(id as string, updated)
-        if (query.includes('returning')) {
-          return Promise.resolve([updated])
+        if (stmt.returning) {
+          return [updated]
         }
-        return Promise.resolve([{ id }])
+        return [{ id }]
       }
-      return Promise.resolve([])
-    }
+      return []
+    },
+  })
 
-    // UPDATE blocked_until
-    if (query.includes('update profiles') && query.includes('blocked_until')) {
-      const id = values[values.length - 1]
+  // UPDATE profiles SET blocked_until (clearing it)
+  // Verb-anchored to update, scoped by blocked_until column (NOT substring match)
+  sqlMock.addHandler({
+    name: 'UPDATE profiles clear blocked_until',
+    verb: 'update',
+    match: (stmt) =>
+      stmt.table === 'profiles' &&
+      hasColumn(stmt, 'blocked_until') &&
+      !hasColumn(stmt, 'no_show_count'), // Differentiate from the above handler
+    respond: (stmt) => {
+      const id = stmt.values[stmt.values.length - 1]
       const profile = profilesStore.get(id as string)
       if (profile) {
         const updated = { ...profile, blocked_until: null }
         profilesStore.set(id as string, updated)
-        if (query.includes('returning')) {
-          return Promise.resolve([updated])
+        if (stmt.returning) {
+          return [updated]
         }
-        return Promise.resolve([{ id }])
+        return [{ id }]
       }
-      return Promise.resolve([])
-    }
+      return []
+    },
+  })
 
-    // UPDATE is_active = false (for deleteUser deactivation step)
-    // Note: is_active is hardcoded as false, only id is a parameter
-    if (query.includes('update profiles') && query.includes('set is_active')) {
-      const id = values[0] as string // Only parameter is the id
+  // UPDATE profiles SET is_active = false (for deleteUser deactivation step)
+  // Verb-anchored to update, scoped by is_active column in SET
+  sqlMock.addHandler({
+    name: 'UPDATE profiles deactivate',
+    verb: 'update',
+    match: (stmt) =>
+      stmt.table === 'profiles' &&
+      hasColumn(stmt, 'is_active') &&
+      !hasColumn(stmt, 'member_number') && // Differentiate from full-update handler
+      !hasColumn(stmt, 'no_show_count'), // Differentiate from reset handlers
+    respond: (stmt) => {
+      const id = stmt.values[0] as string
       const profile = profilesStore.get(id)
       if (profile) {
         const updated = { ...profile, is_active: false }
         profilesStore.set(id, updated)
-        if (query.includes('returning')) {
-          return Promise.resolve([updated])
+        if (stmt.returning) {
+          return [updated]
         }
-        return Promise.resolve([{ id }])
+        return [{ id }]
       }
-      return Promise.resolve([])
-    }
+      return []
+    },
+  })
 
-    // SELECT COUNT with search filter (ILIKE) - must come before generic COUNT
-    if (query.includes('select count') && query.includes('ilike')) {
-      const pattern = values[0] as string
+  // SELECT COUNT with search filter (ILIKE) — verb-anchored, isCountSelect and ilike check
+  sqlMock.addHandler({
+    name: 'SELECT COUNT profiles with ILIKE search',
+    verb: 'select',
+    match: (stmt) =>
+      stmt.table === 'profiles' &&
+      stmt.isCountSelect &&
+      stmt.text.includes('ilike'),
+    respond: (stmt) => {
+      // Extract the pattern from string values (first non-numeric string is typically the search pattern)
+      const stringValues = stmt.values.filter((v) => typeof v === 'string') as string[]
+      const pattern = stringValues[0] || ''
+
       const profiles = Array.from(profilesStore.values()).filter((p) => {
         return (
           matchesPattern(p.member_number, pattern) ||
@@ -163,12 +237,23 @@ function setupSqlMock() {
           matchesPattern(p.email, pattern)
         )
       })
-      return Promise.resolve([{ count: profiles.length }])
-    }
+      return [{ count: profiles.length }]
+    },
+  })
 
-    // SELECT with ILIKE search filter - extract limit and offset from values carefully
-    if (query.includes('select') && query.includes('ilike') && query.includes('order by') && query.includes('limit')) {
-      const pattern = values[0] as string
+  // SELECT profiles with ILIKE search filter — verb-anchored, select columns check
+  sqlMock.addHandler({
+    name: 'SELECT profiles with ILIKE search and ORDER/LIMIT',
+    verb: 'select',
+    match: (stmt) =>
+      stmt.table === 'profiles' &&
+      !stmt.isCountSelect &&
+      stmt.text.includes('ilike'),
+    respond: (stmt) => {
+      // Extract the pattern from string values (first non-numeric string is typically the search pattern)
+      const stringValues = stmt.values.filter((v) => typeof v === 'string') as string[]
+      const pattern = stringValues[0] || ''
+
       let filtered = Array.from(profilesStore.values()).filter((p) => {
         return (
           matchesPattern(p.member_number, pattern) ||
@@ -180,10 +265,8 @@ function setupSqlMock() {
       // Apply ordering by created_at
       filtered = filtered.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
 
-      // Extract LIMIT and OFFSET from values
-      // For query with 3 ilike patterns, values is: [pattern, pattern, pattern, limit, offset]
-      // But we only have one pattern value in values[0], so we need to count numeric values
-      const numericValues = values.filter((v) => typeof v === 'number')
+      // Extract numeric values for LIMIT and OFFSET
+      const numericValues = stmt.values.filter((v) => typeof v === 'number')
       const limit = numericValues[0] as number
       const offset = numericValues[1] as number
 
@@ -191,49 +274,73 @@ function setupSqlMock() {
         filtered = filtered.slice(offset, offset + limit)
       }
 
-      return Promise.resolve(filtered)
-    }
+      return filtered
+    },
+  })
 
-    // SELECT COUNT (no search) - generic COUNT query
-    if (query.includes('select count') && !query.includes('ilike')) {
-      return Promise.resolve([{ count: profilesStore.size }])
-    }
+  // SELECT COUNT (no search) — verb-anchored, isCountSelect check
+  sqlMock.addHandler({
+    name: 'SELECT COUNT profiles (no search)',
+    verb: 'select',
+    match: (stmt) =>
+      stmt.table === 'profiles' &&
+      stmt.isCountSelect,
+    respond: () => [{ count: profilesStore.size }],
+  })
 
-    // SELECT with ORDER/LIMIT/OFFSET (no search)
-    if (query.includes('select') && query.includes('order by') && !query.includes('ilike')) {
+  // SELECT profiles with ORDER/LIMIT/OFFSET (no search) — verb-anchored
+  sqlMock.addHandler({
+    name: 'SELECT profiles with ORDER/LIMIT (no search)',
+    verb: 'select',
+    match: (stmt) =>
+      stmt.table === 'profiles' &&
+      !stmt.isCountSelect,
+    respond: (stmt) => {
       let profiles = Array.from(profilesStore.values()).sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
 
       // Extract numeric values for LIMIT and OFFSET
-      const numericValues = values.filter((v) => typeof v === 'number')
+      const numericValues = stmt.values.filter((v) => typeof v === 'number')
       if (numericValues.length >= 2) {
         const limit = numericValues[0] as number
         const offset = numericValues[1] as number
         profiles = profiles.slice(offset, offset + limit)
       }
 
-      return Promise.resolve(profiles)
-    }
+      return profiles
+    },
+  })
 
-    // DELETE
-    if (query.includes('delete') && query.includes('from profiles')) {
-      const id = values[0]
+  // DELETE from profiles — verb-anchored to delete
+  sqlMock.addHandler({
+    name: 'DELETE profiles by id',
+    verb: 'delete',
+    match: (stmt) =>
+      stmt.table === 'profiles' &&
+      whereHasColumn(stmt, 'id'),
+    respond: (stmt) => {
+      const id = stmt.values[0]
       const deletedProfile = profilesStore.get(id as string)
       profilesStore.delete(id as string)
-      if (query.includes('returning')) {
-        return Promise.resolve(deletedProfile ? [{ id }] : [])
+      if (stmt.returning) {
+        return deletedProfile ? [{ id }] : []
       }
-      return Promise.resolve(deletedProfile ? [{ id }] : [])
-    }
+      return deletedProfile ? [{ id }] : []
+    },
+  })
 
-    // INSERT
-    if (query.includes('insert into profiles')) {
+  // INSERT into profiles — verb-anchored to insert
+  sqlMock.addHandler({
+    name: 'INSERT profiles',
+    verb: 'insert',
+    match: (stmt) => stmt.table === 'profiles',
+    respond: (stmt) => {
       const newProfile = {
         id: `profile-${Math.random().toString(36).substr(2, 9)}`,
-        member_number: values[1],
-        full_name: values[2],
-        auth_email: values[3],
-        email: values[4],
-        phone: values[5],
+        member_number: stmt.values[1],
+        full_name: stmt.values[2],
+        auth_email: stmt.values[3],
+        email: stmt.values[4],
+        phone: stmt.values[5],
         role: 'member',
         is_active: false,
         active_from: null,
@@ -243,10 +350,8 @@ function setupSqlMock() {
         updated_at: new Date().toISOString(),
       }
       profilesStore.set(newProfile.id, newProfile)
-      return Promise.resolve([newProfile])
-    }
-
-    return Promise.resolve([])
+      return [newProfile]
+    },
   })
 }
 
@@ -256,6 +361,8 @@ describe('users-service (raw SQL with Neon)', () => {
     vi.clearAllMocks()
     profilesStore.clear()
     shouldFailUpdateWithZeroRows = false
+
+    setupSqlMock()
 
     // Load test data
     const adminProfile = {
@@ -290,8 +397,6 @@ describe('users-service (raw SQL with Neon)', () => {
     }
     profilesStore.set(adminProfile.id, adminProfile)
     profilesStore.set(memberProfile.id, memberProfile)
-
-    setupSqlMock()
 
     // Reset Clerk mocks with default behavior (succeed)
     clerkGetUserListMock.mockReset()
@@ -711,31 +816,18 @@ describe('users-service (raw SQL with Neon)', () => {
       })
 
       // Mock DB write to fail with unique constraint (23505)
-      sqlQueryMock.mockImplementation(async (strings: TemplateStringsArray | string, ...values: unknown[]) => {
-        const queryStr = typeof strings === 'string'
-          ? strings
-          : strings.reduce((acc, str, i) => acc + str + (i < values.length ? `$${i + 1}` : ''), '')
-        const query = queryStr.toLowerCase()
-
-        // SELECT id from profiles
-        if (query.includes('select') && query.includes('from profiles') && query.includes('where id') && !query.includes('and')) {
-          return Promise.resolve([profilesStore.get(values[0] as string)])
-        }
-
-        // SELECT for member_number duplicate check
-        if (query.includes('select') && query.includes('where member_number') && query.includes('and id <>')) {
-          return Promise.resolve([]) // Pre-check passes
-        }
-
-        // UPDATE profiles for member_number change fails
-        if (query.includes('update profiles') && query.includes('set member_number')) {
+      sqlMock.prependHandler({
+        name: 'UPDATE profiles member_number (fail with 23505)',
+        verb: 'update',
+        match: (stmt) =>
+          stmt.table === 'profiles' &&
+          hasColumn(stmt, 'member_number'),
+        respond: async () => {
           const { NeonDbError } = await import('@neondatabase/serverless')
           const error = new NeonDbError('unique constraint violation')
           ;(error as any).code = '23505'
           throw error
-        }
-
-        return Promise.resolve([])
+        },
       })
 
       const { updateUser } = await import('@/lib/server/users-service')
@@ -1052,22 +1144,15 @@ describe('users-service (raw SQL with Neon)', () => {
 
       clerkDeleteUserMock.mockResolvedValueOnce({ id: 'clerk-find8-db-fail' })
 
-      // Simulate DELETE FROM profiles failing by patching the mock
-      const originalImpl = sqlQueryMock.getMockImplementation()
-      let deleteCallCount = 0
-      sqlQueryMock.mockImplementation(async (strings: TemplateStringsArray | string, ...values: unknown[]) => {
-        const queryStr = typeof strings === 'string'
-          ? strings
-          : strings.reduce((acc, str, i) => acc + str + (i < values.length ? `$${i + 1}` : ''), '')
-        const query = queryStr.toLowerCase()
-        // Throw on the DELETE FROM profiles query
-        if (query.includes('delete') && query.includes('from profiles')) {
-          deleteCallCount++
-          // First two SQL calls are the initial SELECT and UPDATE for deactivation
-          // Third is the DELETE
+      // Inject a handler to make DELETE fail
+      sqlMock.prependHandler({
+        name: 'DELETE profiles (fail)',
+        verb: 'delete',
+        match: (stmt) =>
+          stmt.table === 'profiles',
+        respond: () => {
           throw new Error('Database connection lost')
-        }
-        return originalImpl(strings, ...values)
+        },
       })
 
       const { deleteUser } = await import('@/lib/server/users-service')
@@ -1079,8 +1164,6 @@ describe('users-service (raw SQL with Neon)', () => {
         // When DELETE throws, it's an unhandled error (not wrapped in ServiceError by deleteUser)
         expect(e).toMatchObject(new Error('Database connection lost'))
       }
-
-      sqlQueryMock.mockImplementation(originalImpl)
 
       // Verify: profile row still exists and is deactivated
       const profile = profilesStore.get('find8-db-fail')
