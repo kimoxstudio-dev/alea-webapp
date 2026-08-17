@@ -54,15 +54,17 @@ function setupSqlMock() {
     },
   })
 
-  // SELECT by member_number (WHERE member_number = $1) — verb-anchored, member_number-column scoped
+  // SELECT by member_number (WHERE member_number = $1, exact match) — verb-anchored, member_number-column scoped
+  // NOTE: Deliberately excludes ILIKE queries; those are handled by the fallback search handler
   sqlMock.addHandler({
-    name: 'SELECT profiles by member_number',
+    name: 'SELECT profiles by member_number (exact)',
     verb: 'select',
     match: (stmt) =>
       stmt.table === 'profiles' &&
       whereHasColumn(stmt, 'member_number') &&
       !whereHasColumn(stmt, 'id') && // Differentiate from pre-check query
-      whereConditionCount(stmt) === 1,
+      whereConditionCount(stmt) === 1 &&
+      !stmt.text.includes('ilike'), // Exclude ILIKE/search queries
     respond: (stmt) => {
       const memberNumber = stmt.values[0]
       for (const profile of profilesStore.values()) {
