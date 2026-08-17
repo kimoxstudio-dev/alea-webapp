@@ -62,6 +62,13 @@ export interface ParsedStatement {
    * can never satisfy this.
    */
   isCountSelect: boolean
+  /**
+   * True only for a `select` whose column list (the text between `select`
+   * and `from`) begins with `now(`. Anchored to that position — never a
+   * loose `.includes('now()')` — so a plain column like `created_at` or
+   * ORDER BY clause containing `now()` can never satisfy this.
+   */
+  isNowSelect: boolean
 }
 
 const VERB_RE = /^\s*(select|insert|update|delete)\b/i
@@ -117,15 +124,17 @@ export function parseStatement(
   const returning = /\breturning\b/i.test(text)
 
   let isCountSelect = false
+  let isNowSelect = false
   if (verb === 'select') {
     const selectColumns =
       /^select\s+(.*?)\s+from\b/i.exec(text)?.[1] ??
       /^select\s+(.*)$/i.exec(text)?.[1] ??
       ''
     isCountSelect = /^count\s*\(/i.test(selectColumns.trim())
+    isNowSelect = /^now\s*\(/i.test(selectColumns.trim())
   }
 
-  return { text, verb, values, table, whereClause, returning, isCountSelect }
+  return { text, verb, values, table, whereClause, returning, isCountSelect, isNowSelect }
 }
 
 /**

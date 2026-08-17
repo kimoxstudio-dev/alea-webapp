@@ -120,7 +120,7 @@ function setupSqlMock() {
   sqlMock.addHandler({
     name: 'SELECT now()',
     verb: 'select',
-    match: (stmt) => stmt.text.includes('now()'),
+    match: (stmt) => stmt.isNowSelect,
     respond: () => [{ now: mockDatabaseTime.toISOString() }],
   })
 
