@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createSqlMock, whereHasColumn, hasColumn, whereConditionCount } from '../helpers/sql-mock'
+import { createSqlMock, whereHasColumn, hasColumn, whereConditionCount, whereColumnHasOperator } from '../helpers/sql-mock'
 
 const clerkGetUserListMock = vi.fn()
 const clerkUpdateUserMock = vi.fn()
@@ -55,16 +55,15 @@ function setupSqlMock() {
   })
 
   // SELECT by member_number (WHERE member_number = $1, exact match) — verb-anchored, member_number-column scoped
-  // NOTE: Deliberately excludes ILIKE queries; those are handled by the fallback search handler
+  // Uses whereColumnHasOperator() to check the actual operator on the column, preventing loose text-scan defects
   sqlMock.addHandler({
     name: 'SELECT profiles by member_number (exact)',
     verb: 'select',
     match: (stmt) =>
       stmt.table === 'profiles' &&
-      whereHasColumn(stmt, 'member_number') &&
+      whereColumnHasOperator(stmt, 'member_number', '=') && // Exact operator, not substring
       !whereHasColumn(stmt, 'id') && // Differentiate from pre-check query
-      whereConditionCount(stmt) === 1 &&
-      !stmt.text.includes('ilike'), // Exclude ILIKE/search queries
+      whereConditionCount(stmt) === 1,
     respond: (stmt) => {
       const memberNumber = stmt.values[0]
       for (const profile of profilesStore.values()) {

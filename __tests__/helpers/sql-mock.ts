@@ -165,10 +165,38 @@ export function hasColumn(stmt: ParsedStatement, column: string): boolean {
  * is no WHERE clause). Lets a handler assert that a statement carries as
  * many — or as few — conditions as it expects, instead of assuming a fixed
  * shape regardless of what the statement actually contains.
+ *
+ * NOTE: This counts AND-joined conditions only. An OR-joined group (e.g.,
+ * "A ILIKE $1 OR B ILIKE $2 OR C ILIKE $3") counts as 1, indistinguishable
+ * from a genuine single-condition WHERE. Use whereColumnHasOperator() for
+ * per-column operator detection instead.
  */
 export function whereConditionCount(stmt: ParsedStatement): number {
   if (!stmt.whereClause) return 0
   return stmt.whereClause.split(/\band\b/i).filter((part) => part.trim().length > 0).length
+}
+
+/**
+ * Whether a specific column in the WHERE clause uses a specific operator,
+ * word-boundary anchored. Detects the exact operator (=, ILIKE, <>, etc)
+ * on a given column, not substring-based. This distinguishes:
+ * - `member_number = $1` (exact match)
+ * - `member_number ILIKE $1` (pattern match)
+ * and prevents loose text-scanning defects like #299's `updated_at` vs `update`.
+ */
+export function whereColumnHasOperator(
+  stmt: ParsedStatement,
+  column: string,
+  operator: string,
+): boolean {
+  if (!stmt.whereClause) return false
+  const escapedColumn = escapeRegExp(column)
+  const escapedOp = escapeRegExp(operator)
+  const pattern = new RegExp(
+    `\\b${escapedColumn}\\b\\s*${escapedOp}\\s`,
+    'i',
+  )
+  return pattern.test(stmt.whereClause)
 }
 
 /** Case-insensitive `%term%` ILIKE pattern match against a nullable column value. */
