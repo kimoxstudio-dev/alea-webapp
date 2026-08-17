@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest'
-import { parseStatement, whereConditionCount, whereHasColumn } from './sql-mock'
+import { parseStatement, whereConditionCount, whereHasColumn, whereColumnHasOperator } from './sql-mock'
 
 /**
  * Issue #332 fix validation: whereConditionCount() must correctly count both
@@ -118,20 +118,61 @@ describe('sql-mock: whereConditionCount fix for issue #332', () => {
   })
 
   /**
-   * Verify that whereColumnHasOperator() still works correctly with OR
-   * conditions (from commit 14672e3).
+   * Verify that whereColumnHasOperator() works correctly with OR conditions.
+   * Finding 8: Regression coverage for operator detection on OR-joined columns.
+   * Without this coverage, a change to whereColumnHasOperator() that breaks OR support
+   * would go undetected.
    */
-  it('whereColumnHasOperator still works correctly with OR conditions', () => {
+  it('whereColumnHasOperator works correctly with OR conditions', () => {
     const stmt = parseStatement(
       `SELECT id FROM profiles
        WHERE member_number ILIKE $1 OR full_name ILIKE $2 OR email ILIKE $3`,
       ['pattern', 'pattern', 'pattern'],
     )
 
-    // The ILIKE fix from 14672e3 should still work
+    // whereHasColumn checks (existing test coverage)
     expect(whereHasColumn(stmt, 'member_number')).toBe(true)
     expect(whereHasColumn(stmt, 'full_name')).toBe(true)
     expect(whereHasColumn(stmt, 'email')).toBe(true)
     expect(whereHasColumn(stmt, 'nonexistent')).toBe(false)
+
+    // Finding 8: Direct whereColumnHasOperator assertions for OR-joined columns
+    // These assertions exercise the operator detection logic against the OR WHERE clause
+    expect(whereColumnHasOperator(stmt, 'member_number', 'ILIKE')).toBe(true) // Correct operator
+    expect(whereColumnHasOperator(stmt, 'full_name', 'ILIKE')).toBe(true)
+    expect(whereColumnHasOperator(stmt, 'email', 'ILIKE')).toBe(true)
+
+    // Negative tests: wrong operator should fail
+    expect(whereColumnHasOperator(stmt, 'member_number', '=')).toBe(false) // ILIKE, not =
+    expect(whereColumnHasOperator(stmt, 'full_name', '=')).toBe(false)
+    expect(whereColumnHasOperator(stmt, 'email', '=')).toBe(false)
+
+    // Non-existent column should fail
+    expect(whereColumnHasOperator(stmt, 'nonexistent', 'ILIKE')).toBe(false)
+  })
+
+  /**
+   * Revert-confirm: If whereColumnHasOperator() stops working correctly with OR,
+   * this test will fail and prove the regression.
+   */
+  it('revert-confirm: whereColumnHasOperator fails if operator detection breaks on OR', () => {
+    const stmt = parseStatement(
+      `SELECT id FROM profiles
+       WHERE member_number ILIKE $1 OR full_name = $2`,
+      ['pattern', 'value'],
+    )
+
+    // Positive case: ILIKE on member_number (first condition)
+    expect(whereColumnHasOperator(stmt, 'member_number', 'ILIKE')).toBe(true)
+
+    // Positive case: = on full_name (second condition, after OR)
+    expect(whereColumnHasOperator(stmt, 'full_name', '=')).toBe(true)
+
+    // Cross-operator checks must fail (different columns have different operators)
+    expect(whereColumnHasOperator(stmt, 'member_number', '=')).toBe(false)
+    expect(whereColumnHasOperator(stmt, 'full_name', 'ILIKE')).toBe(false)
+
+    // If whereColumnHasOperator is broken, the = check on full_name would fail
+    // when it should pass, proving the regression. This test acts as a canary.
   })
 })

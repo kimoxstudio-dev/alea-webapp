@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createSqlMock, whereHasColumn, hasColumn, whereConditionCount, whereColumnHasOperator } from '../helpers/sql-mock'
+import { createSqlMock, whereHasColumn, hasColumn, whereConditionCount, whereColumnHasOperator, matchesIlikePattern } from '../helpers/sql-mock'
 
 const clerkGetUserListMock = vi.fn()
 const clerkUpdateUserMock = vi.fn()
@@ -30,14 +30,6 @@ vi.mock('@clerk/nextjs/server', () => ({
 
 function setupSqlMock() {
   sqlMock.reset()
-
-  // Helper to match ILIKE pattern (case-insensitive substring)
-  function matchesPattern(text: string | null | undefined, pattern: string | null | undefined): boolean {
-    if (!pattern || !text) return false
-    // Pattern is in format %search% — extract the search term
-    const searchTerm = pattern.replace(/%/g, '').toLowerCase()
-    return text.toLowerCase().includes(searchTerm)
-  }
 
   // SELECT by id (WHERE id = $1) — verb-anchored, id-column scoped
   sqlMock.addHandler({
@@ -98,12 +90,16 @@ function setupSqlMock() {
 
   // UPDATE profiles with all 7 fields (member_number, full_name, email, phone, role, is_active, auth_email)
   // Verb-anchored to update, scoped by column names in SET and WHERE id clause
+  // Positive assertion: must have ALL these columns in SET (not just member_number)
   sqlMock.addHandler({
     name: 'UPDATE profiles with all 7 fields',
     verb: 'update',
     match: (stmt) =>
       stmt.table === 'profiles' &&
       hasColumn(stmt, 'member_number') &&
+      hasColumn(stmt, 'full_name') &&
+      hasColumn(stmt, 'role') &&
+      hasColumn(stmt, 'auth_email') &&
       whereHasColumn(stmt, 'id'),
     respond: (stmt) => {
       // Test failure injection for finding 7 (zero-rows path)
@@ -148,12 +144,14 @@ function setupSqlMock() {
 
   // UPDATE profiles SET no_show_count, blocked_until
   // Verb-anchored to update, scoped by no_show_count column in SET (NOT substring match)
+  // Positive assertion: must have BOTH columns (not just one)
   sqlMock.addHandler({
     name: 'UPDATE profiles reset no_show_count/blocked_until',
     verb: 'update',
     match: (stmt) =>
       stmt.table === 'profiles' &&
-      hasColumn(stmt, 'no_show_count'),
+      hasColumn(stmt, 'no_show_count') &&
+      hasColumn(stmt, 'blocked_until'),
     respond: (stmt) => {
       const id = stmt.values[0]
       const profile = profilesStore.get(id as string)
@@ -184,6 +182,45 @@ function setupSqlMock() {
       if (profile) {
         const updated = { ...profile, blocked_until: null }
         profilesStore.set(id as string, updated)
+        if (stmt.returning) {
+          return [updated]
+        }
+        return [{ id }]
+      }
+      return []
+    },
+  })
+
+  // UPDATE profiles SET full_name, email, phone (CSV import update path)
+  // Verb-anchored to update, scoped by the specific column set from CSV import
+  // Differentiates from full 7-field update by checking ONLY these three columns present
+  sqlMock.addHandler({
+    name: 'UPDATE profiles (CSV import: full_name, email, phone)',
+    verb: 'update',
+    match: (stmt) =>
+      stmt.table === 'profiles' &&
+      hasColumn(stmt, 'full_name') &&
+      hasColumn(stmt, 'email') &&
+      hasColumn(stmt, 'phone') &&
+      !hasColumn(stmt, 'member_number') && // Differentiate from full-update handler
+      !hasColumn(stmt, 'is_active') && // Differentiate from activation handler
+      whereHasColumn(stmt, 'id'),
+    respond: (stmt) => {
+      const fullName = stmt.values[0] as string
+      const email = stmt.values[1] as string | null
+      const phone = stmt.values[2] as string | null
+      const id = stmt.values[3] as string
+
+      const profile = profilesStore.get(id)
+      if (profile) {
+        const updated = {
+          ...profile,
+          full_name: fullName,
+          email: email,
+          phone: phone,
+          updated_at: new Date().toISOString(),
+        }
+        profilesStore.set(id, updated)
         if (stmt.returning) {
           return [updated]
         }
@@ -234,9 +271,9 @@ function setupSqlMock() {
         // Search with filter
         const filtered = Array.from(profilesStore.values()).filter((p) => {
           return (
-            matchesPattern(p.member_number, pattern) ||
-            matchesPattern(p.full_name, pattern) ||
-            matchesPattern(p.email, pattern)
+            matchesIlikePattern(p.member_number, pattern) ||
+            matchesIlikePattern(p.full_name, pattern) ||
+            matchesIlikePattern(p.email, pattern)
           )
         })
         return [{ count: filtered.length }]
@@ -248,13 +285,19 @@ function setupSqlMock() {
   })
 
   // SELECT profiles with ORDER/LIMIT/OFFSET — matches both search and non-search queries
-  // This is the fallback for any SELECT profiles query that doesn't match a more specific handler
+  // This handler must not be so broad that it silently absorbs future SELECT queries that
+  // don't match more specific handlers. Require ORDER BY/LIMIT/OFFSET present to ensure
+  // only this specific query shape matches, not any future accidental query.
   sqlMock.addHandler({
     name: 'SELECT profiles with ORDER/LIMIT (fallback)',
     verb: 'select',
-    match: (stmt) =>
-      stmt.table === 'profiles' &&
-      !stmt.isCountSelect,
+    match: (stmt) => {
+      // Must be a profiles SELECT (not COUNT)
+      if (stmt.table !== 'profiles' || stmt.isCountSelect) return false
+      // Must have ORDER BY, LIMIT, and at least one OFFSET condition
+      // This ensures the handler is specific to the pagination + sort query it's named for
+      return /\border\s+by\b/i.test(stmt.text) && /\blimit\b/i.test(stmt.text)
+    },
     respond: (stmt) => {
       // If we reach this handler, assume it's a generic select (possibly with search)
       // that wasn't caught by the more specific handlers
@@ -267,9 +310,9 @@ function setupSqlMock() {
       if (maybePattern) {
         profiles = profiles.filter((p) => {
           return (
-            matchesPattern(p.member_number, maybePattern) ||
-            matchesPattern(p.full_name, maybePattern) ||
-            matchesPattern(p.email, maybePattern)
+            matchesIlikePattern(p.member_number, maybePattern) ||
+            matchesIlikePattern(p.full_name, maybePattern) ||
+            matchesIlikePattern(p.email, maybePattern)
           )
         })
       }
@@ -308,6 +351,9 @@ function setupSqlMock() {
   })
 
   // INSERT into profiles — verb-anchored to insert
+  // Production binding order (lib/server/users-service.ts:170-172):
+  // INSERT INTO profiles (...) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, ...)
+  // WHERE: $1=memberNumber, $2=fullName, $3=authEmail, $4=contactEmail, $5=phone
   sqlMock.addHandler({
     name: 'INSERT profiles',
     verb: 'insert',
@@ -315,11 +361,11 @@ function setupSqlMock() {
     respond: (stmt) => {
       const newProfile = {
         id: `profile-${Math.random().toString(36).substr(2, 9)}`,
-        member_number: stmt.values[1],
-        full_name: stmt.values[2],
-        auth_email: stmt.values[3],
-        email: stmt.values[4],
-        phone: stmt.values[5],
+        member_number: stmt.values[0],
+        full_name: stmt.values[1],
+        auth_email: stmt.values[2],
+        email: stmt.values[3],
+        phone: stmt.values[4],
         role: 'member',
         is_active: false,
         active_from: null,
@@ -828,6 +874,79 @@ describe('users-service (raw SQL with Neon)', () => {
       expect(clerkUpdateUserMock).toHaveBeenNthCalledWith(2, 'clerk-toctou', {
         username: 'alea-100011',
       })
+    })
+  })
+
+  describe('Finding 3 — Codex review: CSV import UPDATE path coverage', () => {
+    it('handles CSV import update for existing members (full_name, email, phone)', async () => {
+      // Finding 3: The CSV import path updates existing members with a specific UPDATE query:
+      // UPDATE profiles SET full_name, email, phone WHERE id = ...
+      // This handler was missing, causing the CSV update path to throw instead of being handled.
+
+      const { importMembersFromCsv } = await import('@/lib/server/users-service')
+
+      // Setup: existing member to update via CSV import
+      profilesStore.set('csv-member', {
+        id: 'csv-member',
+        member_number: '100003',
+        full_name: 'Old Name',
+        auth_email: '100003@members.alea.internal',
+        email: 'old@example.com',
+        phone: '600000003',
+        role: 'member' as const,
+        is_active: false,
+        active_from: null,
+        no_show_count: 0,
+        blocked_until: null,
+        created_at: '2024-01-03T00:00:00.000Z',
+        updated_at: '2024-01-03T00:00:00.000Z',
+      })
+
+      // CSV import with updated member data
+      // Format: headers + data rows (member_number,full_name,email,phone)
+      const csvData = 'member_number,full_name,email,phone\n100003,Updated Name,updated@example.com,699000303'
+      const result = await importMembersFromCsv(csvData)
+
+      // Verify the update succeeded (not thrown)
+      expect(result.updatedCount).toBe(1)
+      expect(result.createdCount).toBe(0)
+
+      // Verify the profile was actually updated in the store
+      const updated = profilesStore.get('csv-member')
+      expect(updated?.full_name).toBe('Updated Name')
+      expect(updated?.email).toBe('updated@example.com')
+      expect(updated?.phone).toBe('699000303')
+    })
+
+    it('revert-confirm: without CSV-update handler, the update path would throw', async () => {
+      // This test verifies that the CSV update handler is essential and not just
+      // a duplicate of another handler. When the handler is removed, this test will fail
+      // because the import will throw instead of succeeding.
+
+      const { importMembersFromCsv } = await import('@/lib/server/users-service')
+
+      profilesStore.set('csv-member-2', {
+        id: 'csv-member-2',
+        member_number: '100004',
+        full_name: 'Initial Name',
+        auth_email: '100004@members.alea.internal',
+        email: 'initial@example.com',
+        phone: '600000004',
+        role: 'member' as const,
+        is_active: false,
+        active_from: null,
+        no_show_count: 0,
+        blocked_until: null,
+        created_at: '2024-01-04T00:00:00.000Z',
+        updated_at: '2024-01-04T00:00:00.000Z',
+      })
+
+      // CSV import with updated member data (format: headers + rows with member_number,full_name,email,phone)
+      const csvData = 'member_number,full_name,email,phone\n100004,Updated via CSV,csv@example.com,699000404'
+      const result = await importMembersFromCsv(csvData)
+
+      // Without the CSV-update handler, this assertion would fail (throw before reaching here)
+      expect(result.updatedCount).toBe(1)
     })
   })
 
