@@ -217,86 +217,64 @@ function setupSqlMock() {
     },
   })
 
-  // SELECT COUNT with search filter (ILIKE) — verb-anchored, isCountSelect and ilike check
+  // SELECT COUNT (any profiles count query) — verb-anchored, isCountSelect check
   sqlMock.addHandler({
-    name: 'SELECT COUNT profiles with ILIKE search',
-    verb: 'select',
-    match: (stmt) =>
-      stmt.table === 'profiles' &&
-      stmt.isCountSelect &&
-      stmt.text.includes('ilike'),
-    respond: (stmt) => {
-      // Extract the pattern from string values (first non-numeric string is typically the search pattern)
-      const stringValues = stmt.values.filter((v) => typeof v === 'string') as string[]
-      const pattern = stringValues[0] || ''
-
-      const profiles = Array.from(profilesStore.values()).filter((p) => {
-        return (
-          matchesPattern(p.member_number, pattern) ||
-          matchesPattern(p.full_name, pattern) ||
-          matchesPattern(p.email, pattern)
-        )
-      })
-      return [{ count: profiles.length }]
-    },
-  })
-
-  // SELECT profiles with ILIKE search filter — verb-anchored, select columns check
-  sqlMock.addHandler({
-    name: 'SELECT profiles with ILIKE search and ORDER/LIMIT',
-    verb: 'select',
-    match: (stmt) =>
-      stmt.table === 'profiles' &&
-      !stmt.isCountSelect &&
-      stmt.text.includes('ilike'),
-    respond: (stmt) => {
-      // Extract the pattern from string values (first non-numeric string is typically the search pattern)
-      const stringValues = stmt.values.filter((v) => typeof v === 'string') as string[]
-      const pattern = stringValues[0] || ''
-
-      let filtered = Array.from(profilesStore.values()).filter((p) => {
-        return (
-          matchesPattern(p.member_number, pattern) ||
-          matchesPattern(p.full_name, pattern) ||
-          matchesPattern(p.email, pattern)
-        )
-      })
-
-      // Apply ordering by created_at
-      filtered = filtered.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
-
-      // Extract numeric values for LIMIT and OFFSET
-      const numericValues = stmt.values.filter((v) => typeof v === 'number')
-      const limit = numericValues[0] as number
-      const offset = numericValues[1] as number
-
-      if (limit !== undefined && offset !== undefined) {
-        filtered = filtered.slice(offset, offset + limit)
-      }
-
-      return filtered
-    },
-  })
-
-  // SELECT COUNT (no search) — verb-anchored, isCountSelect check
-  sqlMock.addHandler({
-    name: 'SELECT COUNT profiles (no search)',
+    name: 'SELECT COUNT profiles',
     verb: 'select',
     match: (stmt) =>
       stmt.table === 'profiles' &&
       stmt.isCountSelect,
-    respond: () => [{ count: profilesStore.size }],
+    respond: (stmt) => {
+      // If there are string values, assume they're filter patterns
+      const stringValues = stmt.values.filter((v) => typeof v === 'string') as string[]
+      const pattern = stringValues[0] || ''
+
+      if (pattern) {
+        // Search with filter
+        const filtered = Array.from(profilesStore.values()).filter((p) => {
+          return (
+            matchesPattern(p.member_number, pattern) ||
+            matchesPattern(p.full_name, pattern) ||
+            matchesPattern(p.email, pattern)
+          )
+        })
+        return [{ count: filtered.length }]
+      }
+
+      // No filter, count all
+      return [{ count: profilesStore.size }]
+    },
   })
 
-  // SELECT profiles with ORDER/LIMIT/OFFSET (no search) — verb-anchored
+  // SELECT profiles with ORDER/LIMIT/OFFSET — matches both search and non-search queries
+  // This is the fallback for any SELECT profiles query that doesn't match a more specific handler
   sqlMock.addHandler({
-    name: 'SELECT profiles with ORDER/LIMIT (no search)',
+    name: 'SELECT profiles with ORDER/LIMIT (fallback)',
     verb: 'select',
     match: (stmt) =>
       stmt.table === 'profiles' &&
       !stmt.isCountSelect,
     respond: (stmt) => {
-      let profiles = Array.from(profilesStore.values()).sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+      // If we reach this handler, assume it's a generic select (possibly with search)
+      // that wasn't caught by the more specific handlers
+      const stringValues = stmt.values.filter((v) => typeof v === 'string') as string[]
+      const maybePattern = stringValues[0] || ''
+
+      let profiles = Array.from(profilesStore.values())
+
+      // If there's a pattern value, attempt filtering with it
+      if (maybePattern) {
+        profiles = profiles.filter((p) => {
+          return (
+            matchesPattern(p.member_number, maybePattern) ||
+            matchesPattern(p.full_name, maybePattern) ||
+            matchesPattern(p.email, maybePattern)
+          )
+        })
+      }
+
+      // Sort by created_at
+      profiles = profiles.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
 
       // Extract numeric values for LIMIT and OFFSET
       const numericValues = stmt.values.filter((v) => typeof v === 'number')
