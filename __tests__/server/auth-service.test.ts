@@ -2015,6 +2015,70 @@ describe('auth service (alea- username model)', () => {
       // would incorrectly pass.
       await expect(activateAccount({ token: plainToken })).rejects.toThrow()
     })
+
+    it('revert-confirm: recoverAccount claim rejects a concurrent use between read and UPDATE', async () => {
+      const { recoverAccount } = (await loadService()) as any
+      const plainToken = createActivationToken()
+      const tokenHash = hashActivationToken(plainToken)
+      const token = createTestToken({
+        token_hash: tokenHash,
+        profile_id: 'user-active',
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+      })
+      tokensStore.set(tokenHash, token)
+
+      let reads = 0
+      sqlMock.prependHandler({
+        name: 'TOCTOU: concurrent recovery claim between read and update',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'activation_tokens' && whereColumnHasOperator(stmt, 'token_hash', '=') && whereConditionCount(stmt) === 1,
+        respond: (stmt) => {
+          const hash = stmt.values[0] as string
+          const snapshot = tokensStore.get(hash)
+          reads++
+          if (reads === 1 && snapshot) {
+            tokensStore.set(hash, { ...snapshot, used_at: mockDatabaseTime.toISOString() })
+            return [snapshot]
+          }
+          return snapshot ? [snapshot] : []
+        },
+      })
+
+      await expect(recoverAccount({ token: plainToken, password: 'ValidPassword123!' })).rejects.toMatchObject({ statusCode: 400 })
+      expect(clerkUpdateUserMock).not.toHaveBeenCalled()
+    })
+
+    it('revert-confirm: activateAccount claim rejects a token that expires between read and UPDATE', async () => {
+      const { activateAccount } = (await loadService()) as any
+      const plainToken = createActivationToken()
+      const tokenHash = hashActivationToken(plainToken)
+      const token = createTestToken({
+        token_hash: tokenHash,
+        profile_id: 'user-test',
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+      })
+      tokensStore.set(tokenHash, token)
+
+      let reads = 0
+      sqlMock.prependHandler({
+        name: 'TOCTOU: token expires between activation read and update',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'activation_tokens' && whereColumnHasOperator(stmt, 'token_hash', '=') && whereConditionCount(stmt) === 1,
+        respond: (stmt) => {
+          const hash = stmt.values[0] as string
+          const snapshot = tokensStore.get(hash)
+          reads++
+          if (reads === 1 && snapshot) {
+            tokensStore.set(hash, { ...snapshot, expires_at: new Date(mockDatabaseTime.getTime() - 1).toISOString() })
+            return [snapshot]
+          }
+          return snapshot ? [snapshot] : []
+        },
+      })
+
+      await expect(activateAccount({ token: plainToken, password: 'ValidPassword123!' })).rejects.toMatchObject({ statusCode: 400 })
+      expect(clerkCreateUserMock).not.toHaveBeenCalled()
+    })
   })
 
   describe('authorization seam regression guard', () => {

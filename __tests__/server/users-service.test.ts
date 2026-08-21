@@ -1,6 +1,16 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createSqlMock, whereHasColumn, hasColumn, whereConditionCount, whereColumnHasOperator, matchesIlikePattern } from '../helpers/sql-mock'
+import {
+  createSqlMock,
+  hasColumn,
+  hasExactOrderBy,
+  hasExactSelectColumns,
+  matchesIlikePattern,
+  whereColumnHasOperator,
+  whereConditionCount,
+  whereHasColumn,
+  whereHasExactBoundConditions,
+} from '../helpers/sql-mock'
 import { createTestProfile } from '../helpers/test-factories'
 
 const clerkGetUserListMock = vi.fn()
@@ -14,6 +24,12 @@ const profilesStore = new Map<string, any>()
 let shouldFailUpdateWithZeroRows = false
 
 const sqlMock = createSqlMock()
+const USER_LIST_PROJECTION = 'id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at'
+const SEARCH_PREDICATES = [
+  { column: 'member_number', operator: 'ilike' },
+  { column: 'full_name', operator: 'ilike' },
+  { column: 'email', operator: 'ilike' },
+]
 
 vi.mock('@/lib/db/client', () => ({
   sql: sqlMock.sql,
@@ -268,18 +284,9 @@ function setupSqlMock() {
     verb: 'select',
     match: (stmt) => {
       if (stmt.table !== 'profiles' || !stmt.isCountSelect) return false
-      // If there's a WHERE clause, it must contain only ILIKE conditions on search columns
+      // If there is a WHERE clause, it must be the complete three-field search shape.
       if (stmt.whereClause) {
-        const allowedColumns = ['member_number', 'full_name', 'email']
-        // Check that at least one ILIKE condition exists on these columns
-        let hasIlike = false
-        for (const col of allowedColumns) {
-          if (whereColumnHasOperator(stmt, col, 'ilike')) {
-            hasIlike = true
-            break
-          }
-        }
-        return hasIlike
+        return whereHasExactBoundConditions(stmt, SEARCH_PREDICATES, 'or')
       }
       // No WHERE clause means count all
       return whereConditionCount(stmt) === 0
@@ -318,40 +325,13 @@ function setupSqlMock() {
       // Must be a profiles SELECT (not COUNT)
       if (stmt.table !== 'profiles' || stmt.isCountSelect) return false
 
-      // Must have the specific columns: id, member_number, full_name, etc. (all pagination query columns)
-      // Check via hasColumn (before-WHERE part of statement) using word boundaries
-      if (!hasColumn(stmt, 'id')) return false
-      if (!hasColumn(stmt, 'member_number') || !hasColumn(stmt, 'full_name')) return false
+      if (!hasExactSelectColumns(stmt, USER_LIST_PROJECTION)) return false
+      if (!hasExactOrderBy(stmt, 'created_at asc')) return false
+      if (!stmt.hasLimit || !stmt.hasOffset) return false
 
-      // Must have ORDER BY created_at ASC specifically (literal check, minimal risk for this specific phrase)
-      // Production query is: ORDER BY created_at ASC (nothing else)
-      if (!stmt.text.includes('order by created_at asc')) return false
-
-      // Must have BOTH LIMIT and OFFSET for pagination (these are syntactic, not WHERE clauses)
-      // Use word-boundary anchored checks to avoid substring collisions
-      if (!/\blimit\b/.test(stmt.text) || !/\boffset\b/.test(stmt.text)) return false
-
-      // WHERE clause, if present, must contain ONLY ILIKE conditions on search columns
-      // (member_number, full_name, email) — no other WHERE conditions allowed
+      // WHERE clause, if present, must be the exact three-field search shape.
       if (stmt.whereClause) {
-        const allowedColumns = ['member_number', 'full_name', 'email']
-        // Verify all columns in WHERE are ILIKE on search columns
-        let hasAnyCondition = false
-        for (const col of allowedColumns) {
-          if (whereColumnHasOperator(stmt, col, 'ilike')) {
-            hasAnyCondition = true
-          }
-        }
-        if (!hasAnyCondition) return false // WHERE exists but has no ILIKE on search columns
-
-        // Verify no unexpected conditions remain (strict check)
-        // Remove all ILIKE conditions and check nothing else is there
-        let remaining = stmt.whereClause
-        for (const col of allowedColumns) {
-          remaining = remaining.replace(new RegExp(`\\b${col}\\b\\s+ilike\\s+[^\\s]+`, 'gi'), '')
-        }
-        remaining = remaining.replace(/\bor\b/gi, '')
-        if (remaining.trim()) return false // Something unexpected in WHERE clause
+        return whereHasExactBoundConditions(stmt, SEARCH_PREDICATES, 'or')
       }
 
       return true
@@ -1344,6 +1324,23 @@ describe('users-service (raw SQL with Neon)', () => {
         // Expected: no handler matched because ORDER BY updated_at is not ORDER BY created_at
         expect(err.message).toContain('no handler matched')
       }
+
+      // Test 4: a projection with the former three-column subset plus an extra column.
+      // This must not receive a full profile row from the pagination handler.
+      await expect(
+        sqlMock.sql`SELECT id, member_number, full_name, is_active FROM profiles ORDER BY created_at ASC LIMIT ${10} OFFSET ${0}`,
+      ).rejects.toThrow('no handler matched')
+
+      // Test 5: a COUNT search with an extra authorization predicate. The old matcher
+      // accepted a single allowed ILIKE and silently ignored this additional condition.
+      await expect(
+        sqlMock.sql`SELECT COUNT(*)::int AS count FROM profiles WHERE member_number ILIKE ${'%100%'} OR full_name ILIKE ${'%100%'} OR email ILIKE ${'%100%'} OR is_active = ${true}`,
+      ).rejects.toThrow('no handler matched')
+
+      // Test 6: an identifier that merely starts with the expected direction is not ORDER BY ASC.
+      await expect(
+        sqlMock.sql`SELECT id, member_number, full_name, auth_email, email, phone, role, is_active, active_from, no_show_count, blocked_until, created_at, updated_at FROM profiles ORDER BY created_at ASCENDING LIMIT ${10} OFFSET ${0}`,
+      ).rejects.toThrow('no handler matched')
     })
   })
 })

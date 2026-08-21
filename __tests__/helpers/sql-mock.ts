@@ -69,6 +69,14 @@ export interface ParsedStatement {
    * ORDER BY clause containing `now()` can never satisfy this.
    */
   isNowSelect: boolean
+  /** Exact, normalized SELECT projection (between SELECT and FROM), if this is a SELECT with FROM. */
+  selectColumns: string | null
+  /** Exact, normalized ORDER BY expression, excluding trailing LIMIT/OFFSET. */
+  orderBy: string | null
+  /** True only when the statement has a LIMIT clause with a bound value. */
+  hasLimit: boolean
+  /** True only when the statement has an OFFSET clause with a bound value. */
+  hasOffset: boolean
 }
 
 const VERB_RE = /^\s*(select|insert|update|delete)\b/i
@@ -123,18 +131,22 @@ export function parseStatement(
 
   const returning = /\breturning\b/i.test(text)
 
+  const selectColumns = verb === 'select'
+    ? /^select\s+(.*?)\s+from\b/i.exec(text)?.[1]?.trim() ?? null
+    : null
+  const orderBy = /\border\s+by\s+(.+?)(?=\s+limit\b|\s+offset\b|$)/i.exec(text)?.[1]?.trim() ?? null
+  const hasLimit = /\blimit\s+\$\d+\b/i.test(text)
+  const hasOffset = /\boffset\s+\$\d+\b/i.test(text)
+
   let isCountSelect = false
   let isNowSelect = false
   if (verb === 'select') {
-    const selectColumns =
-      /^select\s+(.*?)\s+from\b/i.exec(text)?.[1] ??
-      /^select\s+(.*)$/i.exec(text)?.[1] ??
-      ''
-    isCountSelect = /^count\s*\(/i.test(selectColumns.trim())
-    isNowSelect = /^now\s*\(/i.test(selectColumns.trim())
+    const projection = selectColumns ?? /^select\s+(.*)$/i.exec(text)?.[1] ?? ''
+    isCountSelect = /^count\s*\(/i.test(projection.trim())
+    isNowSelect = /^now\s*\(/i.test(projection.trim())
   }
 
-  return { text, verb, values, table, whereClause, returning, isCountSelect, isNowSelect }
+  return { text, verb, values, table, whereClause, returning, isCountSelect, isNowSelect, selectColumns, orderBy, hasLimit, hasOffset }
 }
 
 /**
@@ -242,6 +254,43 @@ export function whereColumnHasNullCheck(
     'i',
   )
   return pattern.test(stmt.whereClause)
+}
+
+/**
+ * Matches a simple WHERE clause exactly: every condition must be one of the
+ * requested `column operator $N` predicates, joined with the given connector.
+ * This intentionally rejects extra predicates and duplicate/missing columns.
+ */
+export function whereHasExactBoundConditions(
+  stmt: ParsedStatement,
+  conditions: Array<{ column: string; operator: string }>,
+  connector: 'and' | 'or',
+): boolean {
+  if (!stmt.whereClause) return false
+  const parts = stmt.whereClause.split(new RegExp(`\\s+${connector}\\s+`, 'i'))
+  if (parts.length !== conditions.length) return false
+
+  const remaining = [...conditions]
+  for (const part of parts) {
+    const match = /^\s*([a-z_][a-z0-9_]*)\s+(=|ilike|<>|>|<|>=|<=)\s+\$(\d+)\s*$/i.exec(part)
+    if (!match) return false
+    const index = remaining.findIndex(
+      (condition) => condition.column === match[1].toLowerCase() && condition.operator.toLowerCase() === match[2].toLowerCase(),
+    )
+    if (index === -1) return false
+    remaining.splice(index, 1)
+  }
+  return remaining.length === 0
+}
+
+/** Exact normalized SELECT projection comparison. */
+export function hasExactSelectColumns(stmt: ParsedStatement, columns: string): boolean {
+  return stmt.selectColumns === collapseWhitespace(columns.toLowerCase())
+}
+
+/** Exact normalized ORDER BY comparison. */
+export function hasExactOrderBy(stmt: ParsedStatement, expression: string): boolean {
+  return stmt.orderBy === collapseWhitespace(expression.toLowerCase())
 }
 
 /** Case-insensitive `%term%` ILIKE pattern match against a nullable column value. */
