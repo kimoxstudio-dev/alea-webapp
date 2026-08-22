@@ -3,6 +3,7 @@ import { getTranslations } from 'next-intl/server'
 import { redirect } from 'next/navigation'
 import { RoomsView } from '@/components/rooms/rooms-view'
 import { getSessionFromServerCookies } from '@/lib/server/auth'
+import { localizedSignInUrl } from '@/lib/server/auth-redirect'
 import { getCurrentUser } from '@/lib/server/auth-service'
 import { markExpiredReservationsAsNoShow } from '@/lib/server/reservation-no-show'
 
@@ -13,19 +14,20 @@ export async function generateMetadata(): Promise<Metadata> {
 
 interface RoomsPageProps {
   params: Promise<{ locale: string }>
+  searchParams: Promise<Record<string, string | string[] | undefined>>
 }
 
-export default async function RoomsPage({ params }: RoomsPageProps) {
-  const { locale } = await params
+export default async function RoomsPage({ params, searchParams }: RoomsPageProps) {
+  const [{ locale }, query] = await Promise.all([params, searchParams])
   const session = await getSessionFromServerCookies()
   if (!session) {
-    return redirect(`/${locale}/sign-in`)
+    return redirect(localizedSignInUrl(locale, `/${locale}/rooms`, query))
   }
 
   try {
     await getCurrentUser(session)
   } catch {
-    return redirect(`/${locale}/sign-in`)
+    return redirect(localizedSignInUrl(locale, `/${locale}/rooms`, query))
   }
 
   try {

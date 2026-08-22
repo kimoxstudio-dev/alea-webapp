@@ -2,6 +2,7 @@ import type { Metadata } from 'next'
 import { getTranslations } from 'next-intl/server'
 import { redirect } from 'next/navigation'
 import { getSessionFromServerCookies } from '@/lib/server/auth'
+import { localizedSignInUrl } from '@/lib/server/auth-redirect'
 import { CheckInActivator } from '@/components/check-in/check-in-activator'
 import { locales } from '@/lib/i18n/config'
 import { markExpiredReservationsAsNoShow } from '@/lib/server/reservation-no-show'
@@ -21,9 +22,8 @@ interface CheckInPageProps {
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 export default async function CheckInPage({ params, searchParams }: CheckInPageProps) {
-  const { locale, tableId } = await params
-  const resolvedSearchParams = await searchParams
-  const sideParam = typeof resolvedSearchParams.side === 'string' ? resolvedSearchParams.side : undefined
+  const [{ locale, tableId }, query] = await Promise.all([params, searchParams])
+  const sideParam = typeof query.side === 'string' ? query.side : undefined
 
   if (!(locales as readonly string[]).includes(locale)) {
     redirect('/')
@@ -35,21 +35,7 @@ export default async function CheckInPage({ params, searchParams }: CheckInPageP
 
   const session = await getSessionFromServerCookies()
   if (!session) {
-    // Preserve the FULL query string on the redirect target (not just
-    // `side`), mirroring middleware.ts's use of `request.nextUrl.search`.
-    const preservedQuery = new URLSearchParams()
-    for (const [key, value] of Object.entries(resolvedSearchParams)) {
-      if (Array.isArray(value)) {
-        for (const item of value) preservedQuery.append(key, item)
-      } else if (value !== undefined) {
-        preservedQuery.set(key, value)
-      }
-    }
-    const checkInPath = `/${locale}/check-in/${tableId}${
-      preservedQuery.size > 0 ? `?${preservedQuery.toString()}` : ''
-    }`
-    const signInParams = new URLSearchParams({ redirect_url: checkInPath })
-    redirect(`/${locale}/sign-in?${signInParams.toString()}`)
+    redirect(localizedSignInUrl(locale, `/${locale}/check-in/${tableId}`, query))
   }
 
   try {

@@ -208,7 +208,7 @@ The admin client bypasses all RLS policies and must never be imported in Client 
 
 ## Middleware (`middleware.ts`)
 
-`middleware.ts` runs on page requests (Edge Runtime). The matcher `/((?!api|_next|_vercel|.*\\..*).*)` explicitly excludes all `/api/` routes. Route Handlers run entirely outside middleware.
+`middleware.ts` runs on matched page and API requests (Edge Runtime). Its matcher skips Next.js/Vercel internals and static files, while `middleware.ts` returns API requests before locale routing and Supabase refresh. This still lets Clerk initialize request auth context for Route Handlers.
 
 What middleware does:
 
@@ -217,8 +217,8 @@ What middleware does:
 3. **CSRF cookie setup**: Calls `ensureCsrfCookie()` to set a non-`httpOnly` CSRF token cookie if one is not already present or is shorter than 32 characters. The client reads this cookie and sends it as the `x-csrf-token` header on mutations.
 
 What middleware does NOT do:
-- It does not enforce authentication or redirect unauthenticated users. Auth enforcement is performed inside each Route Handler via `requireAuth()` / `requireAdmin()`.
-- It does not run for any `/api/` routes.
+- It does not enforce authentication or redirect unauthenticated users. Protected Server Components call `getSessionFromServerCookies()` and Route Handlers call `requireAuth()` / `requireAdmin()` at the resource boundary.
+- It does not run locale routing, Supabase refresh, or CSRF setup for `/api/` routes.
 
 ---
 
