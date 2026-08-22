@@ -40,6 +40,23 @@ interface FakeSqlOptions {
   nonEmptyTables?: string[]
   /** Rows returned when loading the schema_migrations ledger. Defaults to empty (no prior runs). */
   ledgerRows?: Array<{ filename: string; checksum: string }>
+  /**
+   * Column names reported by the information_schema.columns query used by
+   * assertLedgerTableShape (PR #338 review round 2, Finding 3). Defaults to
+   * the full expected shape so every pre-existing test (which predates this
+   * check) keeps passing without having to opt in individually.
+   */
+  ledgerTableColumns?: string[]
+  /**
+   * When true, a direct (non-transaction) `DELETE FROM "schema_migrations"`
+   * call throws — simulates a failure in the deferred removedButAllowed
+   * delete on the "nothing new to apply" branch (PR #338 review round 2,
+   * Finding 4). Deliberately scoped to `query` only (not `respond`, which
+   * both `query` and the transaction's `txn.query` share) so it never
+   * affects the transaction-path DELETE used when new files are also being
+   * applied.
+   */
+  failDeferredDelete?: boolean
 }
 
 function createFakeSql(options: FakeSqlOptions = {}) {
@@ -49,6 +66,10 @@ function createFakeSql(options: FakeSqlOptions = {}) {
   function respond(text: string): unknown {
     if (text.includes('pg_namespace')) {
       return options.unexpectedSchemas ?? []
+    }
+    if (text.includes('information_schema') && text.includes('columns')) {
+      const columns = options.ledgerTableColumns ?? ['filename', 'checksum', 'applied_at']
+      return columns.map((column_name) => ({ column_name }))
     }
     if (text.includes('pg_tables')) {
       return options.publicTables ?? []
@@ -83,6 +104,9 @@ function createFakeSql(options: FakeSqlOptions = {}) {
 
   const query = vi.fn(async (text: string, params: unknown[] = []) => {
     queryCalls.push({ text, params })
+    if (options.failDeferredDelete && text.includes('DELETE FROM "schema_migrations"')) {
+      throw new Error('injected deferred-delete failure')
+    }
     return respond(text)
   })
 
@@ -614,6 +638,192 @@ describe('scripts/apply-neon-schema.mjs — checksum-ledger drift detection (#32
       )
       expect(errorCall).toBeDefined()
       expect(String(errorCall?.[0])).toContain('some_leftover_table')
+    })
+  })
+
+  describe('main() — unconditional re-verification of unchanged files (PR #338 review round 2, Finding 1)', () => {
+    it('reports drift on an unchanged ledgered file whose table is missing, even when a genuinely new file is also pending', async () => {
+      const widgetsContent = 'CREATE TABLE IF NOT EXISTS "widgets" (\n  id int\n);'
+      const gadgetsContent = 'CREATE TABLE IF NOT EXISTS "gadgets" (\n  id int\n);'
+      mockSchemaFiles({
+        '001_widgets.sql': widgetsContent,
+        '002_gadgets.sql': gadgetsContent,
+      })
+
+      const { computeChecksum } = await import('../../scripts/apply-neon-schema.mjs')
+      const widgetsChecksum = computeChecksum(widgetsContent)
+
+      const fakeSql = createFakeSql({
+        // "widgets" is missing from the actual schema even though the
+        // ledger says it was already applied unchanged. "gadgets" is a
+        // brand-new file (no ledger row) that would otherwise apply
+        // cleanly — before Finding 1's fix, its presence in filesToApply
+        // would have skipped the re-verification of widgets entirely.
+        publicTables: [{ tablename: 'schema_migrations' }],
+        ledgerRows: [{ filename: '001_widgets.sql', checksum: widgetsChecksum }],
+      })
+      neonMock.mockReturnValue(fakeSql)
+
+      const { main } = await import('../../scripts/apply-neon-schema.mjs')
+
+      await expect(main()).rejects.toThrow(ProcessExitError)
+      expect(exitSpy).toHaveBeenCalledWith(1)
+      // The new file must never be applied either — the run aborts before
+      // any statements execute once drift is detected.
+      expect(fakeSql.transaction).not.toHaveBeenCalled()
+
+      const errorCall = consoleErrorSpy.mock.calls.find((args) =>
+        String(args[0]).includes('Schema drift detected'),
+      )
+      expect(errorCall).toBeDefined()
+      expect(String(errorCall?.[0])).toContain('widgets')
+      // Only the unchanged file's own table(s) are re-verified — gadgets
+      // has no table yet (it hasn't been applied), so it must not appear
+      // as "missing" alongside widgets.
+      expect(String(errorCall?.[0])).not.toContain('gadgets')
+
+      const upToDateLog = consoleLogSpy.mock.calls.find((args) =>
+        String(args[0]).includes('already up to date'),
+      )
+      expect(upToDateLog).toBeUndefined()
+    })
+  })
+
+  describe('main() — --allow-removed cross-checked against the loaded ledger (PR #338 review round 2, Finding 2)', () => {
+    it('hard-fails with an explicit "not present in the ledger" error when --allow-removed names a file the ledger never recorded', async () => {
+      const widgetsContent = 'CREATE TABLE IF NOT EXISTS "widgets" (\n  id int\n);'
+      mockSchemaFiles({ '001_widgets.sql': widgetsContent })
+
+      const { computeChecksum } = await import('../../scripts/apply-neon-schema.mjs')
+      const widgetsChecksum = computeChecksum(widgetsContent)
+
+      const fakeSql = createFakeSql({
+        publicTables: [{ tablename: 'widgets' }, { tablename: 'schema_migrations' }],
+        ledgerRows: [{ filename: '001_widgets.sql', checksum: widgetsChecksum }],
+      })
+      neonMock.mockReturnValue(fakeSql)
+
+      const originalArgv = process.argv
+      process.argv = [...originalArgv, '--allow-removed', 'never_ledgered.sql']
+
+      try {
+        const { main } = await import('../../scripts/apply-neon-schema.mjs')
+        await expect(main()).rejects.toThrow(ProcessExitError)
+      } finally {
+        process.argv = originalArgv
+      }
+
+      expect(exitSpy).toHaveBeenCalledWith(1)
+
+      const errorCall = consoleErrorSpy.mock.calls.find((args) =>
+        String(args[0]).includes('not present in the "schema_migrations" ledger'),
+      )
+      expect(errorCall).toBeDefined()
+      expect(String(errorCall?.[0])).toContain('never_ledgered.sql')
+
+      // The bogus filename must never reach the preflight bypass — the run
+      // fails before assertDatabaseIsCleanOrOwned even runs, so the
+      // unexpected-table check for unrelated tables is never silently
+      // downgraded to a warning.
+      const preflightQuery = fakeSql.queryCalls.find((c) => c.text.includes('pg_namespace'))
+      expect(preflightQuery).toBeUndefined()
+      const preflightNote = consoleLogSpy.mock.calls.find((args) =>
+        String(args[0]).includes('Preflight note'),
+      )
+      expect(preflightNote).toBeUndefined()
+    })
+  })
+
+  describe('main() — ledger table shape verification (PR #338 review round 2, Finding 3)', () => {
+    it('fails with an actionable error, not a raw Postgres error, when a pre-existing schema_migrations table is missing expected columns', async () => {
+      const widgetsContent = 'CREATE TABLE IF NOT EXISTS "widgets" (\n  id int\n);'
+      mockSchemaFiles({ '001_widgets.sql': widgetsContent })
+
+      const fakeSql = createFakeSql({
+        publicTables: [{ tablename: 'widgets' }, { tablename: 'schema_migrations' }],
+        // Simulates a same-named pre-existing table from an unrelated
+        // migration tool (e.g. golang-migrate/Knex/Rails) that does not
+        // share this script's expected column shape.
+        ledgerTableColumns: ['id', 'name'],
+      })
+      neonMock.mockReturnValue(fakeSql)
+
+      const { main } = await import('../../scripts/apply-neon-schema.mjs')
+
+      await expect(main()).rejects.toThrow(ProcessExitError)
+      expect(exitSpy).toHaveBeenCalledWith(1)
+      expect(fakeSql.transaction).not.toHaveBeenCalled()
+
+      const errorCall = consoleErrorSpy.mock.calls.find((args) =>
+        String(args[0]).includes('missing expected column(s)'),
+      )
+      expect(errorCall).toBeDefined()
+      const errorMessage = String(errorCall?.[0])
+      expect(errorMessage).toContain('filename')
+      expect(errorMessage).toContain('checksum')
+      expect(errorMessage).toContain('applied_at')
+      // Must not read like a raw, unactionable Postgres error.
+      expect(errorMessage).not.toContain('column does not exist')
+
+      // The shape check must run (and fail) before the ledger is ever
+      // loaded — a malformed table should never be queried for its rows.
+      const ledgerLoadQuery = fakeSql.queryCalls.find((c) =>
+        c.text.includes('SELECT "filename", "checksum" FROM "schema_migrations"'),
+      )
+      expect(ledgerLoadQuery).toBeUndefined()
+    })
+  })
+
+  describe('main() — deferred DELETE error handling in the "nothing new to apply" branch (PR #338 review round 2, Finding 4)', () => {
+    it('surfaces a specific ledger-row-removal error, not the generic transaction-path message, when the deferred DELETE fails', async () => {
+      const widgetsContent = 'CREATE TABLE IF NOT EXISTS "widgets" (\n  id int\n);'
+      mockSchemaFiles({ '001_widgets.sql': widgetsContent })
+
+      const { computeChecksum } = await import('../../scripts/apply-neon-schema.mjs')
+      const widgetsChecksum = computeChecksum(widgetsContent)
+
+      const fakeSql = createFakeSql({
+        publicTables: [{ tablename: 'widgets' }, { tablename: 'schema_migrations' }],
+        ledgerRows: [
+          { filename: '001_widgets.sql', checksum: widgetsChecksum },
+          // No longer on disk, but acknowledged via --allow-removed below —
+          // its ledger row is deleted in the deferred, no-new-files branch,
+          // not inside sql.transaction().
+          { filename: '999_removed.sql', checksum: 'a'.repeat(64) },
+        ],
+        failDeferredDelete: true,
+      })
+      neonMock.mockReturnValue(fakeSql)
+
+      const originalArgv = process.argv
+      process.argv = [...originalArgv, '--allow-removed', '999_removed.sql']
+
+      try {
+        const { main } = await import('../../scripts/apply-neon-schema.mjs')
+        // main() itself never calls process.exit for this failure — it
+        // logs the specific error and re-throws the original error so the
+        // caller (the import.meta.url guard's main().catch(...)) is the
+        // one that would eventually exit.
+        await expect(main()).rejects.toThrow('injected deferred-delete failure')
+      } finally {
+        process.argv = originalArgv
+      }
+
+      expect(exitSpy).not.toHaveBeenCalled()
+      // Never reached the transactional apply path (no new files pending).
+      expect(fakeSql.transaction).not.toHaveBeenCalled()
+
+      const specificError = consoleErrorSpy.mock.calls.find((args) =>
+        String(args[0]).includes('Failed to remove') && String(args[0]).includes('ledger row(s)'),
+      )
+      expect(specificError).toBeDefined()
+      expect(String(specificError?.[0])).toContain('999_removed.sql')
+
+      // Must not be conflated with the transaction-path failure message.
+      const genericTransactionError = consoleErrorSpy.mock.calls.find((args) =>
+        String(args[0]).includes('Schema application failed — transaction rolled back'),
+      )
+      expect(genericTransactionError).toBeUndefined()
     })
   })
 })
