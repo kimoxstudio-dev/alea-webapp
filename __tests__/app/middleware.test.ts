@@ -16,8 +16,8 @@ import type { CookieOptions } from '@supabase/ssr'
  * - Resource-level auth owns protection; middleware does not redirect pages
  * - Supabase auth-cookie refresh runs on page requests (not /api)
  * - Locale routing still works
- * - /api routes run clerkMiddleware but skip i18n rewrite, the protected-route
- *   gate, and the Supabase refresh
+ * - /api routes run clerkMiddleware but skip the i18n rewrite and the
+ *   Supabase refresh
  */
 
 const createI18nResponse = vi.fn((request: NextRequest) => NextResponse.next())
