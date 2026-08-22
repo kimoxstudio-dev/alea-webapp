@@ -21,14 +21,21 @@ const handleI18nRouting = createMiddleware({
  */
 const isProtectedRoute = createRouteMatcher(
   locales.flatMap((locale) => [
-    `/${locale}/admin(.*)`,
-    `/${locale}/reservations(.*)`,
-    `/${locale}/check-in(.*)`,
-    `/${locale}/rooms(.*)`,
+    `/${locale}/admin(/.*)?`,
+    `/${locale}/reservations(/.*)?`,
+    `/${locale}/check-in(/.*)?`,
+    `/${locale}/rooms(/.*)?`,
   ]),
 )
 
-/** Extracts the locale prefix from a matched protected-route pathname, falling back to the default locale for a malformed/unexpected path. */
+/**
+ * Extracts the locale prefix from a matched protected-route pathname, falling
+ * back to the default locale for a malformed/unexpected path. The fallback
+ * branch is not reachable today — every pattern in `isProtectedRoute` above
+ * requires a valid `/${locale}` prefix to match at all, so this is only ever
+ * called with a pathname that already starts with one — but it's kept as a
+ * defensive guard in case the matcher patterns are ever loosened.
+ */
 function localeFromPathname(pathname: string): Locale {
   const segment = pathname.split('/')[1]
   return (locales as readonly string[]).includes(segment) ? (segment as Locale) : defaultLocale
