@@ -2,6 +2,7 @@ import type { Metadata } from 'next'
 import { getTranslations } from 'next-intl/server'
 import { redirect } from 'next/navigation'
 import { getSessionFromServerCookies } from '@/lib/server/auth'
+import { localizedSignInUrl } from '@/lib/server/auth-redirect'
 import { CheckInActivator } from '@/components/check-in/check-in-activator'
 import { locales } from '@/lib/i18n/config'
 import { markExpiredReservationsAsNoShow } from '@/lib/server/reservation-no-show'
@@ -13,14 +14,14 @@ export async function generateMetadata(): Promise<Metadata> {
 
 interface CheckInPageProps {
   params: Promise<{ locale: string; tableId: string }>
-  searchParams: Promise<{ side?: string }>
+  searchParams: Promise<Record<string, string | string[] | undefined>>
 }
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 export default async function CheckInPage({ params, searchParams }: CheckInPageProps) {
-  const { locale, tableId } = await params
-  const { side: sideParam } = await searchParams
+  const [{ locale, tableId }, query] = await Promise.all([params, searchParams])
+  const sideParam = typeof query.side === 'string' ? query.side : undefined
 
   if (!(locales as readonly string[]).includes(locale)) {
     redirect('/')
@@ -32,7 +33,7 @@ export default async function CheckInPage({ params, searchParams }: CheckInPageP
 
   const session = await getSessionFromServerCookies()
   if (!session) {
-    redirect(`/${locale}/sign-in?redirect_url=/${locale}/check-in/${tableId}${sideParam === 'inf' ? '?side=inf' : ''}`)
+    redirect(localizedSignInUrl(locale, `/${locale}/check-in/${tableId}`, query))
   }
 
   try {
