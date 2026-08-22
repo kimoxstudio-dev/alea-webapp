@@ -312,8 +312,10 @@ export async function main() {
           )
           .join("\n") +
         `\n\nThis means schema changes in the file(s) above may be silently missing from the ` +
-        `database. Review the diff in each file above — if intentional, some form of explicit ` +
-        `re-apply/ack is needed; do not just re-run this script as-is.`,
+        `database. Review the diff in each file above. This script has no automated re-apply ` +
+        `path for a drifted file — if the change is intentional, verify it and apply it to the ` +
+        `database manually, then update that file's row in "${LEDGER_TABLE}" to record its ` +
+        `current checksum before re-running this script.`,
     );
     process.exit(1);
   }
