@@ -50,6 +50,20 @@ This repo is owned by `KimoxStudio` and deploys to Vercel (`kimox-studio` team, 
 
 ---
 
+## Mandatory exhaustive /code-review before opening any PR
+
+Before `security-reviewer` opens a PR, it must run `/code-review` (high or higher effort — exhaustive, not a quick pass) against the branch's own diff and apply/route any real findings first. This runs **in addition to**, not instead of, the manual security review the agent already does.
+
+**Why:** PR #337 (#332, 2026-08-17) opened after `security-reviewer` approved, and a manual `/code-review` run by the user immediately after found 5 real defects the reviewer missed, then Codex's independent review on the open PR found 3 more (1 overlapping) — 7 unique post-open findings total. All were genuine (verified against production SQL, not false positives) and all were fixable before merge if caught pre-open. Catching them after the PR is open means a second round of push/re-review/inline-reply-to-external-bot churn that an exhaustive review before opening would have avoided.
+
+**How to apply:**
+- `security-reviewer`'s prompt must include: run `/code-review` at high/max effort on the diff before opening the PR, not after.
+- Any findings from that pass are fixed (per [[fix-findings-dont-file-issues]] — fix immediately, never file a tracking issue) before the PR is opened, same as any other review-round finding.
+- Only after that review comes back clean does the PR open.
+- This does not replace [[shift-left-review-criteria]] — the implementer's checklist still front-loads conventions/i18n/flow so a late finding is already the exception, not the rule. `/code-review` here is the automated exhaustive net that catches what the checklist and manual read miss, particularly in test-infrastructure logic (mock handler correctness) that isn't covered by the conventions checklist at all.
+
+---
+
 ## Key conventions
 
 - Admin write operations use `createSupabaseServerAdminClient()` (bypasses RLS)
@@ -77,13 +91,17 @@ If a task touches both domains, run agents **sequentially**.
 
 ## Issue Tracking Platform
 
-**issueTracker:** `linear`
+**issueTracker:** `github`
+
+Issues live in GitHub Issues, tracked on Project **#1** of `kimoxstudio-dev` (not the org's Project #5, which is stale and has a duplicate name — see project memory if disambiguation is needed).
 
 The product-manager agent uses this to:
-- Fetch issues from Linear
-- Move issues to "In Progress" when work starts
+- Fetch issues from GitHub Issues
+- Move issues to "In Progress" on the GitHub Project board when work starts
 - Update issues with PR links when complete
-- Query backlog for prioritization
+- Query the backlog for prioritization
+
+Note: PRs targeting `develop` do not auto-close issues via `Closes #N` (GitHub only honors that against the default branch) — close the issue manually and move the board card after each merge.
 
 If this field is missing, product-manager will ask you where issues are tracked.
 
