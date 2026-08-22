@@ -298,6 +298,34 @@ async function loadLedger(sql) {
   return ledger;
 }
 
+// Verifies the ledger table has this script's expected shape before it is
+// queried or written to. LEDGER_TABLE ("schema_migrations") is a common name
+// (golang-migrate, Knex, and Rails all default to it) — a pre-existing,
+// unrelated table with that same name would otherwise pass
+// `CREATE TABLE IF NOT EXISTS` silently (it no-ops on an existing table) and
+// only surface later as a raw, unactionable Postgres "column does not exist"
+// error the first time the ledger is queried or written to.
+async function assertLedgerTableShape(sql) {
+  const rows = await sql.query(
+    `SELECT "column_name" FROM "information_schema"."columns"
+     WHERE "table_schema" = 'public' AND "table_name" = $1`,
+    [LEDGER_TABLE],
+  );
+  const columnNames = new Set(rows.map((row) => row.column_name));
+  const requiredColumns = ["filename", "checksum", "applied_at"];
+  const missingColumns = requiredColumns.filter((name) => !columnNames.has(name));
+  if (missingColumns.length > 0) {
+    console.error(
+      `A "${LEDGER_TABLE}" table already exists but is missing expected column(s): ` +
+        `${missingColumns.join(", ")}.\n` +
+        `This usually means a pre-existing, unrelated table happens to share this name (a ` +
+        `common one — e.g. golang-migrate, Knex, or Rails all default to "${LEDGER_TABLE}"). ` +
+        "Rename or drop that table, or point DATABASE_URL at a different database, before running this script.",
+    );
+    process.exit(1);
+  }
+}
+
 // A fully-matched ledger (every current schema file already has a matching,
 // unchanged checksum row) is not, by itself, proof that the database is
 // actually in the state those files describe — a partially restored or
@@ -344,20 +372,42 @@ export async function main() {
   const expectedTables = extractExpectedTableNames(files);
   expectedTables.add(LEDGER_TABLE);
 
-  // Parsed up front (pure — no DB access) so the preflight check below can
-  // already know whether this run is acknowledging removed file(s): a table
-  // produced by a removed file is expected to still be physically present,
-  // and the preflight's "unexpected table" check would otherwise block the
-  // --allow-removed acknowledgment flow further down before it ever runs
-  // (PR #338 follow-up). See assertDatabaseIsCleanOrOwned's own comment.
-  const allowedRemovedFiles = parseAllowRemovedFlag(process.argv);
+  // The ledger table/rows are loaded before the preflight check below, not
+  // just parsed from argv (PR #338 review, finding 2): --allow-removed
+  // downgrades a hard preflight failure to a warning for the whole run, so a
+  // typo'd or never-actually-ledgered filename must not be able to trigger
+  // that bypass. ensureLedgerTable is idempotent (CREATE TABLE IF NOT
+  // EXISTS) and this table is already treated as always-expected and exempt
+  // from the preflight's row-emptiness check, so creating it here — ahead of
+  // the read-only checks below — does not affect their outcome.
+  await ensureLedgerTable(sql);
+  await assertLedgerTableShape(sql);
+  const ledger = await loadLedger(sql);
 
+  const allowedRemovedFiles = parseAllowRemovedFlag(process.argv);
+  const unknownAllowedRemovedFiles = [...allowedRemovedFiles].filter(
+    (filename) => !ledger.has(filename),
+  );
+  if (unknownAllowedRemovedFiles.length > 0) {
+    console.error(
+      `--allow-removed named file(s) that are not present in the "${LEDGER_TABLE}" ledger: ` +
+        `${unknownAllowedRemovedFiles.join(", ")}.\n` +
+        "Each --allow-removed filename must match a file that was actually applied and recorded " +
+        "in the ledger before its removal can be acknowledged — a typo'd or never-ledgered " +
+        "filename must not be able to silently downgrade the preflight's unexpected-table check " +
+        "for the entire run. Check the filename(s) for typos and re-run.",
+    );
+    process.exit(1);
+  }
+
+  // A table produced by an acknowledged removed file is expected to still be
+  // physically present, and the preflight's "unexpected table" check would
+  // otherwise block the --allow-removed acknowledgment flow further down
+  // before it ever runs (PR #338 follow-up). See assertDatabaseIsCleanOrOwned's
+  // own comment.
   await assertDatabaseIsCleanOrOwned(sql, expectedTables, {
     allowUnexpectedTables: allowedRemovedFiles.size > 0,
   });
-
-  await ensureLedgerTable(sql);
-  const ledger = await loadLedger(sql);
 
   // Reverse-direction drift check: a ledger row records a filename as
   // already applied, but its .sql file no longer exists on disk (deleted or
@@ -419,6 +469,7 @@ export async function main() {
   // way a drifted file anywhere aborts the whole run before any statements
   // are executed, rather than leaving some files applied and others not.
   const filesToApply = [];
+  const unchangedFiles = [];
   const driftedFiles = [];
   for (const file of files) {
     const filePath = join(schemaDir, file);
@@ -432,6 +483,7 @@ export async function main() {
       filesToApply.push({ file, checksum, statements });
     } else if (previousChecksum === checksum) {
       console.log(`-> ${file} (already applied, unchanged — skipping)`);
+      unchangedFiles.push(file);
     } else {
       driftedFiles.push({ file, previousChecksum, checksum });
     }
@@ -458,22 +510,38 @@ export async function main() {
     process.exit(1);
   }
 
-  if (filesToApply.length === 0) {
-    // Do not trust the ledger alone: independently verify the tables these
-    // files describe are actually present before declaring "up to date"
-    // (see assertExpectedTablesArePresent above). Checked before the
-    // deferred removedButAllowed deletion below, so a failure here still
-    // leaves zero DB mutations from this run.
-    await assertExpectedTablesArePresent(sql, expectedTables);
+  // Do not trust the ledger alone: independently verify the tables the
+  // already-ledgered, unchanged files describe are actually present. Run
+  // unconditionally — not only when there is nothing new to apply (PR #338
+  // review, finding 1) — so a run that also has genuinely new schema file(s)
+  // still catches drift on the unrelated ledgered files it is skipping,
+  // rather than only re-verifying when filesToApply happens to be empty.
+  // Restricted to unchangedFiles' own tables (not the full expectedTables
+  // set) since a genuinely new file's table(s) do not exist yet at this
+  // point in the run. Checked before any DB mutation below (both the
+  // deferred removedButAllowed deletion and applying new files), so a
+  // failure here still leaves zero DB mutations from this run.
+  const unchangedExpectedTables = extractExpectedTableNames(unchangedFiles);
+  await assertExpectedTablesArePresent(sql, unchangedExpectedTables);
 
+  if (filesToApply.length === 0) {
     // Only now is the run fully committed to succeeding — safe to persist
     // the removedButAllowed ledger-row deletion(s) deferred above. Batched
     // into a single DELETE (one round-trip regardless of how many filenames
     // were acknowledged) rather than one query per file.
     if (removedButAllowed.length > 0) {
-      await sql.query(`DELETE FROM ${quoteIdent(LEDGER_TABLE)} WHERE "filename" = ANY($1)`, [
-        removedButAllowed,
-      ]);
+      try {
+        await sql.query(`DELETE FROM ${quoteIdent(LEDGER_TABLE)} WHERE "filename" = ANY($1)`, [
+          removedButAllowed,
+        ]);
+      } catch (err) {
+        console.error(
+          `Failed to remove "${LEDGER_TABLE}" ledger row(s) for acknowledged --allow-removed ` +
+            `file(s): ${removedButAllowed.join(", ")}.\n` +
+            "No schema DDL was involved in this run — only the ledger row cleanup failed.",
+        );
+        throw err;
+      }
     }
     console.log("No new or changed schema files to apply. Database is already up to date.");
     return;
