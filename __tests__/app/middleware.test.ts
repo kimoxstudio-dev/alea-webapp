@@ -2,6 +2,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { NextRequest, NextResponse } from 'next/server'
 import type { CookieOptions } from '@supabase/ssr'
+import { defaultLocale } from '@/lib/i18n/config'
 
 /**
  * Clerk middleware test setup
@@ -80,9 +81,14 @@ vi.mock('@clerk/nextjs/server', () => ({
   // Mirrors createRouteMatcher's real contract: takes an array of
   // path-to-regexp-style patterns (the real middleware.ts patterns already
   // use plain `(.*)` capture groups, which are valid regex source as-is) and
-  // returns a matcher function tested against the request pathname.
+  // returns a matcher function tested against the request pathname. The `i`
+  // flag mirrors Clerk's real createRouteMatcher, which compiles
+  // case-insensitive regexes (see the `localeFromPathname` doc comment in
+  // middleware.ts, #330 round 2 finding 2) — without it, a case-variant
+  // locale segment (e.g. `/EN/admin`) would never reach the matcher's
+  // fallback branch under test, silently hiding that scenario.
   createRouteMatcher: vi.fn((patterns: string[]) => {
-    const regexes = patterns.map((pattern) => new RegExp(`^${pattern}$`))
+    const regexes = patterns.map((pattern) => new RegExp(`^${pattern}$`, 'i'))
     return (request: NextRequest) => regexes.some((regex) => regex.test(request.nextUrl.pathname))
   }),
 }))
@@ -177,6 +183,51 @@ describe('middleware', () => {
       expect(csrfCookie?.value).toBeTruthy()
       expect(response.cookies.get('sb-access-token')?.value).toBe('refreshed-token')
       expect(createServerClientMock).toHaveBeenCalled()
+    })
+  })
+
+  describe('anchored route matching rejects look-alike prefixes (#330 round 2, finding 1)', () => {
+    // PR #339 anchored the protected-route patterns as
+    // `/${locale}/${segment}(/.*)?` instead of the old unanchored
+    // `/${locale}/${segment}.*` style. A look-alike path that merely starts
+    // with a protected segment name (no separating `/` before the rest of
+    // the path) must NOT be treated as protected — only an anchored regex
+    // correctly excludes it.
+    it.each(
+      LOCALES.flatMap((locale) =>
+        PROTECTED_SEGMENTS.map((segment) => [locale, `${segment}XYZ`] as const),
+      ),
+    )('does not gate the look-alike path /%s/%s as a protected route', async (locale, lookalike) => {
+      const middleware = (await import('@/middleware')).default
+
+      const response = await middleware(
+        new NextRequest(`http://localhost:3000/${locale}/${lookalike}`),
+      )
+
+      expect(response.status).not.toBe(307)
+      // Confirms the request fell through to normal (non-gated) handling
+      // rather than merely happening to avoid a redirect for some other
+      // reason.
+      expect(createServerClientMock).toHaveBeenCalled()
+    })
+  })
+
+  describe('case-variant locale segment safely falls back (#330 round 2, finding 2)', () => {
+    // Clerk's createRouteMatcher compiles case-insensitive regexes, so a
+    // case-variant locale segment (e.g. `/EN/admin`) still matches
+    // isProtectedRoute. localeFromPathname's lowercase-only `.includes()`
+    // check does not match it though, so it falls back to defaultLocale.
+    // That fallback must stay safe: it should still force the sign-in
+    // redirect (deny access), never grant it.
+    it('still redirects a case-variant locale segment to sign-in, falling back to the default locale', async () => {
+      const middleware = (await import('@/middleware')).default
+
+      const response = await middleware(new NextRequest('http://localhost:3000/EN/admin'))
+
+      expect(response.status).toBe(307)
+      const redirectUrl = new URL(response.headers.get('location')!)
+      expect(redirectUrl.pathname).toBe(`/${defaultLocale}/sign-in`)
+      expect(redirectUrl.searchParams.get('redirect_url')).toBe('/EN/admin')
     })
   })
 

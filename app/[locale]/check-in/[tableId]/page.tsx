@@ -11,16 +11,19 @@ export async function generateMetadata(): Promise<Metadata> {
   return { title: `${t('title')} — Alea` }
 }
 
+type CheckInSearchParams = Record<string, string | string[] | undefined>
+
 interface CheckInPageProps {
   params: Promise<{ locale: string; tableId: string }>
-  searchParams: Promise<{ side?: string }>
+  searchParams: Promise<CheckInSearchParams>
 }
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 export default async function CheckInPage({ params, searchParams }: CheckInPageProps) {
   const { locale, tableId } = await params
-  const { side: sideParam } = await searchParams
+  const resolvedSearchParams = await searchParams
+  const sideParam = typeof resolvedSearchParams.side === 'string' ? resolvedSearchParams.side : undefined
 
   if (!(locales as readonly string[]).includes(locale)) {
     redirect('/')
@@ -32,7 +35,21 @@ export default async function CheckInPage({ params, searchParams }: CheckInPageP
 
   const session = await getSessionFromServerCookies()
   if (!session) {
-    redirect(`/${locale}/sign-in?redirect_url=/${locale}/check-in/${tableId}${sideParam === 'inf' ? '?side=inf' : ''}`)
+    // Preserve the FULL query string on the redirect target (not just
+    // `side`), mirroring middleware.ts's use of `request.nextUrl.search`.
+    const preservedQuery = new URLSearchParams()
+    for (const [key, value] of Object.entries(resolvedSearchParams)) {
+      if (Array.isArray(value)) {
+        for (const item of value) preservedQuery.append(key, item)
+      } else if (value !== undefined) {
+        preservedQuery.set(key, value)
+      }
+    }
+    const checkInPath = `/${locale}/check-in/${tableId}${
+      preservedQuery.size > 0 ? `?${preservedQuery.toString()}` : ''
+    }`
+    const signInParams = new URLSearchParams({ redirect_url: checkInPath })
+    redirect(`/${locale}/sign-in?${signInParams.toString()}`)
   }
 
   try {

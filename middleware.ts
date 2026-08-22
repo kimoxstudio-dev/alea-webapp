@@ -30,11 +30,13 @@ const isProtectedRoute = createRouteMatcher(
 
 /**
  * Extracts the locale prefix from a matched protected-route pathname, falling
- * back to the default locale for a malformed/unexpected path. The fallback
- * branch is not reachable today — every pattern in `isProtectedRoute` above
- * requires a valid `/${locale}` prefix to match at all, so this is only ever
- * called with a pathname that already starts with one — but it's kept as a
- * defensive guard in case the matcher patterns are ever loosened.
+ * back to the default locale for a malformed/unexpected path. This fallback
+ * branch IS reachable today: Clerk's `createRouteMatcher` compiles
+ * case-insensitive patterns, so a case-variant locale segment (e.g.
+ * `/EN/admin`, `/Es/rooms`) still matches `isProtectedRoute` above, but the
+ * lowercase-only `.includes()` check here does not match it. The pathname
+ * then falls through to `defaultLocale`, which is safe — it still forces the
+ * sign-in redirect flow rather than granting access.
  */
 function localeFromPathname(pathname: string): Locale {
   const segment = pathname.split('/')[1]
