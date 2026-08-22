@@ -431,6 +431,19 @@ export async function main() {
   // already owned by this script, is it safe to actually create the ledger
   // table if it does not exist yet (CREATE TABLE IF NOT EXISTS is a no-op
   // when it already does) — this is this run's first real mutation.
+  //
+  // IMPORTANT for future edits: every abort condition below this line
+  // (missingFiles, driftedFiles, assertExpectedTablesArePresent) only fires
+  // when `ledger` is non-empty, and `ledger` is only non-empty when the
+  // table already existed *before* this call (see ledgerTableColumns.size >
+  // 0 above) — so a fresh CREATE TABLE here can never be followed by one of
+  // those aborts. This is exactly the "mutation left behind before an
+  // abort" defect class that PR #338 review rounds 2 and 3 both had to fix
+  // on this file. If you add any new abort condition below this line that
+  // does NOT depend on `ledger` contents (e.g. a connectivity check, a
+  // disk-space check, a new file-syntax validation), move this
+  // ensureLedgerTable() call to after that check too, or the guarantee
+  // above silently breaks.
   await ensureLedgerTable(sql);
 
   // Reverse-direction drift check: a ledger row records a filename as
