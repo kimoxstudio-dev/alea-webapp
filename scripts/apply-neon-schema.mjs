@@ -298,20 +298,35 @@ async function loadLedger(sql) {
   return ledger;
 }
 
-// Verifies the ledger table has this script's expected shape before it is
-// queried or written to. LEDGER_TABLE ("schema_migrations") is a common name
-// (golang-migrate, Knex, and Rails all default to it) — a pre-existing,
-// unrelated table with that same name would otherwise pass
-// `CREATE TABLE IF NOT EXISTS` silently (it no-ops on an existing table) and
-// only surface later as a raw, unactionable Postgres "column does not exist"
-// error the first time the ledger is queried or written to.
-async function assertLedgerTableShape(sql) {
+// Read-only lookup of the columns LEDGER_TABLE currently has, if it exists
+// at all. Returns an empty Set when no such table exists yet (a genuinely
+// fresh database) — information_schema simply reports zero rows for a name
+// that matches no table, so this never needs its own existence probe.
+// Deliberately does NOT create the table (see ensureLedgerTable) — this is
+// called before the preflight check below, and must stay side-effect-free
+// so a preflight failure still leaves zero mutations in an unowned/foreign
+// database.
+async function getLedgerTableColumns(sql) {
   const rows = await sql.query(
     `SELECT "column_name" FROM "information_schema"."columns"
      WHERE "table_schema" = 'public' AND "table_name" = $1`,
     [LEDGER_TABLE],
   );
-  const columnNames = new Set(rows.map((row) => row.column_name));
+  return new Set(rows.map((row) => row.column_name));
+}
+
+// Verifies the ledger table has this script's expected shape, given its
+// already-fetched column set (see getLedgerTableColumns). LEDGER_TABLE
+// ("schema_migrations") is a common name (golang-migrate, Knex, and Rails
+// all default to it) — a pre-existing, unrelated table with that same name
+// would otherwise pass `CREATE TABLE IF NOT EXISTS` silently (it no-ops on
+// an existing table) and only surface later as a raw, unactionable Postgres
+// "column does not exist" error the first time the ledger is queried or
+// written to. An empty columnNames set means the table does not exist yet —
+// that is simply a fresh run, not a malformed pre-existing table, so there
+// is nothing to validate.
+function assertLedgerTableShape(columnNames) {
+  if (columnNames.size === 0) return;
   const requiredColumns = ["filename", "checksum", "applied_at"];
   const missingColumns = requiredColumns.filter((name) => !columnNames.has(name));
   if (missingColumns.length > 0) {
@@ -372,17 +387,20 @@ export async function main() {
   const expectedTables = extractExpectedTableNames(files);
   expectedTables.add(LEDGER_TABLE);
 
-  // The ledger table/rows are loaded before the preflight check below, not
-  // just parsed from argv (PR #338 review, finding 2): --allow-removed
-  // downgrades a hard preflight failure to a warning for the whole run, so a
-  // typo'd or never-actually-ledgered filename must not be able to trigger
-  // that bypass. ensureLedgerTable is idempotent (CREATE TABLE IF NOT
-  // EXISTS) and this table is already treated as always-expected and exempt
-  // from the preflight's row-emptiness check, so creating it here — ahead of
-  // the read-only checks below — does not affect their outcome.
-  await ensureLedgerTable(sql);
-  await assertLedgerTableShape(sql);
-  const ledger = await loadLedger(sql);
+  // The ledger's shape and rows are read — never written — before the
+  // preflight check below, not just parsed from argv (PR #338 review,
+  // finding 2): --allow-removed downgrades a hard preflight failure to a
+  // warning for the whole run, so a typo'd or never-actually-ledgered
+  // filename must not be able to trigger that bypass. Actually creating the
+  // table (ensureLedgerTable) is deferred until after
+  // assertDatabaseIsCleanOrOwned passes below (PR #338 review round 3): an
+  // earlier version of this fix called ensureLedgerTable here too, which
+  // meant a preflight failure against an unowned/foreign database still
+  // left a "schema_migrations" table behind in it, violating this script's
+  // own "abort before any statements are executed" guarantee.
+  const ledgerTableColumns = await getLedgerTableColumns(sql);
+  assertLedgerTableShape(ledgerTableColumns);
+  const ledger = ledgerTableColumns.size > 0 ? await loadLedger(sql) : new Map();
 
   const allowedRemovedFiles = parseAllowRemovedFlag(process.argv);
   const unknownAllowedRemovedFiles = [...allowedRemovedFiles].filter(
@@ -408,6 +426,12 @@ export async function main() {
   await assertDatabaseIsCleanOrOwned(sql, expectedTables, {
     allowUnexpectedTables: allowedRemovedFiles.size > 0,
   });
+
+  // Only now, after the preflight has confirmed the database is empty or
+  // already owned by this script, is it safe to actually create the ledger
+  // table if it does not exist yet (CREATE TABLE IF NOT EXISTS is a no-op
+  // when it already does) — this is this run's first real mutation.
+  await ensureLedgerTable(sql);
 
   // Reverse-direction drift check: a ledger row records a filename as
   // already applied, but its .sql file no longer exists on disk (deleted or
@@ -447,16 +471,17 @@ export async function main() {
   // this run's outcome (PR #338 follow-up). Deleting immediately here would
   // mean a run that ultimately aborts due to unrelated drift still leaves a
   // partial, uncommitted-in-spirit mutation behind — defeating this
-  // script's "abort before any statements are executed" guarantee.
+  // script's "abort before any statements are executed" guarantee. (Not
+  // removed from the in-memory `ledger` Map here either — the only later
+  // reader, the classification loop below, iterates `files` on disk, which
+  // by construction never contains a removedButAllowed filename, so there
+  // is nothing for such a mutation to affect.)
   if (removedButAllowed.length > 0) {
     console.log(
       `--allow-removed acknowledged for ${removedButAllowed.length} previously-applied file(s) ` +
         `no longer on disk; their ledger row(s) will be removed once no other abort condition is ` +
         `found: ${removedButAllowed.join(", ")}`,
     );
-    for (const filename of removedButAllowed) {
-      ledger.delete(filename);
-    }
   }
 
   console.log(
