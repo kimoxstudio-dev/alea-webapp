@@ -12,9 +12,11 @@ export async function generateMetadata(): Promise<Metadata> {
   return { title: `${t('title')} — Alea` }
 }
 
+type CheckInSearchParams = Record<string, string | string[] | undefined>
+
 interface CheckInPageProps {
   params: Promise<{ locale: string; tableId: string }>
-  searchParams: Promise<Record<string, string | string[] | undefined>>
+  searchParams: Promise<CheckInSearchParams>
 }
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i

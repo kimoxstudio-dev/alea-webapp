@@ -56,12 +56,11 @@ function createMiddlewareSupabaseClient(request: NextRequest, response: NextResp
  * `lib/server/equipment-service.ts`) still read a user-scoped Supabase
  * client that depends on this cookie refresh.
  *
- * `/api` requests are intentionally routed around the next-intl rewrite,
- * the deny-by-default page gate above, and the Supabase cookie refresh
- * below (they are not locale-prefixed pages and already resolve their own
- * Clerk/Supabase session per-request via `requireAuth()`/`requireAdmin()`
- * in `lib/server/auth.ts`) — they only need `clerkMiddleware()` to run so
- * Clerk's auth context is populated.
+ * `/api` requests are intentionally routed around the next-intl rewrite and
+ * Supabase cookie refresh (they are not locale-prefixed pages and already
+ * resolve their own Clerk/Supabase session per-request via `requireAuth()` /
+ * `requireAdmin()` in `lib/server/auth.ts`). They only need
+ * `clerkMiddleware()` so Clerk's auth context is populated.
  */
 export default clerkMiddleware(async (_auth, request: NextRequest) => {
   if (request.nextUrl.pathname.startsWith('/api')) {
