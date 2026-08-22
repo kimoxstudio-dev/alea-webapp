@@ -247,7 +247,9 @@ async function loadLedger(sql) {
   return ledger;
 }
 
-async function main() {
+// Exported so tests can import and call it directly with mocks, without
+// triggering the auto-run path below (mirrors scripts/seed-dev.mjs).
+export async function main() {
   loadEnvLocal();
 
   const databaseUrl = process.env.DATABASE_URL;
@@ -351,7 +353,10 @@ async function main() {
   console.log("Schema applied successfully.");
 }
 
-main().catch((err) => {
-  console.error("Failed to apply schema:", err.message);
-  process.exit(1);
-});
+// Only run main() if this script is executed directly, not when imported for testing
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => {
+    console.error("Failed to apply schema:", err.message);
+    process.exit(1);
+  });
+}
