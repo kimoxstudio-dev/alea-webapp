@@ -45,8 +45,8 @@ function createMiddlewareSupabaseClient(request: NextRequest, response: NextResp
  * authorization. This avoids path-matcher auth gates (#340), which Clerk
  * deprecated because their URL matching can diverge from Next.js routing.
  *
- * `clerkMiddleware()` still wraps every non-API-excluded request (see
- * `config.matcher` below, which now also covers `/api`) so `auth()` /
+ * `clerkMiddleware()` still wraps every matched request, including `/api`
+ * (see `config.matcher` below), so `auth()` /
  * `currentUser()` (lib/server/session.ts) are populated for any Route
  * Handler that opts into reading a Clerk session.
  *
