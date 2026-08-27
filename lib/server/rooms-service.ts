@@ -86,11 +86,16 @@ async function listTablesByRoom(roomId: string) {
 }
 
 export async function listAllRooms() {
-  const rows = await sql`
-    SELECT id, name, table_count, description
-    FROM rooms
-    ORDER BY created_at ASC
-  ` as RoomRow[]
+  let rows: RoomRow[]
+  try {
+    rows = await sql`
+      SELECT id, name, table_count, description
+      FROM rooms
+      ORDER BY created_at ASC
+    ` as RoomRow[]
+  } catch {
+    serviceError('Internal server error', 500)
+  }
 
   return rows.map(toRoom)
 }
