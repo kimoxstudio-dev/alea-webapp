@@ -2,6 +2,10 @@
 import type { SessionUser } from '@/lib/server/auth'
 import { beforeEach, describe, expect, it, vi, afterEach } from 'vitest'
 
+vi.mock('@/lib/server/database-time', () => ({
+  getDatabaseNow: vi.fn(async () => new Date()),
+}))
+
 type ReservationRow = {
   id: string
   table_id: string
@@ -937,7 +941,7 @@ describe('reservations service', () => {
       }))
     })
 
-    it('uses the admin client for database time when authenticated RPC access is revoked', async () => {
+    it('uses Neon database time when authenticated Supabase RPC access is revoked', async () => {
       sessionDatabaseTimeDenied = true
       const { createReservationForSession } = await loadReservationModules()
 

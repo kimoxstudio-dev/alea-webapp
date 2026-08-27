@@ -198,7 +198,7 @@ export async function getRoomTablesAvailability(roomId: string, date?: string | 
       .lte('start_date', effectiveDate)
       .gte('end_date', effectiveDate)
       .in('table_id', tables.map((table) => table.id)),
-    getDatabaseNow(admin),
+    getDatabaseNow(),
   ])
 
   const { data, error } = reservationsResult

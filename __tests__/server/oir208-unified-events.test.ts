@@ -16,6 +16,9 @@ import { join } from 'path'
 import type { ServiceError } from '@/lib/server/service-error'
 
 vi.mock('server-only', () => ({}))
+vi.mock('@/lib/server/database-time', () => ({
+  getDatabaseNow: vi.fn(async () => new Date('2026-04-15T12:00:00.000Z')),
+}))
 vi.mock('@/lib/supabase/server', () => ({
   createSupabaseServerAdminClient: vi.fn(),
   createSupabaseServerClient: vi.fn(),

@@ -1,6 +1,10 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+vi.mock('@/lib/server/database-time', () => ({
+  getDatabaseNow: vi.fn(async () => new Date('2026-05-26T12:00:00.000Z')),
+}))
+
 const maybeSingleMock = vi.fn()
 const listReservationsMock = vi.fn()
 const adminTableMaybeSingleMock = vi.fn()

@@ -6,6 +6,7 @@ import { getClerkSession } from '@/lib/server/session'
 import { clerkClient } from '@clerk/nextjs/server'
 import { type PublicProfileRow, toPublicUser } from '@/lib/server/profile-mappers'
 import { sql } from '@/lib/db/client'
+import { getDatabaseNow } from '@/lib/server/database-time'
 import { activationServerSchema, recoveryServerSchema } from '@/lib/validations/auth'
 
 /**
@@ -130,24 +131,6 @@ async function safeRestoreClaimedToken(claim: { id: string; tokenHash: string; u
   }
 }
 
-/**
- * Neon-backed "database now" helper, local to this file (#299).
- *
- * `lib/server/database-time.ts` is Supabase-RPC-backed (`get_database_time`)
- * and is still relied on by several not-yet-migrated Supabase services
- * (reservations-service, tables-service, rooms-service,
- * reservation-no-show.ts) — it is intentionally left untouched. This is the
- * Neon-era equivalent, scoped to the raw-SQL functions in this file only.
- */
-async function getNeonDatabaseNow(): Promise<Date> {
-  const rows = await sql`SELECT now() AS now` as { now: string }[]
-  const value = new Date(rows[0]?.now ?? '')
-  if (isNaN(value.getTime())) {
-    serviceError('Internal server error', 500)
-  }
-  return value
-}
-
 type ActivationTokenRow = {
   id: string
   profile_id: string
@@ -203,7 +186,7 @@ export async function getActivationLinkState(token: string): Promise<ActivationL
   if (activationToken.used_at) {
     return { status: 'used', memberNumber: null, fullName: null }
   }
-  const databaseNow = await getNeonDatabaseNow()
+  const databaseNow = await getDatabaseNow()
   if (isActivationExpired(activationToken.expires_at, databaseNow)) {
     return { status: 'expired', memberNumber: null, fullName: null }
   }
@@ -239,7 +222,7 @@ export async function generateActivationLink(input: {
   }
 
   const token = createActivationToken()
-  const databaseNow = await getNeonDatabaseNow()
+  const databaseNow = await getDatabaseNow()
   const expiresAt = new Date(databaseNow.getTime() + ACTIVATION_WINDOW_MS)
 
   await sql`
@@ -273,7 +256,7 @@ export async function getRecoveryLinkState(token: string): Promise<RecoveryLinkS
   if (recoveryToken.used_at) {
     return { status: 'used', memberNumber: null, fullName: null }
   }
-  const databaseNow = await getNeonDatabaseNow()
+  const databaseNow = await getDatabaseNow()
   if (isActivationExpired(recoveryToken.expires_at, databaseNow)) {
     return { status: 'expired', memberNumber: null, fullName: null }
   }
@@ -309,7 +292,7 @@ export async function generateRecoveryLink(input: {
   }
 
   const token = createActivationToken()
-  const databaseNow = await getNeonDatabaseNow()
+  const databaseNow = await getDatabaseNow()
   const expiresAt = new Date(databaseNow.getTime() + ACTIVATION_WINDOW_MS)
 
   await sql`
@@ -369,7 +352,7 @@ export async function activateAccount(input: { token: unknown; password: unknown
   const tokenHash = hashActivationToken(parsed.data.token)
   const existingToken = await getActivationTokenByHash(tokenHash)
 
-  const databaseNow = existingToken ? await getNeonDatabaseNow() : null
+  const databaseNow = existingToken ? await getDatabaseNow() : null
   if (!existingToken || !databaseNow || isActivationExpired(existingToken.expires_at, databaseNow)) {
     serviceError('Activation link is invalid or has expired', 400)
   }
@@ -385,7 +368,7 @@ export async function activateAccount(input: { token: unknown; password: unknown
     serviceError('Activation link has already been used', 400)
   }
 
-  const activatedAt = (await getNeonDatabaseNow()).toISOString()
+  const activatedAt = (await getDatabaseNow()).toISOString()
   const claimedRows = await sql`
     UPDATE activation_tokens
     SET used_at = ${activatedAt}
@@ -490,7 +473,7 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
   const tokenHash = hashActivationToken(parsed.data.token)
   const existingToken = await getActivationTokenByHash(tokenHash)
 
-  const databaseNow = existingToken ? await getNeonDatabaseNow() : null
+  const databaseNow = existingToken ? await getDatabaseNow() : null
   if (!existingToken || !databaseNow || isActivationExpired(existingToken.expires_at, databaseNow)) {
     serviceError('Recovery link is invalid or has expired', 400)
   }
@@ -503,7 +486,7 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
     serviceError('Recovery link is invalid or has expired', 400)
   }
 
-  const recoveredAt = (await getNeonDatabaseNow()).toISOString()
+  const recoveredAt = (await getDatabaseNow()).toISOString()
   const claimedRows = await sql`
     UPDATE activation_tokens
     SET used_at = ${recoveredAt}

@@ -1,10 +1,11 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { createSqlMock } from '../helpers/sql-mock'
 
-const createSupabaseServerAdminClient = vi.fn()
+const sqlMock = createSqlMock()
 
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseServerAdminClient,
+vi.mock('@/lib/db/client', () => ({
+  sql: sqlMock.sql,
 }))
 
 async function loadModule() {
@@ -14,12 +15,15 @@ async function loadModule() {
 describe('database-time', () => {
   beforeEach(() => {
     vi.resetModules()
-    vi.clearAllMocks()
+    sqlMock.reset()
   })
 
-  it('returns the parsed database timestamp from rpc', async () => {
-    createSupabaseServerAdminClient.mockReturnValue({
-      rpc: vi.fn(async () => ({ data: '2026-04-15T16:00:00.000Z', error: null })),
+  it('returns the database timestamp from a raw SQL now query', async () => {
+    sqlMock.addHandler({
+      name: 'SELECT now()',
+      verb: 'select',
+      match: (stmt) => stmt.isNowSelect && stmt.table === null && stmt.text === 'select now() as now',
+      respond: () => [{ now: '2026-04-15T16:00:00.000Z' }],
     })
 
     const { getDatabaseNow } = await loadModule()
@@ -27,8 +31,16 @@ describe('database-time', () => {
     await expect(getDatabaseNow()).resolves.toEqual(new Date('2026-04-15T16:00:00.000Z'))
   })
 
-  it('throws when the admin client cannot provide rpc access', async () => {
-    createSupabaseServerAdminClient.mockReturnValue({})
+  it.each([
+    { label: 'empty rows', rows: [] },
+    { label: 'invalid timestamp', rows: [{ now: 'not-a-date' }] },
+  ])('throws when SQL returns $label', async ({ rows }) => {
+    sqlMock.addHandler({
+      name: 'SELECT now()',
+      verb: 'select',
+      match: (stmt) => stmt.isNowSelect && stmt.text === 'select now() as now',
+      respond: () => rows,
+    })
 
     const { getDatabaseNow } = await loadModule()
 
@@ -38,9 +50,14 @@ describe('database-time', () => {
     })
   })
 
-  it('throws when rpc returns an unexpected payload', async () => {
-    createSupabaseServerAdminClient.mockReturnValue({
-      rpc: vi.fn(async () => undefined),
+  it('maps SQL failures to an internal service error', async () => {
+    sqlMock.addHandler({
+      name: 'failing SELECT now()',
+      verb: 'select',
+      match: (stmt) => stmt.isNowSelect && stmt.text === 'select now() as now',
+      respond: () => {
+        throw new Error('database unavailable')
+      },
     })
 
     const { getDatabaseNow } = await loadModule()
