@@ -2,6 +2,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ServiceError } from '@/lib/server/service-error'
 
+vi.mock('@/lib/server/database-time', () => ({
+  getDatabaseNow: vi.fn(async () => new Date('2025-01-01T09:00:00.000Z')),
+}))
+
 const maybeSingleMock = vi.fn()
 const listRoomsMock = vi.fn()
 const listTablesMock = vi.fn()

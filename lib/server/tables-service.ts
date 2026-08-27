@@ -122,7 +122,7 @@ export async function getTableAvailability(tableId: string, date?: string | null
       .lte('start_date', effectiveDate)
       .gte('end_date', effectiveDate)
       .limit(1),
-    getDatabaseNow(admin),
+    getDatabaseNow(),
   ])
 
   const allReservations = (reservationsResult.data ?? []) as ReservationRow[]

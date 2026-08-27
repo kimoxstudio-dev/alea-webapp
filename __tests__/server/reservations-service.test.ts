@@ -2,6 +2,10 @@
 import type { SessionUser } from '@/lib/server/auth'
 import { beforeEach, describe, expect, it, vi, afterEach } from 'vitest'
 
+vi.mock('@/lib/server/database-time', () => ({
+  getDatabaseNow: vi.fn(async () => new Date()),
+}))
+
 type ReservationRow = {
   id: string
   table_id: string
@@ -83,32 +87,11 @@ const roomsMap = new Map<string, RoomRow>()
 const eventRoomBlocksState: EventRoomBlockRow[] = []
 let reservationInsertError: { code: string } | null = null
 let reservationUpdateError: { code: string } | null = null
-let sessionDatabaseTimeDenied = false
 // Regression-test knob: simulates the `.eq('user_id', ...)` query filter being
 // accidentally removed/bypassed at the query layer, so the mock returns mixed
 // rows across users. Used to prove assertMemberRowsScoped() itself throws,
 // independent of the query filter working correctly.
 let bypassUserIdFilterInMock = false
-
-function createDatabaseTimeRpc() {
-  return vi.fn(async (fn: string) => {
-    if (fn === 'get_database_time') {
-      // Use new Date() to pick up vi.setSystemTime mocking
-      const now = new Date()
-      return { data: now.toISOString(), error: null }
-    }
-    return { data: null, error: null }
-  })
-}
-
-function createSessionDatabaseTimeRpc() {
-  return vi.fn(async (fn: string) => {
-    if (fn === 'get_database_time' && sessionDatabaseTimeDenied) {
-      return { data: null, error: { code: '42501', message: 'permission denied for function get_database_time' } }
-    }
-    return createDatabaseTimeRpc()(fn)
-  })
-}
 
 function makeReservation(overrides?: Partial<ReservationRow>): ReservationRow {
   return {
@@ -386,7 +369,6 @@ vi.mock('@/lib/supabase/server', () => ({
 
       throw new Error(`Unexpected table ${table}`)
     }),
-    rpc: createSessionDatabaseTimeRpc(),
   })),
   createSupabaseServerAdminClient: vi.fn(() => ({
     from: vi.fn((table: string) => {
@@ -496,7 +478,6 @@ vi.mock('@/lib/supabase/server', () => ({
         }),
       }
     }),
-    rpc: createDatabaseTimeRpc(),
   })),
 }))
 
@@ -512,7 +493,6 @@ describe('reservations service', () => {
     vi.unstubAllEnvs()
     reservationInsertError = null
     reservationUpdateError = null
-    sessionDatabaseTimeDenied = false
     bypassUserIdFilterInMock = false
     seedState()
   })
@@ -935,18 +915,6 @@ describe('reservations service', () => {
         status: 'active',
         surface: null,
       }))
-    })
-
-    it('uses the admin client for database time when authenticated RPC access is revoked', async () => {
-      sessionDatabaseTimeDenied = true
-      const { createReservationForSession } = await loadReservationModules()
-
-      await expect(createReservationForSession(memberSession, {
-        tableId: 't1',
-        date: '2026-12-31',
-        startTime: '12:00',
-        endTime: '13:00',
-      })).resolves.toEqual(expect.objectContaining({ tableId: 't1' }))
     })
 
     it('creates a reservation with optional equipment when available', async () => {

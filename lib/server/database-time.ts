@@ -1,28 +1,16 @@
 import 'server-only'
-import { createSupabaseServerAdminClient } from '@/lib/supabase/server'
+import { sql } from '@/lib/db/client'
 import { serviceError } from '@/lib/server/service-error'
 
-export async function getDatabaseNow(client?: unknown) {
-  const admin = (client ?? createSupabaseServerAdminClient()) as {
-    rpc?: (fn: string, args?: unknown) => Promise<{ data?: unknown; error?: unknown } | undefined>
-  }
-
-  if (typeof admin.rpc !== 'function') {
+export async function getDatabaseNow(query: typeof sql = sql): Promise<Date> {
+  let rows: { now: string | Date }[]
+  try {
+    rows = await query`SELECT now() AS now` as { now: string | Date }[]
+  } catch {
     serviceError('Internal server error', 500)
   }
 
-  const response = await admin.rpc('get_database_time')
-  if (!response || typeof response !== 'object') {
-    serviceError('Internal server error', 500)
-  }
-
-  const { data, error } = response
-
-  if (error || !data) {
-    serviceError('Internal server error', 500)
-  }
-
-  const value = new Date(String(data))
+  const value = new Date(rows[0]?.now ?? '')
   if (isNaN(value.getTime())) {
     serviceError('Internal server error', 500)
   }

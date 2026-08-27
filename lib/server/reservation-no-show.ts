@@ -57,7 +57,7 @@ type NoShowReservationRow = NoShowCandidateSlot & { id: string }
  */
 export async function markExpiredReservationsAsNoShow(): Promise<number> {
   const admin = createSupabaseServerAdminClient()
-  const nowUtc = await getDatabaseNow(admin)
+  const nowUtc = await getDatabaseNow()
 
   const { data, error } = await admin
     .from('reservations')

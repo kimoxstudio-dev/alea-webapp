@@ -298,7 +298,7 @@ async function listActiveReservationsForConflict(input: {
   }
 
   // Lazy evaluation: filter out expired pending reservations
-  const nowUtc = await getDatabaseNow(admin)
+  const nowUtc = await getDatabaseNow()
   return (data ?? []).filter((row) => {
     if (row.status === 'pending' && row.activated_at === null) {
       return !isPendingReservationExpired(row, nowUtc)
@@ -309,7 +309,7 @@ async function listActiveReservationsForConflict(input: {
 
 async function expireStalePendingReservations(tableId: string, date: string) {
   const admin = createSupabaseServerAdminClient()
-  const nowUtc = await getDatabaseNow(admin)
+  const nowUtc = await getDatabaseNow()
   const { data, error } = await admin
     .from('reservations')
     .select(RESERVATION_COLUMNS)
@@ -352,8 +352,8 @@ async function listOverlappingReservationIds(input: {
   const reservationIds: string[] = []
   let from = 0
 
-  // Capture DB time once before the pagination loop to avoid one RPC per page.
-  const nowUtc = await getDatabaseNow(admin)
+  // Capture DB time once before the pagination loop to avoid one query per page.
+  const nowUtc = await getDatabaseNow()
 
   // Get full rows to enable lazy evaluation filtering
   while (true) {
@@ -666,7 +666,7 @@ export async function listVisibleReservations(input: {
   )
 
   const isAdmin = input.session.role === 'admin'
-  const nowUtc = await getDatabaseNow(supabase)
+  const nowUtc = await getDatabaseNow()
 
   return rawRows
     .filter((row) => {
@@ -1065,7 +1065,7 @@ export async function activateReservationByTable(
     serviceError('Invalid reservation data', 500)
   }
 
-  const nowUtc = await getDatabaseNow(admin)
+  const nowUtc = await getDatabaseNow()
   const reservationStart = zonedDateTimeToUtc(reservation.date, normalizeTime(reservation.start_time))
   const reservationEnd = zonedDateTimeToUtc(reservation.date, normalizeTime(reservation.end_time))
 
