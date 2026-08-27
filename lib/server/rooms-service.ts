@@ -75,12 +75,17 @@ function toRoom(row: RoomRow): Room {
 }
 
 async function listTablesByRoom(roomId: string) {
-  const rows = await sql`
-    SELECT id, room_id, name, type, qr_code, qr_code_inf, pos_x, pos_y
-    FROM tables
-    WHERE room_id = ${roomId}
-    ORDER BY name ASC
-  ` as TableRow[]
+  let rows: TableRow[]
+  try {
+    rows = await sql`
+      SELECT id, room_id, name, type, qr_code, qr_code_inf, pos_x, pos_y
+      FROM tables
+      WHERE room_id = ${roomId}
+      ORDER BY name ASC
+    ` as TableRow[]
+  } catch {
+    serviceError('Internal server error', 500)
+  }
 
   return rows.map((row) => toGameTable(row as unknown as Tables<'tables'>))
 }

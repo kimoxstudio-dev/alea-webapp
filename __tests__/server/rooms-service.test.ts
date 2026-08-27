@@ -381,6 +381,20 @@ describe('rooms-service (Neon raw SQL)', () => {
       const tables = await listRoomTables('empty-room')
       expect(tables).toEqual([])
     })
+
+    it('maps a DB error to a 500 ServiceError', async () => {
+      sqlMock.addHandler({
+        name: 'SELECT tables by room_id — failing',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'tables' && whereColumnHasOperator(stmt, 'room_id', '=') && whereConditionCount(stmt) === 1,
+        respond: () => {
+          throw new Error('connection reset')
+        },
+      })
+
+      const { listRoomTables } = await loadRoomsService()
+      await expect(listRoomTables('1')).rejects.toMatchObject({ name: 'ServiceError', statusCode: 500 })
+    })
   })
 
   describe('getRoomTablesAvailability', () => {
@@ -446,6 +460,22 @@ describe('rooms-service (Neon raw SQL)', () => {
 
       expect(result).toEqual({})
       expect(sqlMock.sql).toHaveBeenCalledTimes(1)
+    })
+
+    it('maps a tables DB error to a 500 ServiceError', async () => {
+      sqlMock.addHandler({
+        name: 'SELECT tables by room_id — failing',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'tables' && whereColumnHasOperator(stmt, 'room_id', '=') && whereConditionCount(stmt) === 1,
+        respond: () => {
+          throw new Error('connection reset')
+        },
+      })
+      // No reservations/event_room_blocks/saved_games handlers registered —
+      // the tables query must fail before those are ever reached.
+
+      const { getRoomTablesAvailability } = await loadRoomsService()
+      await expect(getRoomTablesAvailability('1', '2025-01-01')).rejects.toMatchObject({ name: 'ServiceError', statusCode: 500 })
     })
 
     it('maps a reservations DB error to a 500 ServiceError', async () => {
