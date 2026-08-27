@@ -63,3 +63,5 @@ docs/AUDIT-*.md
 
 # Per-developer Claude settings (personal, never shared — .claude/settings.json stays tracked)
 .claude/settings.local.json
+# Added by code-review-graph
+.code-review-graph/
