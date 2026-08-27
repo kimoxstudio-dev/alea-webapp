@@ -1,60 +1,69 @@
 import type { GameTable, Room, TableAvailability } from '@/lib/types'
-import { createSupabaseServerAdminClient, createSupabaseServerClient } from '@/lib/supabase/server'
+import { sql } from '@/lib/db/client'
+import { NeonDbError } from '@neondatabase/serverless'
+import type { Tables } from '@/lib/supabase/types'
 import { serviceError } from '@/lib/server/service-error'
 import { resolveDate, buildAvailability } from '@/lib/server/availability'
-import type { Tables, TablesInsert, TablesUpdate } from '@/lib/supabase/types'
 import { regenerateQrCodes } from '@/lib/server/tables-service'
 import { toGameTable } from '@/lib/server/table-mappers'
 import { getDatabaseNow } from '@/lib/server/database-time'
 import { isPendingReservationExpired } from '@/lib/server/pending-reservation-expiry'
 
-type RoomRow = Tables<'rooms'>
-type TableRow = Tables<'tables'>
-type ReservationRow = Tables<'reservations'>
-type EventBlockRow = Tables<'event_room_blocks'>
-type RoomsTableClient = {
-  select: (columns: string) => {
-    order: (column: string, options: { ascending: boolean }) => Promise<{ data: RoomRow[] | null; error: unknown }>
-  }
-  insert: (values: TablesInsert<'rooms'>) => {
-    select: (columns: string) => {
-      maybeSingle: () => Promise<{ data: RoomRow | null; error: unknown }>
-    }
-  }
-  update: (values: TablesUpdate<'rooms'>) => {
-    eq: (column: 'id', value: string) => {
-      select: (columns: string) => {
-        maybeSingle: () => Promise<{ data: RoomRow | null; error: unknown }>
-      }
-    }
-  }
-}
-type TablesByRoomClient = {
-  select: (columns: string) => {
-    eq: (column: 'room_id', value: string) => {
-      order: (column: string, options: { ascending: boolean }) => Promise<{ data: TableRow[] | null; error: unknown }>
-    }
-  }
-}
-type TablesInsertClient = {
-  insert: (values: TablesInsert<'tables'>) => {
-    select: (columns: string) => {
-      maybeSingle: () => Promise<{ data: TableRow | null; error: unknown }>
-    }
-  }
-}
-type ReservationsByTableClient = {
-  select: (columns: string) => {
-    eq: (column: 'date', value: string) => {
-      in: (column: 'status', values: string[]) => {
-        in: (column: 'table_id', values: string[]) => Promise<{ data: ReservationRow[] | null; error: unknown }>
-      }
-    }
-  }
+/**
+ * Raw-SQL Neon port of the rooms/tables service (#302).
+ *
+ * Ported off Supabase (`createSupabaseServerAdminClient`/
+ * `createSupabaseServerClient`) to the tagged-template `sql` export from
+ * `lib/db/client.ts`, matching the established style from `auth-service.ts`
+ * (#299) and `database-time.ts` (#308). Neon has no RLS, so the old
+ * admin-vs-user-scoped client distinction collapses to a single `sql`.
+ *
+ * Out of scope (left untouched, still Supabase-based): default-equipment
+ * resolution (`lib/server/equipment-service.ts`) and `regenerateQrCodes`
+ * (`lib/server/tables-service.ts`).
+ */
+
+type RoomRow = {
+  id: string
+  name: string
+  table_count: number
+  description: string | null
 }
 
-const ROOM_COLUMNS = 'id, name, table_count, description'
-const TABLE_COLUMNS = 'id, room_id, name, type, qr_code, qr_code_inf, pos_x, pos_y'
+type TableRow = {
+  id: string
+  room_id: string
+  name: string
+  type: 'small' | 'large' | 'removable_top'
+  qr_code: string | null
+  qr_code_inf: string | null
+  pos_x: number | null
+  pos_y: number | null
+}
+
+type ReservationRow = {
+  id: string
+  table_id: string
+  date: string
+  start_time: string
+  end_time: string
+  status: string
+  surface: 'top' | 'bottom' | null
+  user_id: string | null
+  activated_at: string | null
+  created_at: string
+}
+
+type EventBlockRow = {
+  id: string
+  event_id: string
+  room_id: string
+  table_id: string | null
+  date: string
+  start_time: string
+  end_time: string
+  all_day: boolean
+}
 
 function toRoom(row: RoomRow): Room {
   return {
@@ -66,32 +75,34 @@ function toRoom(row: RoomRow): Room {
 }
 
 async function listTablesByRoom(roomId: string) {
-  const supabase = await createSupabaseServerClient()
-  const tables = supabase.from('tables') as unknown as TablesByRoomClient
-  const { data, error } = await tables
-    .select(TABLE_COLUMNS)
-    .eq('room_id', roomId)
-    .order('name', { ascending: true })
-
-  if (error) {
+  let rows: TableRow[]
+  try {
+    rows = await sql`
+      SELECT id, room_id, name, type, qr_code, qr_code_inf, pos_x, pos_y
+      FROM tables
+      WHERE room_id = ${roomId}
+      ORDER BY name ASC
+    ` as TableRow[]
+  } catch {
     serviceError('Internal server error', 500)
   }
 
-  return ((data ?? []) as TableRow[]).map(toGameTable)
+  return rows.map((row) => toGameTable(row as unknown as Tables<'tables'>))
 }
 
 export async function listAllRooms() {
-  const supabase = await createSupabaseServerClient()
-  const rooms = supabase.from('rooms') as unknown as RoomsTableClient
-  const { data, error } = await rooms
-    .select(ROOM_COLUMNS)
-    .order('created_at', { ascending: true })
-
-  if (error) {
+  let rows: RoomRow[]
+  try {
+    rows = await sql`
+      SELECT id, name, table_count, description
+      FROM rooms
+      ORDER BY created_at ASC
+    ` as RoomRow[]
+  } catch {
     serviceError('Internal server error', 500)
   }
 
-  return ((data ?? []) as RoomRow[]).map(toRoom)
+  return rows.map(toRoom)
 }
 
 export async function createRoomEntry(body: { name?: unknown; tableCount?: unknown; description?: unknown }) {
@@ -106,26 +117,25 @@ export async function createRoomEntry(body: { name?: unknown; tableCount?: unkno
     serviceError('tableCount must be a non-negative integer', 400)
   }
 
-  const supabase = createSupabaseServerAdminClient()
-  const insert: TablesInsert<'rooms'> = {
-    name,
-    table_count: tableCount,
-    description: body.description ? String(body.description) : null,
-  }
-  const rooms = supabase.from('rooms') as unknown as RoomsTableClient
-  const { data, error } = await rooms
-    .insert(insert)
-    .select(ROOM_COLUMNS)
-    .maybeSingle()
+  const description = body.description ? String(body.description) : null
 
-  if (error) {
+  let rows: RoomRow[]
+  try {
+    rows = await sql`
+      INSERT INTO rooms (name, table_count, description)
+      VALUES (${name}, ${tableCount}, ${description})
+      RETURNING id, name, table_count, description
+    ` as RoomRow[]
+  } catch {
     serviceError('Internal server error', 500)
   }
+
+  const data = rows[0]
   if (!data) {
     serviceError('Internal server error', 500)
   }
 
-  return toRoom(data as RoomRow)
+  return toRoom(data)
 }
 
 export async function updateRoom(id: string, body: { name?: unknown; description?: unknown; tableCount?: unknown }) {
@@ -138,32 +148,35 @@ export async function updateRoom(id: string, body: { name?: unknown; description
     tableCount = raw
   }
 
-  const supabase = createSupabaseServerAdminClient()
-  const updates: TablesUpdate<'rooms'> = {
-    name: body.name ? String(body.name) : undefined,
-    description:
-      body.description === undefined
-        ? undefined
-        : body.description === null
-          ? null
-          : String(body.description),
-    ...(tableCount !== undefined ? { table_count: tableCount } : {}),
-  }
-  const rooms = supabase.from('rooms') as unknown as RoomsTableClient
-  const { data, error } = await rooms
-    .update(updates)
-    .eq('id', id)
-    .select(ROOM_COLUMNS)
-    .maybeSingle()
+  const name = body.name ? String(body.name) : undefined
+  const description =
+    body.description === undefined
+      ? undefined
+      : body.description === null
+        ? null
+        : String(body.description)
 
-  if (error) {
+  let rows: RoomRow[]
+  try {
+    rows = await sql`
+      UPDATE rooms
+      SET
+        name = COALESCE(${name ?? null}, name),
+        description = CASE WHEN ${description === undefined} THEN description ELSE ${description ?? null} END,
+        table_count = COALESCE(${tableCount ?? null}, table_count)
+      WHERE id = ${id}
+      RETURNING id, name, table_count, description
+    ` as RoomRow[]
+  } catch {
     serviceError('Internal server error', 500)
   }
+
+  const data = rows[0]
   if (!data) {
     serviceError('Room not found', 404)
   }
 
-  return toRoom(data as RoomRow)
+  return toRoom(data)
 }
 
 export async function listRoomTables(roomId: string) {
@@ -177,62 +190,61 @@ export async function getRoomTablesAvailability(roomId: string, date?: string | 
     return {}
   }
 
-  const admin = createSupabaseServerAdminClient()
-  const reservations = admin.from('reservations') as unknown as ReservationsByTableClient
+  const tableIds = tables.map((table) => table.id)
 
-  const [reservationsResult, eventBlocksResult, savedGamesResult, nowUtc] = await Promise.all([
-    reservations
-      .select('id, table_id, date, start_time, end_time, status, surface, user_id, activated_at, created_at')
-      .eq('date', effectiveDate)
-      .in('status', ['active', 'pending'])
-      .in('table_id', tables.map((table) => table.id)),
-    admin
-      .from('event_room_blocks')
-      .select('id, event_id, room_id, table_id, date, start_time, end_time, all_day')
-      .eq('room_id', roomId)
-      .eq('date', effectiveDate),
-    admin
-      .from('saved_games')
-      .select('table_id')
-      .eq('status', 'active')
-      .lte('start_date', effectiveDate)
-      .gte('end_date', effectiveDate)
-      .in('table_id', tables.map((table) => table.id)),
-    getDatabaseNow(),
-  ])
-
-  const { data, error } = reservationsResult
-
-  if (error) {
+  let reservationsRows: ReservationRow[]
+  let eventBlocks: EventBlockRow[]
+  let savedGameRows: { table_id: string }[]
+  let nowUtc: Date
+  try {
+    ;[reservationsRows, eventBlocks, savedGameRows, nowUtc] = await Promise.all([
+      sql`
+        SELECT id, table_id, date, start_time, end_time, status, surface, user_id, activated_at, created_at
+        FROM reservations
+        WHERE date = ${effectiveDate}
+          AND status IN ('active', 'pending')
+          AND table_id = ANY(${tableIds})
+      ` as unknown as Promise<ReservationRow[]>,
+      sql`
+        SELECT id, event_id, room_id, table_id, date, start_time, end_time, all_day
+        FROM event_room_blocks
+        WHERE room_id = ${roomId}
+          AND date = ${effectiveDate}
+      ` as unknown as Promise<EventBlockRow[]>,
+      sql`
+        SELECT table_id
+        FROM saved_games
+        WHERE status = 'active'
+          AND start_date <= ${effectiveDate}
+          AND end_date >= ${effectiveDate}
+          AND table_id = ANY(${tableIds})
+      ` as unknown as Promise<{ table_id: string }[]>,
+      getDatabaseNow(),
+    ])
+  } catch {
     serviceError('Internal server error', 500)
   }
 
-  const activeReservations = ((data ?? []) as ReservationRow[]).filter((row) =>
+  const activeReservations = reservationsRows.filter((row) =>
     row.status !== 'pending' || row.activated_at !== null || !isPendingReservationExpired(row, nowUtc),
   )
-  const eventBlocks = (eventBlocksResult.data ?? []) as EventBlockRow[]
-
-  if (eventBlocksResult.error) {
-    serviceError('Internal server error', 500)
-  }
-  if (savedGamesResult.error) serviceError('Internal server error', 500)
-  const savedGameTableIds = new Set((savedGamesResult.data ?? []).map((row) => row.table_id))
+  const savedGameTableIds = new Set(savedGameRows.map((row) => row.table_id))
 
   let eventTitleById = new Map<string, string>()
   const eventIds = [...new Set(eventBlocks.map((block) => block.event_id))]
   if (eventIds.length > 0) {
-    const eventsResult = await admin
-      .from('events')
-      .select('id, title')
-      .in('id', eventIds)
-
-    if (eventsResult.error) {
+    let eventsRows: Array<{ id: string; title: string }>
+    try {
+      eventsRows = await sql`
+        SELECT id, title
+        FROM events
+        WHERE id = ANY(${eventIds})
+      ` as Array<{ id: string; title: string }>
+    } catch {
       serviceError('Internal server error', 500)
     }
 
-    eventTitleById = new Map(
-      ((eventsResult.data ?? []) as Array<{ id: string; title: string }>).map((event) => [event.id, event.title]),
-    )
+    eventTitleById = new Map(eventsRows.map((event) => [event.id, event.title]))
   }
 
   const reservationsByTable = new Map<string, ReservationRow[]>()
@@ -258,7 +270,7 @@ export async function getRoomTablesAvailability(roomId: string, date?: string | 
     acc[table.id] = buildAvailability(
       table,
       effectiveDate,
-      reservationsByTable.get(table.id) ?? [],
+      (reservationsByTable.get(table.id) ?? []) as unknown as Tables<'reservations'>[],
       eventSlotsForTable(table.id),
       savedGameTableIds.has(table.id),
     )
@@ -283,31 +295,25 @@ export async function createTableEntry(
   }
   const type = rawType as ValidType
 
-  const supabase = createSupabaseServerAdminClient()
-  const insert: TablesInsert<'tables'> = {
-    room_id: roomId,
-    name,
-    type,
-  }
-  const tables = supabase.from('tables') as unknown as TablesInsertClient
-  const { data, error } = await tables
-    .insert(insert)
-    .select(TABLE_COLUMNS)
-    .maybeSingle()
-
-  if (error) {
-    const pgError = error as { code?: string }
-    if (pgError.code === '23503') {
+  let rows: TableRow[]
+  try {
+    rows = await sql`
+      INSERT INTO tables (room_id, name, type)
+      VALUES (${roomId}, ${name}, ${type})
+      RETURNING id, room_id, name, type, qr_code, qr_code_inf, pos_x, pos_y
+    ` as TableRow[]
+  } catch (error) {
+    if (error instanceof NeonDbError && error.code === '23503') {
       // Foreign-key violation: the provided roomId does not reference an existing room.
       serviceError('Invalid room ID', 400)
     }
     serviceError('Internal server error', 500)
   }
-  if (!data) {
+
+  const tableRow = rows[0]
+  if (!tableRow) {
     serviceError('Internal server error', 500)
   }
-
-  const tableRow = data as TableRow
 
   // Fire-and-forget: generate QR codes without blocking the POST response.
   // If QR generation fails the admin can regenerate later via the dashboard.
@@ -318,5 +324,5 @@ export async function createTableEntry(
     })
   }
 
-  return toGameTable(tableRow)
+  return toGameTable(tableRow as unknown as Tables<'tables'>)
 }

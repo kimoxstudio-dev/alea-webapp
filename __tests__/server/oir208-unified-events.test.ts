@@ -14,6 +14,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { readFileSync } from 'fs'
 import { join } from 'path'
 import type { ServiceError } from '@/lib/server/service-error'
+import { createSqlMock, whereColumnHasOperator, whereConditionCount, whereHasColumn } from '../helpers/sql-mock'
 
 vi.mock('server-only', () => ({}))
 vi.mock('@/lib/server/database-time', () => ({
@@ -22,6 +23,19 @@ vi.mock('@/lib/server/database-time', () => ({
 vi.mock('@/lib/supabase/server', () => ({
   createSupabaseServerAdminClient: vi.fn(),
   createSupabaseServerClient: vi.fn(),
+}))
+
+// rooms-service.ts (#302) was migrated off Supabase to the raw-SQL `sql`
+// export from `lib/db/client.ts`. This suite otherwise mocks
+// `@/lib/supabase/server`, which no longer intercepts rooms-service's own
+// queries — a real (unmocked) Neon connection would be attempted without
+// this. Only the `getRoomTablesAvailability respects/blocks` tests below
+// register handlers on it; every other test in this file never reaches
+// rooms-service's `sql` calls, so an unmatched-statement throw here would
+// only ever surface as a failure in those two tests, not silently elsewhere.
+const roomsSqlMock = createSqlMock()
+vi.mock('@/lib/db/client', () => ({
+  sql: roomsSqlMock.sql,
 }))
 vi.mock('@/lib/server/service-error', () => ({
   serviceError: vi.fn((message: string, statusCode: number) => {
@@ -1075,17 +1089,65 @@ describe('OIR-208: Unified Events', () => {
       expect(tableB.slots.find((slot) => slot.startTime === '14:00')?.available).toBe(false)
     })
 
+    // rooms-service.ts (#302) queries raw SQL, not Supabase — register
+    // handlers on `roomsSqlMock` mirroring the same table/event-block
+    // fixtures the Supabase-mock helpers above use, so these two tests
+    // exercise the same table-vs-room block scoping behavior through the
+    // migrated implementation.
+    function setupRoomsSqlMock(tablesById: Record<string, MockTable>, eventBlocks: Array<Record<string, unknown>>) {
+      roomsSqlMock.reset()
+      roomsSqlMock.addHandler({
+        name: 'SELECT tables by room_id',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'tables' && whereColumnHasOperator(stmt, 'room_id', '=') && whereConditionCount(stmt) === 1,
+        respond: (stmt) => {
+          const roomId = stmt.values[0]
+          return Object.values(tablesById)
+            .filter((t) => t.room_id === roomId)
+            .map((t) => ({
+              id: t.id,
+              room_id: t.room_id,
+              name: t.id,
+              type: t.type,
+              qr_code: null,
+              qr_code_inf: null,
+              pos_x: null,
+              pos_y: null,
+            }))
+        },
+      })
+      roomsSqlMock.addHandler({
+        name: 'SELECT reservations for tables/date',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'reservations' && whereColumnHasOperator(stmt, 'date', '=') && whereHasColumn(stmt, 'table_id'),
+        respond: () => [],
+      })
+      roomsSqlMock.addHandler({
+        name: 'SELECT event_room_blocks for room/date',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereColumnHasOperator(stmt, 'room_id', '=') && whereColumnHasOperator(stmt, 'date', '='),
+        respond: () => eventBlocks,
+      })
+      roomsSqlMock.addHandler({
+        name: 'SELECT saved_games active/table-scoped',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'saved_games' && whereHasColumn(stmt, 'table_id'),
+        respond: () => [],
+      })
+      roomsSqlMock.addHandler({
+        name: 'SELECT events by id',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'events' && whereHasColumn(stmt, 'id'),
+        respond: () => [],
+      })
+    }
+
     it('getRoomTablesAvailability respects table-level blocks', async () => {
       const eventBlocks = [{
         id: 'blk-3', event_id: 'evt-1', room_id: ROOM, table_id: 'table-A',
         date: '2026-04-20', start_time: '14:00:00', end_time: '16:00:00', all_day: false,
       }]
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        buildTablesSessionClient(TABLES) as any,
-      )
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        buildAvailabilityAdminClient(eventBlocks) as any,
-      )
+      setupRoomsSqlMock(TABLES, eventBlocks)
 
       const { getRoomTablesAvailability } = await import('@/lib/server/rooms-service')
 
@@ -1099,12 +1161,7 @@ describe('OIR-208: Unified Events', () => {
         id: 'blk-4', event_id: 'evt-1', room_id: ROOM, table_id: null,
         date: '2026-04-20', start_time: '14:00:00', end_time: '16:00:00', all_day: false,
       }]
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        buildTablesSessionClient(TABLES) as any,
-      )
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        buildAvailabilityAdminClient(eventBlocks) as any,
-      )
+      setupRoomsSqlMock(TABLES, eventBlocks)
 
       const { getRoomTablesAvailability } = await import('@/lib/server/rooms-service')
 
