@@ -1281,8 +1281,74 @@ describe('OIR-208: Unified Events', () => {
       }
     }
 
+    function setupReservationServiceSqlMock(config: {
+      eventBlocks: Array<{ id: string; table_id: string | null }>
+      existingReservation?: Record<string, unknown>
+      insertSpy?: (payload: unknown) => void
+    }) {
+      roomsSqlMock.reset()
+      roomsSqlMock.addHandler({
+        name: 'SELECT reservation table', verb: 'select',
+        match: (stmt) => stmt.table === 'tables' && whereColumnHasOperator(stmt, 'id', '=') && whereConditionCount(stmt) === 1,
+        respond: (stmt) => {
+          const table = RESERVATION_TABLES[String(stmt.values[0])]
+          return table ? [table] : []
+        },
+      })
+      roomsSqlMock.addHandler({
+        name: 'SELECT reservation event blocks', verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks', respond: () => config.eventBlocks,
+      })
+      roomsSqlMock.addHandler({
+        name: 'SELECT reservation saved games', verb: 'select',
+        match: (stmt) => stmt.table === 'saved_games', respond: () => [],
+      })
+      roomsSqlMock.addHandler({
+        name: 'SELECT reservation equipment', verb: 'select',
+        match: (stmt) => stmt.table === 'reservation_equipment', respond: () => [],
+      })
+      roomsSqlMock.addHandler({
+        name: 'DELETE reservation equipment', verb: 'delete',
+        match: (stmt) => stmt.table === 'reservation_equipment', respond: () => [],
+      })
+      roomsSqlMock.addHandler({
+        name: 'INSERT reservation equipment', verb: 'insert',
+        match: (stmt) => stmt.table === 'reservation_equipment', respond: () => [],
+      })
+      roomsSqlMock.addHandler({
+        name: 'SELECT all equipment', verb: 'select',
+        match: (stmt) => stmt.table === 'equipment', respond: () => [],
+      })
+      roomsSqlMock.addHandler({
+        name: 'SELECT reservation rows', verb: 'select',
+        match: (stmt) => stmt.table === 'reservations',
+        respond: (stmt) => stmt.values.length === 1 && config.existingReservation?.id === stmt.values[0]
+          ? [config.existingReservation] : [],
+      })
+      roomsSqlMock.addHandler({
+        name: 'UPDATE stale pending reservation', verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && !stmt.returning,
+        respond: () => [],
+      })
+      roomsSqlMock.addHandler({
+        name: 'UPDATE reservation', verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && stmt.returning,
+        respond: () => config.existingReservation ? [config.existingReservation] : [],
+      })
+      roomsSqlMock.addHandler({
+        name: 'INSERT reservation', verb: 'insert',
+        match: (stmt) => stmt.table === 'reservations',
+        respond: (stmt) => {
+          config.insertSpy?.(stmt.values)
+          const [table_id, user_id, date, start_time, end_time, surface] = stmt.values
+          return [{ id: 'new-reservation-id', table_id, user_id, date, start_time, end_time, surface, status: 'active', activated_at: null, created_at: '2026-04-01T00:00:00.000Z' }]
+        },
+      })
+    }
+
     it('hasEventBlockConflict: detects conflict on exact table when table_id set', async () => {
       const eventBlocks = [{ id: 'blk-5', table_id: 'res-table-1' }]
+      setupReservationServiceSqlMock({ eventBlocks })
       vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
         buildReservationSessionClient({}) as any,
       )
@@ -1302,6 +1368,7 @@ describe('OIR-208: Unified Events', () => {
 
     it('hasEventBlockConflict: no conflict for sibling table when table_id set', async () => {
       const eventBlocks = [{ id: 'blk-6', table_id: 'res-table-1' }]
+      setupReservationServiceSqlMock({ eventBlocks })
       vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
         buildReservationSessionClient({}) as any,
       )
@@ -1322,6 +1389,7 @@ describe('OIR-208: Unified Events', () => {
 
     it('hasEventBlockConflict: conflict on any table when table_id is null', async () => {
       const eventBlocks = [{ id: 'blk-7', table_id: null }]
+      setupReservationServiceSqlMock({ eventBlocks })
       vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
         buildReservationSessionClient({}) as any,
       )
@@ -1408,6 +1476,7 @@ describe('OIR-208: Unified Events', () => {
     it('create reservation fails if table-level block conflict', async () => {
       const insertSpy = vi.fn()
       const eventBlocks = [{ id: 'blk-9', table_id: 'res-table-1' }]
+      setupReservationServiceSqlMock({ eventBlocks, insertSpy })
       vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
         buildReservationSessionClient({ insertSpy }) as any,
       )
@@ -1430,6 +1499,7 @@ describe('OIR-208: Unified Events', () => {
     it('create reservation succeeds on sibling table despite table-level block', async () => {
       const insertSpy = vi.fn()
       const eventBlocks = [{ id: 'blk-10', table_id: 'res-table-1' }]
+      setupReservationServiceSqlMock({ eventBlocks, insertSpy })
       vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
         buildReservationSessionClient({ insertSpy }) as any,
       )
@@ -1465,6 +1535,7 @@ describe('OIR-208: Unified Events', () => {
         created_at: '2026-04-01T00:00:00.000Z',
       }
       const eventBlocks = [{ id: 'blk-11', table_id: 'res-table-1' }]
+      setupReservationServiceSqlMock({ eventBlocks, existingReservation })
       vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
         buildReservationSessionClient({ existingReservation }) as any,
       )
