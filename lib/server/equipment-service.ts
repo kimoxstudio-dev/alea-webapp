@@ -197,7 +197,11 @@ export async function setRoomDefaultEquipment(roomId: string, equipmentIds: stri
     // constraint (lib/db/schema/019_room_default_equipment_unique_equipment.sql):
     // a unique-violation surfacing here means another request won the race
     // and already claimed this equipment for a different room.
-    if (error instanceof NeonDbError && error.code === '23505') {
+    if (
+      error instanceof NeonDbError &&
+      error.code === '23505' &&
+      error.constraint === 'room_default_equipment_equipment_id_key'
+    ) {
       serviceError(ERROR_CODES.EQUIPMENT_LOCKED_TO_ANOTHER_ROOM, 400)
     }
     serviceError('Internal server error', 500)
