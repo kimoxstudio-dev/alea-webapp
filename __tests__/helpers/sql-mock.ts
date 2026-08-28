@@ -373,14 +373,25 @@ export interface SqlMock {
 
 /**
  * Builds a real `NeonDbError` instance carrying the given Postgres error
- * code, for a handler's `respond` to `throw` when a test needs to simulate a
- * specific SQL error condition (e.g. `23505` unique_violation) rather than a
- * generic `Error`. Real class, not a plain `{ code }` object, because
- * service code checks `error instanceof NeonDbError` before trusting `.code`.
+ * code (and, optionally, the violated constraint name), for a handler's
+ * `respond` to `throw` when a test needs to simulate a specific SQL error
+ * condition (e.g. `23505` unique_violation) rather than a generic `Error`.
+ * Real class, not a plain `{ code }` object, because service code checks
+ * `error instanceof NeonDbError` before trusting `.code`.
+ *
+ * `constraint` mirrors the real `NeonDbError` class shape (a flat top-level
+ * `constraint: string | undefined` property, alongside `.code`) and defaults
+ * to `undefined` so existing callers that don't need to simulate a specific
+ * constraint name keep working unchanged.
  */
-export function neonDbError(code: string, message = 'simulated Postgres error'): NeonDbError {
+export function neonDbError(
+  code: string,
+  message = 'simulated Postgres error',
+  constraint?: string,
+): NeonDbError {
   const error = new NeonDbError(message)
   error.code = code
+  error.constraint = constraint
   return error
 }
 

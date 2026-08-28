@@ -330,6 +330,7 @@ describe('equipment-service (Neon raw SQL)', () => {
           throw neonDbError(
             '23505',
             'duplicate key value violates unique constraint "room_default_equipment_equipment_id_key"',
+            'room_default_equipment_equipment_id_key',
           )
         })
 
@@ -345,6 +346,29 @@ describe('equipment-service (Neon raw SQL)', () => {
         addRoomDefaultsDeleteHandler(() => [])
         addRoomDefaultsInsertHandler(() => {
           throw neonDbError('23503', 'foreign key violation')
+        })
+
+        const { setRoomDefaultEquipment } = await loadService()
+        await expect(setRoomDefaultEquipment('room-1', ['eq-1'])).rejects.toMatchObject({
+          statusCode: 500,
+        })
+      })
+
+      it('maps a 23505 unique-violation with a DIFFERENT constraint name (e.g. the table\'s own primary key, hit by duplicate equipment ids in the same request) to the generic 500, not EQUIPMENT_LOCKED_TO_ANOTHER_ROOM', async () => {
+        // Proves the catch is scoped to the specific equipment-lock
+        // constraint and not just the '23505' code: a PK violation from
+        // `room_default_equipment_pkey` (e.g. the caller passed the same
+        // equipment id twice in one request) is a distinct failure mode from
+        // the cross-room race the UNIQUE constraint (019) guards against, and
+        // must not be misclassified as EQUIPMENT_LOCKED_TO_ANOTHER_ROOM.
+        addConflictHandler(() => [])
+        addRoomDefaultsDeleteHandler(() => [])
+        addRoomDefaultsInsertHandler(() => {
+          throw neonDbError(
+            '23505',
+            'duplicate key value violates unique constraint "room_default_equipment_pkey"',
+            'room_default_equipment_pkey',
+          )
         })
 
         const { setRoomDefaultEquipment } = await loadService()
