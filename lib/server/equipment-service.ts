@@ -1,35 +1,44 @@
-import { createSupabaseServerAdminClient, createSupabaseServerClient } from '@/lib/supabase/server'
+import { sql } from '@/lib/db/client'
 import { serviceError } from '@/lib/server/service-error'
 import { ERROR_CODES } from '@/lib/types/error-codes'
-import type { Tables, TablesInsert, TablesUpdate } from '@/lib/supabase/types'
 import type { Equipment } from '@/lib/types'
 
 export type { Equipment }
 
-type EquipmentRow = Tables<'equipment'>
-type RoomDefaultEquipmentRow = Tables<'room_default_equipment'>
+type EquipmentRow = {
+  id: string
+  name: string
+  description: string | null
+  created_at: string | Date
+}
+
+type RoomDefaultEquipmentRow = {
+  equipment_id: string
+  room_id: string
+}
 
 function toEquipment(row: EquipmentRow): Equipment {
   return {
     id: row.id,
     name: row.name,
     description: row.description ?? null,
-    createdAt: row.created_at,
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
   }
 }
 
 export async function listEquipment(): Promise<Equipment[]> {
-  const supabase = await createSupabaseServerClient()
-  const { data, error } = await supabase
-    .from('equipment')
-    .select('id, name, description, created_at')
-    .order('name', { ascending: true })
-
-  if (error) {
+  let rows: EquipmentRow[]
+  try {
+    rows = await sql`
+      SELECT id, name, description, created_at
+      FROM equipment
+      ORDER BY name ASC
+    ` as EquipmentRow[]
+  } catch {
     serviceError('Internal server error', 500)
   }
 
-  return ((data ?? []) as EquipmentRow[]).map(toEquipment)
+  return rows.map(toEquipment)
 }
 
 export async function createEquipment(body: { name?: unknown; description?: unknown }): Promise<Equipment> {
@@ -38,129 +47,127 @@ export async function createEquipment(body: { name?: unknown; description?: unkn
     serviceError('Equipment name is required', 400)
   }
 
-  const supabase = createSupabaseServerAdminClient()
-  const insert: TablesInsert<'equipment'> = {
-    name,
-    description: body.description ? String(body.description) : null,
-  }
-
-  const { data, error } = await supabase
-    .from('equipment')
-    .insert(insert)
-    .select('id, name, description, created_at')
-    .maybeSingle()
-
-  if (error) {
-    serviceError('Internal server error', 500)
-  }
-  if (!data) {
+  const description = body.description ? String(body.description) : null
+  let rows: EquipmentRow[]
+  try {
+    rows = await sql`
+      INSERT INTO equipment (name, description)
+      VALUES (${name}, ${description})
+      RETURNING id, name, description, created_at
+    ` as EquipmentRow[]
+  } catch {
     serviceError('Internal server error', 500)
   }
 
-  return toEquipment(data as EquipmentRow)
+  const equipment = rows[0]
+  if (!equipment) {
+    serviceError('Internal server error', 500)
+  }
+
+  return toEquipment(equipment)
 }
 
 export async function updateEquipment(
   id: string,
   body: { name?: unknown; description?: unknown },
 ): Promise<Equipment> {
-  const updates: TablesUpdate<'equipment'> = {}
+  let name: string | undefined
   if (body.name !== undefined) {
-    const name = String(body.name).trim()
+    name = String(body.name).trim()
     if (!name) {
       serviceError('Equipment name cannot be empty', 400)
     }
-    updates.name = name
-  }
-  if (body.description !== undefined) {
-    updates.description = body.description === null ? null : String(body.description) || null
   }
 
-  if (Object.keys(updates).length === 0) {
+  const description = body.description === undefined
+    ? undefined
+    : body.description === null
+      ? null
+      : String(body.description) || null
+
+  if (name === undefined && description === undefined) {
     serviceError('No updatable fields provided', 400)
   }
 
-  const supabase = createSupabaseServerAdminClient()
-  const { data, error } = await supabase
-    .from('equipment')
-    .update(updates)
-    .eq('id', id)
-    .select('id, name, description, created_at')
-    .maybeSingle()
-
-  if (error) {
+  let rows: EquipmentRow[]
+  try {
+    rows = await sql`
+      UPDATE equipment
+      SET
+        name = CASE WHEN ${name === undefined} THEN name ELSE ${name ?? null} END,
+        description = CASE WHEN ${description === undefined} THEN description ELSE ${description ?? null} END
+      WHERE id = ${id}
+      RETURNING id, name, description, created_at
+    ` as EquipmentRow[]
+  } catch {
     serviceError('Internal server error', 500)
   }
-  if (!data) {
+
+  const equipment = rows[0]
+  if (!equipment) {
     serviceError('Equipment not found', 404)
   }
 
-  return toEquipment(data as EquipmentRow)
+  return toEquipment(equipment)
 }
 
 export async function deleteEquipment(id: string): Promise<void> {
-  const supabase = createSupabaseServerAdminClient()
-  const { data, error } = await supabase
-    .from('equipment')
-    .delete()
-    .eq('id', id)
-    .select('id')
-    .maybeSingle()
-
-  if (error) {
+  let rows: Array<{ id: string }>
+  try {
+    rows = await sql`
+      DELETE FROM equipment
+      WHERE id = ${id}
+      RETURNING id
+    ` as Array<{ id: string }>
+  } catch {
     serviceError('Internal server error', 500)
   }
-  if (!data) {
+
+  if (!rows[0]) {
     serviceError('Equipment not found', 404)
   }
 }
 
 export async function getRoomDefaultEquipment(roomId: string): Promise<Equipment[]> {
-  const supabase = await createSupabaseServerClient()
-  const { data, error } = await supabase
-    .from('room_default_equipment')
-    .select('equipment_id, equipment(id, name, description, created_at)')
-    .eq('room_id', roomId)
-
-  if (error) {
+  let rows: EquipmentRow[]
+  try {
+    rows = await sql`
+      SELECT equipment.id, equipment.name, equipment.description, equipment.created_at
+      FROM room_default_equipment
+      INNER JOIN equipment ON equipment.id = room_default_equipment.equipment_id
+      WHERE room_default_equipment.room_id = ${roomId}
+    ` as EquipmentRow[]
+  } catch {
     serviceError('Internal server error', 500)
   }
 
-  return ((data ?? []) as Array<RoomDefaultEquipmentRow & { equipment: EquipmentRow | null }>)
-    .map((row) => row.equipment)
-    .filter((e): e is EquipmentRow => e !== null)
-    .map(toEquipment)
+  return rows.map(toEquipment)
 }
 
 export async function setRoomDefaultEquipment(roomId: string, equipmentIds: string[]): Promise<void> {
-  const supabase = createSupabaseServerAdminClient()
-
   if (equipmentIds.length > 0) {
-    // Enforce exclusivity: reject any equipment already locked to a different room
-    const { data: existingDefaults, error: fetchError } = await supabase
-      .from('room_default_equipment')
-      .select('equipment_id, room_id')
-      .in('equipment_id', equipmentIds)
-
-    if (fetchError) {
+    let existingDefaults: RoomDefaultEquipmentRow[]
+    try {
+      existingDefaults = await sql`
+        SELECT equipment_id, room_id
+        FROM room_default_equipment
+        WHERE equipment_id = ANY(${equipmentIds})
+      ` as RoomDefaultEquipmentRow[]
+    } catch {
       serviceError('Internal server error', 500)
     }
 
-    const conflicts = ((existingDefaults ?? []) as Array<{ equipment_id: string; room_id: string }>)
-      .filter((row) => row.room_id !== roomId)
-
-    if (conflicts.length > 0) {
+    if (existingDefaults.some((row) => row.room_id !== roomId)) {
       serviceError(ERROR_CODES.EQUIPMENT_LOCKED_TO_ANOTHER_ROOM, 400)
     }
   }
 
-  // Delete existing defaults for this room
-  const { error: deleteError } = await supabase
-    .from('room_default_equipment')
-    .delete()
-    .eq('room_id', roomId)
-
-  if (deleteError) {
+  try {
+    await sql`
+      DELETE FROM room_default_equipment
+      WHERE room_id = ${roomId}
+    `
+  } catch {
     serviceError('Internal server error', 500)
   }
 
@@ -168,16 +175,12 @@ export async function setRoomDefaultEquipment(roomId: string, equipmentIds: stri
     return
   }
 
-  const inserts: TablesInsert<'room_default_equipment'>[] = equipmentIds.map((equipment_id) => ({
-    room_id: roomId,
-    equipment_id,
-  }))
-
-  const { error: insertError } = await supabase
-    .from('room_default_equipment')
-    .insert(inserts)
-
-  if (insertError) {
+  try {
+    await sql`
+      INSERT INTO room_default_equipment (room_id, equipment_id)
+      SELECT ${roomId}::uuid, UNNEST(${equipmentIds}::uuid[])
+    `
+  } catch {
     serviceError('Internal server error', 500)
   }
 }
