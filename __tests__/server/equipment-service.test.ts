@@ -5,6 +5,7 @@ import {
   createSqlMock,
   hasExactOrderBy,
   hasExactSelectColumns,
+  neonDbError,
   whereColumnHasOperator,
   whereConditionCount,
   whereHasColumn,
@@ -270,6 +271,87 @@ describe('equipment-service (Neon raw SQL)', () => {
       addRoomDefaultsDeleteHandler(() => [])
       addRoomDefaultsInsertHandler(() => { throw new Error('connection reset') })
       await expect(setRoomDefaultEquipment('room-1', ['eq-1'])).rejects.toMatchObject({ statusCode: 500 })
+    })
+
+    // Regression tests for PR #346's post-merge P1 review (Oiranca): the
+    // replacement DELETE + INSERT must run as a single atomic
+    // `sql.transaction([...])` call (never as two independent `sql` calls
+    // that can leave a room's defaults deleted with nothing replacing them
+    // if the INSERT fails), and a Postgres unique-violation surfacing from
+    // that transaction must map to EQUIPMENT_LOCKED_TO_ANOTHER_ROOM (400),
+    // not the generic 500.
+    describe('atomicity — replacement runs as a single transaction (rollback regression)', () => {
+      it('batches the DELETE and INSERT into exactly one sql.transaction([...]) call, not two independent sql calls', async () => {
+        addConflictHandler(() => [])
+        addRoomDefaultsDeleteHandler(() => [])
+        addRoomDefaultsInsertHandler(() => [])
+
+        const { setRoomDefaultEquipment } = await loadService()
+        await expect(setRoomDefaultEquipment('room-1', ['eq-1', 'eq-2'])).resolves.toBeUndefined()
+
+        // Structural proof of atomicity: exactly one transaction call...
+        expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
+        // ...batching exactly the DELETE and the INSERT together...
+        const batched = sqlMock.transaction.mock.calls[0]?.[0]
+        expect(Array.isArray(batched)).toBe(true)
+        expect(batched).toHaveLength(2)
+        // ...which is what actually dispatches the 2 underlying statements
+        // (conflict preflight + the 2 batched queries = 3 sql calls total).
+        expect(sqlMock.sql).toHaveBeenCalledTimes(3)
+      })
+
+      it('throws a 500 ServiceError when the transaction rejects, without ever un-batching into independent calls', async () => {
+        addConflictHandler(() => [])
+        addRoomDefaultsDeleteHandler(() => [])
+        addRoomDefaultsInsertHandler(() => { throw new Error('insert failed') })
+
+        const { setRoomDefaultEquipment } = await loadService()
+        await expect(setRoomDefaultEquipment('room-1', ['eq-1'])).rejects.toMatchObject({
+          name: 'ServiceError',
+          statusCode: 500,
+        })
+
+        // Still exactly one batched transaction call — a rejection must not
+        // cause a fallback to two separate un-batched sql calls.
+        expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
+        expect(sqlMock.transaction.mock.calls[0]?.[0]).toHaveLength(2)
+      })
+    })
+
+    describe('concurrency — unique-violation from the transaction maps to EQUIPMENT_LOCKED_TO_ANOTHER_ROOM', () => {
+      it('maps a 23505 unique-violation raised by the batched INSERT to 400 EQUIPMENT_LOCKED_TO_ANOTHER_ROOM, not a generic 500', async () => {
+        // Simulates the concurrent-request race the UNIQUE constraint (019)
+        // closes: the preflight SELECT sees no conflict (another request's
+        // write hasn't committed yet from this request's point of view),
+        // but the INSERT itself hits the database-level unique constraint.
+        addConflictHandler(() => [])
+        addRoomDefaultsDeleteHandler(() => [])
+        addRoomDefaultsInsertHandler(() => {
+          throw neonDbError(
+            '23505',
+            'duplicate key value violates unique constraint "room_default_equipment_equipment_id_key"',
+          )
+        })
+
+        const { setRoomDefaultEquipment } = await loadService()
+        await expect(setRoomDefaultEquipment('room-1', ['eq-1'])).rejects.toMatchObject({
+          statusCode: 400,
+          message: ERROR_CODES.EQUIPMENT_LOCKED_TO_ANOTHER_ROOM,
+        })
+      })
+
+      it('still maps a non-unique-violation transaction failure to the generic 500 (does not over-match on any thrown error)', async () => {
+        addConflictHandler(() => [])
+        addRoomDefaultsDeleteHandler(() => [])
+        addRoomDefaultsInsertHandler(() => {
+          throw neonDbError('23503', 'foreign key violation')
+        })
+
+        const { setRoomDefaultEquipment } = await loadService()
+        await expect(setRoomDefaultEquipment('room-1', ['eq-1'])).rejects.toMatchObject({
+          statusCode: 500,
+        })
+      })
     })
   })
 })
