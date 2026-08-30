@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import type { ServiceError } from '@/lib/server/service-error'
+import { createSqlMock, hasExactSelectColumns } from '../helpers/sql-mock'
 
 /**
  * CLUB EVENTS SERVICE TEST COVERAGE (OIR-203)
@@ -39,6 +40,15 @@ vi.mock('@/lib/club-time', () => ({
   getCurrentClubDate: vi.fn(() => '2026-04-15'),
   isValidDateOnlyString: vi.fn((s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s)),
 }))
+
+// club-events-service.ts (#304, still Supabase-based) reuses two functions
+// from events-service.ts (#303, migrated to raw Neon SQL) — `deleteEventCascade`
+// (called by deleteClubEvent) and `listEvents` (re-exported/tested directly
+// here). Both now hit the tagged-template `sql` client from lib/db/client.ts
+// instead of the Supabase admin client, so a Neon sql-mock is needed
+// alongside this file's existing Supabase mocks for those two code paths.
+const eventsServiceSqlMock = createSqlMock()
+vi.mock('@/lib/db/client', () => ({ sql: eventsServiceSqlMock.sql }))
 
 type EventRow = {
   id: string
@@ -288,6 +298,7 @@ async function loadEventsService() {
 describe('club-events-service', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    eventsServiceSqlMock.reset()
   })
 
   describe('createClubEvent', () => {
@@ -1968,19 +1979,52 @@ describe('club-events-service', () => {
     it('admin can delete a club event', async () => {
       const adminSession = createAdminSession()
       const mockSupabaseAdmin = buildSupabaseMock()
-      
+
       vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
         .mockReturnValue(mockSupabaseAdmin as any)
 
+      // deleteClubEvent's own Supabase existence check (above) is satisfied by
+      // buildSupabaseMock's default 'events' handling for id 'evt-1'. It then
+      // calls `deleteEventCascade(admin, id)` — since a real Supabase admin
+      // client is passed, the #303 dual-path fix routes this through
+      // `deleteEventCascadeSupabase` (still Supabase-based, #304 not started),
+      // NOT the Neon `sql` path. `eventsServiceSqlMock` handlers are therefore
+      // irrelevant to this test — no `sql\`...\`` call is ever made — and
+      // asserting on the Supabase mock's own call sites is what actually
+      // proves the cascade ran.
       const { deleteClubEvent } = await loadClubEventsService()
 
       await deleteClubEvent(adminSession, 'evt-1')
+
+      // `deleteEventCascadeSupabase` starts by fetching this event's room
+      // blocks (there are none, per buildSupabaseMock's default 'in' handler
+      // for `event_room_blocks`, so the reservation-cancellation loop and the
+      // 'tables' lookup are both skipped — see the dedicated test below for
+      // that branch) ...
+      expect(mockSupabaseAdmin.from).toHaveBeenCalledWith('event_room_blocks')
+      const blocksFromCall = mockSupabaseAdmin.from.mock.results[
+        mockSupabaseAdmin.from.mock.calls.findIndex((call) => call[0] === 'event_room_blocks')
+      ]
+      expect(blocksFromCall.value.select).toHaveBeenCalledWith('room_id, date, start_time, end_time')
+
+      // No blocks means no room lookup and no reservation cancellation.
+      expect(mockSupabaseAdmin.from).not.toHaveBeenCalledWith('tables')
+      expect(mockSupabaseAdmin.from).not.toHaveBeenCalledWith('reservations')
+
+      // ... then deletes the event row itself.
+      expect(mockSupabaseAdmin.from).toHaveBeenCalledWith('events')
+      const eventsFromCalls = mockSupabaseAdmin.from.mock.calls
+        .map((call, i) => ({ call, result: mockSupabaseAdmin.from.mock.results[i] }))
+        .filter(({ call }) => call[0] === 'events')
+      const deleteCall = eventsFromCalls.find(({ result }) => result.value.delete.mock.calls.length > 0)
+      expect(deleteCall).toBeDefined()
+      expect(deleteCall!.result.value.delete).toHaveBeenCalledTimes(1)
     })
 
     it('non-admin member gets 403 Forbidden on delete', async () => {
       const memberSession = createMemberSession()
       const mockSupabaseAdmin = buildSupabaseMock()
-      
+
       vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
         .mockReturnValue(mockSupabaseAdmin as any)
       vi.mocked(await import('@/lib/server/service-error')).serviceError
@@ -1995,6 +2039,109 @@ describe('club-events-service', () => {
       await expect(
         deleteClubEvent(memberSession, 'evt-1')
       ).rejects.toMatchObject({ statusCode: 403 })
+    })
+
+    it('cascades to cancel overlapping reservations for an event with a room block', async () => {
+      // `buildSupabaseMock`'s shared 'event_room_blocks' `.eq()` chain is not
+      // thenable (it always yields `undefined` data — see the note on the
+      // test above), so it can never exercise the reservation-cancellation
+      // branch of `deleteEventCascadeSupabase`. This test builds a dedicated,
+      // minimal admin mock — scoped to this test only — that returns a real
+      // room block and a real table id, so the reservations `.update()...`
+      // chain actually runs and can be asserted on.
+      const adminSession = createAdminSession()
+
+      const reservationsEqSpy = vi.fn()
+      const reservationsLtSpy = vi.fn()
+      const reservationsGtSpy = vi.fn()
+      const reservationsInSpy = vi.fn()
+      const reservationsUpdateSpy = vi.fn()
+      const eventsDeleteEqSpy = vi.fn(async () => ({ data: null, error: null }))
+
+      const reservationsChain: any = {
+        in: vi.fn((...args: unknown[]) => {
+          reservationsInSpy(...args)
+          return reservationsChain
+        }),
+        eq: vi.fn((...args: unknown[]) => {
+          reservationsEqSpy(...args)
+          return reservationsChain
+        }),
+        lt: vi.fn((...args: unknown[]) => {
+          reservationsLtSpy(...args)
+          return reservationsChain
+        }),
+        gt: vi.fn((...args: unknown[]) => {
+          reservationsGtSpy(...args)
+          return reservationsChain
+        }),
+        then: (onFulfilled: any) => onFulfilled({ data: null, error: null }),
+      }
+
+      const customAdmin = {
+        from: vi.fn((table: string) => {
+          if (table === 'events') {
+            return {
+              select: vi.fn(() => ({
+                eq: vi.fn(() => ({
+                  maybeSingle: vi.fn(async () => ({
+                    data: { id: 'evt-1', title_es: null, title_en: null },
+                    error: null,
+                  })),
+                })),
+              })),
+              delete: vi.fn(() => ({ eq: eventsDeleteEqSpy })),
+            }
+          }
+          if (table === 'event_room_blocks') {
+            return {
+              select: vi.fn(() => ({
+                eq: async () => ({
+                  data: [
+                    { room_id: 'room-1', date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00' },
+                  ],
+                  error: null,
+                }),
+              })),
+            }
+          }
+          if (table === 'tables') {
+            return {
+              select: vi.fn(() => ({
+                in: async () => ({ data: [{ id: 'table-1', room_id: 'room-1' }], error: null }),
+              })),
+            }
+          }
+          if (table === 'reservations') {
+            return {
+              update: vi.fn((data: unknown) => {
+                reservationsUpdateSpy(data)
+                return reservationsChain
+              }),
+            }
+          }
+          throw new Error(`customAdmin.from: unexpected table "${table}"`)
+        }),
+      }
+
+      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
+        .mockReturnValue(customAdmin as any)
+
+      const { deleteClubEvent } = await loadClubEventsService()
+
+      await deleteClubEvent(adminSession, 'evt-1')
+
+      // Cancellation update targets the room's table, the block's date/time
+      // window, and only active/pending reservations.
+      expect(reservationsUpdateSpy).toHaveBeenCalledWith({ status: 'cancelled' })
+      expect(reservationsInSpy).toHaveBeenCalledWith('table_id', ['table-1'])
+      expect(reservationsEqSpy).toHaveBeenCalledWith('date', '2026-04-20')
+      expect(reservationsLtSpy).toHaveBeenCalledWith('start_time', '22:00:00')
+      expect(reservationsGtSpy).toHaveBeenCalledWith('end_time', '18:00:00')
+      expect(reservationsInSpy).toHaveBeenCalledWith('status', ['active', 'pending'])
+
+      // The event row itself is still deleted afterwards.
+      expect(eventsDeleteEqSpy).toHaveBeenCalledWith('id', 'evt-1')
     })
   })
 
@@ -2055,52 +2202,47 @@ describe('club-events-service', () => {
 
   describe('listEvents (from events-service.ts)', () => {
     it('excludes landing-only rows (both title_es and title_en populated)', async () => {
-      const mockSupabaseClient = buildSupabaseMock()
-      mockSupabaseClient.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              or: vi.fn(function (filter: string) {
-                expect(filter).toContain('title_es')
-                expect(filter).toContain('title_en')
-                return {
-                  order: vi.fn(function () {
-                    return {
-                      order: vi.fn(async () => ({
-                        data: [
-                          {
-                            id: 'evt-internal-1',
-                            title: 'Internal Event',
-                            description: null,
-                            date: '2026-04-20',
-                            start_time: '18:00',
-                            end_time: '22:00',
-                            created_by: 'user-1',
-                            created_at: '2026-04-01T00:00:00Z',
-                          },
-                        ],
-                        error: null,
-                      })),
-                    }
-                  }),
-                }
-              }),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient
-        .mockResolvedValue(mockSupabaseClient as any)
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(buildSupabaseMock() as any)
+      // listEvents() (#303) no longer touches Supabase at all — it queries
+      // `WHERE title_es IS NULL OR title_en IS NULL` directly in Neon raw
+      // SQL, which is what actually implements the landing-row exclusion
+      // this test is named for (rather than a Supabase `.or()` filter).
+      const eventsSelectSpy = vi.fn(() => [
+        {
+          id: 'evt-internal-1',
+          title: 'Internal Event',
+          description: null,
+          date: '2026-04-20',
+          start_time: '18:00:00',
+          end_time: '22:00:00',
+          created_by: 'user-1',
+          created_at: '2026-04-01T00:00:00Z',
+        },
+      ])
+      eventsServiceSqlMock.addHandler({
+        name: 'SELECT events excluding landing rows (title_es/title_en IS NULL)',
+        verb: 'select',
+        match: (stmt) =>
+          stmt.table === 'events' &&
+          hasExactSelectColumns(stmt, 'id, title, description, date, start_time, end_time, created_by, created_at') &&
+          Boolean(stmt.whereClause?.includes('title_es')) &&
+          Boolean(stmt.whereClause?.includes('title_en')),
+        respond: eventsSelectSpy,
+      })
+      eventsServiceSqlMock.addHandler({
+        name: 'SELECT event_room_blocks for the listed events',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks',
+        respond: () => [],
+      })
 
       const { listEvents } = await loadEventsService()
 
       const result = await listEvents()
 
+      expect(eventsSelectSpy).toHaveBeenCalledTimes(1)
       expect(Array.isArray(result)).toBe(true)
+      expect(result).toHaveLength(1)
+      expect(result[0].id).toBe('evt-internal-1')
     })
   })
 

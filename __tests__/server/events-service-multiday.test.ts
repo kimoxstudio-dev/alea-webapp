@@ -1,12 +1,19 @@
 // @vitest-environment node
 /**
- * KIM-383: Multi-day event service tests
+ * KIM-383: Multi-day event service tests (Neon raw SQL — #303)
  *
- * Tests for createEvent / updateEvent using the new multi-block (schedules) path.
+ * Tests for createEvent / updateEvent using the multi-block (schedules) path.
+ * Rewritten off the `create_event_with_blocks` / `update_event_with_blocks`
+ * Supabase RPC mocks to the raw-SQL Neon implementation — those RPCs no
+ * longer exist; the same behavior is now plain sequential `sql` statements
+ * (see lib/server/events-service.ts's top-of-file comment).
+ *
  * Verifies:
- * - createEvent with schedules array calls create_event_with_blocks RPC
- * - createEvent with multiple schedules builds correct blocks payload
- * - updateEvent with schedules array calls update_event_with_blocks RPC
+ * - createEvent with schedules array inserts the event row + one
+ *   event_room_blocks row per roomed block, and cancels overlapping
+ *   reservations per block
+ * - createEvent with multiple schedules builds correct blocks/anchor
+ * - updateEvent with schedules array replaces blocks (delete-then-insert)
  * - Validation: each schedule entry must have a valid date
  * - Validation: time boundaries enforced per-block (whole-hour, end > start)
  * - schedules array is populated on the returned AdminEvent
@@ -14,85 +21,207 @@
  * - deleteEvent cancels reservations for every block date, not just the anchor date
  */
 
-import { describe, it, expect, vi, afterEach } from 'vitest'
-import type { ServiceError } from '@/lib/server/service-error'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  createSqlMock,
+  hasExactSelectColumns,
+  neonDbError,
+  whereColumnHasOperator,
+  whereConditionCount,
+  whereHasColumn,
+} from '../helpers/sql-mock'
 
-vi.mock('server-only', () => ({}))
+const sqlMock = createSqlMock()
 
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseServerAdminClient: vi.fn(),
-  createSupabaseServerClient: vi.fn(),
-}))
+vi.mock('@/lib/db/client', () => ({ sql: sqlMock.sql }))
 
-vi.mock('@/lib/server/service-error', () => ({
-  serviceError: vi.fn((message: string, statusCode: number) => {
-    const err = new Error(message) as ServiceError
-    err.name = 'ServiceError'
-    err.statusCode = statusCode
-    throw err
-  }),
-}))
-
-// ---------------------------------------------------------------------------
-// Mock builder
-// ---------------------------------------------------------------------------
-
-function makeBlock(overrides: Record<string, unknown> = {}) {
-  return {
-    id: 'block-1',
-    event_id: 'evt-1',
-    room_id: 'room-1',
-    date: '2026-07-10',
-    start_time: '18:00',
-    end_time: '22:00',
-    all_day: false,
-    ...overrides,
-  }
+async function loadService() {
+  vi.resetModules()
+  return import('@/lib/server/events-service')
 }
 
-function makeRpcResult(overrides: Record<string, unknown> = {}) {
+// ---------------------------------------------------------------------------
+// Row builders
+// ---------------------------------------------------------------------------
+
+function makeEventRow(overrides: Record<string, unknown> = {}) {
   return {
     id: 'evt-1',
     title: 'Multi-Day Event',
     description: null,
     date: '2026-07-10',
-    start_time: '18:00',
-    end_time: '22:00',
+    start_time: '18:00:00',
+    end_time: '22:00:00',
     created_by: null,
     created_at: '2026-07-01T00:00:00Z',
-    room_blocks: [
-      makeBlock(),
-      makeBlock({ id: 'block-2', date: '2026-07-11', start_time: '10:00', end_time: '14:00' }),
-    ],
     ...overrides,
   }
 }
 
-function buildMockAdmin() {
-  const fromMap: Record<string, unknown> = {}
-
-  const mock = {
-    from: vi.fn(function (table: string) {
-      return fromMap[table] ?? buildDefaultTable(table)
-    }),
-    rpc: vi.fn(),
+function makeBlockRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'block-1',
+    event_id: 'evt-1',
+    room_id: 'room-1',
+    date: '2026-07-10',
+    start_time: '18:00:00',
+    end_time: '22:00:00',
+    all_day: false,
+    ...overrides,
   }
+}
 
-  function buildDefaultTable(_table: string) {
-    return {
-      select: vi.fn().mockReturnThis(),
-      eq: vi.fn().mockReturnThis(),
-      in: vi.fn().mockReturnThis(),
-      lt: vi.fn().mockReturnThis(),
-      gt: vi.fn().mockReturnThis(),
-      update: vi.fn().mockReturnThis(),
-      delete: vi.fn().mockReturnThis(),
-      limit: vi.fn().mockResolvedValue({ data: [], error: null }),
-      maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
-    }
-  }
+// ---------------------------------------------------------------------------
+// Shared handler factories
+// ---------------------------------------------------------------------------
 
-  return mock
+/** INSERT INTO events (title, description, date, start_time, end_time, created_by) — multi-block create (6 bound values). */
+function addMultiBlockEventInsertHandler(respond: (values: unknown[]) => unknown) {
+  sqlMock.addHandler({
+    name: 'INSERT events (multi-block, 6 values incl. created_by)',
+    verb: 'insert',
+    match: (stmt) => stmt.table === 'events' && stmt.returning && stmt.values.length === 6,
+    respond: (stmt) => respond(stmt.values),
+  })
+}
+
+/** INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day) RETURNING ... */
+function addRoomBlockInsertHandler(respond: (values: unknown[]) => unknown) {
+  let callIndex = -1
+  sqlMock.addHandler({
+    name: 'INSERT event_room_blocks',
+    verb: 'insert',
+    match: (stmt) => stmt.table === 'event_room_blocks' && stmt.returning,
+    respond: (stmt) => {
+      callIndex += 1
+      return respond(stmt.values)
+    },
+  })
+  return () => callIndex
+}
+
+/** SELECT id FROM tables WHERE room_id = $1 (single room, cancellation preflight) */
+function addTablesBySingleRoomHandler(respond: () => unknown) {
+  sqlMock.addHandler({
+    name: 'SELECT tables by single room_id',
+    verb: 'select',
+    match: (stmt) =>
+      stmt.table === 'tables' &&
+      whereColumnHasOperator(stmt, 'room_id', '=') &&
+      !stmt.whereClause?.includes('any('),
+    respond,
+  })
+}
+
+/** UPDATE reservations SET status='cancelled' WHERE table_id = ANY(...) AND ... */
+function addReservationsCancelHandler(respond: () => unknown) {
+  sqlMock.addHandler({
+    name: 'UPDATE reservations cancel overlapping',
+    verb: 'update',
+    match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'table_id'),
+    respond,
+  })
+}
+
+/** SELECT title, description, date, start_time, end_time, title_es, title_en FROM events WHERE id=$1 LIMIT 1 (updateEvent's currentRows fetch) */
+function addCurrentEventHandler(respond: () => unknown) {
+  sqlMock.addHandler({
+    name: 'SELECT current event row for update',
+    verb: 'select',
+    match: (stmt) =>
+      stmt.table === 'events' &&
+      hasExactSelectColumns(stmt, 'title, description, date, start_time, end_time, title_es, title_en'),
+    respond,
+  })
+}
+
+/** UPDATE events SET title=,description=,date=,start_time=,end_time= WHERE id=... RETURNING ... (multi-block update) */
+function addMultiBlockEventUpdateHandler(respond: (values: unknown[]) => unknown) {
+  sqlMock.addHandler({
+    name: 'UPDATE events (multi-block)',
+    verb: 'update',
+    match: (stmt) =>
+      stmt.table === 'events' &&
+      stmt.returning &&
+      whereColumnHasOperator(stmt, 'id', '=') &&
+      whereConditionCount(stmt) === 1,
+    respond: (stmt) => respond(stmt.values),
+  })
+}
+
+/** DELETE FROM event_room_blocks WHERE event_id=$1 */
+function addBlocksDeleteHandler(respond: () => unknown) {
+  sqlMock.addHandler({
+    name: 'DELETE event_room_blocks WHERE event_id',
+    verb: 'delete',
+    match: (stmt) => stmt.table === 'event_room_blocks',
+    respond,
+  })
+}
+
+/** SELECT id, title_es, title_en FROM events WHERE id=$1 LIMIT 1 (deleteEvent's club-row guard) */
+function addDeleteGuardHandler(respond: () => unknown) {
+  sqlMock.addHandler({
+    name: 'SELECT id, title_es, title_en FROM events (deleteEvent guard)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'events' && hasExactSelectColumns(stmt, 'id, title_es, title_en'),
+    respond,
+  })
+}
+
+/** SELECT room_id, date, start_time, end_time FROM event_room_blocks WHERE event_id=$1 (deleteEventCascade's blocks fetch) */
+function addCascadeBlocksFetchHandler(respond: () => unknown) {
+  sqlMock.addHandler({
+    name: 'SELECT room_id, date, start_time, end_time FROM event_room_blocks (cascade)',
+    verb: 'select',
+    match: (stmt) =>
+      stmt.table === 'event_room_blocks' &&
+      hasExactSelectColumns(stmt, 'room_id, date, start_time, end_time'),
+    respond,
+  })
+}
+
+/** SELECT id, room_id FROM tables WHERE room_id = ANY(...) (deleteEventCascade's batched table lookup) */
+function addTablesByRoomIdsHandler(respond: () => unknown) {
+  sqlMock.addHandler({
+    name: 'SELECT id, room_id FROM tables WHERE room_id = ANY(...)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'tables' && Boolean(stmt.whereClause?.includes('any(')),
+    respond,
+  })
+}
+
+/** DELETE FROM events WHERE id=$1 (deleteEventCascade's final step) */
+function addEventsDeleteHandler(respond: () => unknown) {
+  sqlMock.addHandler({
+    name: 'DELETE events WHERE id',
+    verb: 'delete',
+    match: (stmt) => stmt.table === 'events',
+    respond,
+  })
+}
+
+/** SELECT event_id FROM event_room_blocks WHERE room_id=... AND date=... AND start_time<... AND end_time>... (listEventsBlockingRoom) */
+function addBlockingRoomEventIdsHandler(respond: () => unknown) {
+  sqlMock.addHandler({
+    name: 'SELECT event_id FROM event_room_blocks (listEventsBlockingRoom)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, 'event_id'),
+    respond,
+  })
+}
+
+/** SELECT id, title, description, date, start_time, end_time, created_by, created_at FROM events WHERE id = ANY(...) (listEventsBlockingRoom) */
+function addEventsByIdsHandler(respond: () => unknown) {
+  sqlMock.addHandler({
+    name: 'SELECT events WHERE id = ANY(...)',
+    verb: 'select',
+    match: (stmt) =>
+      stmt.table === 'events' &&
+      Boolean(stmt.whereClause?.includes('any(')) &&
+      hasExactSelectColumns(stmt, 'id, title, description, date, start_time, end_time, created_by, created_at'),
+    respond,
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -100,19 +229,20 @@ function buildMockAdmin() {
 // ---------------------------------------------------------------------------
 
 describe('events-service — createEvent multi-day (schedules)', () => {
-  afterEach(() => {
+  beforeEach(() => {
     vi.resetModules()
-    vi.clearAllMocks()
+    sqlMock.reset()
   })
 
-  it('calls create_event_with_blocks when schedules array is provided', async () => {
-    const mock = buildMockAdmin()
-    mock.rpc.mockResolvedValueOnce({ data: makeRpcResult(), error: null })
+  it('inserts the event row and one event_room_blocks row per block when schedules array is provided', async () => {
+    addMultiBlockEventInsertHandler(() => [makeEventRow()])
+    addRoomBlockInsertHandler((values) => [
+      makeBlockRow({ id: `block-${values[1]}`, date: values[2], start_time: values[3], end_time: values[4] }),
+    ])
+    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+    addReservationsCancelHandler(() => [])
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { createEvent } = await import('@/lib/server/events-service')
+    const { createEvent } = await loadService()
 
     const result = await createEvent({
       title: 'Multi-Day Event',
@@ -122,32 +252,21 @@ describe('events-service — createEvent multi-day (schedules)', () => {
       ],
     })
 
-    expect(mock.rpc).toHaveBeenCalledWith(
-      'create_event_with_blocks',
-      expect.objectContaining({
-        p_title: 'Multi-Day Event',
-        p_description: null,
-        p_created_by: null,
-        p_blocks: expect.arrayContaining([
-          expect.objectContaining({ date: '2026-07-10', start_time: '18:00', end_time: '22:00' }),
-          expect.objectContaining({ date: '2026-07-11', start_time: '10:00', end_time: '14:00' }),
-        ]),
-      })
-    )
-
     expect(result.schedules).toHaveLength(2)
     expect(result.schedules[0].date).toBe('2026-07-10')
     expect(result.schedules[1].date).toBe('2026-07-11')
+    expect(sqlMock.sql).toHaveBeenCalled()
   })
 
-  it('populates schedules and roomBlocks from RPC room_blocks response', async () => {
-    const mock = buildMockAdmin()
-    mock.rpc.mockResolvedValueOnce({ data: makeRpcResult(), error: null })
+  it('populates schedules and roomBlocks from the inserted block rows', async () => {
+    addMultiBlockEventInsertHandler(() => [makeEventRow()])
+    addRoomBlockInsertHandler((values) => [
+      makeBlockRow({ date: values[2] as string, start_time: values[3] as string, end_time: values[4] as string }),
+    ])
+    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+    addReservationsCancelHandler(() => [])
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { createEvent } = await import('@/lib/server/events-service')
+    const { createEvent } = await loadService()
 
     const result = await createEvent({
       title: 'Multi-Day Event',
@@ -164,144 +283,83 @@ describe('events-service — createEvent multi-day (schedules)', () => {
   })
 
   it('sets allDay=true for a block when allDay flag is set', async () => {
-    const allDayRpcResult = makeRpcResult({
-      room_blocks: [
-        makeBlock({ date: '2026-07-10', start_time: '00:00', end_time: '23:59', all_day: true }),
-      ],
-    })
-    const mock = buildMockAdmin()
-    mock.rpc.mockResolvedValueOnce({ data: allDayRpcResult, error: null })
+    addMultiBlockEventInsertHandler(() => [makeEventRow({ date: '2026-07-10', start_time: '00:00:00', end_time: '23:59:00' })])
+    addRoomBlockInsertHandler((values) => [
+      makeBlockRow({ date: values[2] as string, start_time: values[3] as string, end_time: values[4] as string, all_day: values[5] as boolean }),
+    ])
+    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+    addReservationsCancelHandler(() => [])
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { createEvent } = await import('@/lib/server/events-service')
+    const { createEvent } = await loadService()
 
     const result = await createEvent({
       title: 'All Day Event',
-      schedules: [
-        { date: '2026-07-10', roomId: 'room-1', allDay: true, startTime: '', endTime: '' },
-      ],
+      schedules: [{ date: '2026-07-10', roomId: 'room-1', allDay: true, startTime: '', endTime: '' }],
     })
-
-    expect(mock.rpc).toHaveBeenCalledWith(
-      'create_event_with_blocks',
-      expect.objectContaining({
-        p_created_by: null,
-        p_blocks: expect.arrayContaining([
-          expect.objectContaining({ all_day: true, start_time: '00:00', end_time: '23:59' }),
-        ]),
-      })
-    )
 
     expect(result.allDay).toBe(true)
     expect(result.schedules[0].allDay).toBe(true)
   })
 
   it('rejects a schedule block with invalid date format', async () => {
-    const mock = buildMockAdmin()
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    const { createEvent } = await loadService()
 
-    const { createEvent } = await import('@/lib/server/events-service')
-
-    let caught: ServiceError | undefined
-    try {
-      await createEvent({
+    await expect(
+      createEvent({
         title: 'Bad Date Event',
-        schedules: [
-          { date: 'not-a-date', startTime: '18:00', endTime: '22:00', roomId: null, allDay: false },
-        ],
-      })
-    } catch (err) {
-      caught = err as ServiceError
-    }
+        schedules: [{ date: 'not-a-date', startTime: '18:00', endTime: '22:00', roomId: null, allDay: false }],
+      }),
+    ).rejects.toMatchObject({ statusCode: 400, message: expect.stringMatching(/date must be in YYYY-MM-DD format/) })
 
-    expect(caught).toBeDefined()
-    expect(caught?.statusCode).toBe(400)
-    expect(caught?.message).toMatch(/date must be in YYYY-MM-DD format/)
-    expect(mock.rpc).not.toHaveBeenCalled()
+    expect(sqlMock.sql).not.toHaveBeenCalled()
   })
 
   it('rejects a schedule block where endTime <= startTime', async () => {
-    const mock = buildMockAdmin()
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    const { createEvent } = await loadService()
 
-    const { createEvent } = await import('@/lib/server/events-service')
-
-    let caught: ServiceError | undefined
-    try {
-      await createEvent({
+    await expect(
+      createEvent({
         title: 'Bad Time Event',
-        schedules: [
-          { date: '2026-07-10', startTime: '22:00', endTime: '18:00', roomId: null, allDay: false },
-        ],
-      })
-    } catch (err) {
-      caught = err as ServiceError
-    }
+        schedules: [{ date: '2026-07-10', startTime: '22:00', endTime: '18:00', roomId: null, allDay: false }],
+      }),
+    ).rejects.toMatchObject({ statusCode: 400, message: expect.stringMatching(/endTime must be after startTime/) })
 
-    expect(caught).toBeDefined()
-    expect(caught?.statusCode).toBe(400)
-    expect(caught?.message).toMatch(/endTime must be after startTime/)
-    expect(mock.rpc).not.toHaveBeenCalled()
+    expect(sqlMock.sql).not.toHaveBeenCalled()
   })
 
   it('rejects a schedule block with non-whole-hour start time', async () => {
-    const mock = buildMockAdmin()
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    const { createEvent } = await loadService()
 
-    const { createEvent } = await import('@/lib/server/events-service')
-
-    let caught: ServiceError | undefined
-    try {
-      await createEvent({
+    await expect(
+      createEvent({
         title: 'Bad Time Event',
-        schedules: [
-          { date: '2026-07-10', startTime: '18:30', endTime: '22:00', roomId: null, allDay: false },
-        ],
-      })
-    } catch (err) {
-      caught = err as ServiceError
-    }
+        schedules: [{ date: '2026-07-10', startTime: '18:30', endTime: '22:00', roomId: null, allDay: false }],
+      }),
+    ).rejects.toMatchObject({
+      statusCode: 400,
+      message: expect.stringMatching(/startTime must be on a whole-hour boundary/),
+    })
 
-    expect(caught).toBeDefined()
-    expect(caught?.statusCode).toBe(400)
-    expect(caught?.message).toMatch(/startTime must be on a whole-hour boundary/)
-    expect(mock.rpc).not.toHaveBeenCalled()
+    expect(sqlMock.sql).not.toHaveBeenCalled()
   })
 
   it('accepts schedules with null roomId (no room blocked) — returns synthetic schedule entry', async () => {
-    const noRoomResult = makeRpcResult({
-      room_blocks: [],
-    })
-    const mock = buildMockAdmin()
-    mock.rpc.mockResolvedValueOnce({ data: noRoomResult, error: null })
+    addMultiBlockEventInsertHandler(() => [makeEventRow()])
+    const blockInsertSpy = vi.fn(() => [])
+    addRoomBlockInsertHandler(blockInsertSpy)
+    const cancelSpy = vi.fn(() => [])
+    addReservationsCancelHandler(cancelSpy)
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { createEvent } = await import('@/lib/server/events-service')
+    const { createEvent } = await loadService()
 
     const result = await createEvent({
       title: 'No Room Event',
-      schedules: [
-        { date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: null, allDay: false },
-      ],
+      schedules: [{ date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: null, allDay: false }],
     })
 
-    expect(mock.rpc).toHaveBeenCalledWith(
-      'create_event_with_blocks',
-      expect.objectContaining({
-        p_created_by: null,
-        p_blocks: expect.arrayContaining([
-          expect.objectContaining({ room_id: null }),
-        ]),
-      })
-    )
     // No real room blocks (null-room blocks are not stored as room blocks)
+    expect(blockInsertSpy).not.toHaveBeenCalled()
+    expect(cancelSpy).not.toHaveBeenCalled()
     expect(result.roomBlocks).toHaveLength(0)
     // Service synthesises ONE schedule entry from the event anchor when no room blocks exist
     expect(result.schedules).toHaveLength(1)
@@ -311,121 +369,72 @@ describe('events-service — createEvent multi-day (schedules)', () => {
     expect(result.schedules[0].endTime).toBe('22:00')
   })
 
-  it('throws 500 when create_event_with_blocks RPC fails', async () => {
-    const mock = buildMockAdmin()
-    mock.rpc.mockResolvedValueOnce({ data: null, error: { code: 'INTERNAL_ERROR', message: 'DB error' } })
+  it('throws 500 when the events insert fails', async () => {
+    addMultiBlockEventInsertHandler(() => {
+      throw new Error('DB error')
+    })
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    const { createEvent } = await loadService()
 
-    const { createEvent } = await import('@/lib/server/events-service')
-
-    let caught: ServiceError | undefined
-    try {
-      await createEvent({
+    await expect(
+      createEvent({
         title: 'Failing Event',
-        schedules: [
-          { date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', allDay: false },
-        ],
-      })
-    } catch (err) {
-      caught = err as ServiceError
-    }
-
-    expect(caught?.statusCode).toBe(500)
+        schedules: [{ date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', allDay: false }],
+      }),
+    ).rejects.toMatchObject({ statusCode: 500 })
   })
 
   it('rejects empty schedules array with 400', async () => {
-    const mock = buildMockAdmin()
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    const { createEvent } = await loadService()
 
-    const { createEvent } = await import('@/lib/server/events-service')
-
-    let caught: ServiceError | undefined
-    try {
-      await createEvent({ title: 'Empty Schedules', schedules: [] })
-    } catch (err) {
-      caught = err as ServiceError
-    }
-
-    expect(caught).toBeDefined()
-    expect(caught?.statusCode).toBe(400)
-    expect(caught?.message).toMatch(/At least one schedule is required/)
-    expect(mock.rpc).not.toHaveBeenCalled()
+    await expect(createEvent({ title: 'Empty Schedules', schedules: [] })).rejects.toMatchObject({
+      statusCode: 400,
+      message: expect.stringMatching(/At least one schedule is required/),
+    })
+    expect(sqlMock.sql).not.toHaveBeenCalled()
   })
 
   it('rejects schedules array with more than 366 entries with 400', async () => {
-    const mock = buildMockAdmin()
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    const { createEvent } = await loadService()
 
-    const { createEvent } = await import('@/lib/server/events-service')
-
-    // Build 367 schedule entries
     const schedules = Array.from({ length: 367 }, (_, i) => {
       const dateStr = new Date(2026, 0, 1 + (i % 365)).toISOString().slice(0, 10)
       return { date: dateStr, startTime: '10:00', endTime: '12:00', roomId: 'room-1', allDay: false }
     })
 
-    let caught: ServiceError | undefined
-    try {
-      await createEvent({ title: 'Too Many Blocks', schedules })
-    } catch (err) {
-      caught = err as ServiceError
-    }
-
-    expect(caught).toBeDefined()
-    expect(caught?.statusCode).toBe(400)
-    expect(caught?.message).toMatch(/Too many schedule blocks/)
-    expect(mock.rpc).not.toHaveBeenCalled()
+    await expect(createEvent({ title: 'Too Many Blocks', schedules })).rejects.toMatchObject({
+      statusCode: 400,
+      message: expect.stringMatching(/Too many schedule blocks/),
+    })
+    expect(sqlMock.sql).not.toHaveBeenCalled()
   })
 
-  it('passes p_created_by when createdBy is provided in body', async () => {
-    const mock = buildMockAdmin()
-    mock.rpc.mockResolvedValueOnce({
-      data: makeRpcResult({ created_by: 'user-abc' }),
-      error: null,
-    })
+  it('passes createdBy through to the inserted event row when provided in body', async () => {
+    addMultiBlockEventInsertHandler((values) => [makeEventRow({ created_by: values[5] })])
+    addRoomBlockInsertHandler(() => [makeBlockRow()])
+    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+    addReservationsCancelHandler(() => [])
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    const { createEvent } = await loadService()
 
-    const { createEvent } = await import('@/lib/server/events-service')
-
-    await createEvent({
+    const result = await createEvent({
       title: 'Creator Event',
       createdBy: 'user-abc',
-      schedules: [
-        { date: '2026-09-01', startTime: '10:00', endTime: '12:00', roomId: 'room-1', allDay: false },
-      ],
+      schedules: [{ date: '2026-09-01', startTime: '10:00', endTime: '12:00', roomId: 'room-1', allDay: false }],
     })
 
-    expect(mock.rpc).toHaveBeenCalledWith(
-      'create_event_with_blocks',
-      expect.objectContaining({ p_created_by: 'user-abc' })
-    )
+    expect(result.createdBy).toBe('user-abc')
   })
 
   it('derives anchor date as earliest block and sorts schedules ascending when blocks are submitted out of order', async () => {
-    // Blocks returned by RPC in non-chronological order: day 3, day 1, day 2
-    const rpcResult = makeRpcResult({
-      date: '2026-08-01',
-      start_time: '09:00',
-      end_time: '11:00',
-      room_blocks: [
-        makeBlock({ id: 'b3', date: '2026-08-03', start_time: '14:00', end_time: '16:00' }),
-        makeBlock({ id: 'b1', date: '2026-08-01', start_time: '09:00', end_time: '11:00' }),
-        makeBlock({ id: 'b2', date: '2026-08-02', start_time: '10:00', end_time: '12:00' }),
-      ],
-    })
-    const mock = buildMockAdmin()
-    mock.rpc.mockResolvedValueOnce({ data: rpcResult, error: null })
+    addMultiBlockEventInsertHandler((values) => [makeEventRow({ date: values[2], start_time: values[3], end_time: values[4] })])
+    addRoomBlockInsertHandler((values) => [
+      makeBlockRow({ id: `b-${values[2]}`, date: values[2] as string, start_time: values[3] as string, end_time: values[4] as string }),
+    ])
+    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+    addReservationsCancelHandler(() => [])
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { createEvent } = await import('@/lib/server/events-service')
+    const { createEvent } = await loadService()
 
     const result = await createEvent({
       title: 'Out Of Order',
@@ -446,22 +455,14 @@ describe('events-service — createEvent multi-day (schedules)', () => {
   })
 
   it('handles multi-room single-day event (two rooms, same day)', async () => {
-    const rpcResult = makeRpcResult({
-      date: '2026-10-01',
-      start_time: '10:00',
-      end_time: '14:00',
-      room_blocks: [
-        makeBlock({ id: 'b1', room_id: 'room-A', date: '2026-10-01', start_time: '10:00', end_time: '14:00' }),
-        makeBlock({ id: 'b2', room_id: 'room-B', date: '2026-10-01', start_time: '10:00', end_time: '14:00' }),
-      ],
-    })
-    const mock = buildMockAdmin()
-    mock.rpc.mockResolvedValueOnce({ data: rpcResult, error: null })
+    addMultiBlockEventInsertHandler(() => [makeEventRow({ date: '2026-10-01', start_time: '10:00:00', end_time: '14:00:00' })])
+    addRoomBlockInsertHandler((values) => [
+      makeBlockRow({ id: `b-${values[1]}`, room_id: values[1] as string, date: '2026-10-01', start_time: '10:00:00', end_time: '14:00:00' }),
+    ])
+    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+    addReservationsCancelHandler(() => [])
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { createEvent } = await import('@/lib/server/events-service')
+    const { createEvent } = await loadService()
 
     const result = await createEvent({
       title: 'Multi-Room Single Day',
@@ -479,28 +480,381 @@ describe('events-service — createEvent multi-day (schedules)', () => {
     expect(roomIds).toContain('room-B')
   })
 
-  it('maps PG check-constraint error 23514 to 400', async () => {
-    const mock = buildMockAdmin()
-    mock.rpc.mockResolvedValueOnce({ data: null, error: { code: '23514', message: 'check constraint' } })
+  it('maps a PG check-constraint error (23514) from the events insert to 400', async () => {
+    addMultiBlockEventInsertHandler(() => {
+      throw neonDbError('23514', 'check constraint violated')
+    })
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    const { createEvent } = await loadService()
 
-    const { createEvent } = await import('@/lib/server/events-service')
-
-    let caught: ServiceError | undefined
-    try {
-      await createEvent({
+    await expect(
+      createEvent({
         title: 'Constraint Fail',
+        schedules: [{ date: '2026-07-10', startTime: '10:00', endTime: '12:00', roomId: 'room-1', allDay: false }],
+      }),
+    ).rejects.toMatchObject({ statusCode: 400 })
+  })
+
+  it('maps a unique-violation (23505) from a duplicate schedule block insert to 400 (#303 code-review high-effort round)', async () => {
+    // event_room_blocks has a UNIQUE index on (event_id, room_id, date,
+    // start_time, end_time) — see lib/db/schema/009_event_room_blocks.sql.
+    // A duplicate block insert must 400 via mapEventWriteError, not fall
+    // through to the generic 500.
+    addMultiBlockEventInsertHandler(() => [makeEventRow()])
+    addRoomBlockInsertHandler(() => {
+      throw neonDbError('23505', 'duplicate key value violates unique constraint')
+    })
+    // rollbackPartialMultiBlockWrite(deleteEvent: true) fires after the
+    // block insert fails — this handler is what it needs for its own
+    // DELETE FROM events step (insertedBlockIds/cancelledReservations are
+    // both empty here, so no other rollback statement is issued).
+    sqlMock.addHandler({
+      name: 'DELETE events WHERE id (rollback, createEvent)',
+      verb: 'delete',
+      match: (stmt) => stmt.table === 'events',
+      respond: () => [],
+    })
+
+    const { createEvent } = await loadService()
+
+    await expect(
+      createEvent({
+        title: 'Duplicate Block Event',
+        schedules: [{ date: '2026-07-10', startTime: '10:00', endTime: '12:00', roomId: 'room-1', allDay: false }],
+      }),
+    ).rejects.toMatchObject({ statusCode: 400 })
+  })
+
+  it('preserves a roomless block (roomId: null) as a non-persisted schedule entry instead of dropping it (#303 code-review post-PR round, Finding 1)', async () => {
+    addMultiBlockEventInsertHandler(() => [makeEventRow({ date: '2026-07-10', start_time: '10:00:00', end_time: '12:00:00' })])
+    const blockInsertSpy = vi.fn((values: unknown[]) => [
+      makeBlockRow({
+        id: 'block-roomed-1',
+        room_id: values[1] as string,
+        date: values[2] as string,
+        start_time: values[3] as string,
+        end_time: values[4] as string,
+      }),
+    ])
+    addRoomBlockInsertHandler(blockInsertSpy)
+    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+    addReservationsCancelHandler(() => [])
+
+    const { createEvent } = await loadService()
+
+    const result = await createEvent({
+      title: 'Mixed Roomless Event',
+      schedules: [
+        { date: '2026-07-10', startTime: '10:00', endTime: '12:00', roomId: null, allDay: false },
+        { date: '2026-07-11', startTime: '14:00', endTime: '16:00', roomId: 'room-1', allDay: false },
+      ],
+    })
+
+    // Only the room-assigned block issues an INSERT — event_room_blocks.room_id
+    // is NOT NULL, so a roomless block can never become a persisted row.
+    expect(blockInsertSpy).toHaveBeenCalledTimes(1)
+    expect(result.roomBlocks).toHaveLength(1)
+    expect(result.roomBlocks[0].roomId).toBe('room-1')
+
+    // The roomless block must still appear in schedules — as a synthetic,
+    // non-persisted entry (id: undefined, roomId: null) — not be silently
+    // dropped from the response entirely.
+    expect(result.schedules).toHaveLength(2)
+    const roomlessEntry = result.schedules.find((s) => s.roomId === null)
+    expect(roomlessEntry).toBeDefined()
+    expect(roomlessEntry!.id).toBeUndefined()
+    expect(roomlessEntry!.date).toBe('2026-07-10')
+    expect(roomlessEntry!.startTime).toBe('10:00')
+    expect(roomlessEntry!.endTime).toBe('12:00')
+
+    const roomedEntry = result.schedules.find((s) => s.roomId === 'room-1')
+    expect(roomedEntry).toBeDefined()
+    expect(roomedEntry!.date).toBe('2026-07-11')
+  })
+
+  // -------------------------------------------------------------------------
+  // Compensating rollback (#303 code-review Finding 2) — createEvent path.
+  //
+  // These loops are NOT wrapped in a single sql.transaction() (see
+  // lib/server/events-service.ts's rollbackPartialMultiBlockWrite doc
+  // comment): each iteration branches on the previous query's runtime
+  // result, which Neon's HTTP driver's batched transaction() can't express.
+  // If a later block's INSERT fails, rollbackPartialMultiBlockWrite must:
+  // - delete every event_room_blocks row inserted so far in this call
+  // - reactivate every reservation cancelled so far in this call
+  // - (createEvent only) delete the now-orphaned event row
+  // -------------------------------------------------------------------------
+  describe('compensating rollback on partial multi-block write failure', () => {
+    it('rolls back inserted blocks, reactivated reservations, and the orphaned event row when a later block INSERT fails', async () => {
+      addMultiBlockEventInsertHandler(() => [makeEventRow({ id: 'evt-rollback-1' })])
+
+      let insertCallIndex = 0
+      sqlMock.addHandler({
+        name: 'INSERT event_room_blocks (fails on 2nd block)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'event_room_blocks' && stmt.returning,
+        respond: (stmt) => {
+          insertCallIndex += 1
+          if (insertCallIndex === 2) {
+            throw new Error('connection reset mid-insert')
+          }
+          return [
+            makeBlockRow({
+              id: 'block-1',
+              date: stmt.values[2] as string,
+              start_time: stmt.values[3] as string,
+              end_time: stmt.values[4] as string,
+            }),
+          ]
+        },
+      })
+
+      addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+      sqlMock.addHandler({
+        name: 'UPDATE reservations cancel overlapping (RETURNING id)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'table_id'),
+        respond: () => [{ id: 'res-1' }],
+      })
+
+      const rollbackBlocksDeleteSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE id = ANY(...) (rollback)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'id'),
+        respond: rollbackBlocksDeleteSpy,
+      })
+
+      const rollbackReactivateSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'UPDATE reservations SET active WHERE id = ANY(...) (rollback)',
+        verb: 'update',
+        match: (stmt) =>
+          stmt.table === 'reservations' && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'table_id'),
+        respond: rollbackReactivateSpy,
+      })
+
+      const rollbackEventDeleteSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'DELETE events WHERE id (rollback, createEvent)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'events',
+        respond: rollbackEventDeleteSpy,
+      })
+
+      const { createEvent } = await loadService()
+
+      await expect(
+        createEvent({
+          title: 'Rollback Event',
+          schedules: [
+            { date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', allDay: false },
+            { date: '2026-07-11', startTime: '10:00', endTime: '14:00', roomId: 'room-1', allDay: false },
+          ],
+        }),
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      // Rollback deletes exactly the one block inserted before the failure.
+      expect(rollbackBlocksDeleteSpy).toHaveBeenCalledTimes(1)
+      expect(rollbackBlocksDeleteSpy.mock.calls[0][0].values).toEqual([['block-1']])
+
+      // Rollback reactivates exactly the one reservation cancelled before the failure.
+      expect(rollbackReactivateSpy).toHaveBeenCalledTimes(1)
+      expect(rollbackReactivateSpy.mock.calls[0][0].values).toEqual([['res-1']])
+
+      // createEvent's rollback also deletes the now-orphaned event row.
+      expect(rollbackEventDeleteSpy).toHaveBeenCalledTimes(1)
+      expect(rollbackEventDeleteSpy.mock.calls[0][0].values).toEqual(['evt-rollback-1'])
+    })
+
+    it('does not attempt any rollback deletes/reactivations when every block insert succeeds', async () => {
+      addMultiBlockEventInsertHandler(() => [makeEventRow({ id: 'evt-ok-1' })])
+      addRoomBlockInsertHandler((values) => [
+        makeBlockRow({ id: `block-${values[2]}`, date: values[2] as string, start_time: values[3] as string, end_time: values[4] as string }),
+      ])
+      addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+      sqlMock.addHandler({
+        name: 'UPDATE reservations cancel overlapping (RETURNING id)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'table_id'),
+        respond: () => [{ id: 'res-1' }],
+      })
+
+      const rollbackBlocksDeleteSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE id = ANY(...) (rollback)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'id'),
+        respond: rollbackBlocksDeleteSpy,
+      })
+      const rollbackEventDeleteSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'DELETE events WHERE id (rollback, createEvent)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'events',
+        respond: rollbackEventDeleteSpy,
+      })
+
+      const { createEvent } = await loadService()
+
+      await createEvent({
+        title: 'No Rollback Needed',
         schedules: [
-          { date: '2026-07-10', startTime: '10:00', endTime: '12:00', roomId: 'room-1', allDay: false },
+          { date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', allDay: false },
+          { date: '2026-07-11', startTime: '10:00', endTime: '14:00', roomId: 'room-1', allDay: false },
         ],
       })
-    } catch (err) {
-      caught = err as ServiceError
-    }
 
-    expect(caught?.statusCode).toBe(400)
+      expect(rollbackBlocksDeleteSpy).not.toHaveBeenCalled()
+      expect(rollbackEventDeleteSpy).not.toHaveBeenCalled()
+    })
+
+    it('restores a cancelled reservation to its own original status (pending), not hardcoded active (#303 code-review post-PR round, Finding 5)', async () => {
+      addMultiBlockEventInsertHandler(() => [makeEventRow({ id: 'evt-rollback-status-1' })])
+
+      let insertCallIndex = 0
+      sqlMock.addHandler({
+        name: 'INSERT event_room_blocks (fails on 2nd block)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'event_room_blocks' && stmt.returning,
+        respond: (stmt) => {
+          insertCallIndex += 1
+          if (insertCallIndex === 2) throw new Error('connection reset mid-insert')
+          return [makeBlockRow({ id: 'block-1', date: stmt.values[2] as string, start_time: stmt.values[3] as string, end_time: stmt.values[4] as string })]
+        },
+      })
+
+      addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+      // The cancellation RETURNING now includes each reservation's
+      // pre-cancellation status — this one was originally 'pending'.
+      sqlMock.addHandler({
+        name: 'UPDATE reservations cancel overlapping (RETURNING id, status)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'table_id'),
+        respond: () => [{ id: 'res-pending-1', status: 'pending' }],
+      })
+
+      // The SET value ('active'/'pending') is a literal, not a bound param —
+      // distinguish the two rollback branches by that literal text, not by
+      // WHERE shape (both share the same id = ANY(...) AND status = 'cancelled' WHERE).
+      const restoreToPendingSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: "UPDATE reservations SET status = 'pending' (rollback)",
+        verb: 'update',
+        match: (stmt) =>
+          stmt.table === 'reservations' && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'table_id') &&
+          stmt.text.includes("status = 'pending'"),
+        respond: (stmt) => restoreToPendingSpy(stmt.values),
+      })
+      const restoreToActiveSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: "UPDATE reservations SET status = 'active' (rollback)",
+        verb: 'update',
+        match: (stmt) =>
+          stmt.table === 'reservations' && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'table_id') &&
+          stmt.text.includes("status = 'active'"),
+        respond: (stmt) => restoreToActiveSpy(stmt.values),
+      })
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE id = ANY(...) (rollback)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'id'),
+        respond: () => [],
+      })
+      sqlMock.addHandler({
+        name: 'DELETE events WHERE id (rollback, createEvent)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'events',
+        respond: () => [],
+      })
+
+      const { createEvent } = await loadService()
+
+      await expect(
+        createEvent({
+          title: 'Rollback Status Event',
+          schedules: [
+            { date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', allDay: false },
+            { date: '2026-07-11', startTime: '10:00', endTime: '14:00', roomId: 'room-1', allDay: false },
+          ],
+        }),
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      expect(restoreToPendingSpy).toHaveBeenCalledTimes(1)
+      expect(restoreToPendingSpy.mock.calls[0][0]).toEqual([['res-pending-1']])
+      expect(restoreToActiveSpy).not.toHaveBeenCalled()
+    })
+
+    it('restores a cancelled reservation to active when that was its own original status (#303 code-review post-PR round, Finding 5)', async () => {
+      addMultiBlockEventInsertHandler(() => [makeEventRow({ id: 'evt-rollback-status-2' })])
+
+      let insertCallIndex = 0
+      sqlMock.addHandler({
+        name: 'INSERT event_room_blocks (fails on 2nd block)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'event_room_blocks' && stmt.returning,
+        respond: (stmt) => {
+          insertCallIndex += 1
+          if (insertCallIndex === 2) throw new Error('connection reset mid-insert')
+          return [makeBlockRow({ id: 'block-1', date: stmt.values[2] as string, start_time: stmt.values[3] as string, end_time: stmt.values[4] as string })]
+        },
+      })
+
+      addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+      sqlMock.addHandler({
+        name: 'UPDATE reservations cancel overlapping (RETURNING id, status)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'table_id'),
+        respond: () => [{ id: 'res-active-1', status: 'active' }],
+      })
+
+      const restoreToPendingSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: "UPDATE reservations SET status = 'pending' (rollback)",
+        verb: 'update',
+        match: (stmt) =>
+          stmt.table === 'reservations' && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'table_id') &&
+          stmt.text.includes("status = 'pending'"),
+        respond: (stmt) => restoreToPendingSpy(stmt.values),
+      })
+      const restoreToActiveSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: "UPDATE reservations SET status = 'active' (rollback)",
+        verb: 'update',
+        match: (stmt) =>
+          stmt.table === 'reservations' && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'table_id') &&
+          stmt.text.includes("status = 'active'"),
+        respond: (stmt) => restoreToActiveSpy(stmt.values),
+      })
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE id = ANY(...) (rollback)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'id'),
+        respond: () => [],
+      })
+      sqlMock.addHandler({
+        name: 'DELETE events WHERE id (rollback, createEvent)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'events',
+        respond: () => [],
+      })
+
+      const { createEvent } = await loadService()
+
+      await expect(
+        createEvent({
+          title: 'Rollback Status Event 2',
+          schedules: [
+            { date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', allDay: false },
+            { date: '2026-07-11', startTime: '10:00', endTime: '14:00', roomId: 'room-1', allDay: false },
+          ],
+        }),
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      expect(restoreToActiveSpy).toHaveBeenCalledTimes(1)
+      expect(restoreToActiveSpy.mock.calls[0][0]).toEqual([['res-active-1']])
+      expect(restoreToPendingSpy).not.toHaveBeenCalled()
+    })
   })
 })
 
@@ -509,56 +863,25 @@ describe('events-service — createEvent multi-day (schedules)', () => {
 // ---------------------------------------------------------------------------
 
 describe('events-service — updateEvent multi-day (schedules)', () => {
-  afterEach(() => {
+  beforeEach(() => {
     vi.resetModules()
-    vi.clearAllMocks()
+    sqlMock.reset()
   })
 
-  it('calls update_event_with_blocks when schedules array is provided', async () => {
-    const updatedResult = makeRpcResult({
-      room_blocks: [
-        makeBlock({ date: '2026-08-01', start_time: '09:00', end_time: '13:00' }),
-        makeBlock({ id: 'block-2', date: '2026-08-02', start_time: '14:00', end_time: '18:00' }),
-      ],
-    })
-    const mock = buildMockAdmin()
+  it('replaces blocks (delete-then-insert) when schedules array is provided', async () => {
+    addCurrentEventHandler(() => [
+      { title: 'Old Title', description: null, date: '2026-07-10', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null },
+    ])
+    addMultiBlockEventUpdateHandler(() => [makeEventRow({ title: 'Updated Multi-Day' })])
+    const deleteSpy = vi.fn(() => [])
+    addBlocksDeleteHandler(deleteSpy)
+    addRoomBlockInsertHandler((values) => [
+      makeBlockRow({ date: values[2] as string, start_time: values[3] as string, end_time: values[4] as string }),
+    ])
+    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+    addReservationsCancelHandler(() => [])
 
-    // updateEvent loads current event first
-    mock.from.mockImplementation((table: string) => {
-      if (table === 'events') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockReturnThis(),
-          maybeSingle: vi.fn().mockResolvedValue({
-            data: {
-              title: 'Old Title',
-              description: null,
-              date: '2026-07-10',
-              start_time: '18:00',
-              end_time: '22:00',
-            },
-            error: null,
-          }),
-        }
-      }
-      return {
-        select: vi.fn().mockReturnThis(),
-        eq: vi.fn().mockReturnThis(),
-        in: vi.fn().mockReturnThis(),
-        lt: vi.fn().mockReturnThis(),
-        gt: vi.fn().mockReturnThis(),
-        update: vi.fn().mockReturnThis(),
-        limit: vi.fn().mockResolvedValue({ data: [], error: null }),
-        maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
-      }
-    })
-
-    mock.rpc.mockResolvedValueOnce({ data: updatedResult, error: null })
-
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { updateEvent } = await import('@/lib/server/events-service')
+    const { updateEvent } = await loadService()
 
     const result = await updateEvent('evt-1', {
       title: 'Updated Multi-Day',
@@ -568,352 +891,126 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
       ],
     })
 
-    expect(mock.rpc).toHaveBeenCalledWith(
-      'update_event_with_blocks',
-      expect.objectContaining({
-        p_id: 'evt-1',
-        p_title: 'Updated Multi-Day',
-        p_blocks: expect.arrayContaining([
-          expect.objectContaining({ date: '2026-08-01' }),
-          expect.objectContaining({ date: '2026-08-02' }),
-        ]),
-      })
-    )
-
+    expect(deleteSpy).toHaveBeenCalledTimes(1)
     expect(result.schedules).toHaveLength(2)
   })
 
   it('derives title from current event row when not provided in update body', async () => {
-    const mock = buildMockAdmin()
+    addCurrentEventHandler(() => [
+      { title: 'Existing Title', description: 'Existing desc', date: '2026-07-10', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null },
+    ])
+    addMultiBlockEventUpdateHandler((values) => [makeEventRow({ title: values[0] })])
+    addBlocksDeleteHandler(() => [])
+    addRoomBlockInsertHandler(() => [makeBlockRow()])
+    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+    addReservationsCancelHandler(() => [])
 
-    mock.from.mockImplementation((table: string) => {
-      if (table === 'events') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockReturnThis(),
-          maybeSingle: vi.fn().mockResolvedValue({
-            data: {
-              title: 'Existing Title',
-              description: 'Existing desc',
-              date: '2026-07-10',
-              start_time: '18:00',
-              end_time: '22:00',
-            },
-            error: null,
-          }),
-        }
-      }
-      return {
-        select: vi.fn().mockReturnThis(),
-        eq: vi.fn().mockReturnThis(),
-        maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
-      }
+    const { updateEvent } = await loadService()
+
+    const result = await updateEvent('evt-1', {
+      schedules: [{ date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', allDay: false }],
     })
 
-    mock.rpc.mockResolvedValueOnce({
-      data: makeRpcResult({ title: 'Existing Title' }),
-      error: null,
-    })
-
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { updateEvent } = await import('@/lib/server/events-service')
-
-    await updateEvent('evt-1', {
-      schedules: [
-        { date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', allDay: false },
-      ],
-    })
-
-    expect(mock.rpc).toHaveBeenCalledWith(
-      'update_event_with_blocks',
-      expect.objectContaining({ p_title: 'Existing Title' })
-    )
+    expect(result.title).toBe('Existing Title')
   })
 
   it('throws 404 when event does not exist', async () => {
-    const mock = buildMockAdmin()
+    addCurrentEventHandler(() => [])
 
-    mock.from.mockImplementation((table: string) => {
-      if (table === 'events') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockReturnThis(),
-          maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
-        }
-      }
-      return {
-        select: vi.fn().mockReturnThis(),
-        eq: vi.fn().mockReturnThis(),
-        maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
-      }
-    })
+    const { updateEvent } = await loadService()
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { updateEvent } = await import('@/lib/server/events-service')
-
-    let caught: ServiceError | undefined
-    try {
-      await updateEvent('nonexistent', {
-        schedules: [
-          { date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', allDay: false },
-        ],
-      })
-    } catch (err) {
-      caught = err as ServiceError
-    }
-
-    expect(caught?.statusCode).toBe(404)
-    expect(mock.rpc).not.toHaveBeenCalled()
+    await expect(
+      updateEvent('nonexistent', {
+        schedules: [{ date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', allDay: false }],
+      }),
+    ).rejects.toMatchObject({ statusCode: 404 })
   })
 
-  it('throws 500 when update_event_with_blocks RPC fails', async () => {
-    const mock = buildMockAdmin()
-
-    mock.from.mockImplementation((table: string) => {
-      if (table === 'events') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockReturnThis(),
-          maybeSingle: vi.fn().mockResolvedValue({
-            data: {
-              title: 'Title',
-              description: null,
-              date: '2026-07-10',
-              start_time: '18:00',
-              end_time: '22:00',
-            },
-            error: null,
-          }),
-        }
-      }
-      return {
-        select: vi.fn().mockReturnThis(),
-        eq: vi.fn().mockReturnThis(),
-        maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
-      }
+  it('throws 500 when the events update fails', async () => {
+    addCurrentEventHandler(() => [
+      { title: 'Title', description: null, date: '2026-07-10', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null },
+    ])
+    addMultiBlockEventUpdateHandler(() => {
+      throw new Error('DB error')
     })
 
-    mock.rpc.mockResolvedValueOnce({ data: null, error: { code: 'INTERNAL_ERROR', message: 'DB error' } })
+    const { updateEvent } = await loadService()
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { updateEvent } = await import('@/lib/server/events-service')
-
-    let caught: ServiceError | undefined
-    try {
-      await updateEvent('evt-1', {
-        schedules: [
-          { date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', allDay: false },
-        ],
-      })
-    } catch (err) {
-      caught = err as ServiceError
-    }
-
-    expect(caught?.statusCode).toBe(500)
+    await expect(
+      updateEvent('evt-1', {
+        schedules: [{ date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', allDay: false }],
+      }),
+    ).rejects.toMatchObject({ statusCode: 500 })
   })
 
   it('rejects empty schedules array with 400 on update', async () => {
-    const mock = buildMockAdmin()
+    addCurrentEventHandler(() => [
+      { title: 'Existing', description: null, date: '2026-07-10', start_time: '10:00:00', end_time: '12:00:00', title_es: null, title_en: null },
+    ])
 
-    mock.from.mockImplementation((table: string) => {
-      if (table === 'events') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockReturnThis(),
-          maybeSingle: vi.fn().mockResolvedValue({
-            data: {
-              title: 'Existing',
-              description: null,
-              date: '2026-07-10',
-              start_time: '10:00',
-              end_time: '12:00',
-            },
-            error: null,
-          }),
-        }
-      }
-      return {
-        select: vi.fn().mockReturnThis(),
-        eq: vi.fn().mockReturnThis(),
-        maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
-      }
+    const { updateEvent } = await loadService()
+
+    await expect(updateEvent('evt-1', { schedules: [] })).rejects.toMatchObject({
+      statusCode: 400,
+      message: expect.stringMatching(/At least one schedule is required/),
     })
-
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { updateEvent } = await import('@/lib/server/events-service')
-
-    let caught: ServiceError | undefined
-    try {
-      await updateEvent('evt-1', { schedules: [] })
-    } catch (err) {
-      caught = err as ServiceError
-    }
-
-    expect(caught).toBeDefined()
-    expect(caught?.statusCode).toBe(400)
-    expect(caught?.message).toMatch(/At least one schedule is required/)
-    expect(mock.rpc).not.toHaveBeenCalled()
   })
 
   it('rejects schedules array > 366 entries with 400 on update', async () => {
-    const mock = buildMockAdmin()
+    addCurrentEventHandler(() => [
+      { title: 'Existing', description: null, date: '2026-07-10', start_time: '10:00:00', end_time: '12:00:00', title_es: null, title_en: null },
+    ])
 
-    mock.from.mockImplementation((table: string) => {
-      if (table === 'events') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockReturnThis(),
-          maybeSingle: vi.fn().mockResolvedValue({
-            data: {
-              title: 'Existing',
-              description: null,
-              date: '2026-07-10',
-              start_time: '10:00',
-              end_time: '12:00',
-            },
-            error: null,
-          }),
-        }
-      }
-      return {
-        select: vi.fn().mockReturnThis(),
-        eq: vi.fn().mockReturnThis(),
-        maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
-      }
-    })
-
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { updateEvent } = await import('@/lib/server/events-service')
+    const { updateEvent } = await loadService()
 
     const schedules = Array.from({ length: 367 }, (_, i) => {
       const dateStr = new Date(2026, 0, 1 + (i % 365)).toISOString().slice(0, 10)
       return { date: dateStr, startTime: '10:00', endTime: '12:00', roomId: 'room-1', allDay: false }
     })
 
-    let caught: ServiceError | undefined
-    try {
-      await updateEvent('evt-1', { schedules })
-    } catch (err) {
-      caught = err as ServiceError
-    }
-
-    expect(caught).toBeDefined()
-    expect(caught?.statusCode).toBe(400)
-    expect(caught?.message).toMatch(/Too many schedule blocks/)
-    expect(mock.rpc).not.toHaveBeenCalled()
+    await expect(updateEvent('evt-1', { schedules })).rejects.toMatchObject({
+      statusCode: 400,
+      message: expect.stringMatching(/Too many schedule blocks/),
+    })
   })
 
   it('shrinks block count from 2 to 1 and returns correct schedules', async () => {
-    const shrunkResult = makeRpcResult({
-      date: '2026-08-01',
-      start_time: '09:00',
-      end_time: '13:00',
-      room_blocks: [
-        makeBlock({ id: 'b1', date: '2026-08-01', start_time: '09:00', end_time: '13:00' }),
-      ],
-    })
-    const mock = buildMockAdmin()
+    addCurrentEventHandler(() => [
+      { title: 'Event', description: null, date: '2026-07-10', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null },
+    ])
+    addMultiBlockEventUpdateHandler(() => [makeEventRow({ date: '2026-08-01', start_time: '09:00:00', end_time: '13:00:00' })])
+    addBlocksDeleteHandler(() => [])
+    addRoomBlockInsertHandler((values) => [
+      makeBlockRow({ id: 'b1', date: values[2] as string, start_time: values[3] as string, end_time: values[4] as string }),
+    ])
+    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+    addReservationsCancelHandler(() => [])
 
-    mock.from.mockImplementation((table: string) => {
-      if (table === 'events') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockReturnThis(),
-          maybeSingle: vi.fn().mockResolvedValue({
-            data: {
-              title: 'Event',
-              description: null,
-              date: '2026-07-10',
-              start_time: '18:00',
-              end_time: '22:00',
-            },
-            error: null,
-          }),
-        }
-      }
-      return {
-        select: vi.fn().mockReturnThis(),
-        eq: vi.fn().mockReturnThis(),
-        maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
-      }
-    })
-
-    mock.rpc.mockResolvedValueOnce({ data: shrunkResult, error: null })
-
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { updateEvent } = await import('@/lib/server/events-service')
+    const { updateEvent } = await loadService()
 
     const result = await updateEvent('evt-1', {
-      schedules: [
-        { date: '2026-08-01', startTime: '09:00', endTime: '13:00', roomId: 'room-1', allDay: false },
-      ],
+      schedules: [{ date: '2026-08-01', startTime: '09:00', endTime: '13:00', roomId: 'room-1', allDay: false }],
     })
 
     expect(result.schedules).toHaveLength(1)
     expect(result.schedules[0].date).toBe('2026-08-01')
-    expect(mock.rpc).toHaveBeenCalledWith(
-      'update_event_with_blocks',
-      expect.objectContaining({
-        p_blocks: expect.arrayContaining([expect.objectContaining({ date: '2026-08-01' })]),
-      })
-    )
   })
 
   it('grows block count from 1 to 3 and returns correct schedules', async () => {
-    const grownResult = makeRpcResult({
-      date: '2026-09-01',
-      start_time: '10:00',
-      end_time: '14:00',
-      room_blocks: [
-        makeBlock({ id: 'b1', date: '2026-09-01', start_time: '10:00', end_time: '14:00' }),
-        makeBlock({ id: 'b2', date: '2026-09-02', start_time: '10:00', end_time: '14:00' }),
-        makeBlock({ id: 'b3', date: '2026-09-03', start_time: '10:00', end_time: '14:00' }),
-      ],
+    addCurrentEventHandler(() => [
+      { title: 'Growing Event', description: null, date: '2026-09-01', start_time: '10:00:00', end_time: '14:00:00', title_es: null, title_en: null },
+    ])
+    addMultiBlockEventUpdateHandler(() => [makeEventRow({ date: '2026-09-01', start_time: '10:00:00', end_time: '14:00:00' })])
+    addBlocksDeleteHandler(() => [])
+    let n = 0
+    addRoomBlockInsertHandler((values) => {
+      n += 1
+      return [makeBlockRow({ id: `b${n}`, date: values[2] as string, start_time: values[3] as string, end_time: values[4] as string })]
     })
-    const mock = buildMockAdmin()
+    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+    addReservationsCancelHandler(() => [])
 
-    mock.from.mockImplementation((table: string) => {
-      if (table === 'events') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockReturnThis(),
-          maybeSingle: vi.fn().mockResolvedValue({
-            data: {
-              title: 'Growing Event',
-              description: null,
-              date: '2026-09-01',
-              start_time: '10:00',
-              end_time: '14:00',
-            },
-            error: null,
-          }),
-        }
-      }
-      return {
-        select: vi.fn().mockReturnThis(),
-        eq: vi.fn().mockReturnThis(),
-        maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
-      }
-    })
-
-    mock.rpc.mockResolvedValueOnce({ data: grownResult, error: null })
-
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { updateEvent } = await import('@/lib/server/events-service')
+    const { updateEvent } = await loadService()
 
     const result = await updateEvent('evt-1', {
       schedules: [
@@ -929,100 +1026,383 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
     expect(result.schedules[2].date).toBe('2026-09-03')
   })
 
-  it('maps PG P0001 error to 404 on update', async () => {
-    const mock = buildMockAdmin()
-
-    mock.from.mockImplementation((table: string) => {
-      if (table === 'events') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockReturnThis(),
-          maybeSingle: vi.fn().mockResolvedValue({
-            data: {
-              title: 'Title',
-              description: null,
-              date: '2026-07-10',
-              start_time: '10:00',
-              end_time: '12:00',
-            },
-            error: null,
-          }),
-        }
-      }
-      return {
-        select: vi.fn().mockReturnThis(),
-        eq: vi.fn().mockReturnThis(),
-        maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
-      }
+  it('maps a distinct non-check-constraint NeonDbError from the update to the generic 500 (error-mapping coverage on the update path too)', async () => {
+    // Adapted from the pre-Neon-migration test "maps PG P0001 error to 404 on
+    // update": that scenario relied on `update_event_atomic`'s custom
+    // `RAISE EXCEPTION ... P0001` for an event that disappeared between the
+    // existence check and the RPC call — a race the RPC itself detected.
+    // The Neon port has no equivalent later existence check (there is no
+    // second, RPC-internal existence check to race against — updateEvent's
+    // single upfront `currentRows` SELECT is the only such check, already
+    // covered by the "throws 404 when event does not exist" test above), and
+    // mapEventWriteError has no code that maps to 404 — only 23514/22P02/
+    // 23502 map to 400, everything else (including an arbitrary NeonDbError
+    // code) maps to 500. This test instead documents that behavior directly:
+    // a NeonDbError whose code isn't one of the three 400-mapped codes still
+    // falls through to the generic 500, not a mis-mapped 4xx.
+    addCurrentEventHandler(() => [
+      { title: 'Title', description: null, date: '2026-07-10', start_time: '10:00:00', end_time: '12:00:00', title_es: null, title_en: null },
+    ])
+    addMultiBlockEventUpdateHandler(() => {
+      throw neonDbError('40001', 'serialization_failure')
     })
 
-    mock.rpc.mockResolvedValueOnce({ data: null, error: { code: 'P0001', message: 'event not found' } })
+    const { updateEvent } = await loadService()
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { updateEvent } = await import('@/lib/server/events-service')
-
-    let caught: ServiceError | undefined
-    try {
-      await updateEvent('evt-1', {
-        schedules: [
-          { date: '2026-07-10', startTime: '10:00', endTime: '12:00', roomId: 'room-1', allDay: false },
-        ],
-      })
-    } catch (err) {
-      caught = err as ServiceError
-    }
-
-    expect(caught?.statusCode).toBe(404)
+    await expect(
+      updateEvent('evt-1', {
+        schedules: [{ date: '2026-07-10', startTime: '10:00', endTime: '12:00', roomId: 'room-1', allDay: false }],
+      }),
+    ).rejects.toMatchObject({ statusCode: 500 })
   })
 
   it('maps PG check-constraint 23514 to 400 on update', async () => {
-    const mock = buildMockAdmin()
-
-    mock.from.mockImplementation((table: string) => {
-      if (table === 'events') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockReturnThis(),
-          maybeSingle: vi.fn().mockResolvedValue({
-            data: {
-              title: 'Title',
-              description: null,
-              date: '2026-07-10',
-              start_time: '10:00',
-              end_time: '12:00',
-            },
-            error: null,
-          }),
-        }
-      }
-      return {
-        select: vi.fn().mockReturnThis(),
-        eq: vi.fn().mockReturnThis(),
-        maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
-      }
+    addCurrentEventHandler(() => [
+      { title: 'Title', description: null, date: '2026-07-10', start_time: '10:00:00', end_time: '12:00:00', title_es: null, title_en: null },
+    ])
+    addMultiBlockEventUpdateHandler(() => {
+      throw neonDbError('23514', 'check constraint violated')
     })
 
-    mock.rpc.mockResolvedValueOnce({ data: null, error: { code: '23514', message: 'check constraint violated' } })
+    const { updateEvent } = await loadService()
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
+    await expect(
+      updateEvent('evt-1', {
+        schedules: [{ date: '2026-07-10', startTime: '10:00', endTime: '12:00', roomId: 'room-1', allDay: false }],
+      }),
+    ).rejects.toMatchObject({ statusCode: 400 })
+  })
 
-    const { updateEvent } = await import('@/lib/server/events-service')
+  it('preserves a roomless block (roomId: null) as a non-persisted schedule entry, even though the unconditional DELETE already wiped all prior blocks (#303 code-review post-PR round, Finding 2)', async () => {
+    addCurrentEventHandler(() => [
+      { title: 'Existing', description: null, date: '2026-07-10', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null },
+    ])
+    addMultiBlockEventUpdateHandler(() => [makeEventRow({ id: 'evt-1' })])
+    // The pre-loop DELETE wipes every pre-existing block for this event,
+    // unconditionally, before the loop below even looks at the roomless
+    // entry — this is what makes Finding 2 worse than Finding 1: a skip
+    // here isn't just missing from the response, it's permanently lost.
+    const replaceDeleteSpy = vi.fn(() => [])
+    addBlocksDeleteHandler(replaceDeleteSpy)
 
-    let caught: ServiceError | undefined
-    try {
-      await updateEvent('evt-1', {
-        schedules: [
-          { date: '2026-07-10', startTime: '10:00', endTime: '12:00', roomId: 'room-1', allDay: false },
-        ],
+    const blockInsertSpy = vi.fn((values: unknown[]) => [
+      makeBlockRow({
+        id: 'block-roomed-1',
+        room_id: values[1] as string,
+        date: values[2] as string,
+        start_time: values[3] as string,
+        end_time: values[4] as string,
+      }),
+    ])
+    addRoomBlockInsertHandler(blockInsertSpy)
+    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+    addReservationsCancelHandler(() => [])
+
+    const { updateEvent } = await loadService()
+
+    const result = await updateEvent('evt-1', {
+      schedules: [
+        { date: '2026-07-10', startTime: '10:00', endTime: '12:00', roomId: null, allDay: false },
+        { date: '2026-07-11', startTime: '14:00', endTime: '16:00', roomId: 'room-1', allDay: false },
+      ],
+    })
+
+    // The pre-loop wipe did happen (proving this scenario really exercises
+    // the "worse than createEvent" ordering)...
+    expect(replaceDeleteSpy).toHaveBeenCalledTimes(1)
+
+    // ...only the room-assigned block issues an INSERT...
+    expect(blockInsertSpy).toHaveBeenCalledTimes(1)
+    expect(result.roomBlocks).toHaveLength(1)
+
+    // ...and the roomless block is NOT silently dropped: it still appears in
+    // schedules as a synthetic, non-persisted entry.
+    expect(result.schedules).toHaveLength(2)
+    const roomlessEntry = result.schedules.find((s) => s.roomId === null)
+    expect(roomlessEntry).toBeDefined()
+    expect(roomlessEntry!.id).toBeUndefined()
+    expect(roomlessEntry!.date).toBe('2026-07-10')
+    expect(roomlessEntry!.startTime).toBe('10:00')
+    expect(roomlessEntry!.endTime).toBe('12:00')
+  })
+
+  // -------------------------------------------------------------------------
+  // Compensating rollback (#303 code-review Finding 2) — updateEvent path.
+  //
+  // Unlike createEvent's rollback, the event row here pre-existed the call
+  // and must NOT be deleted on failure — only the blocks/reservations this
+  // specific call touched are rolled back (see rollbackPartialMultiBlockWrite
+  // callers in lib/server/events-service.ts).
+  // -------------------------------------------------------------------------
+  describe('compensating rollback on partial multi-block write failure', () => {
+    it('rolls back inserted blocks and reactivated reservations, but does NOT delete the pre-existing event row', async () => {
+      addCurrentEventHandler(() => [
+        { title: 'Existing', description: null, date: '2026-07-10', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null },
+      ])
+      addMultiBlockEventUpdateHandler(() => [makeEventRow({ id: 'evt-1' })])
+
+      // The "replace" step deletes ALL existing blocks for this event first —
+      // distinct from the rollback's targeted id=ANY(...) delete below (its
+      // WHERE clause is `event_id = $1`, which never satisfies the
+      // word-boundary-anchored `whereHasColumn(stmt, 'id')` check the
+      // rollback handler uses).
+      const replaceDeleteSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE event_id (replace step)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'event_id'),
+        respond: replaceDeleteSpy,
       })
-    } catch (err) {
-      caught = err as ServiceError
-    }
 
-    expect(caught?.statusCode).toBe(400)
+      let insertCallIndex = 0
+      sqlMock.addHandler({
+        name: 'INSERT event_room_blocks (fails on 2nd block)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'event_room_blocks' && stmt.returning,
+        respond: (stmt) => {
+          insertCallIndex += 1
+          if (insertCallIndex === 2) {
+            throw new Error('connection reset mid-insert')
+          }
+          return [
+            makeBlockRow({
+              id: 'block-1',
+              date: stmt.values[2] as string,
+              start_time: stmt.values[3] as string,
+              end_time: stmt.values[4] as string,
+            }),
+          ]
+        },
+      })
+
+      addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+      sqlMock.addHandler({
+        name: 'UPDATE reservations cancel overlapping (RETURNING id)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'table_id'),
+        respond: () => [{ id: 'res-1' }],
+      })
+
+      const rollbackBlocksDeleteSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE id = ANY(...) (rollback)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'id'),
+        respond: rollbackBlocksDeleteSpy,
+      })
+
+      const rollbackReactivateSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'UPDATE reservations SET active WHERE id = ANY(...) (rollback)',
+        verb: 'update',
+        match: (stmt) =>
+          stmt.table === 'reservations' && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'table_id'),
+        respond: rollbackReactivateSpy,
+      })
+
+      const eventsDeleteSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'DELETE events WHERE id (must NOT be called by updateEvent rollback)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'events',
+        respond: eventsDeleteSpy,
+      })
+      // revertEventFieldsOnFailure also fires on this failure path (round 4)
+      // — asserted directly by the dedicated test below; present here only
+      // so this pre-existing test's mock doesn't throw an unhandled-query
+      // error for it.
+      sqlMock.addHandler({
+        name: 'UPDATE events (revert fields, no RETURNING)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'events' && !stmt.returning,
+        respond: () => [],
+      })
+
+      const { updateEvent } = await loadService()
+
+      await expect(
+        updateEvent('evt-1', {
+          schedules: [
+            { date: '2026-08-01', startTime: '09:00', endTime: '13:00', roomId: 'room-1', allDay: false },
+            { date: '2026-08-02', startTime: '14:00', endTime: '18:00', roomId: 'room-1', allDay: false },
+          ],
+        }),
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      // Rollback deletes exactly the one block inserted before the failure.
+      expect(rollbackBlocksDeleteSpy).toHaveBeenCalledTimes(1)
+      expect(rollbackBlocksDeleteSpy.mock.calls[0][0].values).toEqual([['block-1']])
+
+      // Rollback reactivates exactly the one reservation cancelled before the failure.
+      expect(rollbackReactivateSpy).toHaveBeenCalledTimes(1)
+      expect(rollbackReactivateSpy.mock.calls[0][0].values).toEqual([['res-1']])
+
+      // updateEvent's rollback does NOT delete the event row — it pre-existed this call.
+      expect(eventsDeleteSpy).not.toHaveBeenCalled()
+    })
+
+    it('also restores the pre-existing blocks the unconditional DELETE wiped, and reverts the event-row field mutation, when a later block insert fails (#303 code-review round 4)', async () => {
+      const originalRow = { title: 'Existing', description: 'Existing desc', date: '2026-07-10', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null }
+      addCurrentEventHandler(() => [originalRow])
+      addMultiBlockEventUpdateHandler(() => [makeEventRow({ id: 'evt-1', title: 'Updated Multi-Day' })])
+
+      // The unconditional "replace" DELETE now captures (via RETURNING) the
+      // block(s) it wipes, so they can be restored if a later block's INSERT
+      // fails mid-loop.
+      const preExistingBlock = {
+        id: 'block-pre-1',
+        event_id: 'evt-1',
+        room_id: 'room-1',
+        date: '2026-07-10',
+        start_time: '18:00:00',
+        end_time: '22:00:00',
+        all_day: false,
+      }
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE event_id (replace step, RETURNING)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'event_id'),
+        respond: () => [preExistingBlock],
+      })
+
+      let insertCallIndex = 0
+      sqlMock.addHandler({
+        name: 'INSERT event_room_blocks (fails on 2nd block)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'event_room_blocks' && stmt.returning,
+        respond: (stmt) => {
+          insertCallIndex += 1
+          if (insertCallIndex === 2) {
+            throw new Error('connection reset mid-insert')
+          }
+          return [
+            makeBlockRow({
+              id: 'block-new-1',
+              date: stmt.values[2] as string,
+              start_time: stmt.values[3] as string,
+              end_time: stmt.values[4] as string,
+            }),
+          ]
+        },
+      })
+
+      addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+      sqlMock.addHandler({
+        name: 'UPDATE reservations cancel overlapping (RETURNING id)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'table_id'),
+        respond: () => [{ id: 'res-1' }],
+      })
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE id = ANY(...) (rollback)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'id'),
+        respond: () => [],
+      })
+      sqlMock.addHandler({
+        name: 'UPDATE reservations SET active WHERE id = ANY(...) (rollback)',
+        verb: 'update',
+        match: (stmt) =>
+          stmt.table === 'reservations' && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'table_id'),
+        respond: () => [],
+      })
+
+      // restoreDeletedBlocksOnUpdateFailure's reinsert: has an explicit `id`
+      // column and NO RETURNING clause — distinct from the block-insert
+      // handler above (which requires RETURNING).
+      const restoreInsertSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'INSERT event_room_blocks (restore, no RETURNING)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'event_room_blocks' && !stmt.returning,
+        respond: (stmt) => restoreInsertSpy(stmt.values),
+      })
+
+      // revertEventFieldsOnFailure's UPDATE: same columns as the multi-block
+      // UPDATE events RETURNING statement, but with NO RETURNING clause.
+      const revertFieldsSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'UPDATE events (revert fields, no RETURNING)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'events' && !stmt.returning,
+        respond: (stmt) => revertFieldsSpy(stmt.values),
+      })
+
+      const { updateEvent } = await loadService()
+
+      await expect(
+        updateEvent('evt-1', {
+          schedules: [
+            { date: '2026-08-01', startTime: '09:00', endTime: '13:00', roomId: 'room-1', allDay: false },
+            { date: '2026-08-02', startTime: '14:00', endTime: '18:00', roomId: 'room-1', allDay: false },
+          ],
+        }),
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      // The pre-existing block wiped by the unconditional DELETE is reinserted verbatim.
+      expect(restoreInsertSpy).toHaveBeenCalledTimes(1)
+      expect(restoreInsertSpy).toHaveBeenCalledWith([
+        preExistingBlock.id,
+        preExistingBlock.event_id,
+        preExistingBlock.room_id,
+        preExistingBlock.date,
+        preExistingBlock.start_time,
+        preExistingBlock.end_time,
+        preExistingBlock.all_day,
+      ])
+
+      // The event row's field mutation is reverted back to its pre-update values.
+      expect(revertFieldsSpy).toHaveBeenCalledTimes(1)
+      expect(revertFieldsSpy).toHaveBeenCalledWith([
+        originalRow.title,
+        originalRow.description,
+        originalRow.date,
+        originalRow.start_time,
+        originalRow.end_time,
+        'evt-1',
+      ])
+    })
+
+    it('reverts the event-row field mutation when the unconditional block DELETE itself fails (#303 code-review round 4 audit)', async () => {
+      const originalRow = { title: 'Existing', description: null, date: '2026-07-10', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null }
+      addCurrentEventHandler(() => [originalRow])
+      addMultiBlockEventUpdateHandler(() => [makeEventRow({ id: 'evt-1', title: 'Updated Multi-Day' })])
+
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE event_id (replace step, fails)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'event_id'),
+        respond: () => {
+          throw new Error('connection reset on delete')
+        },
+      })
+
+      const revertFieldsSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'UPDATE events (revert fields, no RETURNING)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'events' && !stmt.returning,
+        respond: (stmt) => revertFieldsSpy(stmt.values),
+      })
+
+      const { updateEvent } = await loadService()
+
+      await expect(
+        updateEvent('evt-1', {
+          schedules: [{ date: '2026-08-01', startTime: '09:00', endTime: '13:00', roomId: 'room-1', allDay: false }],
+        }),
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      expect(revertFieldsSpy).toHaveBeenCalledTimes(1)
+      expect(revertFieldsSpy).toHaveBeenCalledWith([
+        originalRow.title,
+        originalRow.description,
+        originalRow.date,
+        originalRow.start_time,
+        originalRow.end_time,
+        'evt-1',
+      ])
+    })
   })
 })
 
@@ -1031,53 +1411,18 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
 // ---------------------------------------------------------------------------
 
 describe('events-service — listEventsBlockingRoom (multi-day awareness)', () => {
-  afterEach(() => {
+  beforeEach(() => {
     vi.resetModules()
-    vi.clearAllMocks()
+    sqlMock.reset()
   })
 
   it('returns events blocking a room on a specific date within time range', async () => {
-    const mockAdmin = buildMockAdmin()
-    // event_room_blocks query returns one block
-    mockAdmin.from.mockImplementation((table: string) => {
-      if (table === 'event_room_blocks') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockReturnThis(),
-          lt: vi.fn().mockReturnThis(),
-          gt: vi.fn().mockResolvedValue({ data: [{ event_id: 'evt-multi' }], error: null }),
-        }
-      }
-      if (table === 'events') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          in: vi.fn().mockResolvedValue({
-            data: [{
-              id: 'evt-multi',
-              title: 'Multi-Day Blocker',
-              description: null,
-              date: '2026-08-01',
-              start_time: '10:00',
-              end_time: '18:00',
-              created_by: null,
-              created_at: '2026-07-01T00:00:00Z',
-            }],
-            error: null,
-          }),
-        }
-      }
-      return {
-        select: vi.fn().mockReturnThis(),
-        eq: vi.fn().mockReturnThis(),
-        lt: vi.fn().mockReturnThis(),
-        gt: vi.fn().mockResolvedValue({ data: [], error: null }),
-      }
-    })
+    addBlockingRoomEventIdsHandler(() => [{ event_id: 'evt-multi' }])
+    addEventsByIdsHandler(() => [
+      makeEventRow({ id: 'evt-multi', title: 'Multi-Day Blocker', date: '2026-08-01', start_time: '10:00:00', end_time: '18:00:00' }),
+    ])
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mockAdmin as any)
-
-    const { listEventsBlockingRoom } = await import('@/lib/server/events-service')
+    const { listEventsBlockingRoom } = await loadService()
 
     const results = await listEventsBlockingRoom('room-1', '2026-08-01', '11:00', '14:00')
 
@@ -1091,31 +1436,17 @@ describe('events-service — listEventsBlockingRoom (multi-day awareness)', () =
   })
 
   it('returns empty array when no blocks overlap the query window', async () => {
-    const mockAdmin = buildMockAdmin()
-    mockAdmin.from.mockImplementation((table: string) => {
-      if (table === 'event_room_blocks') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockReturnThis(),
-          lt: vi.fn().mockReturnThis(),
-          gt: vi.fn().mockResolvedValue({ data: [], error: null }),
-        }
-      }
-      return {
-        select: vi.fn().mockReturnThis(),
-        eq: vi.fn().mockReturnThis(),
-        in: vi.fn().mockResolvedValue({ data: [], error: null }),
-      }
-    })
+    addBlockingRoomEventIdsHandler(() => [])
+    const eventsSpy = vi.fn(() => [])
+    addEventsByIdsHandler(eventsSpy)
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mockAdmin as any)
-
-    const { listEventsBlockingRoom } = await import('@/lib/server/events-service')
+    const { listEventsBlockingRoom } = await loadService()
 
     const results = await listEventsBlockingRoom('room-1', '2026-09-15', '08:00', '10:00')
 
     expect(results).toHaveLength(0)
+    // Short-circuits before querying events when there are no matching blocks
+    expect(eventsSpy).not.toHaveBeenCalled()
   })
 })
 
@@ -1124,221 +1455,75 @@ describe('events-service — listEventsBlockingRoom (multi-day awareness)', () =
 // ---------------------------------------------------------------------------
 
 describe('events-service — deleteEvent multi-day cancellation', () => {
-  afterEach(() => {
+  beforeEach(() => {
     vi.resetModules()
-    vi.clearAllMocks()
+    sqlMock.reset()
   })
 
-  /** Build a chainable mock for a table that resolves at the end of the chain. */
-  function buildChainableMock(resolveWith: unknown = { data: null, error: null }) {
-    const chain: Record<string, unknown> = {}
-    const methods = ['select', 'eq', 'in', 'lt', 'gt', 'update', 'delete', 'limit']
-    for (const m of methods) {
-      chain[m] = vi.fn(() => chain)
-    }
-    ;(chain as any).maybeSingle = vi.fn().mockResolvedValue(resolveWith)
-    return chain
-  }
-
   it('cancels reservations for every block date (multi-day event)', async () => {
-    const mock = buildMockAdmin()
+    addDeleteGuardHandler(() => [{ id: 'evt-multi', title_es: null, title_en: null }])
+    addCascadeBlocksFetchHandler(() => [
+      { room_id: 'room-1', date: '2026-08-01', start_time: '10:00:00', end_time: '14:00:00' },
+      { room_id: 'room-1', date: '2026-08-02', start_time: '10:00:00', end_time: '14:00:00' },
+      { room_id: 'room-1', date: '2026-08-03', start_time: '10:00:00', end_time: '14:00:00' },
+    ])
+    addTablesByRoomIdsHandler(() => [{ id: 'table-1', room_id: 'room-1' }])
+    const cancelSpy = vi.fn(() => [])
+    addReservationsCancelHandler(cancelSpy)
+    addEventsDeleteHandler(() => [])
 
-    // Track calls to reservations.update
-    const inStatusMock = vi.fn().mockResolvedValue({ data: null, error: null })
-    const gtEndTimeMock = vi.fn(() => ({ in: inStatusMock }))
-    const ltStartTimeMock = vi.fn(() => ({ gt: gtEndTimeMock }))
-    const eqDateMock = vi.fn(() => ({ lt: ltStartTimeMock }))
-    const inTablesMock = vi.fn(() => ({ eq: eqDateMock }))
-    const updateReturnMock = vi.fn(() => ({ in: inTablesMock }))
-
-    let eventsDeleteCalled = false
-
-    mock.from.mockImplementation((table: string) => {
-      if (table === 'events') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockReturnThis(),
-          delete: vi.fn(() => {
-            eventsDeleteCalled = true
-            return { eq: vi.fn().mockResolvedValue({ data: null, error: null }) }
-          }),
-          maybeSingle: vi.fn().mockResolvedValue({ data: { id: 'evt-multi' }, error: null }),
-        }
-      }
-      if (table === 'event_room_blocks') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockResolvedValue({
-            data: [
-              { room_id: 'room-1', date: '2026-08-01', start_time: '10:00', end_time: '14:00' },
-              { room_id: 'room-1', date: '2026-08-02', start_time: '10:00', end_time: '14:00' },
-              { room_id: 'room-1', date: '2026-08-03', start_time: '10:00', end_time: '14:00' },
-            ],
-            error: null,
-          }),
-        }
-      }
-      if (table === 'tables') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          in: vi.fn().mockResolvedValue({
-            data: [{ id: 'table-1', room_id: 'room-1' }],
-            error: null,
-          }),
-        }
-      }
-      if (table === 'reservations') {
-        return { update: updateReturnMock }
-      }
-      return buildChainableMock()
-    })
-
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { deleteEvent } = await import('@/lib/server/events-service')
+    const { deleteEvent } = await loadService()
 
     await deleteEvent('evt-multi')
 
     // update called once per block (3 blocks, each with a real room)
-    expect(updateReturnMock).toHaveBeenCalledTimes(3)
-    expect(updateReturnMock).toHaveBeenCalledWith({ status: 'cancelled' })
+    expect(cancelSpy).toHaveBeenCalledTimes(3)
   })
 
   it('skips reservation cancellation for null-room blocks', async () => {
-    const mock = buildMockAdmin()
+    addDeleteGuardHandler(() => [{ id: 'evt-null', title_es: null, title_en: null }])
+    addCascadeBlocksFetchHandler(() => [
+      { room_id: null, date: '2026-09-01', start_time: '10:00:00', end_time: '12:00:00' },
+    ])
+    const cancelSpy = vi.fn(() => [])
+    addReservationsCancelHandler(cancelSpy)
+    addEventsDeleteHandler(() => [])
 
-    const updateReturnMock = vi.fn().mockReturnThis()
-
-    mock.from.mockImplementation((table: string) => {
-      if (table === 'events') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockReturnThis(),
-          delete: vi.fn().mockReturnThis(),
-          maybeSingle: vi.fn().mockResolvedValue({ data: { id: 'evt-null' }, error: null }),
-        }
-      }
-      if (table === 'event_room_blocks') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockResolvedValue({
-            data: [
-              // All blocks have null room_id
-              { room_id: null, date: '2026-09-01', start_time: '10:00', end_time: '12:00' },
-            ],
-            error: null,
-          }),
-        }
-      }
-      if (table === 'tables') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          in: vi.fn().mockResolvedValue({ data: [], error: null }),
-        }
-      }
-      if (table === 'reservations') {
-        return { update: updateReturnMock }
-      }
-      return buildChainableMock()
-    })
-
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { deleteEvent } = await import('@/lib/server/events-service')
+    const { deleteEvent } = await loadService()
 
     await deleteEvent('evt-null')
 
-    // No reservations should be cancelled — null-room blocks have no tableIds
-    expect(updateReturnMock).not.toHaveBeenCalled()
+    // No reservations should be cancelled — null-room blocks have no tableIds,
+    // and (per the cascade's distinctRoomIds.filter(Boolean)) the tables
+    // lookup itself is skipped entirely.
+    expect(cancelSpy).not.toHaveBeenCalled()
   })
 
   it('handles mixed null-room and real-room blocks — cancels only for real-room blocks', async () => {
-    const mock = buildMockAdmin()
+    addDeleteGuardHandler(() => [{ id: 'evt-mixed', title_es: null, title_en: null }])
+    addCascadeBlocksFetchHandler(() => [
+      { room_id: null, date: '2026-10-01', start_time: '10:00:00', end_time: '12:00:00' },
+      { room_id: 'room-1', date: '2026-10-02', start_time: '10:00:00', end_time: '12:00:00' },
+      { room_id: null, date: '2026-10-03', start_time: '10:00:00', end_time: '12:00:00' },
+    ])
+    addTablesByRoomIdsHandler(() => [{ id: 'table-1', room_id: 'room-1' }])
+    const cancelSpy = vi.fn(() => [])
+    addReservationsCancelHandler(cancelSpy)
+    addEventsDeleteHandler(() => [])
 
-    const inStatusFn = vi.fn().mockResolvedValue({ data: null, error: null })
-    const gtFn = vi.fn(() => ({ in: inStatusFn }))
-    const ltFn = vi.fn(() => ({ gt: gtFn }))
-    const eqFn = vi.fn(() => ({ lt: ltFn }))
-    const inTablesFn = vi.fn(() => ({ eq: eqFn }))
-    const updateFn = vi.fn(() => ({ in: inTablesFn }))
-
-    mock.from.mockImplementation((table: string) => {
-      if (table === 'events') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockReturnThis(),
-          delete: vi.fn().mockReturnThis(),
-          maybeSingle: vi.fn().mockResolvedValue({ data: { id: 'evt-mixed' }, error: null }),
-        }
-      }
-      if (table === 'event_room_blocks') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockResolvedValue({
-            data: [
-              { room_id: null,     date: '2026-10-01', start_time: '10:00', end_time: '12:00' },
-              { room_id: 'room-1', date: '2026-10-02', start_time: '10:00', end_time: '12:00' },
-              { room_id: null,     date: '2026-10-03', start_time: '10:00', end_time: '12:00' },
-            ],
-            error: null,
-          }),
-        }
-      }
-      if (table === 'tables') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          in: vi.fn().mockResolvedValue({
-            data: [{ id: 'table-1', room_id: 'room-1' }],
-            error: null,
-          }),
-        }
-      }
-      if (table === 'reservations') {
-        return { update: updateFn }
-      }
-      return buildChainableMock()
-    })
-
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { deleteEvent } = await import('@/lib/server/events-service')
+    const { deleteEvent } = await loadService()
 
     await deleteEvent('evt-mixed')
 
     // Only the one real-room block (2026-10-02) triggers a reservation update
-    expect(updateFn).toHaveBeenCalledTimes(1)
-    expect(updateFn).toHaveBeenCalledWith({ status: 'cancelled' })
+    expect(cancelSpy).toHaveBeenCalledTimes(1)
   })
 
   it('throws 404 when deleting a non-existent event', async () => {
-    const mock = buildMockAdmin()
+    addDeleteGuardHandler(() => [])
 
-    mock.from.mockImplementation((table: string) => {
-      if (table === 'events') {
-        return {
-          select: vi.fn().mockReturnThis(),
-          eq: vi.fn().mockReturnThis(),
-          maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
-        }
-      }
-      return buildChainableMock()
-    })
+    const { deleteEvent } = await loadService()
 
-    const { createSupabaseServerAdminClient } = await import('@/lib/supabase/server')
-    vi.mocked(createSupabaseServerAdminClient).mockReturnValue(mock as any)
-
-    const { deleteEvent } = await import('@/lib/server/events-service')
-
-    let caught: ServiceError | undefined
-    try {
-      await deleteEvent('nonexistent')
-    } catch (err) {
-      caught = err as ServiceError
-    }
-
-    expect(caught?.statusCode).toBe(404)
+    await expect(deleteEvent('nonexistent')).rejects.toMatchObject({ statusCode: 404 })
   })
 })
