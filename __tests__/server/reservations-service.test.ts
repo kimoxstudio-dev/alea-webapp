@@ -1,6 +1,25 @@
 // @vitest-environment node
 import type { SessionUser } from '@/lib/server/auth'
 import { beforeEach, describe, expect, it, vi, afterEach } from 'vitest'
+import { createSqlMock, parseStatement, whereColumnHasOperator, whereConditionCount, whereHasColumn } from '../helpers/sql-mock'
+import { NeonDbError } from '@neondatabase/serverless'
+
+/**
+ * Builds a real `NeonDbError` instance with the given Postgres error code.
+ * `isConflictError` (#348 code-review fix) narrows on `instanceof NeonDbError`
+ * rather than an unchecked cast, so a plain `{ code: '23P01' }` object no
+ * longer satisfies it — tests simulating a DB exclusion-constraint race must
+ * throw an actual `NeonDbError`.
+ */
+function makeNeonDbError(code: string): NeonDbError {
+  const error = new NeonDbError('exclusion constraint violation')
+  error.code = code
+  return error
+}
+
+const sqlMock = createSqlMock()
+
+vi.mock('@/lib/db/client', () => ({ sql: sqlMock.sql }))
 
 vi.mock('@/lib/server/database-time', () => ({
   getDatabaseNow: vi.fn(async () => new Date()),
@@ -85,8 +104,8 @@ const tablesState = new Map<string, TableRow>()
 const profilesMap = new Map<string, { member_number: string }>()
 const roomsMap = new Map<string, RoomRow>()
 const eventRoomBlocksState: EventRoomBlockRow[] = []
-let reservationInsertError: { code: string } | null = null
-let reservationUpdateError: { code: string } | null = null
+let reservationInsertError: NeonDbError | null = null
+let reservationUpdateError: NeonDbError | null = null
 // Regression-test knob: simulates the `.eq('user_id', ...)` query filter being
 // accidentally removed/bypassed at the query layer, so the mock returns mixed
 // rows across users. Used to prove assertMemberRowsScoped() itself throws,
@@ -490,11 +509,241 @@ async function loadReservationModules() {
 describe('reservations service', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    sqlMock.reset()
     vi.unstubAllEnvs()
     reservationInsertError = null
     reservationUpdateError = null
     bypassUserIdFilterInMock = false
     seedState()
+    sqlMock.addHandler({
+      name: 'SELECT table by id',
+      verb: 'select',
+      match: (stmt) =>
+        stmt.table === 'tables' &&
+        whereColumnHasOperator(stmt, 'id', '=') &&
+        whereConditionCount(stmt) === 1,
+      respond: (stmt) => {
+        const table = tablesState.get(String(stmt.values[0]))
+        return table ? [table] : []
+      },
+    })
+    sqlMock.addHandler({
+      name: 'SELECT overlapping event room blocks',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'event_room_blocks' && whereConditionCount(stmt) === 4,
+      respond: (stmt) => {
+        const [roomId, date, endTime, startTime] = stmt.values.map(String)
+        return eventRoomBlocksState.filter((block) =>
+          block.room_id === roomId &&
+          block.date === date &&
+          block.start_time < endTime &&
+          block.end_time > startTime,
+        )
+      },
+    })
+    sqlMock.addHandler({
+      name: 'SELECT active saved game for bottom surface',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'saved_games' && whereConditionCount(stmt) === 4,
+      respond: () => [],
+    })
+    sqlMock.addHandler({
+      name: 'SELECT conflicting reservation equipment',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'reservation_equipment' && stmt.values.length === 2,
+      respond: (stmt) => reservationEquipmentState.filter((row) =>
+        (stmt.values[0] as string[]).includes(row.reservation_id) &&
+        (stmt.values[1] as string[]).includes(row.equipment_id),
+      ),
+    })
+    sqlMock.addHandler({
+      name: 'SELECT reservation equipment ids',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'reservation_equipment' && stmt.values.length === 1 && stmt.orderBy === null,
+      respond: (stmt) => reservationEquipmentState.filter((row) => row.reservation_id === String(stmt.values[0])),
+    })
+    sqlMock.addHandler({
+      name: 'DELETE reservation equipment',
+      verb: 'delete',
+      match: (stmt) => stmt.table === 'reservation_equipment',
+      respond: (stmt) => {
+        const id = String(stmt.values[0])
+        for (let index = reservationEquipmentState.length - 1; index >= 0; index -= 1) {
+          if (reservationEquipmentState[index]!.reservation_id === id) reservationEquipmentState.splice(index, 1)
+        }
+        return []
+      },
+    })
+    sqlMock.addHandler({
+      name: 'INSERT reservation equipment',
+      verb: 'insert',
+      match: (stmt) => stmt.table === 'reservation_equipment',
+      respond: (stmt) => {
+        const [reservationId, equipmentIds] = stmt.values as [string, string[]]
+        reservationEquipmentState.push(...equipmentIds.map((equipment_id) => ({ reservation_id: reservationId, equipment_id })))
+        return []
+      },
+    })
+    sqlMock.addHandler({
+      name: 'SELECT all equipment ordered by name',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'equipment' && stmt.whereClause === null && stmt.orderBy === 'name asc',
+      respond: () => [...equipmentState.values()].sort((left, right) => left.name.localeCompare(right.name)),
+    })
+    sqlMock.addHandler({
+      name: 'SELECT equipment locked to other rooms',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'room_default_equipment' && stmt.whereClause?.includes('room_id <>') === true,
+      respond: (stmt) => roomDefaultEquipmentState.filter((row) => row.room_id !== String(stmt.values[0])),
+    })
+    sqlMock.addHandler({
+      name: 'SELECT room default equipment',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'room_default_equipment' && stmt.whereClause?.includes('room_id =') === true,
+      respond: (stmt) => roomDefaultEquipmentState
+        .filter((row) => row.room_id === String(stmt.values[0]))
+        .map((row) => equipmentState.get(row.equipment_id)).filter(Boolean),
+    })
+    sqlMock.addHandler({
+      name: 'SELECT stale pending reservations',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'reservations' && stmt.whereClause?.includes('activated_at is null') === true,
+      respond: (stmt) => {
+        const [tableId, date] = stmt.values.map(String)
+        return reservationsState.filter((row) =>
+          row.status === 'pending' && row.table_id === tableId && row.date === date && row.activated_at === null,
+        ).map(cloneReservation)
+      },
+    })
+    sqlMock.addHandler({
+      name: 'UPDATE stale pending reservations to cancelled (batched via ANY(...))',
+      verb: 'update',
+      match: (stmt) => stmt.table === 'reservations' && stmt.whereClause?.includes('activated_at is null') === true,
+      respond: (stmt) => {
+        // #348: expireStalePendingReservations batches all expired ids into a
+        // single `WHERE id = ANY($1::uuid[])` UPDATE instead of one UPDATE per
+        // row — the bound value is the full array of ids, not a single id.
+        const expiredIds = (Array.isArray(stmt.values[0]) ? stmt.values[0] : [stmt.values[0]]).map(String)
+        for (const id of expiredIds) {
+          const row = reservationsState.find((reservation) => reservation.id === id)
+          if (row && row.status === 'pending' && row.activated_at === null) row.status = 'cancelled'
+        }
+        return []
+      },
+    })
+    sqlMock.addHandler({
+      name: 'UPDATE reservation returning row',
+      verb: 'update',
+      match: (stmt) => stmt.table === 'reservations' && stmt.returning,
+      respond: (stmt) => {
+        if (reservationUpdateError) throw reservationUpdateError
+        const [date, start_time, end_time, surface, status, id] = stmt.values
+        const row = reservationsState.find((reservation) => reservation.id === String(id))
+        if (!row) return []
+        Object.assign(row, { date, start_time: `${start_time}:00`, end_time: `${end_time}:00`, surface, status })
+        return [cloneReservation(row)]
+      },
+    })
+    sqlMock.addHandler({
+      name: 'INSERT reservation returning row',
+      verb: 'insert',
+      match: (stmt) => stmt.table === 'reservations',
+      respond: (stmt) => {
+        if (reservationInsertError) throw reservationInsertError
+        const [table_id, user_id, date, start_time, end_time, surface] = stmt.values.map((value) => value == null ? null : String(value))
+        const row = makeReservation({ id: `r${reservationsState.length + 1}`, table_id: table_id!, user_id: user_id!, date: date!, start_time: `${start_time}:00`, end_time: `${end_time}:00`, surface: surface as ReservationRow['surface'], created_at: '2026-04-04T12:00:00.000Z' })
+        reservationsState.push(row)
+        return [cloneReservation(row)]
+      },
+    })
+    sqlMock.addHandler({
+      name: 'SELECT overlapping reservations for user',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'reservations' && stmt.values.length === 6 && stmt.whereClause?.includes('user_id') === true && stmt.orderBy === null,
+      respond: (stmt) => {
+        const [userId, date, endTime, startTime, ignoredId] = stmt.values
+        return reservationsState.filter((row) =>
+          row.user_id === String(userId) && row.date === String(date) &&
+          (row.status === 'pending' || row.status === 'active') &&
+          row.start_time.slice(0, 5) < String(endTime) && row.end_time.slice(0, 5) > String(startTime) &&
+          (ignoredId == null || row.id !== String(ignoredId)),
+        ).map(cloneReservation)
+      },
+    })
+    sqlMock.addHandler({
+      name: 'SELECT overlapping reservations paginated',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'reservations' && stmt.values.length === 7 && stmt.orderBy === 'id asc',
+      respond: (stmt) => {
+        const [date, endTime, startTime, ignoredId, , limit, offset] = stmt.values
+        return reservationsState.filter((row) =>
+          row.date === String(date) &&
+          (row.status === 'active' || row.status === 'pending') &&
+          row.start_time.slice(0, 5) < String(endTime) &&
+          row.end_time.slice(0, 5) > String(startTime) &&
+          (ignoredId == null || row.id !== String(ignoredId)),
+        ).sort((left, right) => left.id.localeCompare(right.id))
+          .slice(Number(offset), Number(offset) + Number(limit)).map(cloneReservation)
+      },
+    })
+    sqlMock.addHandler({
+      name: 'SELECT active reservations for table conflict',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'reservations' && stmt.values.length === 4 && stmt.whereClause?.includes('table_id') === true,
+      respond: (stmt) => {
+        const [tableId, date, ignoredId] = stmt.values.map((value) => value == null ? null : String(value))
+        return reservationsState.filter((row) =>
+          row.table_id === tableId &&
+          row.date === date &&
+          (row.status === 'active' || row.status === 'pending') &&
+          (ignoredId == null || row.id !== ignoredId),
+        ).map(cloneReservation)
+      },
+    })
+    sqlMock.addHandler({
+      name: 'SELECT visible reservations with metadata',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'reservations' && stmt.values.length === 6 && stmt.orderBy === 'r.date asc, r.start_time asc, r.id asc',
+      respond: (stmt) => {
+        const [userId, , tableId, , date] = stmt.values
+        return reservationsState.filter((row) =>
+          (bypassUserIdFilterInMock || userId == null || row.user_id === String(userId)) &&
+          (tableId == null || row.table_id === String(tableId)) &&
+          (date == null || row.date === String(date)),
+        ).sort((left, right) =>
+          left.date.localeCompare(right.date) || left.start_time.localeCompare(right.start_time) || left.id.localeCompare(right.id),
+        ).map((row) => {
+          const table = tablesState.get(row.table_id)
+          return {
+            ...cloneReservation(row),
+            member_number: profilesMap.get(row.user_id)?.member_number ?? null,
+            table_name: table?.name ?? null,
+            room_name: table ? (roomsMap.get(table.room_id)?.name ?? null) : null,
+          }
+        })
+      },
+    })
+    sqlMock.addHandler({
+      name: 'SELECT visible reservation equipment',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'reservation_equipment' && stmt.values.length === 1 && stmt.orderBy === 're.reservation_id asc, e.name asc',
+      respond: (stmt) => {
+        const reservationIds = stmt.values[0] as string[]
+        return reservationEquipmentState
+          .filter((row) => reservationIds.includes(row.reservation_id))
+          .map((row) => ({ reservation_id: row.reservation_id, ...(equipmentState.get(row.equipment_id)!) }))
+          .sort((left, right) => left.reservation_id.localeCompare(right.reservation_id) || left.name.localeCompare(right.name))
+      },
+    })
+    sqlMock.addHandler({
+      name: 'SELECT reservation by id for access',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'reservations' && whereConditionCount(stmt) === 1,
+      respond: (stmt) => {
+        const reservation = reservationsState.find((row) => row.id === String(stmt.values[0]))
+        return reservation ? [cloneReservation(reservation)] : []
+      },
+    })
   })
 
   describe('listVisibleReservations', () => {
@@ -983,7 +1232,7 @@ describe('reservations service', () => {
 
     it('maps database exclusion conflicts to SLOT_TAKEN when the insert races', async () => {
       const { createReservationForSession } = await loadReservationModules()
-      reservationInsertError = { code: '23P01' }
+      reservationInsertError = makeNeonDbError('23P01')
 
       await expect(createReservationForSession(memberSession, {
         tableId: 't2',
@@ -1165,6 +1414,55 @@ describe('reservations service', () => {
         endTime: '13:30',
       }))
       expect(reservationsState[0]!.status).toBe('cancelled')
+    })
+
+    it('batches multiple expired pending reservations into a single UPDATE call', async () => {
+      // #348 code-review fix: expireStalePendingReservations now issues one
+      // batched `WHERE id = ANY($1::uuid[])` UPDATE instead of a sequential
+      // per-row UPDATE loop.
+      const { createReservationForSession } = await loadReservationModules()
+      const now = new Date('2026-12-31T11:01:00.000Z')
+      vi.setSystemTime(now)
+
+      reservationsState[0]!.status = 'pending'
+      reservationsState[0]!.user_id = 'other-user'
+      reservationsState[0]!.start_time = '10:00:00'
+      reservationsState[0]!.end_time = '18:00:00'
+      reservationsState[0]!.created_at = '2026-12-20T10:00:00.000Z'
+
+      const secondStale = makeReservation({
+        id: 'r-stale-2',
+        table_id: 't1',
+        user_id: 'other-user',
+        status: 'pending',
+        start_time: '10:00:00',
+        end_time: '18:00:00',
+        created_at: '2026-12-20T10:00:00.000Z',
+      })
+      reservationsState.push(secondStale)
+
+      await expect(createReservationForSession(memberSession, {
+        tableId: 't1',
+        date: '2026-12-31',
+        startTime: '12:30',
+        endTime: '13:30',
+      })).resolves.toEqual(expect.objectContaining({
+        tableId: 't1',
+        startTime: '12:30',
+        endTime: '13:30',
+      }))
+
+      expect(reservationsState[0]!.status).toBe('cancelled')
+      expect(secondStale.status).toBe('cancelled')
+
+      const batchUpdateCalls = sqlMock.sql.mock.calls.filter(([strings, ...values]) => {
+        const stmt = parseStatement(strings, values)
+        return stmt.verb === 'update' && stmt.table === 'reservations' && whereHasColumn(stmt, 'activated_at')
+      })
+      expect(batchUpdateCalls).toHaveLength(1)
+      const [strings, ...values] = batchUpdateCalls[0]!
+      const stmt = parseStatement(strings, values)
+      expect(stmt.values[0]).toEqual(expect.arrayContaining(['r1', 'r-stale-2']))
     })
 
     it('does not cancel an old future pending booking during concurrent cleanup', async () => {
@@ -1462,6 +1760,55 @@ describe('reservations service', () => {
       expect(updated.surface).toBeNull()
     })
 
+    it('scopes the UPDATE statement to the caller at the query-predicate level for members (defense-in-depth)', async () => {
+      // #348 code-review fix: the raw-SQL UPDATE now carries
+      // `AND (<isAdmin> OR user_id = <callerId>)` so a member can never
+      // update another member's row even if application-layer access
+      // checks were ever bypassed. This asserts the predicate itself,
+      // not just the end-to-end outcome already covered by other tests.
+      const { updateReservationForSession } = await loadReservationModules()
+
+      await updateReservationForSession(memberSession, 'r1', {
+        startTime: '18:00',
+        endTime: '19:00',
+      })
+
+      const updateCall = sqlMock.sql.mock.calls.find(([strings, ...values]) => {
+        const stmt = parseStatement(strings, values)
+        return stmt.verb === 'update' && stmt.table === 'reservations' && stmt.returning
+      })
+      expect(updateCall).toBeDefined()
+
+      const [strings, ...values] = updateCall!
+      const stmt = parseStatement(strings, values)
+
+      expect(whereHasColumn(stmt, 'user_id')).toBe(true)
+      expect(whereColumnHasOperator(stmt, 'user_id', '=')).toBe(true)
+      // For a member session the admin-bypass boolean must be bound false,
+      // and the scoping value must be the caller's own id.
+      expect(stmt.values).toContain(false)
+      expect(stmt.values).toContain(memberSession.id)
+    })
+
+    it('binds the admin-bypass predicate to true when an admin updates another member reservation', async () => {
+      const { updateReservationForSession } = await loadReservationModules()
+
+      await updateReservationForSession(adminSession, 'r1', { status: 'completed' })
+
+      const updateCall = sqlMock.sql.mock.calls.find(([strings, ...values]) => {
+        const stmt = parseStatement(strings, values)
+        return stmt.verb === 'update' && stmt.table === 'reservations' && stmt.returning
+      })
+      expect(updateCall).toBeDefined()
+
+      const [strings, ...values] = updateCall!
+      const stmt = parseStatement(strings, values)
+
+      // Admin bypass: the bound boolean is true, so the OR short-circuits
+      // regardless of the row's actual user_id.
+      expect(stmt.values).toContain(true)
+    })
+
     it('surface stays null when body.surface is undefined', async () => {
       const { updateReservationForSession } = await loadReservationModules()
 
@@ -1627,7 +1974,7 @@ describe('reservations service', () => {
 
     it('maps database exclusion conflicts to SLOT_TAKEN when update races', async () => {
       const { updateReservationForSession } = await loadReservationModules()
-      reservationUpdateError = { code: '23P01' }
+      reservationUpdateError = makeNeonDbError('23P01')
 
       await expect(updateReservationForSession(memberSession, 'r1', {
         date: '2026-12-31',

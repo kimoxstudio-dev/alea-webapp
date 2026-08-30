@@ -5,8 +5,9 @@ import { getCurrentClubDate, isValidDateOnlyString, zonedDateTimeToUtc } from '@
 import { getDatabaseNow } from '@/lib/server/database-time'
 import { serviceError } from '@/lib/server/service-error'
 import { assertMemberRowsScoped } from '@/lib/server/data-scoping'
-import { createSupabaseServerAdminClient, createSupabaseServerClient } from '@/lib/supabase/server'
-import type { Tables, TablesInsert, TablesUpdate } from '@/lib/supabase/types'
+import { sql } from '@/lib/db/client'
+import { NeonDbError } from '@neondatabase/serverless'
+import type { Tables } from '@/lib/supabase/types'
 import { normalizeTime } from '@/lib/server/availability'
 import {
   CHECK_IN_LATE_MINUTES,
@@ -17,75 +18,10 @@ import {
 type ReservationRow = Tables<'reservations'>
 type TableRow = Tables<'tables'>
 type EquipmentRow = Tables<'equipment'>
-type ReservationEquipmentRow = Tables<'reservation_equipment'>
-type PostgrestErrorLike = { code?: string }
-type TablesLookupClient = {
-  select: (columns?: string) => {
-    eq: (column: 'id', value: string) => {
-      maybeSingle: () => Promise<{ data: TableRow | null; error: unknown }>
-    }
-  }
-}
-type AdminReservationsQuery = {
-  eq: (column: 'id' | 'table_id' | 'date' | 'status', value: string) => AdminReservationsQuery
-  neq: (column: 'id', value: string) => AdminReservationsQuery
-  in: (column: 'status', values: string[]) => AdminReservationsQuery
-  lt: (column: 'start_time', value: string) => AdminReservationsQuery
-  gt: (column: 'end_time', value: string) => AdminReservationsQuery
-  order: (column: string, options?: { ascending: boolean }) => AdminReservationsQuery
-  range: (from: number, to: number) => Promise<{ data: Array<{ id: string }> | null; error: unknown }>
-  limit: (count: number) => Promise<{ data: Array<{ id: string }> | null; error: unknown }>
-  maybeSingle: () => Promise<{ data: ReservationRow | null; error: unknown }>
-  then: Promise<{ data: ReservationRow[] | null; error: unknown }>['then']
-}
-type AdminReservationsTableClient = {
-  select: (columns: string) => AdminReservationsQuery
-}
-type SessionReservationsQuery = {
-  eq: (column: 'user_id' | 'table_id' | 'date', value: string) => SessionReservationsQuery
-  order: (column: string, options: { ascending: boolean }) => SessionReservationsQuery
-  then: Promise<{ data: ReservationRow[] | null; error: unknown }>['then']
-}
-type UserSlotOverlapQuery = {
-  eq: (column: 'user_id' | 'date', value: string) => UserSlotOverlapQuery
-  neq: (column: 'id', value: string) => UserSlotOverlapQuery
-  in: (column: 'status', values: string[]) => UserSlotOverlapQuery
-  lt: (column: 'start_time' | 'end_time', value: string) => UserSlotOverlapQuery
-  gt: (column: 'start_time' | 'end_time', value: string) => UserSlotOverlapQuery
-  then: Promise<{ data: ReservationRow[] | null; error: unknown }>['then']
-}
-type UserSlotOverlapTableClient = {
-  select: (columns: string) => UserSlotOverlapQuery
-}
-type SessionReservationsTableClient = {
-  select: (columns: string) => SessionReservationsQuery
-  insert: (values: TablesInsert<'reservations'>) => {
-    select: (columns: string) => {
-      single: () => Promise<{ data: ReservationRow | null; error: PostgrestErrorLike | null }>
-    }
-  }
-  update: (values: TablesUpdate<'reservations'>) => {
-    eq: (column: 'id', value: string) => {
-      select: (columns: string) => {
-        single: () => Promise<{ data: ReservationRow | null; error: PostgrestErrorLike | null }>
-      }
-    }
-  }
-}
-
-type EnrichedReservationRow = ReservationRow & {
-  profiles?: { member_number: string } | null
-  tables?: { name: string; rooms?: { name: string } | null } | null
-  reservation_equipment?: Array<ReservationEquipmentRow & { equipment: EquipmentRow | null }> | null
-}
-
-type EnrichedReservationsQuery = {
-  eq: (column: 'user_id' | 'table_id' | 'date', value: string) => EnrichedReservationsQuery
-  order: (column: string, options: { ascending: boolean }) => EnrichedReservationsQuery
-  then: Promise<{ data: EnrichedReservationRow[] | null; error: unknown }>['then']
-}
-type EnrichedReservationsTableClient = {
-  select: (columns: string) => EnrichedReservationsQuery
+type ReservationListRow = ReservationRow & {
+  member_number: string | null
+  table_name: string | null
+  room_name: string | null
 }
 
 /** @deprecated Pending expiry is slot-relative; retained for compatibility. */
@@ -98,7 +34,6 @@ export const BOOKING_WINDOW_DAYS = 7
 const CANCELLATION_CUTOFF_MS = 60 * 60 * 1000 // 60 minutes
 
 const RESERVATION_COLUMNS = 'id, table_id, user_id, date, start_time, end_time, status, surface, activated_at, created_at'
-const RESERVATION_ENRICHED_COLUMNS = 'id, table_id, user_id, date, start_time, end_time, status, surface, activated_at, created_at, profiles(member_number), tables(name, rooms(name)), reservation_equipment(equipment(id, name, description, created_at))'
 
 function parseDate(value: string): string {
   if (!isValidDateOnlyString(value)) {
@@ -177,7 +112,7 @@ function mapReservation(row: ReservationRow): Reservation {
   }
 }
 
-function mapEnrichedReservation(row: EnrichedReservationRow): Reservation {
+function mapReservationListRow(row: ReservationListRow, equipment: Equipment[]): Reservation {
   return {
     id: row.id,
     tableId: row.table_id,
@@ -189,29 +124,27 @@ function mapEnrichedReservation(row: EnrichedReservationRow): Reservation {
     surface: row.surface,
     activatedAt: row.activated_at ?? null,
     createdAt: row.created_at,
-    memberNumber: row.profiles?.member_number ?? null,
-    roomName: row.tables?.rooms?.name ?? null,
-    tableName: row.tables?.name ?? null,
-    equipment: (row.reservation_equipment ?? [])
-      .map((item) => item.equipment)
-      .filter((item): item is EquipmentRow => item !== null)
-      .map(toEquipment),
+    memberNumber: row.member_number,
+    roomName: row.room_name,
+    tableName: row.table_name,
+    equipment,
   }
 }
 
 async function getTable(tableId: string) {
-  const supabase = await createSupabaseServerClient()
-  const tables = supabase.from('tables') as unknown as TablesLookupClient
-  const { data, error } = await tables
-    .select('id, type, room_id')
-    .eq('id', tableId)
-    .maybeSingle()
-
-  if (error) {
+  let rows: TableRow[]
+  try {
+    rows = await sql`
+      SELECT id, type, room_id
+      FROM tables
+      WHERE id = ${tableId}
+      LIMIT 1
+    ` as TableRow[]
+  } catch {
     serviceError('Internal server error', 500)
   }
 
-  return data as TableRow | null
+  return rows[0] ?? null
 }
 
 async function hasEventBlockConflict(input: {
@@ -221,22 +154,23 @@ async function hasEventBlockConflict(input: {
   startTime: string
   endTime: string
 }) {
-  const admin = createSupabaseServerAdminClient()
-  const { data, error } = await admin
-    .from('event_room_blocks')
-    .select('id, table_id')
-    .eq('room_id', input.roomId)
-    .eq('date', input.date)
-    .lt('start_time', input.endTime)
-    .gt('end_time', input.startTime)
-
-  if (error) {
+  let rows: Array<{ id: string; table_id: string | null }>
+  try {
+    rows = await sql`
+      SELECT id, table_id
+      FROM event_room_blocks
+      WHERE room_id = ${input.roomId}
+        AND date = ${input.date}
+        AND start_time < ${input.endTime}
+        AND end_time > ${input.startTime}
+    ` as Array<{ id: string; table_id: string | null }>
+  } catch {
     serviceError('Internal server error', 500)
   }
 
   // OIR-208: a block with a table_id only conflicts with that single table;
   // NULL (the pre-OIR-208 default) conflicts with every table of the room.
-  return ((data ?? []) as Array<{ id: string; table_id: string | null }>).some(
+  return rows.some(
     (block) => block.table_id == null || block.table_id === input.tableId,
   )
 }
@@ -247,33 +181,36 @@ async function hasSavedGameBottomConflict(input: {
   surface?: TableSurface
 }) {
   if (input.surface !== 'bottom') return false
-  const admin = createSupabaseServerAdminClient()
-  const { data, error } = await admin
-    .from('saved_games')
-    .select('id')
-    .eq('table_id', input.tableId)
-    .eq('status', 'active')
-    .lte('start_date', input.date)
-    .gte('end_date', input.date)
-    .limit(1)
-
-  if (error) serviceError('Internal server error', 500)
-  return Boolean(data?.length)
+  let rows: Array<{ id: string }>
+  try {
+    rows = await sql`
+      SELECT id
+      FROM saved_games
+      WHERE table_id = ${input.tableId}
+        AND status = 'active'
+        AND start_date <= ${input.date}
+        AND end_date >= ${input.date}
+      LIMIT 1
+    ` as Array<{ id: string }>
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+  return rows.length > 0
 }
 
 async function getReservationForAccess(reservationId: string) {
-  const admin = createSupabaseServerAdminClient()
-  const reservations = admin.from('reservations') as unknown as AdminReservationsTableClient
-  const { data, error } = await reservations
-    .select(RESERVATION_COLUMNS)
-    .eq('id', reservationId)
-    .maybeSingle()
-
-  if (error) {
+  let rows: ReservationRow[]
+  try {
+    rows = await sql`
+      SELECT ${sql.unsafe(RESERVATION_COLUMNS)}
+      FROM reservations
+      WHERE id = ${reservationId}
+      LIMIT 1
+    ` as ReservationRow[]
+  } catch {
     serviceError('Internal server error', 500)
   }
-
-  return data as ReservationRow | null
+  return rows[0] ?? null
 }
 
 async function listActiveReservationsForConflict(input: {
@@ -281,25 +218,23 @@ async function listActiveReservationsForConflict(input: {
   date: string
   ignoreReservationId?: string
 }) {
-  const admin = createSupabaseServerAdminClient()
-  const query = (admin.from('reservations') as unknown as AdminReservationsTableClient)
-    .select(RESERVATION_COLUMNS)
-    .eq('table_id', input.tableId)
-    .eq('date', input.date)
-    .in('status', ['active', 'pending'])
-
-  const result = input.ignoreReservationId
-    ? await query.neq('id', input.ignoreReservationId)
-    : await query
-  const { data, error } = result
-
-  if (error) {
+  let rows: ReservationRow[]
+  try {
+    rows = await sql`
+      SELECT ${sql.unsafe(RESERVATION_COLUMNS)}
+      FROM reservations
+      WHERE table_id = ${input.tableId}
+        AND date = ${input.date}
+        AND status IN ('active', 'pending')
+        AND (${input.ignoreReservationId ?? null}::uuid IS NULL OR id <> ${input.ignoreReservationId ?? null}::uuid)
+    ` as ReservationRow[]
+  } catch {
     serviceError('Internal server error', 500)
   }
 
   // Lazy evaluation: filter out expired pending reservations
   const nowUtc = await getDatabaseNow()
-  return (data ?? []).filter((row) => {
+  return rows.filter((row) => {
     if (row.status === 'pending' && row.activated_at === null) {
       return !isPendingReservationExpired(row, nowUtc)
     }
@@ -308,36 +243,40 @@ async function listActiveReservationsForConflict(input: {
 }
 
 async function expireStalePendingReservations(tableId: string, date: string) {
-  const admin = createSupabaseServerAdminClient()
   const nowUtc = await getDatabaseNow()
-  const { data, error } = await admin
-    .from('reservations')
-    .select(RESERVATION_COLUMNS)
-    .eq('status', 'pending')
-    .eq('table_id', tableId)
-    .eq('date', date)
-    .is('activated_at', null)
-
-  if (error) {
+  let rows: ReservationRow[]
+  try {
+    rows = await sql`
+      SELECT ${sql.unsafe(RESERVATION_COLUMNS)}
+      FROM reservations
+      WHERE status = 'pending'
+        AND table_id = ${tableId}
+        AND date = ${date}
+        AND activated_at IS NULL
+    ` as ReservationRow[]
+  } catch (error) {
     console.error('expireStalePendingReservations failed (non-fatal):', error)
     return
   }
 
-  const expiredIds = (data ?? [])
+  const expiredIds = rows
     .filter((row) => isPendingReservationExpired(row, nowUtc))
     .map((row) => row.id)
 
-  for (const id of expiredIds) {
-    const { error: updateError } = await admin
-      .from('reservations')
-      .update({ status: 'cancelled' })
-      .eq('id', id)
-      .eq('status', 'pending')
-      .is('activated_at', null)
+  if (expiredIds.length === 0) {
+    return
+  }
 
-    if (updateError) {
-      console.error('expireStalePendingReservations failed (non-fatal):', updateError)
-    }
+  try {
+    await sql`
+      UPDATE reservations
+      SET status = 'cancelled'
+      WHERE id = ANY(${expiredIds}::uuid[])
+        AND status = 'pending'
+        AND activated_at IS NULL
+    `
+  } catch (error) {
+    console.error('expireStalePendingReservations failed (non-fatal):', error)
   }
 }
 
@@ -347,7 +286,6 @@ async function listOverlappingReservationIds(input: {
   endTime: string
   ignoreReservationId?: string
 }) {
-  const admin = createSupabaseServerAdminClient()
   const pageSize = 1000
   const reservationIds: string[] = []
   let from = 0
@@ -357,24 +295,23 @@ async function listOverlappingReservationIds(input: {
 
   // Get full rows to enable lazy evaluation filtering
   while (true) {
-    let query = (admin.from('reservations') as unknown as AdminReservationsTableClient)
-      .select(RESERVATION_COLUMNS)
-      .eq('date', input.date)
-      .in('status', ['pending', 'active'])
-      .lt('start_time', input.endTime)
-      .gt('end_time', input.startTime)
-
-    if (input.ignoreReservationId) {
-      query = query.neq('id', input.ignoreReservationId)
-    }
-
-    const { data, error } = await query.order('id', { ascending: true }).range(from, from + pageSize - 1)
-
-    if (error) {
+    let rows: ReservationRow[]
+    try {
+      rows = await sql`
+        SELECT ${sql.unsafe(RESERVATION_COLUMNS)}
+        FROM reservations
+        WHERE date = ${input.date}
+          AND status IN ('pending', 'active')
+          AND start_time < ${input.endTime}
+          AND end_time > ${input.startTime}
+          AND (${input.ignoreReservationId ?? null}::uuid IS NULL OR id <> ${input.ignoreReservationId ?? null}::uuid)
+        ORDER BY id ASC
+        LIMIT ${pageSize}
+        OFFSET ${from}
+      ` as ReservationRow[]
+    } catch {
       serviceError('Internal server error', 500)
     }
-
-    const rows = (data ?? []) as ReservationRow[]
 
     // Lazy evaluation: filter out expired pending reservations
     const filteredRows = rows.filter((row) => {
@@ -394,50 +331,49 @@ async function listOverlappingReservationIds(input: {
 }
 
 async function listRoomDefaultEquipment(roomId: string) {
-  const admin = createSupabaseServerAdminClient()
-  const { data, error } = await admin
-    .from('room_default_equipment')
-    .select('equipment(id, name, description, created_at)')
-    .eq('room_id', roomId)
-
-  if (error) {
+  let rows: EquipmentRow[]
+  try {
+    rows = await sql`
+      SELECT equipment.id, equipment.name, equipment.description, equipment.created_at
+      FROM room_default_equipment
+      INNER JOIN equipment ON equipment.id = room_default_equipment.equipment_id
+      WHERE room_default_equipment.room_id = ${roomId}
+    ` as EquipmentRow[]
+  } catch {
     serviceError('Internal server error', 500)
   }
-
-  return ((data ?? []) as Array<{ equipment: EquipmentRow | null }>)
-    .map((row) => row.equipment)
-    .filter((row): row is EquipmentRow => row !== null)
+  return rows
 }
 
 async function listAllEquipment() {
-  const admin = createSupabaseServerAdminClient()
-  const { data, error } = await admin
-    .from('equipment')
-    .select('id, name, description, created_at')
-    .order('name', { ascending: true })
-
-  if (error) {
+  let rows: EquipmentRow[]
+  try {
+    rows = await sql`
+      SELECT id, name, description, created_at
+      FROM equipment
+      ORDER BY name ASC
+    ` as EquipmentRow[]
+  } catch {
     serviceError('Internal server error', 500)
   }
-
-  return (data ?? []) as EquipmentRow[]
+  return rows
 }
 
 async function listEquipmentLockedToOtherRooms(roomId: string): Promise<Set<string>> {
-  const admin = createSupabaseServerAdminClient()
-  const { data, error } = await admin
-    .from('room_default_equipment')
-    .select('equipment_id, room_id')
-
-  if (error) {
+  let rows: Array<{ equipment_id: string; room_id: string }>
+  try {
+    rows = await sql`
+      SELECT equipment_id, room_id
+      FROM room_default_equipment
+      WHERE room_id <> ${roomId}
+    ` as Array<{ equipment_id: string; room_id: string }>
+  } catch {
     serviceError('Internal server error', 500)
   }
 
   const lockedToOther = new Set<string>()
-  for (const row of (data ?? []) as Array<{ equipment_id: string; room_id: string }>) {
-    if (row.room_id !== roomId) {
-      lockedToOther.add(row.equipment_id)
-    }
+  for (const row of rows) {
+    lockedToOther.add(row.equipment_id)
   }
   return lockedToOther
 }
@@ -492,18 +428,18 @@ async function listConflictingEquipmentIds(input: {
     return new Set<string>()
   }
 
-  const admin = createSupabaseServerAdminClient()
-  const { data, error } = await admin
-    .from('reservation_equipment')
-    .select('equipment_id')
-    .in('reservation_id', overlappingReservationIds)
-    .in('equipment_id', input.equipmentIds)
-
-  if (error) {
+  let rows: Array<{ equipment_id: string }>
+  try {
+    rows = await sql`
+      SELECT equipment_id
+      FROM reservation_equipment
+      WHERE reservation_id = ANY(${overlappingReservationIds}::uuid[])
+        AND equipment_id = ANY(${input.equipmentIds}::uuid[])
+    ` as Array<{ equipment_id: string }>
+  } catch {
     serviceError('Internal server error', 500)
   }
-
-  return new Set((data ?? []).map((row) => row.equipment_id))
+  return new Set(rows.map((row) => row.equipment_id))
 }
 
 async function assertEquipmentSelectionAllowed(input: {
@@ -545,13 +481,9 @@ async function assertEquipmentSelectionAllowed(input: {
 }
 
 async function saveReservationEquipment(reservationId: string, equipmentIds: string[]) {
-  const admin = createSupabaseServerAdminClient()
-  const { error: deleteError } = await admin
-    .from('reservation_equipment')
-    .delete()
-    .eq('reservation_id', reservationId)
-
-  if (deleteError) {
+  try {
+    await sql`DELETE FROM reservation_equipment WHERE reservation_id = ${reservationId}`
+  } catch {
     serviceError('Internal server error', 500)
   }
 
@@ -559,31 +491,28 @@ async function saveReservationEquipment(reservationId: string, equipmentIds: str
     return
   }
 
-  const inserts: TablesInsert<'reservation_equipment'>[] = equipmentIds.map((equipment_id) => ({
-    reservation_id: reservationId,
-    equipment_id,
-  }))
-  const { error: insertError } = await admin
-    .from('reservation_equipment')
-    .insert(inserts)
-
-  if (insertError) {
+  try {
+    await sql`
+      INSERT INTO reservation_equipment (reservation_id, equipment_id)
+      SELECT ${reservationId}::uuid, UNNEST(${equipmentIds}::uuid[])
+    `
+  } catch {
     serviceError('Internal server error', 500)
   }
 }
 
 async function getReservationEquipmentIds(reservationId: string) {
-  const admin = createSupabaseServerAdminClient()
-  const { data, error } = await admin
-    .from('reservation_equipment')
-    .select('equipment_id')
-    .eq('reservation_id', reservationId)
-
-  if (error) {
+  let rows: Array<{ equipment_id: string }>
+  try {
+    rows = await sql`
+      SELECT equipment_id
+      FROM reservation_equipment
+      WHERE reservation_id = ${reservationId}
+    ` as Array<{ equipment_id: string }>
+  } catch {
     serviceError('Internal server error', 500)
   }
-
-  return (data ?? []).map((row) => row.equipment_id)
+  return rows.map((row) => row.equipment_id)
 }
 
 function hasReservationConflict(
@@ -617,8 +546,8 @@ function assertReservationAccess(
   }
 }
 
-function isConflictError(error: PostgrestErrorLike | null | undefined) {
-  return error?.code === '23P01'
+function isConflictError(error: unknown) {
+  return error instanceof NeonDbError && error.code === '23P01'
 }
 
 function throwSlotTaken(): never {
@@ -631,39 +560,55 @@ export async function listVisibleReservations(input: {
   tableId?: string | null
   date?: string | null
 }) {
-  // Admin client required: RLS is removed in Phase 2. Member isolation is
-  // enforced by deriving effectiveUserId from session.id for non-admin callers
-  // (see line below), ensuring members can only query their own reservations.
-  const supabase = createSupabaseServerAdminClient()
-  const effectiveUserId = input.session.role === 'admin' ? input.userId ?? undefined : input.session.id
+  const effectiveUserId = input.session.role === 'admin' ? input.userId || undefined : input.session.id
+  const effectiveTableId = input.tableId || undefined
   const effectiveDate = input.date != null && input.date !== '' ? parseDate(input.date) : undefined
 
-  let query = (supabase.from('reservations') as unknown as EnrichedReservationsTableClient)
-    .select(RESERVATION_ENRICHED_COLUMNS)
-    .order('date', { ascending: true })
-    .order('start_time', { ascending: true })
-
-  if (effectiveUserId) {
-    query = query.eq('user_id', effectiveUserId)
-  }
-  if (input.tableId) {
-    query = query.eq('table_id', input.tableId)
-  }
-  if (effectiveDate) {
-    query = query.eq('date', effectiveDate)
-  }
-
-  const { data, error } = await query
-
-  if (error) {
+  let rows: ReservationListRow[]
+  try {
+    rows = await sql`
+      SELECT r.id, r.table_id, r.user_id, r.date, r.start_time, r.end_time, r.status, r.surface, r.activated_at, r.created_at,
+        p.member_number, t.name AS table_name, rooms.name AS room_name
+      FROM reservations r
+      LEFT JOIN profiles p ON p.id = r.user_id
+      LEFT JOIN tables t ON t.id = r.table_id
+      LEFT JOIN rooms ON rooms.id = t.room_id
+      WHERE (${effectiveUserId ?? null}::uuid IS NULL OR r.user_id = ${effectiveUserId ?? null}::uuid)
+        AND (${effectiveTableId ?? null}::uuid IS NULL OR r.table_id = ${effectiveTableId ?? null}::uuid)
+        AND (${effectiveDate ?? null}::date IS NULL OR r.date = ${effectiveDate ?? null}::date)
+      ORDER BY r.date ASC, r.start_time ASC, r.id ASC
+    ` as ReservationListRow[]
+  } catch {
     serviceError('Internal server error', 500)
   }
 
   // Defense-in-depth: verify the query filter held before mapping rows out.
   const rawRows = assertMemberRowsScoped(
-    (data ?? []) as EnrichedReservationRow[],
+    rows,
     input.session,
   )
+
+  const reservationIds = rawRows.map((row) => row.id)
+  let equipmentRows: Array<{ reservation_id: string } & EquipmentRow> = []
+  if (reservationIds.length > 0) {
+    try {
+      equipmentRows = await sql`
+        SELECT re.reservation_id, e.id, e.name, e.description, e.created_at
+        FROM reservation_equipment re
+        INNER JOIN equipment e ON e.id = re.equipment_id
+        WHERE re.reservation_id = ANY(${reservationIds}::uuid[])
+        ORDER BY re.reservation_id ASC, e.name ASC
+      ` as Array<{ reservation_id: string } & EquipmentRow>
+    } catch {
+      serviceError('Internal server error', 500)
+    }
+  }
+  const equipmentByReservation = new Map<string, Equipment[]>()
+  for (const row of equipmentRows) {
+    const equipment = equipmentByReservation.get(row.reservation_id) ?? []
+    equipment.push(toEquipment(row))
+    equipmentByReservation.set(row.reservation_id, equipment)
+  }
 
   const isAdmin = input.session.role === 'admin'
   const nowUtc = await getDatabaseNow()
@@ -679,7 +624,7 @@ export async function listVisibleReservations(input: {
       return true
     })
     .map((row) => {
-      const reservation = mapEnrichedReservation(row)
+      const reservation = mapReservationListRow(row, equipmentByReservation.get(row.id) ?? [])
       if (!isAdmin) {
         reservation.memberNumber = undefined
       }
@@ -715,30 +660,27 @@ async function checkUserSlotOverlap(
   date: string,
   startTime: string,
   endTime: string,
-  supabase: Awaited<ReturnType<typeof createSupabaseServerClient>>,
   ignoreReservationId?: string,
 ) {
-  let query = (supabase.from('reservations') as unknown as UserSlotOverlapTableClient)
-    .select(RESERVATION_COLUMNS)
-    .eq('user_id', userId)
-    .eq('date', date)
-    .in('status', ['pending', 'active'])
-    .lt('start_time', endTime)
-    .gt('end_time', startTime)
-
-  if (ignoreReservationId) {
-    query = query.neq('id', ignoreReservationId)
-  }
-
-  const { data, error } = await query
-
-  if (error) {
+  let rows: ReservationRow[]
+  try {
+    rows = await sql`
+      SELECT ${sql.unsafe(RESERVATION_COLUMNS)}
+      FROM reservations
+      WHERE user_id = ${userId}
+        AND date = ${date}
+        AND status IN ('pending', 'active')
+        AND start_time < ${endTime}
+        AND end_time > ${startTime}
+        AND (${ignoreReservationId ?? null}::uuid IS NULL OR id <> ${ignoreReservationId ?? null}::uuid)
+    ` as ReservationRow[]
+  } catch {
     serviceError('Internal server error', 500)
   }
 
   // Lazy evaluation: filter out expired pending reservations
   const nowUtc = await getDatabaseNow()
-  const activeReservations = (data ?? []).filter((row) => {
+  const activeReservations = rows.filter((row) => {
     if (row.status === 'pending' && row.activated_at === null) {
       return !isPendingReservationExpired(row, nowUtc)
     }
@@ -785,10 +727,8 @@ export async function createReservationForSession(
   assertReservationNotInPast(date, startTime)
   assertReservationWithinBookingWindow(date)
 
-  const supabase = await createSupabaseServerClient()
-
   await expireStalePendingReservations(tableId, date)
-  await checkUserSlotOverlap(session.id, date, startTime, endTime, supabase)
+  await checkUserSlotOverlap(session.id, date, startTime, endTime)
 
   const conflictingReservations = await listActiveReservationsForConflict({ tableId, date })
   if (hasReservationConflict(conflictingReservations, { startTime, endTime, surface })) {
@@ -807,26 +747,21 @@ export async function createReservationForSession(
     startTime,
     endTime,
   })
-  const insertPayload: TablesInsert<'reservations'> = {
-    table_id: tableId,
-    user_id: session.id,
-    date,
-    start_time: startTime,
-    end_time: endTime,
-    surface: surface ?? null,
-  }
-  const reservations = supabase.from('reservations') as unknown as SessionReservationsTableClient
-  const { data, error } = await reservations
-    .insert(insertPayload)
-    .select(RESERVATION_COLUMNS)
-    .single()
-
-  if (error || !data) {
+  let rows: ReservationRow[]
+  try {
+    rows = await sql`
+      INSERT INTO reservations (table_id, user_id, date, start_time, end_time, surface)
+      VALUES (${tableId}, ${session.id}, ${date}, ${startTime}, ${endTime}, ${surface ?? null})
+      RETURNING ${sql.unsafe(RESERVATION_COLUMNS)}
+    ` as ReservationRow[]
+  } catch (error) {
     if (isConflictError(error)) {
       throwSlotTaken()
     }
     serviceError('Internal server error', 500)
   }
+  const data = rows[0]
+  if (!data) serviceError('Internal server error', 500)
 
   try {
     await saveReservationEquipment(data.id, equipmentIds)
@@ -834,8 +769,11 @@ export async function createReservationForSession(
     // Compensating delete: remove the just-created reservation to avoid a ghost
     // row with no equipment association. Ignore errors from the delete itself —
     // the original equipment error is what the caller needs to act on.
-    const adminForRollback = createSupabaseServerAdminClient()
-    await adminForRollback.from('reservations').delete().eq('id', data.id)
+    try {
+      await sql`DELETE FROM reservations WHERE id = ${data.id}`
+    } catch (deleteError) {
+      console.error('createReservationForSession: compensating delete failed (non-fatal):', deleteError)
+    }
     serviceError('Failed to save equipment. Reservation was cancelled. Please try again.', 500)
   }
 
@@ -943,14 +881,12 @@ export async function updateReservationForSession(
     serviceError(ERROR_CODES.SAVED_GAME_BOTTOM_RESERVED, 409)
   }
 
-  const supabase = await createSupabaseServerClient()
   if (needsUserOverlapCheck) {
     await checkUserSlotOverlap(
       existingReservation.user_id,
       nextDate,
       nextStartTime,
       nextEndTime,
-      supabase,
       existingReservation.id,
     )
   }
@@ -965,38 +901,25 @@ export async function updateReservationForSession(
       ignoreReservationId: existingReservation.id,
     })
   }
-  const updatePayload: TablesUpdate<'reservations'> = {
-    date: nextDate,
-    start_time: nextStartTime,
-    end_time: nextEndTime,
-    surface: nextSurface,
-    status: nextStatus == null ? existingReservation.status : String(nextStatus) as ReservationRow['status'],
-  }
-  const reservations = supabase.from('reservations') as unknown as SessionReservationsTableClient
-  const { data, error } = await reservations
-    .update(updatePayload)
-    .eq('id', reservationId)
-    .select(RESERVATION_COLUMNS)
-    .single()
-
-  if (error || !data) {
+  const status = nextStatus == null ? existingReservation.status : String(nextStatus) as ReservationRow['status']
+  let rows: ReservationRow[]
+  try {
+    rows = await sql`
+      UPDATE reservations
+      SET date = ${nextDate}, start_time = ${nextStartTime}, end_time = ${nextEndTime}, surface = ${nextSurface}, status = ${status}
+      WHERE id = ${reservationId}
+        AND (${session.role === 'admin'} OR user_id = ${session.id})
+      RETURNING ${sql.unsafe(RESERVATION_COLUMNS)}
+    ` as ReservationRow[]
+  } catch (error) {
     if (isConflictError(error)) {
       throwSlotTaken()
     }
     serviceError('Internal server error', 500)
   }
 
-  return mapReservation(data as ReservationRow)
-}
-
-type ActivationAdminQuery = {
-  eq: (column: 'table_id' | 'date' | 'status' | 'user_id' | 'surface' | 'id', value: string) => ActivationAdminQuery
-  or: (filter: string) => ActivationAdminQuery
-  maybeSingle: () => Promise<{ data: ReservationRow | null; error: unknown }>
-  select: (columns?: string) => ActivationAdminQuery
-  update: (values: TablesUpdate<'reservations'>) => ActivationAdminQuery
-  single: () => Promise<{ data: ReservationRow | null; error: PostgrestErrorLike | null }>
-  then: Promise<{ data: ReservationRow | null; error: PostgrestErrorLike | null }>['then']
+  if (!rows[0]) serviceError('Reservation not found', 404)
+  return mapReservation(rows[0])
 }
 
 export async function activateReservationByTable(
@@ -1008,58 +931,52 @@ export async function activateReservationByTable(
   // DST transition days resolve to the correct calendar date.
   const today = getCurrentClubDate()
 
-  // Look up the table via the session-scoped client to decide whether to apply
-  // a surface filter. removable_top tables store surface='top'/'bottom'; all
-  // other types store null — filtering by surface for those would always fail.
   const table = await getTable(tableId)
   if (!table) {
     serviceError('Table not found', 404)
   }
-  const admin = createSupabaseServerAdminClient()
-
-  let pendingQuery = (admin.from('reservations') as unknown as { select: (c: string) => ActivationAdminQuery })
-    .select(RESERVATION_COLUMNS)
-    .eq('table_id', tableId)
-    .eq('date', today)
-    .eq('user_id', userId)
-    .eq('status', 'pending')
-
-  if (side === 'inf') {
-    pendingQuery = pendingQuery.eq('surface', 'bottom')
-  }
-
-  const { data: pendingData, error: pendingError } = await pendingQuery.maybeSingle()
-
-  if (pendingError) {
+  const requiresBottomSurface = side === 'inf'
+  let pendingRows: ReservationRow[]
+  try {
+    pendingRows = await sql`
+      SELECT ${sql.unsafe(RESERVATION_COLUMNS)}
+      FROM reservations
+      WHERE table_id = ${tableId}
+        AND date = ${today}
+        AND user_id = ${userId}
+        AND status = 'pending'
+        AND (${requiresBottomSurface} = false OR surface = 'bottom')
+      LIMIT 1
+    ` as ReservationRow[]
+  } catch {
     serviceError('Internal server error', 500)
   }
 
-  if (!pendingData) {
-    let activeQuery = (admin.from('reservations') as unknown as { select: (c: string) => ActivationAdminQuery })
-      .select(RESERVATION_COLUMNS)
-      .eq('table_id', tableId)
-      .eq('date', today)
-      .eq('user_id', userId)
-      .eq('status', 'active')
-
-    if (side === 'inf') {
-      activeQuery = activeQuery.eq('surface', 'bottom')
-    }
-
-    const { data: activeData, error: activeError } = await activeQuery.maybeSingle()
-
-    if (activeError) {
+  if (!pendingRows[0]) {
+    let activeRows: ReservationRow[]
+    try {
+      activeRows = await sql`
+        SELECT ${sql.unsafe(RESERVATION_COLUMNS)}
+        FROM reservations
+        WHERE table_id = ${tableId}
+          AND date = ${today}
+          AND user_id = ${userId}
+          AND status = 'active'
+          AND (${requiresBottomSurface} = false OR surface = 'bottom')
+        LIMIT 1
+      ` as ReservationRow[]
+    } catch {
       serviceError('Internal server error', 500)
     }
 
-    if (activeData) {
+    if (activeRows[0]) {
       serviceError(ERROR_CODES.CHECK_IN_ALREADY_ACTIVE, 409)
     }
 
     serviceError(ERROR_CODES.CHECK_IN_NO_RESERVATION, 404)
   }
 
-  const reservation = pendingData as ReservationRow
+  const reservation = pendingRows[0]
 
   if (!reservation.end_time) {
     serviceError('Invalid reservation data', 500)
@@ -1085,26 +1002,20 @@ export async function activateReservationByTable(
     serviceError(ERROR_CODES.CHECK_IN_TOO_LATE, 400)
   }
 
-  const { data: updated, error: updateError } = await admin
-    .from('reservations')
-    .update({ status: 'active', activated_at: nowUtc.toISOString() })
-    .eq('id', reservation.id)
-    .eq('status', 'pending')
-    .select(RESERVATION_COLUMNS)
-    .single()
-
-  // PGRST116: PostgREST returns this code when .single() matches zero rows.
-  // Here it means the reservation was already activated by a concurrent request
-  // (TOCTOU race) between our read and this UPDATE. Return 409, not 500.
-  if ((updateError as PostgrestErrorLike | null)?.code === 'PGRST116') {
-    serviceError(ERROR_CODES.CHECK_IN_ALREADY_ACTIVE, 409)
-  }
-  if (updateError) {
+  let updatedRows: ReservationRow[]
+  try {
+    updatedRows = await sql`
+      UPDATE reservations
+      SET status = 'active', activated_at = ${nowUtc.toISOString()}
+      WHERE id = ${reservation.id} AND status = 'pending'
+      RETURNING ${sql.unsafe(RESERVATION_COLUMNS)}
+    ` as ReservationRow[]
+  } catch {
     serviceError('Internal server error', 500)
   }
-  if (!updated) {
+  if (!updatedRows[0]) {
     serviceError(ERROR_CODES.CHECK_IN_ALREADY_ACTIVE, 409)
   }
 
-  return mapReservation(updated as ReservationRow)
+  return mapReservation(updatedRows[0])
 }
