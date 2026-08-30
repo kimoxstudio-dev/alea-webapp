@@ -495,6 +495,36 @@ describe('events-service — createEvent multi-day (schedules)', () => {
     ).rejects.toMatchObject({ statusCode: 400 })
   })
 
+  it('maps a unique-violation (23505) from a duplicate schedule block insert to 400 (#303 code-review high-effort round)', async () => {
+    // event_room_blocks has a UNIQUE index on (event_id, room_id, date,
+    // start_time, end_time) — see lib/db/schema/009_event_room_blocks.sql.
+    // A duplicate block insert must 400 via mapEventWriteError, not fall
+    // through to the generic 500.
+    addMultiBlockEventInsertHandler(() => [makeEventRow()])
+    addRoomBlockInsertHandler(() => {
+      throw neonDbError('23505', 'duplicate key value violates unique constraint')
+    })
+    // rollbackPartialMultiBlockWrite(deleteEvent: true) fires after the
+    // block insert fails — this handler is what it needs for its own
+    // DELETE FROM events step (insertedBlockIds/cancelledReservations are
+    // both empty here, so no other rollback statement is issued).
+    sqlMock.addHandler({
+      name: 'DELETE events WHERE id (rollback, createEvent)',
+      verb: 'delete',
+      match: (stmt) => stmt.table === 'events',
+      respond: () => [],
+    })
+
+    const { createEvent } = await loadService()
+
+    await expect(
+      createEvent({
+        title: 'Duplicate Block Event',
+        schedules: [{ date: '2026-07-10', startTime: '10:00', endTime: '12:00', roomId: 'room-1', allDay: false }],
+      }),
+    ).rejects.toMatchObject({ statusCode: 400 })
+  })
+
   it('preserves a roomless block (roomId: null) as a non-persisted schedule entry instead of dropping it (#303 code-review post-PR round, Finding 1)', async () => {
     addMultiBlockEventInsertHandler(() => [makeEventRow({ date: '2026-07-10', start_time: '10:00:00', end_time: '12:00:00' })])
     const blockInsertSpy = vi.fn((values: unknown[]) => [
