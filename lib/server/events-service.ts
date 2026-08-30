@@ -625,7 +625,20 @@ export async function createEvent(body: {
     const blockRow = blockRows[0]
     if (blockRow) roomBlocks.push(blockRow)
 
-    await cancelOverlappingReservationsForRoom(roomId, date, resolvedTimes.startTime, resolvedTimes.endTime)
+    try {
+      await cancelOverlappingReservationsForRoom(roomId, date, resolvedTimes.startTime, resolvedTimes.endTime)
+    } catch (error) {
+      // #303 code-review round 5: this call was previously outside any
+      // try/catch — a failure here left the just-committed event + block
+      // rows with no compensation. Delete the just-inserted event (cascades
+      // to its block via ON DELETE CASCADE — see
+      // lib/db/schema/009_event_room_blocks.sql), mirroring the block-insert
+      // failure's rollback above.
+      await rollbackPartialMultiBlockWrite({
+        eventId: event.id, insertedBlockIds: blockRow ? [blockRow.id] : [], cancelledReservationIds: [], deleteEvent: true,
+      })
+      throw error
+    }
   }
 
   return toAdminEvent(event, roomBlocks)
@@ -862,7 +875,24 @@ export async function updateEvent(
     const blockRow = blockRows[0]
     if (blockRow) roomBlocks.push(blockRow)
 
-    await cancelOverlappingReservationsForRoom(roomId, date, resolvedTimes.startTime, resolvedTimes.endTime)
+    try {
+      await cancelOverlappingReservationsForRoom(roomId, date, resolvedTimes.startTime, resolvedTimes.endTime)
+    } catch (error) {
+      // #303 code-review round 5: this call was previously outside any
+      // try/catch. By this point the event fields were updated, the old
+      // blocks deleted, and the new block inserted — a failure here left
+      // all of that committed, with conflicting reservations still active
+      // (double-booking risk) on top of the silent partial write. Undo
+      // everything this call did: delete the newly-inserted block, restore
+      // the blocks that existed before this call, and revert the event's
+      // field values — same helpers used by the failure branches above.
+      await rollbackPartialMultiBlockWrite({
+        eventId: id, insertedBlockIds: blockRow ? [blockRow.id] : [], cancelledReservationIds: [], deleteEvent: false,
+      })
+      await restoreDeletedBlocksOnUpdateFailure(blocksToRestoreOnFailure)
+      await revertEventFieldsOnFailure(id, currentRow)
+      throw error
+    }
   }
 
   return toAdminEvent(event, roomBlocks)
