@@ -363,17 +363,17 @@ async function rollbackPartialMultiBlockWrite(params: {
 }
 
 /**
- * Compensating rollback for the legacy single-block `updateEvent` path
- * (#303 code-review round 3, Finding 2). That path deletes the event's
- * existing room block(s) *before* inserting the replacement — worse
- * ordering than the multi-block path — so a failure inserting the new block
- * would otherwise leave the event with zero blocks, silently losing its
- * room assignment. Reinserts the exact rows the failed call just deleted
- * (captured via the DELETE's own `RETURNING`, see call site). Best-effort:
- * errors here are logged and swallowed, matching the pattern in
- * `rollbackPartialMultiBlockWrite` above.
+ * Compensating rollback for `updateEvent`'s legacy single-block path
+ * (#303 code-review round 3, Finding 2) AND its multi-block path (round 4 —
+ * same gap, same fix, since both delete the event's existing room block(s)
+ * *before* inserting the replacement(s)). A failure inserting a replacement
+ * block would otherwise leave the event with zero blocks, silently losing
+ * its room assignment. Reinserts the exact rows the failed call just
+ * deleted (captured via the DELETE's own `RETURNING`, see each call site).
+ * Best-effort: errors here are logged and swallowed, matching the pattern
+ * in `rollbackPartialMultiBlockWrite` above.
  */
-async function restoreDeletedBlocksOnLegacyUpdateFailure(
+async function restoreDeletedBlocksOnUpdateFailure(
   deletedBlocks: EventRoomBlockRow[],
 ): Promise<void> {
   if (deletedBlocks.length === 0) return
@@ -386,6 +386,38 @@ async function restoreDeletedBlocksOnLegacyUpdateFailure(
     }
   } catch (rollbackError) {
     console.error('events-service: compensating block restore failed (non-fatal):', rollbackError)
+  }
+}
+
+/**
+ * Compensating rollback for `updateEvent`'s own `UPDATE events SET title =
+ * ..., date = ..., ...` statement (#303 code-review round 4 audit — found
+ * while verifying no 5th instance of the rounds 1-4 pattern remained). Both
+ * updateEvent paths mutate the event row's fields *before* the block
+ * delete/insert steps that can still fail; on such a failure the event's
+ * new field values would otherwise persist despite the request reporting an
+ * error. Reverts the row back to the field values it had before this call
+ * (captured from the pre-write `currentRow` read at the top of
+ * `updateEvent`). Best-effort: errors here are logged and swallowed,
+ * matching the pattern above.
+ */
+async function revertEventFieldsOnFailure(
+  eventId: string,
+  original: Pick<EventRow, 'title' | 'description' | 'date' | 'start_time' | 'end_time'>,
+): Promise<void> {
+  try {
+    await sql`
+      UPDATE events
+      SET
+        title       = ${original.title},
+        description = ${original.description},
+        date        = ${original.date},
+        start_time  = ${original.start_time},
+        end_time    = ${original.end_time}
+      WHERE id = ${eventId}
+    `
+  } catch (rollbackError) {
+    console.error('events-service: compensating event-fields revert failed (non-fatal):', rollbackError)
   }
 }
 
@@ -669,9 +701,23 @@ export async function updateEvent(
     const event = updatedRows[0]
     if (!event) serviceError('Event not found', 404)
 
+    // #303 code-review round 4, Finding (4th recurrence): capture (via
+    // RETURNING, no extra round trip) the blocks this call is about to wipe,
+    // so they can be restored if a later block's INSERT fails mid-loop below
+    // — same gap, same fix shape as round 3's legacy single-block updateEvent
+    // path (restoreDeletedBlocksOnUpdateFailure).
+    let preExistingBlocks: EventRoomBlockRow[]
     try {
-      await sql`DELETE FROM event_room_blocks WHERE event_id = ${id}`
+      preExistingBlocks = await sql`
+        DELETE FROM event_room_blocks
+        WHERE event_id = ${id}
+        RETURNING id, event_id, room_id, date, start_time, end_time, all_day
+      ` as EventRoomBlockRow[]
     } catch {
+      // Round 4 audit: the UPDATE events above already committed new field
+      // values before this DELETE ran and failed — revert them so the
+      // request's 500 isn't paired with a silently-applied partial update.
+      await revertEventFieldsOnFailure(id, currentRow)
       serviceError('Internal server error', 500)
     }
 
@@ -702,9 +748,15 @@ export async function updateEvent(
         // Unlike createEvent, `event` pre-existed this call — only the newly
         // (partially) inserted blocks and cancellations from this call are
         // rolled back; the event row itself is not deleted on failure.
+        // Also restore the pre-existing blocks the unconditional DELETE
+        // above already wiped (see comment there) — without this, the event
+        // would silently end up with zero room blocks alongside whatever
+        // this call itself managed to insert.
         await rollbackPartialMultiBlockWrite({
           eventId: id, insertedBlockIds, cancelledReservationIds, deleteEvent: false,
         })
+        await restoreDeletedBlocksOnUpdateFailure(preExistingBlocks)
+        await revertEventFieldsOnFailure(id, currentRow)
         mapEventWriteError(error)
       }
     }
@@ -785,6 +837,10 @@ export async function updateEvent(
       RETURNING id, event_id, room_id, date, start_time, end_time, all_day
     ` as EventRoomBlockRow[]
   } catch {
+    // Round 4 audit: the UPDATE events above already committed new field
+    // values before this DELETE ran and failed — revert them so the
+    // request's 500 isn't paired with a silently-applied partial update.
+    await revertEventFieldsOnFailure(id, currentRow)
     serviceError('Internal server error', 500)
   }
 
@@ -798,7 +854,8 @@ export async function updateEvent(
         RETURNING id, event_id, room_id, date, start_time, end_time, all_day
       ` as EventRoomBlockRow[]
     } catch {
-      await restoreDeletedBlocksOnLegacyUpdateFailure(blocksToRestoreOnFailure)
+      await restoreDeletedBlocksOnUpdateFailure(blocksToRestoreOnFailure)
+      await revertEventFieldsOnFailure(id, currentRow)
       serviceError('Internal server error', 500)
     }
 
