@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import type { ServiceError } from '@/lib/server/service-error'
+import { createSqlMock, hasExactSelectColumns } from '../helpers/sql-mock'
 
 /**
  * CLUB EVENTS SERVICE TEST COVERAGE (OIR-203)
@@ -39,6 +40,15 @@ vi.mock('@/lib/club-time', () => ({
   getCurrentClubDate: vi.fn(() => '2026-04-15'),
   isValidDateOnlyString: vi.fn((s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s)),
 }))
+
+// club-events-service.ts (#304, still Supabase-based) reuses two functions
+// from events-service.ts (#303, migrated to raw Neon SQL) — `deleteEventCascade`
+// (called by deleteClubEvent) and `listEvents` (re-exported/tested directly
+// here). Both now hit the tagged-template `sql` client from lib/db/client.ts
+// instead of the Supabase admin client, so a Neon sql-mock is needed
+// alongside this file's existing Supabase mocks for those two code paths.
+const eventsServiceSqlMock = createSqlMock()
+vi.mock('@/lib/db/client', () => ({ sql: eventsServiceSqlMock.sql }))
 
 type EventRow = {
   id: string
@@ -288,6 +298,7 @@ async function loadEventsService() {
 describe('club-events-service', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    eventsServiceSqlMock.reset()
   })
 
   describe('createClubEvent', () => {
@@ -1968,9 +1979,29 @@ describe('club-events-service', () => {
     it('admin can delete a club event', async () => {
       const adminSession = createAdminSession()
       const mockSupabaseAdmin = buildSupabaseMock()
-      
+
       vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
         .mockReturnValue(mockSupabaseAdmin as any)
+
+      // deleteClubEvent's own Supabase existence check (above) is satisfied by
+      // buildSupabaseMock's default 'events' handling for id 'evt-1'. It then
+      // calls the Neon-backed deleteEventCascade (#303) directly, which needs
+      // its own sql-mock handlers: the block fetch (no room blocks here) and
+      // the final events row delete.
+      eventsServiceSqlMock.addHandler({
+        name: 'SELECT room_id, date, start_time, end_time FROM event_room_blocks (cascade)',
+        verb: 'select',
+        match: (stmt) =>
+          stmt.table === 'event_room_blocks' &&
+          hasExactSelectColumns(stmt, 'room_id, date, start_time, end_time'),
+        respond: () => [],
+      })
+      eventsServiceSqlMock.addHandler({
+        name: 'DELETE events WHERE id',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'events',
+        respond: () => [],
+      })
 
       const { deleteClubEvent } = await loadClubEventsService()
 
@@ -2055,52 +2086,47 @@ describe('club-events-service', () => {
 
   describe('listEvents (from events-service.ts)', () => {
     it('excludes landing-only rows (both title_es and title_en populated)', async () => {
-      const mockSupabaseClient = buildSupabaseMock()
-      mockSupabaseClient.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              or: vi.fn(function (filter: string) {
-                expect(filter).toContain('title_es')
-                expect(filter).toContain('title_en')
-                return {
-                  order: vi.fn(function () {
-                    return {
-                      order: vi.fn(async () => ({
-                        data: [
-                          {
-                            id: 'evt-internal-1',
-                            title: 'Internal Event',
-                            description: null,
-                            date: '2026-04-20',
-                            start_time: '18:00',
-                            end_time: '22:00',
-                            created_by: 'user-1',
-                            created_at: '2026-04-01T00:00:00Z',
-                          },
-                        ],
-                        error: null,
-                      })),
-                    }
-                  }),
-                }
-              }),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient
-        .mockResolvedValue(mockSupabaseClient as any)
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(buildSupabaseMock() as any)
+      // listEvents() (#303) no longer touches Supabase at all — it queries
+      // `WHERE title_es IS NULL OR title_en IS NULL` directly in Neon raw
+      // SQL, which is what actually implements the landing-row exclusion
+      // this test is named for (rather than a Supabase `.or()` filter).
+      const eventsSelectSpy = vi.fn(() => [
+        {
+          id: 'evt-internal-1',
+          title: 'Internal Event',
+          description: null,
+          date: '2026-04-20',
+          start_time: '18:00:00',
+          end_time: '22:00:00',
+          created_by: 'user-1',
+          created_at: '2026-04-01T00:00:00Z',
+        },
+      ])
+      eventsServiceSqlMock.addHandler({
+        name: 'SELECT events excluding landing rows (title_es/title_en IS NULL)',
+        verb: 'select',
+        match: (stmt) =>
+          stmt.table === 'events' &&
+          hasExactSelectColumns(stmt, 'id, title, description, date, start_time, end_time, created_by, created_at') &&
+          Boolean(stmt.whereClause?.includes('title_es')) &&
+          Boolean(stmt.whereClause?.includes('title_en')),
+        respond: eventsSelectSpy,
+      })
+      eventsServiceSqlMock.addHandler({
+        name: 'SELECT event_room_blocks for the listed events',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks',
+        respond: () => [],
+      })
 
       const { listEvents } = await loadEventsService()
 
       const result = await listEvents()
 
+      expect(eventsSelectSpy).toHaveBeenCalledTimes(1)
       expect(Array.isArray(result)).toBe(true)
+      expect(result).toHaveLength(1)
+      expect(result[0].id).toBe('evt-internal-1')
     })
   })
 
