@@ -36,12 +36,13 @@ type SupabaseAdminClient = ReturnType<typeof createSupabaseServerAdminClient>
  *
  * `deleteEventCascade` is exported and reused by
  * `lib/server/club-events-service.ts` (`deleteClubEvent`), which is still
- * Supabase-based (#304, not started). Its first parameter used to be the
- * Supabase admin client; that call site (`deleteEventCascade(admin, id)`)
- * is left untouched (out of scope), so the parameter is kept for source
- * compatibility but is now unused — the cascade itself always operates
- * against Neon, since `events`/`event_room_blocks`/`tables`/`reservations`
- * already live there per the sibling migrations above.
+ * Supabase-based (#304, not started). It keeps a dual Neon/Supabase path: a
+ * real Supabase admin client (the still-Supabase `deleteClubEvent` caller)
+ * routes through a restored pre-#303 Supabase-based cascade, since
+ * `events`/`event_room_blocks` are effectively empty in Neon until #304
+ * migrates that caller; `undefined` (this service's own already-migrated
+ * `deleteEvent`) uses the Neon path. See `deleteEventCascade`'s own doc
+ * comment below for the full rationale.
  */
 
 export type { AdminEvent, AdminEventRoomBlock, AdminEventSchedule }
