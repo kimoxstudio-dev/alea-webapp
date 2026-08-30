@@ -325,6 +325,58 @@ describe('events-service — createEvent (legacy single-block) with roomId cance
     expect(rollbackEventDeleteSpy).toHaveBeenCalledTimes(1)
     expect(rollbackEventDeleteSpy.mock.calls[0][0].values).toEqual(['evt-1'])
   })
+
+  it('rolls back the just-inserted event AND block rows when cancelOverlappingReservationsForRoom throws (#303 code-review round 5)', async () => {
+    // This call was previously outside any try/catch — a failure here left
+    // the just-committed event + block rows with no compensation. Now
+    // wrapped: rollbackPartialMultiBlockWrite(deleteEvent: true) deletes the
+    // inserted block explicitly (id = ANY([blockRow.id])) and the event row
+    // (whose ON DELETE CASCADE would also remove the block, but the explicit
+    // block delete still runs first per the helper's own order).
+    addLegacyEventInsertHandler(() => [eventRow])
+    addRoomBlockInsertHandler(() => [
+      { id: 'block-1', event_id: 'evt-1', room_id: 'room-1', date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00', all_day: false },
+    ])
+    // cancelOverlappingReservationsForRoom's own internal try/catch turns
+    // this into a real 500 ServiceError, which propagates out and triggers
+    // createEvent's rollback.
+    addTablesBySingleRoomHandler(() => {
+      throw new Error('connection reset')
+    })
+
+    const rollbackBlocksDeleteSpy = vi.fn(() => [])
+    sqlMock.addHandler({
+      name: 'DELETE event_room_blocks WHERE id = ANY(...) (rollback)',
+      verb: 'delete',
+      match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'id'),
+      respond: rollbackBlocksDeleteSpy,
+    })
+    const rollbackEventDeleteSpy = vi.fn(() => [])
+    sqlMock.addHandler({
+      name: 'DELETE events WHERE id (rollback, legacy createEvent)',
+      verb: 'delete',
+      match: (stmt) => stmt.table === 'events',
+      respond: rollbackEventDeleteSpy,
+    })
+
+    const { createEvent } = await loadService()
+
+    await expect(
+      createEvent({
+        title: 'Test Event',
+        date: '2026-04-20',
+        startTime: '18:00',
+        endTime: '22:00',
+        roomId: 'room-1',
+      }),
+    ).rejects.toMatchObject({ statusCode: 500 })
+
+    expect(rollbackBlocksDeleteSpy).toHaveBeenCalledTimes(1)
+    expect(rollbackBlocksDeleteSpy.mock.calls[0][0].values).toEqual([['block-1']])
+
+    expect(rollbackEventDeleteSpy).toHaveBeenCalledTimes(1)
+    expect(rollbackEventDeleteSpy.mock.calls[0][0].values).toEqual(['evt-1'])
+  })
 })
 
 describe('events-service — updateEvent (legacy single-block) with cancellation', () => {
@@ -671,6 +723,114 @@ describe('events-service — updateEvent (legacy single-block) with cancellation
       statusCode: 500,
     })
 
+    expect(revertFieldsSpy).toHaveBeenCalledTimes(1)
+    expect(revertFieldsSpy).toHaveBeenCalledWith([
+      originalRow.title,
+      originalRow.description,
+      originalRow.date,
+      originalRow.start_time,
+      originalRow.end_time,
+      'evt-update-1',
+    ])
+  })
+
+  it('undoes the event-field update, the just-inserted block, AND restores the pre-existing block(s) when cancelOverlappingReservationsForRoom throws (#303 code-review round 5)', async () => {
+    // By the time this call runs, the event fields were updated, the old
+    // block(s) deleted, and the new block inserted. A failure here must undo
+    // all three: delete the newly-inserted block (rollbackPartialMultiBlockWrite,
+    // deleteEvent: false — the event itself pre-existed this call), restore
+    // the block(s) that existed before this call (restoreDeletedBlocksOnUpdateFailure),
+    // and revert the event's field values (revertEventFieldsOnFailure).
+    const originalRow = { title: 'Original Title', description: 'Original desc', date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null }
+    addCurrentEventHandler(() => [originalRow])
+    addExistingBlocksHandler(() => [{ room_id: 'room-1', all_day: false }])
+    addLegacyEventUpdateHandler(([, , date, start_time, end_time]) => [
+      { ...eventRow, date: date as string, start_time: start_time as string, end_time: end_time as string },
+    ])
+
+    const deletedBlockRow = {
+      id: 'block-old-1',
+      event_id: 'evt-update-1',
+      room_id: 'room-1',
+      date: '2026-04-20',
+      start_time: '18:00:00',
+      end_time: '22:00:00',
+      all_day: false,
+    }
+    // Scoped explicitly to `event_id` (not the generic `addBlocksDeleteHandler`,
+    // which matches any DELETE on this table regardless of WHERE clause) so it
+    // never intercepts the rollback's `id = ANY(...)` delete registered below.
+    sqlMock.addHandler({
+      name: 'DELETE event_room_blocks WHERE event_id (replace step)',
+      verb: 'delete',
+      match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'event_id'),
+      respond: () => [deletedBlockRow],
+    })
+    addRoomBlockInsertHandler(() => [
+      { id: 'block-new-1', event_id: 'evt-update-1', room_id: 'room-1', date: '2026-04-20', start_time: '16:00:00', end_time: '20:00:00', all_day: false },
+    ])
+    // cancelOverlappingReservationsForRoom's own internal try/catch turns
+    // this into a real 500 ServiceError, which propagates out and triggers
+    // updateEvent's rollback.
+    addTablesBySingleRoomHandler(() => {
+      throw new Error('connection reset')
+    })
+
+    const rollbackBlocksDeleteSpy = vi.fn(() => [])
+    sqlMock.addHandler({
+      name: 'DELETE event_room_blocks WHERE id = ANY(...) (rollback, new block)',
+      verb: 'delete',
+      match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'id'),
+      respond: rollbackBlocksDeleteSpy,
+    })
+    const eventsDeleteSpy = vi.fn(() => [])
+    sqlMock.addHandler({
+      name: 'DELETE events WHERE id (must NOT be called by updateEvent rollback)',
+      verb: 'delete',
+      match: (stmt) => stmt.table === 'events',
+      respond: eventsDeleteSpy,
+    })
+    const restoreInsertSpy = vi.fn(() => [])
+    sqlMock.addHandler({
+      name: 'INSERT event_room_blocks (restore pre-existing, no RETURNING)',
+      verb: 'insert',
+      match: (stmt) => stmt.table === 'event_room_blocks' && !stmt.returning,
+      respond: (stmt) => restoreInsertSpy(stmt.values),
+    })
+    const revertFieldsSpy = vi.fn(() => [])
+    sqlMock.addHandler({
+      name: 'UPDATE events (revert fields, no RETURNING)',
+      verb: 'update',
+      match: (stmt) => stmt.table === 'events' && !stmt.returning,
+      respond: (stmt) => revertFieldsSpy(stmt.values),
+    })
+
+    const { updateEvent } = await loadService()
+
+    await expect(updateEvent('evt-update-1', { startTime: '16:00', endTime: '20:00' })).rejects.toMatchObject({
+      statusCode: 500,
+    })
+
+    // The newly-inserted block from this call is deleted.
+    expect(rollbackBlocksDeleteSpy).toHaveBeenCalledTimes(1)
+    expect(rollbackBlocksDeleteSpy.mock.calls[0][0].values).toEqual([['block-new-1']])
+
+    // The event row itself is NOT deleted — it pre-existed this call.
+    expect(eventsDeleteSpy).not.toHaveBeenCalled()
+
+    // The block that existed before this call is reinserted verbatim.
+    expect(restoreInsertSpy).toHaveBeenCalledTimes(1)
+    expect(restoreInsertSpy).toHaveBeenCalledWith([
+      deletedBlockRow.id,
+      deletedBlockRow.event_id,
+      deletedBlockRow.room_id,
+      deletedBlockRow.date,
+      deletedBlockRow.start_time,
+      deletedBlockRow.end_time,
+      deletedBlockRow.all_day,
+    ])
+
+    // The event row's field mutation is reverted back to its pre-update values.
     expect(revertFieldsSpy).toHaveBeenCalledTimes(1)
     expect(revertFieldsSpy).toHaveBeenCalledWith([
       originalRow.title,
