@@ -90,21 +90,6 @@ function resolveBlockTimes(date: string, startTime: string, endTime: string, all
   return { startTime, endTime }
 }
 
-/** Derive the earliest (date, start_time, end_time) from a block list for the event anchor columns */
-function deriveAnchor(blocks: EventRoomBlockRow[]): { date: string; startTime: string; endTime: string } {
-  if (blocks.length === 0) return { date: '', startTime: '00:00', endTime: '00:00' }
-  const sorted = [...blocks].sort((a, b) => {
-    const d = a.date.localeCompare(b.date)
-    return d !== 0 ? d : a.start_time.localeCompare(b.start_time)
-  })
-  const first = sorted[0]
-  return {
-    date: first.date,
-    startTime: first.start_time.slice(0, 5),
-    endTime: first.end_time.slice(0, 5),
-  }
-}
-
 /**
  * @param roomlessBlocks Submitted schedule entries with `room_id === null`
  *   (#303 code-review post-PR round, Finding 1/2). `event_room_blocks.room_id`
@@ -119,13 +104,6 @@ function toAdminEvent(
   blocks: EventRoomBlockRow[],
   roomlessBlocks: NormalisedEventSchedule[] = [],
 ): AdminEvent {
-  const anchor = blocks.length > 0 ? deriveAnchor(blocks) : {
-    date: row.date,
-    startTime: row.start_time.slice(0, 5),
-    endTime: row.end_time.slice(0, 5),
-  }
-  const inferredAllDay = anchor.startTime === '00:00' && anchor.endTime === '23:59'
-
   const roomBlocks: AdminEventRoomBlock[] = blocks.map((b) => ({
     id: b.id,
     roomId: b.room_id,
@@ -161,6 +139,19 @@ function toAdminEvent(
     const d = a.date.localeCompare(b.date)
     return d !== 0 ? d : a.startTime.localeCompare(b.startTime)
   })
+
+  // #303 code-review, high-effort round, Finding 3: derive the read-time
+  // anchor from ALL blocks (room-bearing AND roomless), matching write-time
+  // deriveAnchorFromBlocks below — which also considers every submitted
+  // block, not just the ones that ended up persisted in event_room_blocks.
+  // Previously this anchor only looked at `blocks` (room-bearing), so an
+  // event with an earlier roomless block returned a `date`/`startTime`/
+  // `endTime` that mismatched both the persisted events row and
+  // `schedules[0]`.
+  const anchor = schedules.length > 0
+    ? { date: schedules[0].date, startTime: schedules[0].startTime, endTime: schedules[0].endTime }
+    : { date: row.date, startTime: row.start_time.slice(0, 5), endTime: row.end_time.slice(0, 5) }
+  const inferredAllDay = anchor.startTime === '00:00' && anchor.endTime === '23:59'
 
   // If no blocks exist at all (room-bearing or roomless), synthesize one
   // entry from the event anchor so edit pre-fill works
@@ -251,8 +242,11 @@ function deriveAnchorFromBlocks(blocks: NormalisedEventSchedule[]): NormalisedEv
 function mapEventWriteError(error: unknown): never {
   if (
     error instanceof NeonDbError &&
-    (error.code === '23514' || error.code === '22P02' || error.code === '23502')
+    (error.code === '23514' || error.code === '22P02' || error.code === '23502' || error.code === '23503')
   ) {
+    // 23503 = foreign_key_violation — e.g. an invalid roomId on a block
+    // insert (event_room_blocks_room_id_fkey), same 400 treatment as the
+    // other input-shape errors above (#303 code-review, high-effort round).
     serviceError('Invalid event data', 400)
   }
   serviceError('Internal server error', 500)
@@ -659,8 +653,13 @@ export async function createEvent(body: {
       VALUES (${title}, ${description}, ${date}, ${resolvedTimes.startTime}, ${resolvedTimes.endTime})
       RETURNING id, title, description, date, start_time, end_time, created_by, created_at
     ` as EventRow[]
-  } catch {
-    serviceError('Internal server error', 500)
+  } catch (error) {
+    // #303 code-review, high-effort round, Finding 2: use the same
+    // mapEventWriteError classification the multi-block path uses, instead
+    // of a bare 500 — this legacy single-block path is still live
+    // (app/api/events/route.ts), so the same input error class must not get
+    // an inconsistent status code depending on which path handled it.
+    mapEventWriteError(error)
   }
 
   const event = eventRows[0]
@@ -675,7 +674,7 @@ export async function createEvent(body: {
         VALUES (${event.id}, ${roomId}, ${date}, ${resolvedTimes.startTime}, ${resolvedTimes.endTime}, ${allDay})
         RETURNING id, event_id, room_id, date, start_time, end_time, all_day
       ` as EventRoomBlockRow[]
-    } catch {
+    } catch (error) {
       // #303 code-review round 3, Finding 1: the event insert above and this
       // block insert are two separate statements (same non-transactional
       // constraint as the multi-block loops — see file header). On failure
@@ -685,7 +684,9 @@ export async function createEvent(body: {
       await rollbackPartialMultiBlockWrite({
         eventId: event.id, insertedBlockIds: [], cancelledReservations: [], deleteEvent: true,
       })
-      serviceError('Internal server error', 500)
+      // High-effort review round, Finding 2: mapEventWriteError here too
+      // (e.g. an invalid roomId now correctly 400s via 23503 instead of 500).
+      mapEventWriteError(error)
     }
 
     const blockRow = blockRows[0]
@@ -903,8 +904,10 @@ export async function updateEvent(
       WHERE id = ${id}
       RETURNING id, title, description, date, start_time, end_time, created_by, created_at
     ` as EventRow[]
-  } catch {
-    serviceError('Internal server error', 500)
+  } catch (error) {
+    // High-effort review round, Finding 2: mapEventWriteError, matching the
+    // multi-block path — this legacy path is still live.
+    mapEventWriteError(error)
   }
 
   const event = updatedRows[0]
@@ -942,10 +945,11 @@ export async function updateEvent(
         VALUES (${id}, ${roomId}, ${date}, ${resolvedTimes.startTime}, ${resolvedTimes.endTime}, ${allDay})
         RETURNING id, event_id, room_id, date, start_time, end_time, all_day
       ` as EventRoomBlockRow[]
-    } catch {
+    } catch (error) {
       await restoreDeletedBlocksOnUpdateFailure(blocksToRestoreOnFailure)
       await revertEventFieldsOnFailure(id, currentRow)
-      serviceError('Internal server error', 500)
+      // High-effort review round, Finding 2: mapEventWriteError here too.
+      mapEventWriteError(error)
     }
 
     const blockRow = blockRows[0]
