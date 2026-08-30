@@ -1,4 +1,5 @@
 import { sql } from '@/lib/db/client'
+import { NeonDbError } from '@neondatabase/serverless'
 import { serviceError } from '@/lib/server/service-error'
 import { ERROR_CODES } from '@/lib/types/error-codes'
 import type { Equipment } from '@/lib/types'
@@ -162,25 +163,47 @@ export async function setRoomDefaultEquipment(roomId: string, equipmentIds: stri
     }
   }
 
-  try {
-    await sql`
-      DELETE FROM room_default_equipment
-      WHERE room_id = ${roomId}
-    `
-  } catch {
-    serviceError('Internal server error', 500)
-  }
-
   if (equipmentIds.length === 0) {
+    try {
+      await sql`
+        DELETE FROM room_default_equipment
+        WHERE room_id = ${roomId}
+      `
+    } catch {
+      serviceError('Internal server error', 500)
+    }
     return
   }
 
   try {
-    await sql`
-      INSERT INTO room_default_equipment (room_id, equipment_id)
-      SELECT ${roomId}::uuid, UNNEST(${equipmentIds}::uuid[])
-    `
-  } catch {
+    // DELETE + INSERT run as a single non-interactive Postgres transaction
+    // over HTTP (Neon's sql.transaction) so a failing INSERT can never leave
+    // the room with its defaults deleted and nothing replacing them.
+    await sql.transaction([
+      sql`
+        DELETE FROM room_default_equipment
+        WHERE room_id = ${roomId}
+      `,
+      sql`
+        INSERT INTO room_default_equipment (room_id, equipment_id)
+        SELECT ${roomId}::uuid, UNNEST(${equipmentIds}::uuid[])
+      `,
+    ])
+  } catch (error) {
+    // The preflight SELECT above is only a cheap fast-path for the common
+    // non-racing case — it is NOT concurrency-safe by itself (two concurrent
+    // requests can both observe no conflict before either writes). The real
+    // safety net is the `room_default_equipment_equipment_id_key` UNIQUE
+    // constraint (lib/db/schema/019_room_default_equipment_unique_equipment.sql):
+    // a unique-violation surfacing here means another request won the race
+    // and already claimed this equipment for a different room.
+    if (
+      error instanceof NeonDbError &&
+      error.code === '23505' &&
+      error.constraint === 'room_default_equipment_equipment_id_key'
+    ) {
+      serviceError(ERROR_CODES.EQUIPMENT_LOCKED_TO_ANOTHER_ROOM, 400)
+    }
     serviceError('Internal server error', 500)
   }
 }

@@ -1,4 +1,5 @@
 import { vi, type Mock } from 'vitest'
+import { NeonDbError } from '@neondatabase/serverless'
 
 /**
  * Shared raw-SQL mock helper for `lib/db/client.ts`'s tagged-template `sql`
@@ -38,6 +39,32 @@ import { vi, type Mock } from 'vitest'
  * 4. Column/table checks are word-boundary anchored (`hasWord`), not
  *    substring checks, so `no_show_count` never satisfies a `count` check
  *    and `updated_at` never satisfies an `update` check.
+ *
+ * ## `.transaction()` support (#346 P1 follow-up)
+ *
+ * Neon's non-interactive HTTP transaction (`sql.transaction([...queries])`)
+ * batches several already-invoked `sql\`...\`` calls into one atomic
+ * round-trip. Each element of that array is a promise from a tagged-template
+ * call that — in this mock — already dispatched through the handler-matching
+ * system above and already started settling by the time it's placed in the
+ * array (there's no real network round-trip to defer it). So a mock
+ * transaction can't roll anything back; the only thing worth modelling is
+ * the two guarantees callers actually depend on:
+ *
+ * 1. The DELETE and INSERT must travel together as a single
+ *    `sql.transaction([...])` call, not as two independent `sql` calls —
+ *    `transaction` below is its own `vi.fn`, both exposed as
+ *    `SqlMock.transaction` (for assertions) and attached as `sql.transaction`
+ *    (because that's the property production code actually calls).
+ * 2. A rejection from any batched query must propagate as a rejection of
+ *    the whole `sql.transaction(...)` call — implemented as a plain
+ *    `Promise.all`, which already has that exact semantic.
+ *
+ * `neonDbError()` below is a companion helper for handlers that need to
+ * simulate a specific Postgres error code (e.g. `23505` unique_violation)
+ * rather than a generic `Error` — it constructs a *real* `NeonDbError`
+ * instance (not a plain object), which matters because service code guards
+ * on `error instanceof NeonDbError` before trusting `.code`.
  */
 
 export type SqlVerb = 'select' | 'insert' | 'update' | 'delete'
@@ -319,16 +346,53 @@ export interface SqlMockHandler {
 }
 
 export interface SqlMock {
-  /** Pass this directly as the `sql` export: `vi.mock('@/lib/db/client', () => ({ sql: mock.sql }))`. */
-  sql: Mock
+  /**
+   * Pass this directly as the `sql` export: `vi.mock('@/lib/db/client', () =>
+   * ({ sql: mock.sql }))`. Also carries a `.transaction` property (the same
+   * mock as `SqlMock.transaction` below), because that's the property path
+   * production code calls: `sql.transaction([...])`.
+   */
+  sql: Mock & { transaction: Mock }
+  /**
+   * The same mock as `sql.transaction`, exposed at the top level so tests
+   * can assert on it directly (call count, batched array contents) without
+   * reaching through `sql.transaction`. Defaults to `Promise.all(queries)` —
+   * runs every already-dispatched batched query and rejects the whole call
+   * if any of them rejects.
+   */
+  transaction: Mock
   /** Registers a handler, checked after every previously-added handler (first match, in registration order, wins). */
   addHandler(handler: SqlMockHandler): SqlMock
   /** Registers a handler that is checked BEFORE all currently-registered handlers — for test-specific overrides layered on top of a shared base setup. */
   prependHandler(handler: SqlMockHandler): SqlMock
   /** Removes all registered handlers. Does not touch `sql`'s call history. */
   clearHandlers(): void
-  /** Clears handlers and resets `sql`'s call history/implementation. Call from `beforeEach` for a clean slate between tests. */
+  /** Clears handlers and resets `sql`'s and `sql.transaction`'s call history/implementation. Call from `beforeEach` for a clean slate between tests. */
   reset(): void
+}
+
+/**
+ * Builds a real `NeonDbError` instance carrying the given Postgres error
+ * code (and, optionally, the violated constraint name), for a handler's
+ * `respond` to `throw` when a test needs to simulate a specific SQL error
+ * condition (e.g. `23505` unique_violation) rather than a generic `Error`.
+ * Real class, not a plain `{ code }` object, because service code checks
+ * `error instanceof NeonDbError` before trusting `.code`.
+ *
+ * `constraint` mirrors the real `NeonDbError` class shape (a flat top-level
+ * `constraint: string | undefined` property, alongside `.code`) and defaults
+ * to `undefined` so existing callers that don't need to simulate a specific
+ * constraint name keep working unchanged.
+ */
+export function neonDbError(
+  code: string,
+  message = 'simulated Postgres error',
+  constraint?: string,
+): NeonDbError {
+  const error = new NeonDbError(message)
+  error.code = code
+  error.constraint = constraint
+  return error
 }
 
 /**
@@ -367,8 +431,16 @@ export function createSqlMock(): SqlMock {
     )
   })
 
+  // Neon's non-interactive HTTP transaction: batches already-dispatched
+  // tagged-template promises into one call. `Promise.all` already has the
+  // exact semantics needed — resolve to all results, reject the whole call
+  // if any one of them rejects — so there is nothing bespoke to implement.
+  const transaction = vi.fn(async (queries: unknown[]) => Promise.all(queries as Array<Promise<unknown>>))
+  ;(sql as unknown as { transaction: Mock }).transaction = transaction
+
   const api: SqlMock = {
-    sql,
+    sql: sql as Mock & { transaction: Mock },
+    transaction,
     addHandler(handler) {
       handlers.push(handler)
       return api
@@ -383,6 +455,7 @@ export function createSqlMock(): SqlMock {
     reset() {
       handlers = []
       sql.mockClear()
+      transaction.mockClear()
     },
   }
 
