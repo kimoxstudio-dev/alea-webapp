@@ -105,7 +105,20 @@ function deriveAnchor(blocks: EventRoomBlockRow[]): { date: string; startTime: s
   }
 }
 
-function toAdminEvent(row: EventRow, blocks: EventRoomBlockRow[]): AdminEvent {
+/**
+ * @param roomlessBlocks Submitted schedule entries with `room_id === null`
+ *   (#303 code-review post-PR round, Finding 1/2). `event_room_blocks.room_id`
+ *   is `NOT NULL` (see `lib/db/schema/009_event_room_blocks.sql`), so these
+ *   can never become a persisted row — but they must still appear in the
+ *   returned `schedules` (as synthetic, non-persisted entries with
+ *   `id: undefined`), matching every other submitted block, instead of being
+ *   silently dropped from the response entirely.
+ */
+function toAdminEvent(
+  row: EventRow,
+  blocks: EventRoomBlockRow[],
+  roomlessBlocks: NormalisedEventSchedule[] = [],
+): AdminEvent {
   const anchor = blocks.length > 0 ? deriveAnchor(blocks) : {
     date: row.date,
     startTime: row.start_time.slice(0, 5),
@@ -133,13 +146,24 @@ function toAdminEvent(row: EventRow, blocks: EventRoomBlockRow[]): AdminEvent {
     allDay: b.all_day,
   }))
 
+  const roomlessSchedules: AdminEventSchedule[] = roomlessBlocks.map((b) => ({
+    id: undefined,
+    roomId: null,
+    tableId: null,
+    date: b.date,
+    startTime: b.start_time.slice(0, 5),
+    endTime: b.end_time.slice(0, 5),
+    allDay: b.all_day,
+  }))
+
   // Sort schedules chronologically ascending (date, then startTime)
-  const schedules = [...rawSchedules].sort((a, b) => {
+  const schedules = [...rawSchedules, ...roomlessSchedules].sort((a, b) => {
     const d = a.date.localeCompare(b.date)
     return d !== 0 ? d : a.startTime.localeCompare(b.startTime)
   })
 
-  // If no blocks exist, synthesize one entry from the event anchor so edit pre-fill works
+  // If no blocks exist at all (room-bearing or roomless), synthesize one
+  // entry from the event anchor so edit pre-fill works
   if (schedules.length === 0) {
     schedules.push({
       id: undefined,
@@ -162,7 +186,7 @@ function toAdminEvent(row: EventRow, blocks: EventRoomBlockRow[]): AdminEvent {
     createdAt: row.created_at,
     roomBlocks,
     schedules,
-    allDay: blocks.some((b) => b.all_day) || inferredAllDay,
+    allDay: blocks.some((b) => b.all_day) || roomlessBlocks.some((b) => b.all_day) || inferredAllDay,
   }
 }
 
@@ -270,20 +294,32 @@ async function cancelOverlappingReservationsForRoom(
   }
 }
 
+/** A reservation cancelled by `cancelOverlappingReservationsForRoomCapturing`, with the status it had before cancellation. */
+export interface CancelledReservation {
+  id: string
+  /** The status ('active' | 'pending') this reservation had before being cancelled — needed to restore it exactly on rollback (#303 code-review post-PR round, Finding 5), rather than assuming 'active'. */
+  status: string
+}
+
 /**
  * Same overlap-cancellation as `cancelOverlappingReservationsForRoom`, but
- * also returns the ids of every reservation it cancelled, so a multi-block
- * loop (see `createEvent`/`updateEvent`'s schedules path below) can restore
- * them if a *later* block in the same call fails. Used only by those loops —
- * `cancelOverlappingReservationsForRoom` itself is unchanged and still backs
- * the legacy single-block path.
+ * also returns each cancelled reservation's id AND its pre-cancellation
+ * status, so a multi-block loop (see `createEvent`/`updateEvent`'s schedules
+ * path below) can restore it *exactly* if a *later* block in the same call
+ * fails. Used only by those loops — `cancelOverlappingReservationsForRoom`
+ * itself is unchanged and still backs the legacy single-block path.
+ *
+ * The prior status is captured via an `UPDATE ... FROM (subquery)` join
+ * rather than a preceding `SELECT` — Postgres evaluates the subquery's rows
+ * against the pre-update snapshot within the same statement, so this stays
+ * a single round trip instead of two.
  */
 async function cancelOverlappingReservationsForRoomCapturing(
   roomId: string,
   date: string,
   startTime: string,
   endTime: string,
-): Promise<string[]> {
+): Promise<CancelledReservation[]> {
   let tableRows: Array<{ id: string }>
   try {
     tableRows = await sql`
@@ -296,23 +332,27 @@ async function cancelOverlappingReservationsForRoomCapturing(
   const tableIds = tableRows.map((t) => t.id)
   if (tableIds.length === 0) return []
 
-  let cancelledRows: Array<{ id: string }>
+  let cancelledRows: CancelledReservation[]
   try {
     cancelledRows = await sql`
       UPDATE reservations
       SET status = 'cancelled'
-      WHERE table_id = ANY(${tableIds})
-        AND date = ${date}
-        AND start_time < ${endTime}
-        AND end_time > ${startTime}
-        AND status IN ('active', 'pending')
-      RETURNING id
-    ` as Array<{ id: string }>
+      FROM (
+        SELECT id, status FROM reservations
+        WHERE table_id = ANY(${tableIds})
+          AND date = ${date}
+          AND start_time < ${endTime}
+          AND end_time > ${startTime}
+          AND status IN ('active', 'pending')
+      ) AS prior
+      WHERE reservations.id = prior.id
+      RETURNING reservations.id, prior.status
+    ` as CancelledReservation[]
   } catch {
     serviceError('Internal server error', 500)
   }
 
-  return cancelledRows.map((r) => r.id)
+  return cancelledRows
 }
 
 /**
@@ -326,11 +366,10 @@ async function cancelOverlappingReservationsForRoomCapturing(
  * done so far in the current call: deletes any `event_room_blocks` rows it
  * already inserted, and reactivates any reservations it already cancelled.
  *
- * Restoring cancelled reservations to `'active'` rather than each one's
- * exact prior status (`'active'` vs `'pending'`) is an accepted
- * simplification — undoing the loop's own partial writes matters far more
- * here than perfectly reproducing a reservation's prior pending/active
- * distinction on this already-rare failure path.
+ * Restores each cancelled reservation to its own captured pre-cancellation
+ * status (`'active'` or `'pending'`) rather than assuming `'active'` (#303
+ * code-review post-PR round, Finding 5) — a reservation that was only
+ * `'pending'` must come back as `'pending'`, not get incorrectly promoted.
  *
  * Best-effort: errors from the rollback itself are logged and swallowed, so
  * the caller's original failure (via `mapEventWriteError`) is always what
@@ -340,19 +379,34 @@ async function cancelOverlappingReservationsForRoomCapturing(
 async function rollbackPartialMultiBlockWrite(params: {
   eventId: string
   insertedBlockIds: string[]
-  cancelledReservationIds: string[]
+  cancelledReservations: CancelledReservation[]
   deleteEvent: boolean
 }): Promise<void> {
-  const { eventId, insertedBlockIds, cancelledReservationIds, deleteEvent } = params
+  const { eventId, insertedBlockIds, cancelledReservations, deleteEvent } = params
   try {
     if (insertedBlockIds.length > 0) {
       await sql`DELETE FROM event_room_blocks WHERE id = ANY(${insertedBlockIds})`
     }
-    if (cancelledReservationIds.length > 0) {
+    // Group by original status so each reservation is restored to exactly
+    // what it had before cancellation, not a hardcoded 'active' (#303
+    // code-review post-PR round, Finding 5). The status is written as a
+    // literal per branch (not interpolated as a bound param) so the
+    // all-'active' case — by far the common one — keeps the exact same
+    // single-bound-param query shape this statement always had.
+    const pendingIds = cancelledReservations.filter((r) => r.status === 'pending').map((r) => r.id)
+    const activeIds = cancelledReservations.filter((r) => r.status !== 'pending').map((r) => r.id)
+    if (activeIds.length > 0) {
       await sql`
         UPDATE reservations
         SET status = 'active'
-        WHERE id = ANY(${cancelledReservationIds}) AND status = 'cancelled'
+        WHERE id = ANY(${activeIds}) AND status = 'cancelled'
+      `
+    }
+    if (pendingIds.length > 0) {
+      await sql`
+        UPDATE reservations
+        SET status = 'pending'
+        WHERE id = ANY(${pendingIds}) AND status = 'cancelled'
       `
     }
     if (deleteEvent) {
@@ -549,15 +603,26 @@ export async function createEvent(body: {
 
     const roomBlocks: EventRoomBlockRow[] = []
     const insertedBlockIds: string[] = []
-    const cancelledReservationIds: string[] = []
+    const cancelledReservations: CancelledReservation[] = []
+    // #303 code-review post-PR round, Finding 1: a schedule entry with no
+    // room can't become an event_room_blocks row (room_id is NOT NULL — see
+    // lib/db/schema/009_event_room_blocks.sql), but it must still be
+    // represented in the returned schedules instead of being silently
+    // dropped from the event entirely. Only the room-specific steps below
+    // (the INSERT and the reservation-overlap cancellation, both of which
+    // require a room) are skipped for it.
+    const roomlessBlocks: NormalisedEventSchedule[] = []
     for (const block of normBlocks) {
-      if (block.room_id === null) continue
+      if (block.room_id === null) {
+        roomlessBlocks.push(block)
+        continue
+      }
 
       try {
         const blockRows = await sql`
-          INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day)
-          VALUES (${event.id}, ${block.room_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day})
-          RETURNING id, event_id, room_id, date, start_time, end_time, all_day
+          INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day, table_id)
+          VALUES (${event.id}, ${block.room_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day}, ${block.table_id})
+          RETURNING id, event_id, room_id, date, start_time, end_time, all_day, table_id
         ` as EventRoomBlockRow[]
 
         const blockRow = blockRows[0]
@@ -569,16 +634,16 @@ export async function createEvent(body: {
         const cancelled = await cancelOverlappingReservationsForRoomCapturing(
           block.room_id, block.date, block.start_time, block.end_time,
         )
-        cancelledReservationIds.push(...cancelled)
+        cancelledReservations.push(...cancelled)
       } catch (error) {
         await rollbackPartialMultiBlockWrite({
-          eventId: event.id, insertedBlockIds, cancelledReservationIds, deleteEvent: true,
+          eventId: event.id, insertedBlockIds, cancelledReservations, deleteEvent: true,
         })
         mapEventWriteError(error)
       }
     }
 
-    return toAdminEvent(event, roomBlocks)
+    return toAdminEvent(event, roomBlocks, roomlessBlocks)
   }
 
   // --- Legacy single-block path (preserved for existing callers / tests) ---
@@ -618,7 +683,7 @@ export async function createEvent(body: {
       // orphaned with zero blocks, mirroring the multi-block createEvent
       // path's rollbackPartialMultiBlockWrite(deleteEvent: true).
       await rollbackPartialMultiBlockWrite({
-        eventId: event.id, insertedBlockIds: [], cancelledReservationIds: [], deleteEvent: true,
+        eventId: event.id, insertedBlockIds: [], cancelledReservations: [], deleteEvent: true,
       })
       serviceError('Internal server error', 500)
     }
@@ -636,7 +701,7 @@ export async function createEvent(body: {
       // lib/db/schema/009_event_room_blocks.sql), mirroring the block-insert
       // failure's rollback above.
       await rollbackPartialMultiBlockWrite({
-        eventId: event.id, insertedBlockIds: blockRow ? [blockRow.id] : [], cancelledReservationIds: [], deleteEvent: true,
+        eventId: event.id, insertedBlockIds: blockRow ? [blockRow.id] : [], cancelledReservations: [], deleteEvent: true,
       })
       throw error
     }
@@ -737,15 +802,25 @@ export async function updateEvent(
 
     const roomBlocks: EventRoomBlockRow[] = []
     const insertedBlockIds: string[] = []
-    const cancelledReservationIds: string[] = []
+    const cancelledReservations: CancelledReservation[] = []
+    // #303 code-review post-PR round, Finding 2: same gap as createEvent's
+    // multi-block loop (see comment there), but worse here — the DELETE
+    // above already wiped the event's pre-existing blocks, so a roomless
+    // entry silently skipped from this loop is not just missing from the
+    // response, it's permanently gone. Track it for the response's
+    // schedules instead of dropping it.
+    const roomlessBlocks: NormalisedEventSchedule[] = []
     for (const block of normBlocks) {
-      if (block.room_id === null) continue
+      if (block.room_id === null) {
+        roomlessBlocks.push(block)
+        continue
+      }
 
       try {
         const blockRows = await sql`
-          INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day)
-          VALUES (${id}, ${block.room_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day})
-          RETURNING id, event_id, room_id, date, start_time, end_time, all_day
+          INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day, table_id)
+          VALUES (${id}, ${block.room_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day}, ${block.table_id})
+          RETURNING id, event_id, room_id, date, start_time, end_time, all_day, table_id
         ` as EventRoomBlockRow[]
 
         const blockRow = blockRows[0]
@@ -757,7 +832,7 @@ export async function updateEvent(
         const cancelled = await cancelOverlappingReservationsForRoomCapturing(
           block.room_id, block.date, block.start_time, block.end_time,
         )
-        cancelledReservationIds.push(...cancelled)
+        cancelledReservations.push(...cancelled)
       } catch (error) {
         // Unlike createEvent, `event` pre-existed this call — only the newly
         // (partially) inserted blocks and cancellations from this call are
@@ -767,7 +842,7 @@ export async function updateEvent(
         // would silently end up with zero room blocks alongside whatever
         // this call itself managed to insert.
         await rollbackPartialMultiBlockWrite({
-          eventId: id, insertedBlockIds, cancelledReservationIds, deleteEvent: false,
+          eventId: id, insertedBlockIds, cancelledReservations, deleteEvent: false,
         })
         await restoreDeletedBlocksOnUpdateFailure(preExistingBlocks)
         await revertEventFieldsOnFailure(id, currentRow)
@@ -775,7 +850,7 @@ export async function updateEvent(
       }
     }
 
-    return toAdminEvent(event, roomBlocks)
+    return toAdminEvent(event, roomBlocks, roomlessBlocks)
   }
 
   // --- Legacy single-block path ---
@@ -888,7 +963,7 @@ export async function updateEvent(
       // the blocks that existed before this call, and revert the event's
       // field values — same helpers used by the failure branches above.
       await rollbackPartialMultiBlockWrite({
-        eventId: id, insertedBlockIds: blockRow ? [blockRow.id] : [], cancelledReservationIds: [], deleteEvent: false,
+        eventId: id, insertedBlockIds: blockRow ? [blockRow.id] : [], cancelledReservations: [], deleteEvent: false,
       })
       await restoreDeletedBlocksOnUpdateFailure(blocksToRestoreOnFailure)
       await revertEventFieldsOnFailure(id, currentRow)
