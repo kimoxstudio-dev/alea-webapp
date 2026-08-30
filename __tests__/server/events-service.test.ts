@@ -290,6 +290,41 @@ describe('events-service — createEvent (legacy single-block) with roomId cance
 
     expect(sqlMock.sql).not.toHaveBeenCalled()
   })
+
+  it('rolls back (deletes) the just-inserted event row when the room-block insert fails (#303 code-review round 3, Finding 1)', async () => {
+    // The event insert and the block insert are two separate statements
+    // (non-transactional, same constraint documented at the top of
+    // events-service.ts). A failure here must not leave an orphaned event
+    // row with zero blocks — the legacy path reuses
+    // rollbackPartialMultiBlockWrite(deleteEvent: true) as-is.
+    addLegacyEventInsertHandler(() => [eventRow])
+    addRoomBlockInsertHandler(() => {
+      throw new Error('connection reset mid-insert')
+    })
+
+    const rollbackEventDeleteSpy = vi.fn(() => [])
+    sqlMock.addHandler({
+      name: 'DELETE events WHERE id (rollback, legacy createEvent)',
+      verb: 'delete',
+      match: (stmt) => stmt.table === 'events',
+      respond: rollbackEventDeleteSpy,
+    })
+
+    const { createEvent } = await loadService()
+
+    await expect(
+      createEvent({
+        title: 'Test Event',
+        date: '2026-04-20',
+        startTime: '18:00',
+        endTime: '22:00',
+        roomId: 'room-1',
+      }),
+    ).rejects.toMatchObject({ statusCode: 500 })
+
+    expect(rollbackEventDeleteSpy).toHaveBeenCalledTimes(1)
+    expect(rollbackEventDeleteSpy.mock.calls[0][0].values).toEqual(['evt-1'])
+  })
 })
 
 describe('events-service — updateEvent (legacy single-block) with cancellation', () => {
@@ -450,6 +485,99 @@ describe('events-service — updateEvent (legacy single-block) with cancellation
     await expect(updateEvent('evt-update-1', { startTime: '16:00', endTime: '20:00' })).rejects.toMatchObject({
       statusCode: 404,
     })
+  })
+
+  it('restores the deleted block(s) when the replacement block insert fails (#303 code-review round 3, Finding 2)', async () => {
+    // The legacy update path deletes the event's existing block(s) BEFORE
+    // inserting the replacement — worse ordering than the multi-block path.
+    // A failure inserting the new block must reinsert the exact row(s) the
+    // DELETE...RETURNING just captured, so the event doesn't end up with
+    // zero blocks.
+    addCurrentEventHandler(() => [
+      { title: 'Title', description: null, date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null },
+    ])
+    addExistingBlocksHandler(() => [{ room_id: 'room-1', all_day: false }])
+    addLegacyEventUpdateHandler(([, , date, start_time, end_time]) => [
+      { ...eventRow, date: date as string, start_time: start_time as string, end_time: end_time as string },
+    ])
+
+    const deletedBlockRow = {
+      id: 'block-old-1',
+      event_id: 'evt-update-1',
+      room_id: 'room-1',
+      date: '2026-04-20',
+      start_time: '18:00:00',
+      end_time: '22:00:00',
+      all_day: false,
+    }
+    // DELETE FROM event_room_blocks WHERE event_id=$1 RETURNING ... — captures
+    // the row(s) about to be restored on failure.
+    addBlocksDeleteHandler(() => [deletedBlockRow])
+
+    // The replacement insert (RETURNING present) fails.
+    addRoomBlockInsertHandler(() => {
+      throw new Error('connection reset mid-insert')
+    })
+
+    // The restore path re-inserts each captured row WITHOUT a RETURNING
+    // clause — distinct from addRoomBlockInsertHandler above, which only
+    // matches inserts that DO have RETURNING.
+    const restoreInsertSpy = vi.fn(() => [])
+    sqlMock.addHandler({
+      name: 'INSERT event_room_blocks (restore, no RETURNING)',
+      verb: 'insert',
+      match: (stmt) => stmt.table === 'event_room_blocks' && !stmt.returning,
+      respond: (stmt) => restoreInsertSpy(stmt.values),
+    })
+
+    const { updateEvent } = await loadService()
+
+    await expect(updateEvent('evt-update-1', { startTime: '16:00', endTime: '20:00' })).rejects.toMatchObject({
+      statusCode: 500,
+    })
+
+    expect(restoreInsertSpy).toHaveBeenCalledTimes(1)
+    expect(restoreInsertSpy).toHaveBeenCalledWith([
+      deletedBlockRow.id,
+      deletedBlockRow.event_id,
+      deletedBlockRow.room_id,
+      deletedBlockRow.date,
+      deletedBlockRow.start_time,
+      deletedBlockRow.end_time,
+      deletedBlockRow.all_day,
+    ])
+  })
+
+  it('does not attempt any block restore when the replacement insert succeeds', async () => {
+    addCurrentEventHandler(() => [
+      { title: 'Title', description: null, date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null },
+    ])
+    addExistingBlocksHandler(() => [{ room_id: 'room-1', all_day: false }])
+    addLegacyEventUpdateHandler(([, , date, start_time, end_time]) => [
+      { ...eventRow, date: date as string, start_time: start_time as string, end_time: end_time as string },
+    ])
+    addBlocksDeleteHandler(() => [
+      { id: 'block-old-1', event_id: 'evt-update-1', room_id: 'room-1', date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00', all_day: false },
+    ])
+    addRoomBlockInsertHandler(() => [
+      { id: 'block-new-1', event_id: 'evt-update-1', room_id: 'room-1', date: '2026-04-20', start_time: '16:00:00', end_time: '20:00:00', all_day: false },
+    ])
+    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+    addReservationsCancelHandler(() => [])
+
+    const restoreInsertSpy = vi.fn(() => [])
+    sqlMock.addHandler({
+      name: 'INSERT event_room_blocks (restore, no RETURNING)',
+      verb: 'insert',
+      match: (stmt) => stmt.table === 'event_room_blocks' && !stmt.returning,
+      respond: (stmt) => restoreInsertSpy(stmt.values),
+    })
+
+    const { updateEvent } = await loadService()
+
+    await updateEvent('evt-update-1', { startTime: '16:00', endTime: '20:00' })
+
+    expect(restoreInsertSpy).not.toHaveBeenCalled()
   })
 
   describe('isClubEventRow guard (Finding 3)', () => {
