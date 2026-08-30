@@ -4,6 +4,9 @@ import { NeonDbError } from '@neondatabase/serverless'
 import { serviceError } from '@/lib/server/service-error'
 import type { Tables } from '@/lib/supabase/types'
 import type { AdminEvent, AdminEventRoomBlock, AdminEventSchedule } from '@/lib/types'
+import type { createSupabaseServerAdminClient } from '@/lib/supabase/server'
+
+type SupabaseAdminClient = ReturnType<typeof createSupabaseServerAdminClient>
 
 /**
  * Raw-SQL Neon port of the legacy internal events service (#303).
@@ -266,6 +269,99 @@ async function cancelOverlappingReservationsForRoom(
   }
 }
 
+/**
+ * Same overlap-cancellation as `cancelOverlappingReservationsForRoom`, but
+ * also returns the ids of every reservation it cancelled, so a multi-block
+ * loop (see `createEvent`/`updateEvent`'s schedules path below) can restore
+ * them if a *later* block in the same call fails. Used only by those loops —
+ * `cancelOverlappingReservationsForRoom` itself is unchanged and still backs
+ * the legacy single-block path.
+ */
+async function cancelOverlappingReservationsForRoomCapturing(
+  roomId: string,
+  date: string,
+  startTime: string,
+  endTime: string,
+): Promise<string[]> {
+  let tableRows: Array<{ id: string }>
+  try {
+    tableRows = await sql`
+      SELECT id FROM tables WHERE room_id = ${roomId}
+    ` as Array<{ id: string }>
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+
+  const tableIds = tableRows.map((t) => t.id)
+  if (tableIds.length === 0) return []
+
+  let cancelledRows: Array<{ id: string }>
+  try {
+    cancelledRows = await sql`
+      UPDATE reservations
+      SET status = 'cancelled'
+      WHERE table_id = ANY(${tableIds})
+        AND date = ${date}
+        AND start_time < ${endTime}
+        AND end_time > ${startTime}
+        AND status IN ('active', 'pending')
+      RETURNING id
+    ` as Array<{ id: string }>
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+
+  return cancelledRows.map((r) => r.id)
+}
+
+/**
+ * Compensating rollback for the multi-block `createEvent`/`updateEvent`
+ * loops (#303 code-review Finding 2). Those loops are NOT wrapped in a
+ * single `sql.transaction()`: each iteration's overlap-cancellation branches
+ * on the previous query's runtime result (the room's table ids), which is
+ * exactly the batching limitation the file header documents for the old
+ * RPCs' insert-then-use-new-id flow. If a later block's INSERT (or the
+ * cancellation that follows it) throws, this restores what the loop has
+ * done so far in the current call: deletes any `event_room_blocks` rows it
+ * already inserted, and reactivates any reservations it already cancelled.
+ *
+ * Restoring cancelled reservations to `'active'` rather than each one's
+ * exact prior status (`'active'` vs `'pending'`) is an accepted
+ * simplification — undoing the loop's own partial writes matters far more
+ * here than perfectly reproducing a reservation's prior pending/active
+ * distinction on this already-rare failure path.
+ *
+ * Best-effort: errors from the rollback itself are logged and swallowed, so
+ * the caller's original failure (via `mapEventWriteError`) is always what
+ * actually surfaces to the API caller — mirroring the compensating-delete
+ * pattern in `reservations-service.ts`'s `createReservationForSession`.
+ */
+async function rollbackPartialMultiBlockWrite(params: {
+  eventId: string
+  insertedBlockIds: string[]
+  cancelledReservationIds: string[]
+  deleteEvent: boolean
+}): Promise<void> {
+  const { eventId, insertedBlockIds, cancelledReservationIds, deleteEvent } = params
+  try {
+    if (insertedBlockIds.length > 0) {
+      await sql`DELETE FROM event_room_blocks WHERE id = ANY(${insertedBlockIds})`
+    }
+    if (cancelledReservationIds.length > 0) {
+      await sql`
+        UPDATE reservations
+        SET status = 'active'
+        WHERE id = ANY(${cancelledReservationIds}) AND status = 'cancelled'
+      `
+    }
+    if (deleteEvent) {
+      await sql`DELETE FROM events WHERE id = ${eventId}`
+    }
+  } catch (rollbackError) {
+    console.error('events-service: compensating rollback failed (non-fatal):', rollbackError)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 //
@@ -392,24 +488,34 @@ export async function createEvent(body: {
     if (!event) serviceError('Internal server error', 500)
 
     const roomBlocks: EventRoomBlockRow[] = []
+    const insertedBlockIds: string[] = []
+    const cancelledReservationIds: string[] = []
     for (const block of normBlocks) {
       if (block.room_id === null) continue
 
-      let blockRows: EventRoomBlockRow[]
       try {
-        blockRows = await sql`
+        const blockRows = await sql`
           INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day)
           VALUES (${event.id}, ${block.room_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day})
           RETURNING id, event_id, room_id, date, start_time, end_time, all_day
         ` as EventRoomBlockRow[]
+
+        const blockRow = blockRows[0]
+        if (blockRow) {
+          roomBlocks.push(blockRow)
+          insertedBlockIds.push(blockRow.id)
+        }
+
+        const cancelled = await cancelOverlappingReservationsForRoomCapturing(
+          block.room_id, block.date, block.start_time, block.end_time,
+        )
+        cancelledReservationIds.push(...cancelled)
       } catch (error) {
+        await rollbackPartialMultiBlockWrite({
+          eventId: event.id, insertedBlockIds, cancelledReservationIds, deleteEvent: true,
+        })
         mapEventWriteError(error)
       }
-
-      const blockRow = blockRows[0]
-      if (blockRow) roomBlocks.push(blockRow)
-
-      await cancelOverlappingReservationsForRoom(block.room_id, block.date, block.start_time, block.end_time)
     }
 
     return toAdminEvent(event, roomBlocks)
@@ -534,24 +640,37 @@ export async function updateEvent(
     }
 
     const roomBlocks: EventRoomBlockRow[] = []
+    const insertedBlockIds: string[] = []
+    const cancelledReservationIds: string[] = []
     for (const block of normBlocks) {
       if (block.room_id === null) continue
 
-      let blockRows: EventRoomBlockRow[]
       try {
-        blockRows = await sql`
+        const blockRows = await sql`
           INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day)
           VALUES (${id}, ${block.room_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day})
           RETURNING id, event_id, room_id, date, start_time, end_time, all_day
         ` as EventRoomBlockRow[]
+
+        const blockRow = blockRows[0]
+        if (blockRow) {
+          roomBlocks.push(blockRow)
+          insertedBlockIds.push(blockRow.id)
+        }
+
+        const cancelled = await cancelOverlappingReservationsForRoomCapturing(
+          block.room_id, block.date, block.start_time, block.end_time,
+        )
+        cancelledReservationIds.push(...cancelled)
       } catch (error) {
+        // Unlike createEvent, `event` pre-existed this call — only the newly
+        // (partially) inserted blocks and cancellations from this call are
+        // rolled back; the event row itself is not deleted on failure.
+        await rollbackPartialMultiBlockWrite({
+          eventId: id, insertedBlockIds, cancelledReservationIds, deleteEvent: false,
+        })
         mapEventWriteError(error)
       }
-
-      const blockRow = blockRows[0]
-      if (blockRow) roomBlocks.push(blockRow)
-
-      await cancelOverlappingReservationsForRoom(block.room_id, block.date, block.start_time, block.end_time)
     }
 
     return toAdminEvent(event, roomBlocks)
@@ -612,7 +731,11 @@ export async function updateEvent(
   }
 
   const event = updatedRows[0]
-  if (!event) serviceError('Internal server error', 500)
+  // Race: the event existed at the SELECT above but was deleted before this
+  // UPDATE ran. Matches the multi-block path's identical race (line ~631),
+  // which already returns 404 here — keep both paths consistent (#303
+  // code-review Finding 3) instead of this one surfacing a spurious 500.
+  if (!event) serviceError('Event not found', 404)
 
   try {
     await sql`DELETE FROM event_room_blocks WHERE event_id = ${id}`
@@ -673,15 +796,29 @@ export async function deleteEvent(id: string): Promise<void> {
  * calling this directly, so it must NOT go through the `isClubEventRow`
  * check in `deleteEvent`).
  *
- * The first parameter used to be the Supabase admin client (still-Supabase
- * `club-events-service.ts` passes its own `admin` instance). It is now
- * unused — this cascade always operates against Neon — but is kept so that
- * call site (out of scope, #304) keeps compiling unchanged.
+ * DUAL PATH (#303 code-review Finding 1): `club-events-service.ts` is still
+ * Supabase-based (#304, not started) — `deleteClubEvent` confirms the event
+ * row exists via Supabase and then calls this function with its own
+ * Supabase admin client. `events`/`event_room_blocks` are effectively empty
+ * in Neon until #304 migrates that service, so routing that caller through
+ * the Neon-only path below would silently affect 0 rows — `deleteClubEvent`
+ * would report success without deleting anything. So: when a real Supabase
+ * admin client is passed, this restores the pre-#303 Supabase-based cascade
+ * (see `git show develop:lib/server/events-service.ts`) for that caller;
+ * when called with `undefined` (this service's own, already-migrated
+ * `deleteEvent`), it uses the Neon path. Remove this dual path once #304
+ * migrates `club-events-service.ts` to Neon and its caller no longer has a
+ * Supabase admin client to pass here.
  */
 export async function deleteEventCascade(
-  _admin: unknown,
+  admin: SupabaseAdminClient | undefined,
   id: string,
 ): Promise<void> {
+  if (admin) {
+    await deleteEventCascadeSupabase(admin, id)
+    return
+  }
+
   let blocks: Array<{ room_id: string; date: string; start_time: string; end_time: string }>
   try {
     blocks = await sql`
@@ -740,6 +877,64 @@ export async function deleteEventCascade(
   } catch {
     serviceError('Internal server error', 500)
   }
+}
+
+/**
+ * Pre-#303 Supabase-based cascade delete, restored as the fallback path for
+ * `deleteEventCascade`'s still-Supabase caller (`club-events-service.ts`'s
+ * `deleteClubEvent`) — see the dual-path note above. Ported unchanged from
+ * `git show develop:lib/server/events-service.ts`.
+ */
+async function deleteEventCascadeSupabase(
+  admin: SupabaseAdminClient,
+  id: string,
+): Promise<void> {
+  const { data: blocks } = await admin
+    .from('event_room_blocks')
+    .select('room_id, date, start_time, end_time')
+    .eq('event_id', id)
+
+  type SupabaseBlock = { room_id: string; date: string; start_time: string; end_time: string }
+
+  // Collect distinct room_ids and pre-fetch their table ids into a Map to avoid N+1 round trips
+  const distinctRoomIds = [...new Set(
+    ((blocks ?? []) as SupabaseBlock[]).map((b) => b.room_id).filter(Boolean),
+  )]
+
+  const roomTableMap = new Map<string, string[]>()
+  if (distinctRoomIds.length > 0) {
+    const { data: tables } = await admin
+      .from('tables')
+      .select('id, room_id')
+      .in('room_id', distinctRoomIds)
+
+    for (const t of (tables ?? []) as { id: string; room_id: string }[]) {
+      const list = roomTableMap.get(t.room_id) ?? []
+      list.push(t.id)
+      roomTableMap.set(t.room_id, list)
+    }
+  }
+
+  // Cancel overlapping reservations for every block (multi-day aware)
+  for (const block of (blocks ?? []) as SupabaseBlock[]) {
+    const tableIds = roomTableMap.get(block.room_id) ?? []
+
+    if (tableIds.length > 0) {
+      const { error: cancelError } = await admin
+        .from('reservations')
+        .update({ status: 'cancelled' })
+        .in('table_id', tableIds)
+        .eq('date', block.date)
+        .lt('start_time', block.end_time)
+        .gt('end_time', block.start_time)
+        .in('status', ['active', 'pending'])
+
+      if (cancelError) serviceError('Internal server error', 500)
+    }
+  }
+
+  const { error } = await admin.from('events').delete().eq('id', id)
+  if (error) serviceError('Internal server error', 500)
 }
 
 export interface EventConflictBlock {
