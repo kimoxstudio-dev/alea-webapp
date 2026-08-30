@@ -620,9 +620,9 @@ export async function createEvent(body: {
 
       try {
         const blockRows = await sql`
-          INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day, table_id)
-          VALUES (${event.id}, ${block.room_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day}, ${block.table_id})
-          RETURNING id, event_id, room_id, date, start_time, end_time, all_day, table_id
+          INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day)
+          VALUES (${event.id}, ${block.room_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day})
+          RETURNING id, event_id, room_id, date, start_time, end_time, all_day
         ` as EventRoomBlockRow[]
 
         const blockRow = blockRows[0]
@@ -818,9 +818,9 @@ export async function updateEvent(
 
       try {
         const blockRows = await sql`
-          INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day, table_id)
-          VALUES (${id}, ${block.room_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day}, ${block.table_id})
-          RETURNING id, event_id, room_id, date, start_time, end_time, all_day, table_id
+          INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day)
+          VALUES (${id}, ${block.room_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day})
+          RETURNING id, event_id, room_id, date, start_time, end_time, all_day
         ` as EventRoomBlockRow[]
 
         const blockRow = blockRows[0]
