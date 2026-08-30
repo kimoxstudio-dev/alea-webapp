@@ -149,6 +149,14 @@ describe('events-service — previewEventConflicts', () => {
 
     // The tables lookup should be called exactly once (batched), not once per block
     expect(tablesSpy).toHaveBeenCalledTimes(1)
+    // ...and the room_id list bound into `WHERE room_id = ANY(...)` must be
+    // deduplicated — three blocks sharing 'room-C' must produce a single
+    // 'room-C' entry, not ['room-C', 'room-C', 'room-C']. `respond` is
+    // invoked by the sql-mock dispatcher as `respond(stmt)`, so the parsed
+    // statement (and its bound `values`) is captured as this spy's call arg
+    // despite the factory's `() => unknown` signature not naming it.
+    const stmt = tablesSpy.mock.calls[0][0] as { values: unknown[] }
+    expect(stmt.values).toEqual([['room-C']])
   })
 
   // -------------------------------------------------------------------------
