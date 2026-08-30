@@ -930,6 +930,16 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
         match: (stmt) => stmt.table === 'events',
         respond: eventsDeleteSpy,
       })
+      // revertEventFieldsOnFailure also fires on this failure path (round 4)
+      // — asserted directly by the dedicated test below; present here only
+      // so this pre-existing test's mock doesn't throw an unhandled-query
+      // error for it.
+      sqlMock.addHandler({
+        name: 'UPDATE events (revert fields, no RETURNING)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'events' && !stmt.returning,
+        respond: () => [],
+      })
 
       const { updateEvent } = await loadService()
 
@@ -952,6 +962,169 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
 
       // updateEvent's rollback does NOT delete the event row — it pre-existed this call.
       expect(eventsDeleteSpy).not.toHaveBeenCalled()
+    })
+
+    it('also restores the pre-existing blocks the unconditional DELETE wiped, and reverts the event-row field mutation, when a later block insert fails (#303 code-review round 4)', async () => {
+      const originalRow = { title: 'Existing', description: 'Existing desc', date: '2026-07-10', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null }
+      addCurrentEventHandler(() => [originalRow])
+      addMultiBlockEventUpdateHandler(() => [makeEventRow({ id: 'evt-1', title: 'Updated Multi-Day' })])
+
+      // The unconditional "replace" DELETE now captures (via RETURNING) the
+      // block(s) it wipes, so they can be restored if a later block's INSERT
+      // fails mid-loop.
+      const preExistingBlock = {
+        id: 'block-pre-1',
+        event_id: 'evt-1',
+        room_id: 'room-1',
+        date: '2026-07-10',
+        start_time: '18:00:00',
+        end_time: '22:00:00',
+        all_day: false,
+      }
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE event_id (replace step, RETURNING)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'event_id'),
+        respond: () => [preExistingBlock],
+      })
+
+      let insertCallIndex = 0
+      sqlMock.addHandler({
+        name: 'INSERT event_room_blocks (fails on 2nd block)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'event_room_blocks' && stmt.returning,
+        respond: (stmt) => {
+          insertCallIndex += 1
+          if (insertCallIndex === 2) {
+            throw new Error('connection reset mid-insert')
+          }
+          return [
+            makeBlockRow({
+              id: 'block-new-1',
+              date: stmt.values[2] as string,
+              start_time: stmt.values[3] as string,
+              end_time: stmt.values[4] as string,
+            }),
+          ]
+        },
+      })
+
+      addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+      sqlMock.addHandler({
+        name: 'UPDATE reservations cancel overlapping (RETURNING id)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'table_id'),
+        respond: () => [{ id: 'res-1' }],
+      })
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE id = ANY(...) (rollback)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'id'),
+        respond: () => [],
+      })
+      sqlMock.addHandler({
+        name: 'UPDATE reservations SET active WHERE id = ANY(...) (rollback)',
+        verb: 'update',
+        match: (stmt) =>
+          stmt.table === 'reservations' && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'table_id'),
+        respond: () => [],
+      })
+
+      // restoreDeletedBlocksOnUpdateFailure's reinsert: has an explicit `id`
+      // column and NO RETURNING clause — distinct from the block-insert
+      // handler above (which requires RETURNING).
+      const restoreInsertSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'INSERT event_room_blocks (restore, no RETURNING)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'event_room_blocks' && !stmt.returning,
+        respond: (stmt) => restoreInsertSpy(stmt.values),
+      })
+
+      // revertEventFieldsOnFailure's UPDATE: same columns as the multi-block
+      // UPDATE events RETURNING statement, but with NO RETURNING clause.
+      const revertFieldsSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'UPDATE events (revert fields, no RETURNING)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'events' && !stmt.returning,
+        respond: (stmt) => revertFieldsSpy(stmt.values),
+      })
+
+      const { updateEvent } = await loadService()
+
+      await expect(
+        updateEvent('evt-1', {
+          schedules: [
+            { date: '2026-08-01', startTime: '09:00', endTime: '13:00', roomId: 'room-1', allDay: false },
+            { date: '2026-08-02', startTime: '14:00', endTime: '18:00', roomId: 'room-1', allDay: false },
+          ],
+        }),
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      // The pre-existing block wiped by the unconditional DELETE is reinserted verbatim.
+      expect(restoreInsertSpy).toHaveBeenCalledTimes(1)
+      expect(restoreInsertSpy).toHaveBeenCalledWith([
+        preExistingBlock.id,
+        preExistingBlock.event_id,
+        preExistingBlock.room_id,
+        preExistingBlock.date,
+        preExistingBlock.start_time,
+        preExistingBlock.end_time,
+        preExistingBlock.all_day,
+      ])
+
+      // The event row's field mutation is reverted back to its pre-update values.
+      expect(revertFieldsSpy).toHaveBeenCalledTimes(1)
+      expect(revertFieldsSpy).toHaveBeenCalledWith([
+        originalRow.title,
+        originalRow.description,
+        originalRow.date,
+        originalRow.start_time,
+        originalRow.end_time,
+        'evt-1',
+      ])
+    })
+
+    it('reverts the event-row field mutation when the unconditional block DELETE itself fails (#303 code-review round 4 audit)', async () => {
+      const originalRow = { title: 'Existing', description: null, date: '2026-07-10', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null }
+      addCurrentEventHandler(() => [originalRow])
+      addMultiBlockEventUpdateHandler(() => [makeEventRow({ id: 'evt-1', title: 'Updated Multi-Day' })])
+
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE event_id (replace step, fails)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'event_id'),
+        respond: () => {
+          throw new Error('connection reset on delete')
+        },
+      })
+
+      const revertFieldsSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'UPDATE events (revert fields, no RETURNING)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'events' && !stmt.returning,
+        respond: (stmt) => revertFieldsSpy(stmt.values),
+      })
+
+      const { updateEvent } = await loadService()
+
+      await expect(
+        updateEvent('evt-1', {
+          schedules: [{ date: '2026-08-01', startTime: '09:00', endTime: '13:00', roomId: 'room-1', allDay: false }],
+        }),
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      expect(revertFieldsSpy).toHaveBeenCalledTimes(1)
+      expect(revertFieldsSpy).toHaveBeenCalledWith([
+        originalRow.title,
+        originalRow.description,
+        originalRow.date,
+        originalRow.start_time,
+        originalRow.end_time,
+        'evt-1',
+      ])
     })
   })
 })

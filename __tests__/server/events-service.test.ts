@@ -529,6 +529,15 @@ describe('events-service — updateEvent (legacy single-block) with cancellation
       match: (stmt) => stmt.table === 'event_room_blocks' && !stmt.returning,
       respond: (stmt) => restoreInsertSpy(stmt.values),
     })
+    // revertEventFieldsOnFailure also fires on this failure path (round 4) —
+    // asserted directly by the dedicated test below; present here only so
+    // this pre-existing test's mock doesn't throw an unhandled-query error.
+    sqlMock.addHandler({
+      name: 'UPDATE events (revert fields, no RETURNING)',
+      verb: 'update',
+      match: (stmt) => stmt.table === 'events' && !stmt.returning,
+      respond: () => [],
+    })
 
     const { updateEvent } = await loadService()
 
@@ -578,6 +587,99 @@ describe('events-service — updateEvent (legacy single-block) with cancellation
     await updateEvent('evt-update-1', { startTime: '16:00', endTime: '20:00' })
 
     expect(restoreInsertSpy).not.toHaveBeenCalled()
+  })
+
+  it('reverts the event-row field mutation (in addition to restoring blocks) when the replacement block insert fails (#303 code-review round 4)', async () => {
+    // The `UPDATE events SET title=...` above already committed new field
+    // values before this INSERT ran and failed — revertEventFieldsOnFailure
+    // must put them back, alongside restoreDeletedBlocksOnUpdateFailure
+    // restoring the wiped block (already covered by the round-3 test above).
+    const originalRow = { title: 'Original Title', description: 'Original desc', date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null }
+    addCurrentEventHandler(() => [originalRow])
+    addExistingBlocksHandler(() => [{ room_id: 'room-1', all_day: false }])
+    addLegacyEventUpdateHandler(([, , date, start_time, end_time]) => [
+      { ...eventRow, date: date as string, start_time: start_time as string, end_time: end_time as string },
+    ])
+    addBlocksDeleteHandler(() => [
+      { id: 'block-old-1', event_id: 'evt-update-1', room_id: 'room-1', date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00', all_day: false },
+    ])
+    addRoomBlockInsertHandler(() => {
+      throw new Error('connection reset mid-insert')
+    })
+    // restoreDeletedBlocksOnUpdateFailure's reinsert (no RETURNING) — present
+    // here so this test's own scenario resolves cleanly; asserted directly
+    // by the round-3 test above.
+    sqlMock.addHandler({
+      name: 'INSERT event_room_blocks (restore, no RETURNING)',
+      verb: 'insert',
+      match: (stmt) => stmt.table === 'event_room_blocks' && !stmt.returning,
+      respond: () => [],
+    })
+
+    const revertFieldsSpy = vi.fn(() => [])
+    sqlMock.addHandler({
+      name: 'UPDATE events (revert fields, no RETURNING)',
+      verb: 'update',
+      match: (stmt) => stmt.table === 'events' && !stmt.returning,
+      respond: (stmt) => revertFieldsSpy(stmt.values),
+    })
+
+    const { updateEvent } = await loadService()
+
+    await expect(updateEvent('evt-update-1', { startTime: '16:00', endTime: '20:00' })).rejects.toMatchObject({
+      statusCode: 500,
+    })
+
+    expect(revertFieldsSpy).toHaveBeenCalledTimes(1)
+    expect(revertFieldsSpy).toHaveBeenCalledWith([
+      originalRow.title,
+      originalRow.description,
+      originalRow.date,
+      originalRow.start_time,
+      originalRow.end_time,
+      'evt-update-1',
+    ])
+  })
+
+  it('reverts the event-row field mutation when the block DELETE itself fails, after the event fields already committed (#303 code-review round 4 audit)', async () => {
+    const originalRow = { title: 'Original Title', description: null, date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null }
+    addCurrentEventHandler(() => [originalRow])
+    addExistingBlocksHandler(() => [{ room_id: 'room-1', all_day: false }])
+    addLegacyEventUpdateHandler(([, , date, start_time, end_time]) => [
+      { ...eventRow, date: date as string, start_time: start_time as string, end_time: end_time as string },
+    ])
+    sqlMock.addHandler({
+      name: 'DELETE event_room_blocks WHERE event_id (fails)',
+      verb: 'delete',
+      match: (stmt) => stmt.table === 'event_room_blocks',
+      respond: () => {
+        throw new Error('connection reset on delete')
+      },
+    })
+
+    const revertFieldsSpy = vi.fn(() => [])
+    sqlMock.addHandler({
+      name: 'UPDATE events (revert fields, no RETURNING)',
+      verb: 'update',
+      match: (stmt) => stmt.table === 'events' && !stmt.returning,
+      respond: (stmt) => revertFieldsSpy(stmt.values),
+    })
+
+    const { updateEvent } = await loadService()
+
+    await expect(updateEvent('evt-update-1', { startTime: '16:00', endTime: '20:00' })).rejects.toMatchObject({
+      statusCode: 500,
+    })
+
+    expect(revertFieldsSpy).toHaveBeenCalledTimes(1)
+    expect(revertFieldsSpy).toHaveBeenCalledWith([
+      originalRow.title,
+      originalRow.description,
+      originalRow.date,
+      originalRow.start_time,
+      originalRow.end_time,
+      'evt-update-1',
+    ])
   })
 
   describe('isClubEventRow guard (Finding 3)', () => {
