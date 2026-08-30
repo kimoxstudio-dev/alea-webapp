@@ -6,6 +6,7 @@ import { getDatabaseNow } from '@/lib/server/database-time'
 import { serviceError } from '@/lib/server/service-error'
 import { assertMemberRowsScoped } from '@/lib/server/data-scoping'
 import { sql } from '@/lib/db/client'
+import { NeonDbError } from '@neondatabase/serverless'
 import type { Tables } from '@/lib/supabase/types'
 import { normalizeTime } from '@/lib/server/availability'
 import {
@@ -17,7 +18,6 @@ import {
 type ReservationRow = Tables<'reservations'>
 type TableRow = Tables<'tables'>
 type EquipmentRow = Tables<'equipment'>
-type PostgrestErrorLike = { code?: string }
 type ReservationListRow = ReservationRow & {
   member_number: string | null
   table_name: string | null
@@ -33,6 +33,7 @@ export { CHECK_IN_LATE_MINUTES }
 export const BOOKING_WINDOW_DAYS = 7
 const CANCELLATION_CUTOFF_MS = 60 * 60 * 1000 // 60 minutes
 
+const RESERVATION_COLUMNS = 'id, table_id, user_id, date, start_time, end_time, status, surface, activated_at, created_at'
 
 function parseDate(value: string): string {
   if (!isValidDateOnlyString(value)) {
@@ -201,7 +202,7 @@ async function getReservationForAccess(reservationId: string) {
   let rows: ReservationRow[]
   try {
     rows = await sql`
-      SELECT id, table_id, user_id, date, start_time, end_time, status, surface, activated_at, created_at
+      SELECT ${sql.unsafe(RESERVATION_COLUMNS)}
       FROM reservations
       WHERE id = ${reservationId}
       LIMIT 1
@@ -220,7 +221,7 @@ async function listActiveReservationsForConflict(input: {
   let rows: ReservationRow[]
   try {
     rows = await sql`
-      SELECT id, table_id, user_id, date, start_time, end_time, status, surface, activated_at, created_at
+      SELECT ${sql.unsafe(RESERVATION_COLUMNS)}
       FROM reservations
       WHERE table_id = ${input.tableId}
         AND date = ${input.date}
@@ -246,7 +247,7 @@ async function expireStalePendingReservations(tableId: string, date: string) {
   let rows: ReservationRow[]
   try {
     rows = await sql`
-      SELECT id, table_id, user_id, date, start_time, end_time, status, surface, activated_at, created_at
+      SELECT ${sql.unsafe(RESERVATION_COLUMNS)}
       FROM reservations
       WHERE status = 'pending'
         AND table_id = ${tableId}
@@ -262,18 +263,20 @@ async function expireStalePendingReservations(tableId: string, date: string) {
     .filter((row) => isPendingReservationExpired(row, nowUtc))
     .map((row) => row.id)
 
-  for (const id of expiredIds) {
-    try {
-      await sql`
-        UPDATE reservations
-        SET status = 'cancelled'
-        WHERE id = ${id}
-          AND status = 'pending'
-          AND activated_at IS NULL
-      `
-    } catch (error) {
-      console.error('expireStalePendingReservations failed (non-fatal):', error)
-    }
+  if (expiredIds.length === 0) {
+    return
+  }
+
+  try {
+    await sql`
+      UPDATE reservations
+      SET status = 'cancelled'
+      WHERE id = ANY(${expiredIds}::uuid[])
+        AND status = 'pending'
+        AND activated_at IS NULL
+    `
+  } catch (error) {
+    console.error('expireStalePendingReservations failed (non-fatal):', error)
   }
 }
 
@@ -295,7 +298,7 @@ async function listOverlappingReservationIds(input: {
     let rows: ReservationRow[]
     try {
       rows = await sql`
-        SELECT id, table_id, user_id, date, start_time, end_time, status, surface, activated_at, created_at
+        SELECT ${sql.unsafe(RESERVATION_COLUMNS)}
         FROM reservations
         WHERE date = ${input.date}
           AND status IN ('pending', 'active')
@@ -430,8 +433,8 @@ async function listConflictingEquipmentIds(input: {
     rows = await sql`
       SELECT equipment_id
       FROM reservation_equipment
-      WHERE reservation_id = ANY(${overlappingReservationIds})
-        AND equipment_id = ANY(${input.equipmentIds})
+      WHERE reservation_id = ANY(${overlappingReservationIds}::uuid[])
+        AND equipment_id = ANY(${input.equipmentIds}::uuid[])
     ` as Array<{ equipment_id: string }>
   } catch {
     serviceError('Internal server error', 500)
@@ -543,8 +546,8 @@ function assertReservationAccess(
   }
 }
 
-function isConflictError(error: PostgrestErrorLike | null | undefined) {
-  return error?.code === '23P01'
+function isConflictError(error: unknown) {
+  return error instanceof NeonDbError && error.code === '23P01'
 }
 
 function throwSlotTaken(): never {
@@ -662,7 +665,7 @@ async function checkUserSlotOverlap(
   let rows: ReservationRow[]
   try {
     rows = await sql`
-      SELECT id, table_id, user_id, date, start_time, end_time, status, surface, activated_at, created_at
+      SELECT ${sql.unsafe(RESERVATION_COLUMNS)}
       FROM reservations
       WHERE user_id = ${userId}
         AND date = ${date}
@@ -749,10 +752,10 @@ export async function createReservationForSession(
     rows = await sql`
       INSERT INTO reservations (table_id, user_id, date, start_time, end_time, surface)
       VALUES (${tableId}, ${session.id}, ${date}, ${startTime}, ${endTime}, ${surface ?? null})
-      RETURNING id, table_id, user_id, date, start_time, end_time, status, surface, activated_at, created_at
+      RETURNING ${sql.unsafe(RESERVATION_COLUMNS)}
     ` as ReservationRow[]
   } catch (error) {
-    if (isConflictError(error as PostgrestErrorLike)) {
+    if (isConflictError(error)) {
       throwSlotTaken()
     }
     serviceError('Internal server error', 500)
@@ -766,7 +769,11 @@ export async function createReservationForSession(
     // Compensating delete: remove the just-created reservation to avoid a ghost
     // row with no equipment association. Ignore errors from the delete itself —
     // the original equipment error is what the caller needs to act on.
-    await sql`DELETE FROM reservations WHERE id = ${data.id}`
+    try {
+      await sql`DELETE FROM reservations WHERE id = ${data.id}`
+    } catch (deleteError) {
+      console.error('createReservationForSession: compensating delete failed (non-fatal):', deleteError)
+    }
     serviceError('Failed to save equipment. Reservation was cancelled. Please try again.', 500)
   }
 
@@ -901,10 +908,11 @@ export async function updateReservationForSession(
       UPDATE reservations
       SET date = ${nextDate}, start_time = ${nextStartTime}, end_time = ${nextEndTime}, surface = ${nextSurface}, status = ${status}
       WHERE id = ${reservationId}
-      RETURNING id, table_id, user_id, date, start_time, end_time, status, surface, activated_at, created_at
+        AND (${session.role === 'admin'} OR user_id = ${session.id})
+      RETURNING ${sql.unsafe(RESERVATION_COLUMNS)}
     ` as ReservationRow[]
   } catch (error) {
-    if (isConflictError(error as PostgrestErrorLike)) {
+    if (isConflictError(error)) {
       throwSlotTaken()
     }
     serviceError('Internal server error', 500)
@@ -931,7 +939,7 @@ export async function activateReservationByTable(
   let pendingRows: ReservationRow[]
   try {
     pendingRows = await sql`
-      SELECT id, table_id, user_id, date, start_time, end_time, status, surface, activated_at, created_at
+      SELECT ${sql.unsafe(RESERVATION_COLUMNS)}
       FROM reservations
       WHERE table_id = ${tableId}
         AND date = ${today}
@@ -948,7 +956,7 @@ export async function activateReservationByTable(
     let activeRows: ReservationRow[]
     try {
       activeRows = await sql`
-        SELECT id, table_id, user_id, date, start_time, end_time, status, surface, activated_at, created_at
+        SELECT ${sql.unsafe(RESERVATION_COLUMNS)}
         FROM reservations
         WHERE table_id = ${tableId}
           AND date = ${today}
@@ -1000,7 +1008,7 @@ export async function activateReservationByTable(
       UPDATE reservations
       SET status = 'active', activated_at = ${nowUtc.toISOString()}
       WHERE id = ${reservation.id} AND status = 'pending'
-      RETURNING id, table_id, user_id, date, start_time, end_time, status, surface, activated_at, created_at
+      RETURNING ${sql.unsafe(RESERVATION_COLUMNS)}
     ` as ReservationRow[]
   } catch {
     serviceError('Internal server error', 500)
