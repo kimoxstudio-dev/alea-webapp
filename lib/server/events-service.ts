@@ -560,9 +560,13 @@ export async function updateEvent(
   // --- Legacy single-block path ---
   const date = body.date !== undefined ? String(body.date).trim() || currentRow.date : currentRow.date
   const inputStartTime =
-    body.startTime !== undefined ? String(body.startTime).trim() || currentRow.start_time : currentRow.start_time
+    body.startTime !== undefined
+      ? String(body.startTime).trim() || currentRow.start_time.slice(0, 5)
+      : currentRow.start_time.slice(0, 5)
   const inputEndTime =
-    body.endTime !== undefined ? String(body.endTime).trim() || currentRow.end_time : currentRow.end_time
+    body.endTime !== undefined
+      ? String(body.endTime).trim() || currentRow.end_time.slice(0, 5)
+      : currentRow.end_time.slice(0, 5)
 
   let roomId: string | null
   let currentAllDay = false
