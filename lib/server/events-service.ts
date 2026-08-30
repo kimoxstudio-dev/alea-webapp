@@ -242,11 +242,16 @@ function deriveAnchorFromBlocks(blocks: NormalisedEventSchedule[]): NormalisedEv
 function mapEventWriteError(error: unknown): never {
   if (
     error instanceof NeonDbError &&
-    (error.code === '23514' || error.code === '22P02' || error.code === '23502' || error.code === '23503')
+    (error.code === '23514' || error.code === '22P02' || error.code === '23502' ||
+      error.code === '23503' || error.code === '23505')
   ) {
     // 23503 = foreign_key_violation — e.g. an invalid roomId on a block
-    // insert (event_room_blocks_room_id_fkey), same 400 treatment as the
-    // other input-shape errors above (#303 code-review, high-effort round).
+    // insert (event_room_blocks_room_id_fkey). 23505 = unique_violation —
+    // e.g. a duplicate schedule block hitting event_room_blocks' unique
+    // index on (event_id, room_id, date, start_time, end_time) (see
+    // lib/db/schema/009_event_room_blocks.sql). Same 400 treatment as the
+    // other input-shape errors above (#303 code-review, high-effort round),
+    // matching equipment-service.ts's convention of mapping 23505 to 400.
     serviceError('Invalid event data', 400)
   }
   serviceError('Internal server error', 500)
