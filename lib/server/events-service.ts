@@ -362,6 +362,33 @@ async function rollbackPartialMultiBlockWrite(params: {
   }
 }
 
+/**
+ * Compensating rollback for the legacy single-block `updateEvent` path
+ * (#303 code-review round 3, Finding 2). That path deletes the event's
+ * existing room block(s) *before* inserting the replacement — worse
+ * ordering than the multi-block path — so a failure inserting the new block
+ * would otherwise leave the event with zero blocks, silently losing its
+ * room assignment. Reinserts the exact rows the failed call just deleted
+ * (captured via the DELETE's own `RETURNING`, see call site). Best-effort:
+ * errors here are logged and swallowed, matching the pattern in
+ * `rollbackPartialMultiBlockWrite` above.
+ */
+async function restoreDeletedBlocksOnLegacyUpdateFailure(
+  deletedBlocks: EventRoomBlockRow[],
+): Promise<void> {
+  if (deletedBlocks.length === 0) return
+  try {
+    for (const block of deletedBlocks) {
+      await sql`
+        INSERT INTO event_room_blocks (id, event_id, room_id, date, start_time, end_time, all_day)
+        VALUES (${block.id}, ${block.event_id}, ${block.room_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day})
+      `
+    }
+  } catch (rollbackError) {
+    console.error('events-service: compensating block restore failed (non-fatal):', rollbackError)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 //
@@ -551,6 +578,15 @@ export async function createEvent(body: {
         RETURNING id, event_id, room_id, date, start_time, end_time, all_day
       ` as EventRoomBlockRow[]
     } catch {
+      // #303 code-review round 3, Finding 1: the event insert above and this
+      // block insert are two separate statements (same non-transactional
+      // constraint as the multi-block loops — see file header). On failure
+      // here, remove the just-inserted event row so it doesn't persist
+      // orphaned with zero blocks, mirroring the multi-block createEvent
+      // path's rollbackPartialMultiBlockWrite(deleteEvent: true).
+      await rollbackPartialMultiBlockWrite({
+        eventId: event.id, insertedBlockIds: [], cancelledReservationIds: [], deleteEvent: true,
+      })
       serviceError('Internal server error', 500)
     }
 
@@ -737,8 +773,17 @@ export async function updateEvent(
   // code-review Finding 3) instead of this one surfacing a spurious 500.
   if (!event) serviceError('Event not found', 404)
 
+  // #303 code-review round 3, Finding 2: capture (via RETURNING, no extra
+  // round trip) the blocks this call is about to delete, so they can be
+  // restored if the replacement INSERT below fails — otherwise the event
+  // silently loses its room assignment (ends up with zero blocks) on a 500.
+  let blocksToRestoreOnFailure: EventRoomBlockRow[]
   try {
-    await sql`DELETE FROM event_room_blocks WHERE event_id = ${id}`
+    blocksToRestoreOnFailure = await sql`
+      DELETE FROM event_room_blocks
+      WHERE event_id = ${id}
+      RETURNING id, event_id, room_id, date, start_time, end_time, all_day
+    ` as EventRoomBlockRow[]
   } catch {
     serviceError('Internal server error', 500)
   }
@@ -753,6 +798,7 @@ export async function updateEvent(
         RETURNING id, event_id, room_id, date, start_time, end_time, all_day
       ` as EventRoomBlockRow[]
     } catch {
+      await restoreDeletedBlocksOnLegacyUpdateFailure(blocksToRestoreOnFailure)
       serviceError('Internal server error', 500)
     }
 
