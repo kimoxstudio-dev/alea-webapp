@@ -432,6 +432,26 @@ describe('events-service — updateEvent (legacy single-block) with cancellation
     })
   })
 
+  it('throws 404 (not 500) when the events UPDATE...RETURNING affects 0 rows — event deleted between the read and the write (#303 code-review Finding 3)', async () => {
+    // Distinct from "throws 404 when event does not exist" above (which
+    // fails the upfront currentRows SELECT) and from "throws 500 when the
+    // events update fails" above (which throws from the UPDATE itself).
+    // Here the SELECT succeeds (event exists at read time) but the UPDATE
+    // affects 0 rows — a real race, not an error — and must map to the same
+    // 404 the multi-block path already returns for the equivalent race.
+    addCurrentEventHandler(() => [
+      { title: 'Title', description: null, date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null },
+    ])
+    addExistingBlocksHandler(() => [])
+    addLegacyEventUpdateHandler(() => [])
+
+    const { updateEvent } = await loadService()
+
+    await expect(updateEvent('evt-update-1', { startTime: '16:00', endTime: '20:00' })).rejects.toMatchObject({
+      statusCode: 404,
+    })
+  })
+
   describe('isClubEventRow guard (Finding 3)', () => {
     it('updateEvent rejects club event rows (both title_es and title_en set)', async () => {
       addCurrentEventHandler(() => [

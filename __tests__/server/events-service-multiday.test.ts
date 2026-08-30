@@ -494,6 +494,144 @@ describe('events-service — createEvent multi-day (schedules)', () => {
       }),
     ).rejects.toMatchObject({ statusCode: 400 })
   })
+
+  // -------------------------------------------------------------------------
+  // Compensating rollback (#303 code-review Finding 2) — createEvent path.
+  //
+  // These loops are NOT wrapped in a single sql.transaction() (see
+  // lib/server/events-service.ts's rollbackPartialMultiBlockWrite doc
+  // comment): each iteration branches on the previous query's runtime
+  // result, which Neon's HTTP driver's batched transaction() can't express.
+  // If a later block's INSERT fails, rollbackPartialMultiBlockWrite must:
+  // - delete every event_room_blocks row inserted so far in this call
+  // - reactivate every reservation cancelled so far in this call
+  // - (createEvent only) delete the now-orphaned event row
+  // -------------------------------------------------------------------------
+  describe('compensating rollback on partial multi-block write failure', () => {
+    it('rolls back inserted blocks, reactivated reservations, and the orphaned event row when a later block INSERT fails', async () => {
+      addMultiBlockEventInsertHandler(() => [makeEventRow({ id: 'evt-rollback-1' })])
+
+      let insertCallIndex = 0
+      sqlMock.addHandler({
+        name: 'INSERT event_room_blocks (fails on 2nd block)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'event_room_blocks' && stmt.returning,
+        respond: (stmt) => {
+          insertCallIndex += 1
+          if (insertCallIndex === 2) {
+            throw new Error('connection reset mid-insert')
+          }
+          return [
+            makeBlockRow({
+              id: 'block-1',
+              date: stmt.values[2] as string,
+              start_time: stmt.values[3] as string,
+              end_time: stmt.values[4] as string,
+            }),
+          ]
+        },
+      })
+
+      addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+      sqlMock.addHandler({
+        name: 'UPDATE reservations cancel overlapping (RETURNING id)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'table_id'),
+        respond: () => [{ id: 'res-1' }],
+      })
+
+      const rollbackBlocksDeleteSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE id = ANY(...) (rollback)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'id'),
+        respond: rollbackBlocksDeleteSpy,
+      })
+
+      const rollbackReactivateSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'UPDATE reservations SET active WHERE id = ANY(...) (rollback)',
+        verb: 'update',
+        match: (stmt) =>
+          stmt.table === 'reservations' && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'table_id'),
+        respond: rollbackReactivateSpy,
+      })
+
+      const rollbackEventDeleteSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'DELETE events WHERE id (rollback, createEvent)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'events',
+        respond: rollbackEventDeleteSpy,
+      })
+
+      const { createEvent } = await loadService()
+
+      await expect(
+        createEvent({
+          title: 'Rollback Event',
+          schedules: [
+            { date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', allDay: false },
+            { date: '2026-07-11', startTime: '10:00', endTime: '14:00', roomId: 'room-1', allDay: false },
+          ],
+        }),
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      // Rollback deletes exactly the one block inserted before the failure.
+      expect(rollbackBlocksDeleteSpy).toHaveBeenCalledTimes(1)
+      expect(rollbackBlocksDeleteSpy.mock.calls[0][0].values).toEqual([['block-1']])
+
+      // Rollback reactivates exactly the one reservation cancelled before the failure.
+      expect(rollbackReactivateSpy).toHaveBeenCalledTimes(1)
+      expect(rollbackReactivateSpy.mock.calls[0][0].values).toEqual([['res-1']])
+
+      // createEvent's rollback also deletes the now-orphaned event row.
+      expect(rollbackEventDeleteSpy).toHaveBeenCalledTimes(1)
+      expect(rollbackEventDeleteSpy.mock.calls[0][0].values).toEqual(['evt-rollback-1'])
+    })
+
+    it('does not attempt any rollback deletes/reactivations when every block insert succeeds', async () => {
+      addMultiBlockEventInsertHandler(() => [makeEventRow({ id: 'evt-ok-1' })])
+      addRoomBlockInsertHandler((values) => [
+        makeBlockRow({ id: `block-${values[2]}`, date: values[2] as string, start_time: values[3] as string, end_time: values[4] as string }),
+      ])
+      addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+      sqlMock.addHandler({
+        name: 'UPDATE reservations cancel overlapping (RETURNING id)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'table_id'),
+        respond: () => [{ id: 'res-1' }],
+      })
+
+      const rollbackBlocksDeleteSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE id = ANY(...) (rollback)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'id'),
+        respond: rollbackBlocksDeleteSpy,
+      })
+      const rollbackEventDeleteSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'DELETE events WHERE id (rollback, createEvent)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'events',
+        respond: rollbackEventDeleteSpy,
+      })
+
+      const { createEvent } = await loadService()
+
+      await createEvent({
+        title: 'No Rollback Needed',
+        schedules: [
+          { date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', allDay: false },
+          { date: '2026-07-11', startTime: '10:00', endTime: '14:00', roomId: 'room-1', allDay: false },
+        ],
+      })
+
+      expect(rollbackBlocksDeleteSpy).not.toHaveBeenCalled()
+      expect(rollbackEventDeleteSpy).not.toHaveBeenCalled()
+    })
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -709,6 +847,112 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
         schedules: [{ date: '2026-07-10', startTime: '10:00', endTime: '12:00', roomId: 'room-1', allDay: false }],
       }),
     ).rejects.toMatchObject({ statusCode: 400 })
+  })
+
+  // -------------------------------------------------------------------------
+  // Compensating rollback (#303 code-review Finding 2) — updateEvent path.
+  //
+  // Unlike createEvent's rollback, the event row here pre-existed the call
+  // and must NOT be deleted on failure — only the blocks/reservations this
+  // specific call touched are rolled back (see rollbackPartialMultiBlockWrite
+  // callers in lib/server/events-service.ts).
+  // -------------------------------------------------------------------------
+  describe('compensating rollback on partial multi-block write failure', () => {
+    it('rolls back inserted blocks and reactivated reservations, but does NOT delete the pre-existing event row', async () => {
+      addCurrentEventHandler(() => [
+        { title: 'Existing', description: null, date: '2026-07-10', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null },
+      ])
+      addMultiBlockEventUpdateHandler(() => [makeEventRow({ id: 'evt-1' })])
+
+      // The "replace" step deletes ALL existing blocks for this event first —
+      // distinct from the rollback's targeted id=ANY(...) delete below (its
+      // WHERE clause is `event_id = $1`, which never satisfies the
+      // word-boundary-anchored `whereHasColumn(stmt, 'id')` check the
+      // rollback handler uses).
+      const replaceDeleteSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE event_id (replace step)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'event_id'),
+        respond: replaceDeleteSpy,
+      })
+
+      let insertCallIndex = 0
+      sqlMock.addHandler({
+        name: 'INSERT event_room_blocks (fails on 2nd block)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'event_room_blocks' && stmt.returning,
+        respond: (stmt) => {
+          insertCallIndex += 1
+          if (insertCallIndex === 2) {
+            throw new Error('connection reset mid-insert')
+          }
+          return [
+            makeBlockRow({
+              id: 'block-1',
+              date: stmt.values[2] as string,
+              start_time: stmt.values[3] as string,
+              end_time: stmt.values[4] as string,
+            }),
+          ]
+        },
+      })
+
+      addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+      sqlMock.addHandler({
+        name: 'UPDATE reservations cancel overlapping (RETURNING id)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'table_id'),
+        respond: () => [{ id: 'res-1' }],
+      })
+
+      const rollbackBlocksDeleteSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE id = ANY(...) (rollback)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'id'),
+        respond: rollbackBlocksDeleteSpy,
+      })
+
+      const rollbackReactivateSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'UPDATE reservations SET active WHERE id = ANY(...) (rollback)',
+        verb: 'update',
+        match: (stmt) =>
+          stmt.table === 'reservations' && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'table_id'),
+        respond: rollbackReactivateSpy,
+      })
+
+      const eventsDeleteSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: 'DELETE events WHERE id (must NOT be called by updateEvent rollback)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'events',
+        respond: eventsDeleteSpy,
+      })
+
+      const { updateEvent } = await loadService()
+
+      await expect(
+        updateEvent('evt-1', {
+          schedules: [
+            { date: '2026-08-01', startTime: '09:00', endTime: '13:00', roomId: 'room-1', allDay: false },
+            { date: '2026-08-02', startTime: '14:00', endTime: '18:00', roomId: 'room-1', allDay: false },
+          ],
+        }),
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      // Rollback deletes exactly the one block inserted before the failure.
+      expect(rollbackBlocksDeleteSpy).toHaveBeenCalledTimes(1)
+      expect(rollbackBlocksDeleteSpy.mock.calls[0][0].values).toEqual([['block-1']])
+
+      // Rollback reactivates exactly the one reservation cancelled before the failure.
+      expect(rollbackReactivateSpy).toHaveBeenCalledTimes(1)
+      expect(rollbackReactivateSpy.mock.calls[0][0].values).toEqual([['res-1']])
+
+      // updateEvent's rollback does NOT delete the event row — it pre-existed this call.
+      expect(eventsDeleteSpy).not.toHaveBeenCalled()
+    })
   })
 })
 
