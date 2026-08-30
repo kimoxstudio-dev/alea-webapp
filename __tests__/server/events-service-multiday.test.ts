@@ -495,6 +495,77 @@ describe('events-service — createEvent multi-day (schedules)', () => {
     ).rejects.toMatchObject({ statusCode: 400 })
   })
 
+  it('preserves a roomless block (roomId: null) as a non-persisted schedule entry instead of dropping it (#303 code-review post-PR round, Finding 1)', async () => {
+    addMultiBlockEventInsertHandler(() => [makeEventRow({ date: '2026-07-10', start_time: '10:00:00', end_time: '12:00:00' })])
+    const blockInsertSpy = vi.fn((values: unknown[]) => [
+      makeBlockRow({
+        id: 'block-roomed-1',
+        room_id: values[1] as string,
+        date: values[2] as string,
+        start_time: values[3] as string,
+        end_time: values[4] as string,
+      }),
+    ])
+    addRoomBlockInsertHandler(blockInsertSpy)
+    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+    addReservationsCancelHandler(() => [])
+
+    const { createEvent } = await loadService()
+
+    const result = await createEvent({
+      title: 'Mixed Roomless Event',
+      schedules: [
+        { date: '2026-07-10', startTime: '10:00', endTime: '12:00', roomId: null, allDay: false },
+        { date: '2026-07-11', startTime: '14:00', endTime: '16:00', roomId: 'room-1', allDay: false },
+      ],
+    })
+
+    // Only the room-assigned block issues an INSERT — event_room_blocks.room_id
+    // is NOT NULL, so a roomless block can never become a persisted row.
+    expect(blockInsertSpy).toHaveBeenCalledTimes(1)
+    expect(result.roomBlocks).toHaveLength(1)
+    expect(result.roomBlocks[0].roomId).toBe('room-1')
+
+    // The roomless block must still appear in schedules — as a synthetic,
+    // non-persisted entry (id: undefined, roomId: null) — not be silently
+    // dropped from the response entirely.
+    expect(result.schedules).toHaveLength(2)
+    const roomlessEntry = result.schedules.find((s) => s.roomId === null)
+    expect(roomlessEntry).toBeDefined()
+    expect(roomlessEntry!.id).toBeUndefined()
+    expect(roomlessEntry!.date).toBe('2026-07-10')
+    expect(roomlessEntry!.startTime).toBe('10:00')
+    expect(roomlessEntry!.endTime).toBe('12:00')
+
+    const roomedEntry = result.schedules.find((s) => s.roomId === 'room-1')
+    expect(roomedEntry).toBeDefined()
+    expect(roomedEntry!.date).toBe('2026-07-11')
+  })
+
+  it('includes table_id in the event_room_blocks INSERT when a schedule block specifies both roomId and tableId (#303 code-review post-PR round, Finding 3)', async () => {
+    addMultiBlockEventInsertHandler(() => [makeEventRow()])
+    const blockInsertSpy = vi.fn((values: unknown[]) => [
+      makeBlockRow({ id: 'block-1', table_id: values[6] as string }),
+    ])
+    addRoomBlockInsertHandler(blockInsertSpy)
+    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+    addReservationsCancelHandler(() => [])
+
+    const { createEvent } = await loadService()
+
+    await createEvent({
+      title: 'Table Scoped Event',
+      schedules: [{ date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', tableId: 'table-42', allDay: false }],
+    })
+
+    expect(blockInsertSpy).toHaveBeenCalledTimes(1)
+    // (event_id, room_id, date, start_time, end_time, all_day, table_id) — 7 bound values.
+    const insertedValues = blockInsertSpy.mock.calls[0][0] as unknown[]
+    expect(insertedValues).toHaveLength(7)
+    expect(insertedValues[1]).toBe('room-1')
+    expect(insertedValues[6]).toBe('table-42')
+  })
+
   // -------------------------------------------------------------------------
   // Compensating rollback (#303 code-review Finding 2) — createEvent path.
   //
@@ -630,6 +701,153 @@ describe('events-service — createEvent multi-day (schedules)', () => {
 
       expect(rollbackBlocksDeleteSpy).not.toHaveBeenCalled()
       expect(rollbackEventDeleteSpy).not.toHaveBeenCalled()
+    })
+
+    it('restores a cancelled reservation to its own original status (pending), not hardcoded active (#303 code-review post-PR round, Finding 5)', async () => {
+      addMultiBlockEventInsertHandler(() => [makeEventRow({ id: 'evt-rollback-status-1' })])
+
+      let insertCallIndex = 0
+      sqlMock.addHandler({
+        name: 'INSERT event_room_blocks (fails on 2nd block)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'event_room_blocks' && stmt.returning,
+        respond: (stmt) => {
+          insertCallIndex += 1
+          if (insertCallIndex === 2) throw new Error('connection reset mid-insert')
+          return [makeBlockRow({ id: 'block-1', date: stmt.values[2] as string, start_time: stmt.values[3] as string, end_time: stmt.values[4] as string })]
+        },
+      })
+
+      addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+      // The cancellation RETURNING now includes each reservation's
+      // pre-cancellation status — this one was originally 'pending'.
+      sqlMock.addHandler({
+        name: 'UPDATE reservations cancel overlapping (RETURNING id, status)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'table_id'),
+        respond: () => [{ id: 'res-pending-1', status: 'pending' }],
+      })
+
+      // The SET value ('active'/'pending') is a literal, not a bound param —
+      // distinguish the two rollback branches by that literal text, not by
+      // WHERE shape (both share the same id = ANY(...) AND status = 'cancelled' WHERE).
+      const restoreToPendingSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: "UPDATE reservations SET status = 'pending' (rollback)",
+        verb: 'update',
+        match: (stmt) =>
+          stmt.table === 'reservations' && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'table_id') &&
+          stmt.text.includes("status = 'pending'"),
+        respond: (stmt) => restoreToPendingSpy(stmt.values),
+      })
+      const restoreToActiveSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: "UPDATE reservations SET status = 'active' (rollback)",
+        verb: 'update',
+        match: (stmt) =>
+          stmt.table === 'reservations' && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'table_id') &&
+          stmt.text.includes("status = 'active'"),
+        respond: (stmt) => restoreToActiveSpy(stmt.values),
+      })
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE id = ANY(...) (rollback)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'id'),
+        respond: () => [],
+      })
+      sqlMock.addHandler({
+        name: 'DELETE events WHERE id (rollback, createEvent)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'events',
+        respond: () => [],
+      })
+
+      const { createEvent } = await loadService()
+
+      await expect(
+        createEvent({
+          title: 'Rollback Status Event',
+          schedules: [
+            { date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', allDay: false },
+            { date: '2026-07-11', startTime: '10:00', endTime: '14:00', roomId: 'room-1', allDay: false },
+          ],
+        }),
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      expect(restoreToPendingSpy).toHaveBeenCalledTimes(1)
+      expect(restoreToPendingSpy.mock.calls[0][0]).toEqual([['res-pending-1']])
+      expect(restoreToActiveSpy).not.toHaveBeenCalled()
+    })
+
+    it('restores a cancelled reservation to active when that was its own original status (#303 code-review post-PR round, Finding 5)', async () => {
+      addMultiBlockEventInsertHandler(() => [makeEventRow({ id: 'evt-rollback-status-2' })])
+
+      let insertCallIndex = 0
+      sqlMock.addHandler({
+        name: 'INSERT event_room_blocks (fails on 2nd block)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'event_room_blocks' && stmt.returning,
+        respond: (stmt) => {
+          insertCallIndex += 1
+          if (insertCallIndex === 2) throw new Error('connection reset mid-insert')
+          return [makeBlockRow({ id: 'block-1', date: stmt.values[2] as string, start_time: stmt.values[3] as string, end_time: stmt.values[4] as string })]
+        },
+      })
+
+      addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+      sqlMock.addHandler({
+        name: 'UPDATE reservations cancel overlapping (RETURNING id, status)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'table_id'),
+        respond: () => [{ id: 'res-active-1', status: 'active' }],
+      })
+
+      const restoreToPendingSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: "UPDATE reservations SET status = 'pending' (rollback)",
+        verb: 'update',
+        match: (stmt) =>
+          stmt.table === 'reservations' && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'table_id') &&
+          stmt.text.includes("status = 'pending'"),
+        respond: (stmt) => restoreToPendingSpy(stmt.values),
+      })
+      const restoreToActiveSpy = vi.fn(() => [])
+      sqlMock.addHandler({
+        name: "UPDATE reservations SET status = 'active' (rollback)",
+        verb: 'update',
+        match: (stmt) =>
+          stmt.table === 'reservations' && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'table_id') &&
+          stmt.text.includes("status = 'active'"),
+        respond: (stmt) => restoreToActiveSpy(stmt.values),
+      })
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE id = ANY(...) (rollback)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'id'),
+        respond: () => [],
+      })
+      sqlMock.addHandler({
+        name: 'DELETE events WHERE id (rollback, createEvent)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'events',
+        respond: () => [],
+      })
+
+      const { createEvent } = await loadService()
+
+      await expect(
+        createEvent({
+          title: 'Rollback Status Event 2',
+          schedules: [
+            { date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', allDay: false },
+            { date: '2026-07-11', startTime: '10:00', endTime: '14:00', roomId: 'room-1', allDay: false },
+          ],
+        }),
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      expect(restoreToActiveSpy).toHaveBeenCalledTimes(1)
+      expect(restoreToActiveSpy.mock.calls[0][0]).toEqual([['res-active-1']])
+      expect(restoreToPendingSpy).not.toHaveBeenCalled()
     })
   })
 })
@@ -847,6 +1065,86 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
         schedules: [{ date: '2026-07-10', startTime: '10:00', endTime: '12:00', roomId: 'room-1', allDay: false }],
       }),
     ).rejects.toMatchObject({ statusCode: 400 })
+  })
+
+  it('preserves a roomless block (roomId: null) as a non-persisted schedule entry, even though the unconditional DELETE already wiped all prior blocks (#303 code-review post-PR round, Finding 2)', async () => {
+    addCurrentEventHandler(() => [
+      { title: 'Existing', description: null, date: '2026-07-10', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null },
+    ])
+    addMultiBlockEventUpdateHandler(() => [makeEventRow({ id: 'evt-1' })])
+    // The pre-loop DELETE wipes every pre-existing block for this event,
+    // unconditionally, before the loop below even looks at the roomless
+    // entry — this is what makes Finding 2 worse than Finding 1: a skip
+    // here isn't just missing from the response, it's permanently lost.
+    const replaceDeleteSpy = vi.fn(() => [])
+    addBlocksDeleteHandler(replaceDeleteSpy)
+
+    const blockInsertSpy = vi.fn((values: unknown[]) => [
+      makeBlockRow({
+        id: 'block-roomed-1',
+        room_id: values[1] as string,
+        date: values[2] as string,
+        start_time: values[3] as string,
+        end_time: values[4] as string,
+      }),
+    ])
+    addRoomBlockInsertHandler(blockInsertSpy)
+    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+    addReservationsCancelHandler(() => [])
+
+    const { updateEvent } = await loadService()
+
+    const result = await updateEvent('evt-1', {
+      schedules: [
+        { date: '2026-07-10', startTime: '10:00', endTime: '12:00', roomId: null, allDay: false },
+        { date: '2026-07-11', startTime: '14:00', endTime: '16:00', roomId: 'room-1', allDay: false },
+      ],
+    })
+
+    // The pre-loop wipe did happen (proving this scenario really exercises
+    // the "worse than createEvent" ordering)...
+    expect(replaceDeleteSpy).toHaveBeenCalledTimes(1)
+
+    // ...only the room-assigned block issues an INSERT...
+    expect(blockInsertSpy).toHaveBeenCalledTimes(1)
+    expect(result.roomBlocks).toHaveLength(1)
+
+    // ...and the roomless block is NOT silently dropped: it still appears in
+    // schedules as a synthetic, non-persisted entry.
+    expect(result.schedules).toHaveLength(2)
+    const roomlessEntry = result.schedules.find((s) => s.roomId === null)
+    expect(roomlessEntry).toBeDefined()
+    expect(roomlessEntry!.id).toBeUndefined()
+    expect(roomlessEntry!.date).toBe('2026-07-10')
+    expect(roomlessEntry!.startTime).toBe('10:00')
+    expect(roomlessEntry!.endTime).toBe('12:00')
+  })
+
+  it('includes table_id in the event_room_blocks INSERT when a schedule block specifies both roomId and tableId (#303 code-review post-PR round, Finding 4)', async () => {
+    addCurrentEventHandler(() => [
+      { title: 'Existing', description: null, date: '2026-07-10', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null },
+    ])
+    addMultiBlockEventUpdateHandler(() => [makeEventRow({ id: 'evt-1' })])
+    addBlocksDeleteHandler(() => [])
+    const blockInsertSpy = vi.fn((values: unknown[]) => [
+      makeBlockRow({ id: 'block-1', table_id: values[6] as string }),
+    ])
+    addRoomBlockInsertHandler(blockInsertSpy)
+    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
+    addReservationsCancelHandler(() => [])
+
+    const { updateEvent } = await loadService()
+
+    await updateEvent('evt-1', {
+      schedules: [{ date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', tableId: 'table-42', allDay: false }],
+    })
+
+    expect(blockInsertSpy).toHaveBeenCalledTimes(1)
+    // (event_id, room_id, date, start_time, end_time, all_day, table_id) — 7 bound values.
+    const insertedValues = blockInsertSpy.mock.calls[0][0] as unknown[]
+    expect(insertedValues).toHaveLength(7)
+    expect(insertedValues[1]).toBe('room-1')
+    expect(insertedValues[6]).toBe('table-42')
   })
 
   // -------------------------------------------------------------------------
