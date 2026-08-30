@@ -81,6 +81,32 @@ export interface ParsedStatement {
 
 const VERB_RE = /^\s*(select|insert|update|delete)\b/i
 
+/**
+ * Marker symbol identifying a value produced by the mock's `sql.unsafe()` —
+ * mirrors the real Neon driver's `sql.unsafe()`, which inlines its argument
+ * as literal query text instead of binding it as a parameter. Recognizing
+ * this here (rather than treating it like any other interpolated value) is
+ * what lets `RESERVATION_COLUMNS`-style `sql.unsafe(...)` column lists
+ * render as literal text in the rebuilt statement, so existing
+ * column-list/handler matching keeps working unchanged (#348 code-review
+ * fixes reintroduced a shared column list injected via `sql.unsafe`).
+ */
+const RAW_SQL_MARKER = Symbol('sql-mock-raw-fragment')
+
+interface RawSqlFragment {
+  [RAW_SQL_MARKER]: true
+  text: string
+}
+
+function isRawSqlFragment(value: unknown): value is RawSqlFragment {
+  return typeof value === 'object' && value !== null && (value as Record<symbol, unknown>)[RAW_SQL_MARKER] === true
+}
+
+/** Wraps a string as a raw/unsafe SQL fragment — the mock counterpart to the real driver's `sql.unsafe()`. */
+export function unsafeSqlFragment(text: string): RawSqlFragment {
+  return { [RAW_SQL_MARKER]: true, text }
+}
+
 function collapseWhitespace(value: string): string {
   return value.replace(/\s+/g, ' ').trim()
 }
@@ -96,18 +122,40 @@ function escapeRegExp(value: string): string {
  * the single place statement shape is derived from — handlers must always
  * consume the parsed fields below rather than re-deriving shape with ad hoc
  * `.includes()` checks against raw text.
+ *
+ * Values produced by `sql.unsafe()` are inlined as literal text (not
+ * numbered as bound parameters), matching the real driver's behaviour, and
+ * are excluded from the returned `values` array — only genuinely bound
+ * parameters are numbered/collected.
  */
 export function parseStatement(
   strings: TemplateStringsArray | string,
   values: unknown[],
 ): ParsedStatement {
+  let boundValues: unknown[] = values
   const raw =
     typeof strings === 'string'
       ? strings
-      : strings.reduce(
-          (acc, part, i) => acc + part + (i < values.length ? `$${i + 1}` : ''),
-          '',
-        )
+      : (() => {
+          let result = ''
+          let paramIndex = 0
+          const collected: unknown[] = []
+          strings.forEach((part, i) => {
+            result += part
+            if (i < values.length) {
+              const value = values[i]
+              if (isRawSqlFragment(value)) {
+                result += value.text
+              } else {
+                paramIndex += 1
+                result += `$${paramIndex}`
+                collected.push(value)
+              }
+            }
+          })
+          boundValues = collected
+          return result
+        })()
 
   const text = collapseWhitespace(raw.toLowerCase())
 
@@ -146,7 +194,7 @@ export function parseStatement(
     isNowSelect = /^now\s*\(/i.test(projection.trim())
   }
 
-  return { text, verb, values, table, whereClause, returning, isCountSelect, isNowSelect, selectColumns, orderBy, hasLimit, hasOffset }
+  return { text, verb, values: boundValues, table, whereClause, returning, isCountSelect, isNowSelect, selectColumns, orderBy, hasLimit, hasOffset }
 }
 
 /**
@@ -320,7 +368,7 @@ export interface SqlMockHandler {
 
 export interface SqlMock {
   /** Pass this directly as the `sql` export: `vi.mock('@/lib/db/client', () => ({ sql: mock.sql }))`. */
-  sql: Mock
+  sql: Mock & { unsafe: typeof unsafeSqlFragment }
   /** Registers a handler, checked after every previously-added handler (first match, in registration order, wins). */
   addHandler(handler: SqlMockHandler): SqlMock
   /** Registers a handler that is checked BEFORE all currently-registered handlers — for test-specific overrides layered on top of a shared base setup. */
@@ -365,7 +413,14 @@ export function createSqlMock(): SqlMock {
       `sql-mock: no handler matched ${stmt.verb.toUpperCase()} statement (no silent [] fallback) — ` +
         `"${stmt.text}" values=${JSON.stringify(stmt.values)}`,
     )
-  })
+  }) as Mock & { unsafe: typeof unsafeSqlFragment }
+
+  // Mirrors the real Neon driver's `sql.unsafe()` — used by callers (e.g.
+  // reservations-service's shared `RESERVATION_COLUMNS`) to inject a raw
+  // literal SQL fragment. See `parseStatement`/`isRawSqlFragment` for how
+  // this is recognized and inlined instead of being treated as a bound
+  // parameter.
+  sql.unsafe = unsafeSqlFragment
 
   const api: SqlMock = {
     sql,

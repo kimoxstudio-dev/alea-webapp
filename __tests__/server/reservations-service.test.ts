@@ -1,7 +1,21 @@
 // @vitest-environment node
 import type { SessionUser } from '@/lib/server/auth'
 import { beforeEach, describe, expect, it, vi, afterEach } from 'vitest'
-import { createSqlMock, whereColumnHasOperator, whereConditionCount } from '../helpers/sql-mock'
+import { createSqlMock, parseStatement, whereColumnHasOperator, whereConditionCount, whereHasColumn } from '../helpers/sql-mock'
+import { NeonDbError } from '@neondatabase/serverless'
+
+/**
+ * Builds a real `NeonDbError` instance with the given Postgres error code.
+ * `isConflictError` (#348 code-review fix) narrows on `instanceof NeonDbError`
+ * rather than an unchecked cast, so a plain `{ code: '23P01' }` object no
+ * longer satisfies it — tests simulating a DB exclusion-constraint race must
+ * throw an actual `NeonDbError`.
+ */
+function makeNeonDbError(code: string): NeonDbError {
+  const error = new NeonDbError('exclusion constraint violation')
+  error.code = code
+  return error
+}
 
 const sqlMock = createSqlMock()
 
@@ -90,8 +104,8 @@ const tablesState = new Map<string, TableRow>()
 const profilesMap = new Map<string, { member_number: string }>()
 const roomsMap = new Map<string, RoomRow>()
 const eventRoomBlocksState: EventRoomBlockRow[] = []
-let reservationInsertError: { code: string } | null = null
-let reservationUpdateError: { code: string } | null = null
+let reservationInsertError: NeonDbError | null = null
+let reservationUpdateError: NeonDbError | null = null
 // Regression-test knob: simulates the `.eq('user_id', ...)` query filter being
 // accidentally removed/bypassed at the query layer, so the mock returns mixed
 // rows across users. Used to prove assertMemberRowsScoped() itself throws,
@@ -602,12 +616,18 @@ describe('reservations service', () => {
       },
     })
     sqlMock.addHandler({
-      name: 'UPDATE stale pending reservation to cancelled',
+      name: 'UPDATE stale pending reservations to cancelled (batched via ANY(...))',
       verb: 'update',
       match: (stmt) => stmt.table === 'reservations' && stmt.whereClause?.includes('activated_at is null') === true,
       respond: (stmt) => {
-        const row = reservationsState.find((reservation) => reservation.id === String(stmt.values[0]))
-        if (row && row.status === 'pending' && row.activated_at === null) row.status = 'cancelled'
+        // #348: expireStalePendingReservations batches all expired ids into a
+        // single `WHERE id = ANY($1::uuid[])` UPDATE instead of one UPDATE per
+        // row — the bound value is the full array of ids, not a single id.
+        const expiredIds = (Array.isArray(stmt.values[0]) ? stmt.values[0] : [stmt.values[0]]).map(String)
+        for (const id of expiredIds) {
+          const row = reservationsState.find((reservation) => reservation.id === id)
+          if (row && row.status === 'pending' && row.activated_at === null) row.status = 'cancelled'
+        }
         return []
       },
     })
@@ -1212,7 +1232,7 @@ describe('reservations service', () => {
 
     it('maps database exclusion conflicts to SLOT_TAKEN when the insert races', async () => {
       const { createReservationForSession } = await loadReservationModules()
-      reservationInsertError = { code: '23P01' }
+      reservationInsertError = makeNeonDbError('23P01')
 
       await expect(createReservationForSession(memberSession, {
         tableId: 't2',
@@ -1394,6 +1414,55 @@ describe('reservations service', () => {
         endTime: '13:30',
       }))
       expect(reservationsState[0]!.status).toBe('cancelled')
+    })
+
+    it('batches multiple expired pending reservations into a single UPDATE call', async () => {
+      // #348 code-review fix: expireStalePendingReservations now issues one
+      // batched `WHERE id = ANY($1::uuid[])` UPDATE instead of a sequential
+      // per-row UPDATE loop.
+      const { createReservationForSession } = await loadReservationModules()
+      const now = new Date('2026-12-31T11:01:00.000Z')
+      vi.setSystemTime(now)
+
+      reservationsState[0]!.status = 'pending'
+      reservationsState[0]!.user_id = 'other-user'
+      reservationsState[0]!.start_time = '10:00:00'
+      reservationsState[0]!.end_time = '18:00:00'
+      reservationsState[0]!.created_at = '2026-12-20T10:00:00.000Z'
+
+      const secondStale = makeReservation({
+        id: 'r-stale-2',
+        table_id: 't1',
+        user_id: 'other-user',
+        status: 'pending',
+        start_time: '10:00:00',
+        end_time: '18:00:00',
+        created_at: '2026-12-20T10:00:00.000Z',
+      })
+      reservationsState.push(secondStale)
+
+      await expect(createReservationForSession(memberSession, {
+        tableId: 't1',
+        date: '2026-12-31',
+        startTime: '12:30',
+        endTime: '13:30',
+      })).resolves.toEqual(expect.objectContaining({
+        tableId: 't1',
+        startTime: '12:30',
+        endTime: '13:30',
+      }))
+
+      expect(reservationsState[0]!.status).toBe('cancelled')
+      expect(secondStale.status).toBe('cancelled')
+
+      const batchUpdateCalls = sqlMock.sql.mock.calls.filter(([strings, ...values]) => {
+        const stmt = parseStatement(strings, values)
+        return stmt.verb === 'update' && stmt.table === 'reservations' && whereHasColumn(stmt, 'activated_at')
+      })
+      expect(batchUpdateCalls).toHaveLength(1)
+      const [strings, ...values] = batchUpdateCalls[0]!
+      const stmt = parseStatement(strings, values)
+      expect(stmt.values[0]).toEqual(expect.arrayContaining(['r1', 'r-stale-2']))
     })
 
     it('does not cancel an old future pending booking during concurrent cleanup', async () => {
@@ -1691,6 +1760,55 @@ describe('reservations service', () => {
       expect(updated.surface).toBeNull()
     })
 
+    it('scopes the UPDATE statement to the caller at the query-predicate level for members (defense-in-depth)', async () => {
+      // #348 code-review fix: the raw-SQL UPDATE now carries
+      // `AND (<isAdmin> OR user_id = <callerId>)` so a member can never
+      // update another member's row even if application-layer access
+      // checks were ever bypassed. This asserts the predicate itself,
+      // not just the end-to-end outcome already covered by other tests.
+      const { updateReservationForSession } = await loadReservationModules()
+
+      await updateReservationForSession(memberSession, 'r1', {
+        startTime: '18:00',
+        endTime: '19:00',
+      })
+
+      const updateCall = sqlMock.sql.mock.calls.find(([strings, ...values]) => {
+        const stmt = parseStatement(strings, values)
+        return stmt.verb === 'update' && stmt.table === 'reservations' && stmt.returning
+      })
+      expect(updateCall).toBeDefined()
+
+      const [strings, ...values] = updateCall!
+      const stmt = parseStatement(strings, values)
+
+      expect(whereHasColumn(stmt, 'user_id')).toBe(true)
+      expect(whereColumnHasOperator(stmt, 'user_id', '=')).toBe(true)
+      // For a member session the admin-bypass boolean must be bound false,
+      // and the scoping value must be the caller's own id.
+      expect(stmt.values).toContain(false)
+      expect(stmt.values).toContain(memberSession.id)
+    })
+
+    it('binds the admin-bypass predicate to true when an admin updates another member reservation', async () => {
+      const { updateReservationForSession } = await loadReservationModules()
+
+      await updateReservationForSession(adminSession, 'r1', { status: 'completed' })
+
+      const updateCall = sqlMock.sql.mock.calls.find(([strings, ...values]) => {
+        const stmt = parseStatement(strings, values)
+        return stmt.verb === 'update' && stmt.table === 'reservations' && stmt.returning
+      })
+      expect(updateCall).toBeDefined()
+
+      const [strings, ...values] = updateCall!
+      const stmt = parseStatement(strings, values)
+
+      // Admin bypass: the bound boolean is true, so the OR short-circuits
+      // regardless of the row's actual user_id.
+      expect(stmt.values).toContain(true)
+    })
+
     it('surface stays null when body.surface is undefined', async () => {
       const { updateReservationForSession } = await loadReservationModules()
 
@@ -1856,7 +1974,7 @@ describe('reservations service', () => {
 
     it('maps database exclusion conflicts to SLOT_TAKEN when update races', async () => {
       const { updateReservationForSession } = await loadReservationModules()
-      reservationUpdateError = { code: '23P01' }
+      reservationUpdateError = makeNeonDbError('23P01')
 
       await expect(updateReservationForSession(memberSession, 'r1', {
         date: '2026-12-31',
