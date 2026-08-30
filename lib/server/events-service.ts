@@ -1,8 +1,45 @@
 import 'server-only'
-import { createSupabaseServerAdminClient, createSupabaseServerClient } from '@/lib/supabase/server'
+import { sql } from '@/lib/db/client'
+import { NeonDbError } from '@neondatabase/serverless'
 import { serviceError } from '@/lib/server/service-error'
 import type { Tables } from '@/lib/supabase/types'
 import type { AdminEvent, AdminEventRoomBlock, AdminEventSchedule } from '@/lib/types'
+
+/**
+ * Raw-SQL Neon port of the legacy internal events service (#303).
+ *
+ * Ported off Supabase (`createSupabaseServerAdminClient`/
+ * `createSupabaseServerClient`) to the tagged-template `sql` export from
+ * `lib/db/client.ts`, matching the established style from
+ * `equipment-service.ts` (#305), `rooms-service.ts`/`tables-service.ts`
+ * (#302/#308) and `database-time.ts`.
+ *
+ * The `create_event_atomic` / `update_event_atomic` / `create_event_with_blocks`
+ * / `update_event_with_blocks` Postgres RPC functions this service used to
+ * call are business logic, not table structure (see
+ * `lib/db/schema/008_events.sql`), and are intentionally NOT part of the
+ * Neon schema-as-code (that's #309/#334, not started). Their exact behavior
+ * (see `supabase/migrations/20260417000003_baseline.sql` and
+ * `supabase/migrations/20260617000001_kim383_multi_day_events.sql`) is
+ * reproduced here as plain sequential `sql` statements instead — the same
+ * "no DB functions/triggers" approach already used by sibling Neon-migrated
+ * services for multi-step writes (e.g. `equipment-service.ts`'s
+ * `setRoomDefaultEquipment`). Neon's HTTP driver's `sql.transaction()` only
+ * batches queries that are fully built up-front (no branching on a prior
+ * query's runtime result), which these RPCs' insert-then-use-the-new-id flow
+ * needs, so — matching `reservations-service.ts`'s established precedent —
+ * these are sequential non-transactional statements, not a single atomic
+ * `sql.transaction()`.
+ *
+ * `deleteEventCascade` is exported and reused by
+ * `lib/server/club-events-service.ts` (`deleteClubEvent`), which is still
+ * Supabase-based (#304, not started). Its first parameter used to be the
+ * Supabase admin client; that call site (`deleteEventCascade(admin, id)`)
+ * is left untouched (out of scope), so the parameter is kept for source
+ * compatibility but is now unused — the cascade itself always operates
+ * against Neon, since `events`/`event_room_blocks`/`tables`/`reservations`
+ * already live there per the sibling migrations above.
+ */
 
 export type { AdminEvent, AdminEventRoomBlock, AdminEventSchedule }
 
@@ -125,84 +162,6 @@ function toAdminEvent(row: EventRow, blocks: EventRoomBlockRow[]): AdminEvent {
   }
 }
 
-function jsonBlockToSchedule(b: Record<string, unknown>): AdminEventSchedule {
-  return {
-    id: b.id != null ? String(b.id) : undefined,
-    roomId: b.room_id != null ? String(b.room_id) : null,
-    tableId: b.table_id != null ? String(b.table_id) : null,
-    date: String(b.date),
-    startTime: String(b.start_time).slice(0, 5),
-    endTime: String(b.end_time).slice(0, 5),
-    allDay: Boolean(b.all_day),
-  }
-}
-
-function jsonToAdminEvent(obj: Record<string, unknown>): AdminEvent {
-  const rawBlocks = Array.isArray(obj.room_blocks) ? obj.room_blocks : []
-  const rawSchedules: AdminEventSchedule[] = rawBlocks.map((b: unknown) =>
-    jsonBlockToSchedule(b as Record<string, unknown>)
-  )
-  const roomBlocks: AdminEventRoomBlock[] = rawBlocks
-    .filter((b: unknown) => (b as Record<string, unknown>).room_id != null)
-    .map((b: unknown) => {
-      const block = b as Record<string, unknown>
-      return {
-        id: String(block.id),
-        roomId: String(block.room_id),
-        tableId: block.table_id != null ? String(block.table_id) : null,
-        date: String(block.date),
-        startTime: String(block.start_time).slice(0, 5),
-        endTime: String(block.end_time).slice(0, 5),
-        allDay: Boolean(block.all_day),
-      }
-    })
-
-  // Derive anchor from blocks if present, otherwise fall back to event row fields
-  let anchorDate = String(obj.date)
-  let anchorStart = String(obj.start_time).slice(0, 5)
-  let anchorEnd = String(obj.end_time).slice(0, 5)
-
-  // Sort schedules chronologically ascending (date, then startTime)
-  const schedules = [...rawSchedules].sort((a, b) => {
-    const d = a.date.localeCompare(b.date)
-    return d !== 0 ? d : a.startTime.localeCompare(b.startTime)
-  })
-
-  if (schedules.length > 0) {
-    anchorDate = schedules[0].date
-    anchorStart = schedules[0].startTime
-    anchorEnd = schedules[0].endTime
-  }
-
-  const inferredAllDay = anchorStart === '00:00' && anchorEnd === '23:59'
-
-  // If no blocks exist, synthesize one entry from the event anchor so edit pre-fill works
-  if (schedules.length === 0) {
-    schedules.push({
-      id: undefined,
-      roomId: null,
-      date: anchorDate,
-      startTime: anchorStart,
-      endTime: anchorEnd,
-      allDay: inferredAllDay,
-    })
-  }
-
-  return {
-    id: String(obj.id),
-    title: String(obj.title),
-    description: obj.description != null ? String(obj.description) : null,
-    date: anchorDate,
-    startTime: anchorStart,
-    endTime: anchorEnd,
-    createdBy: obj.created_by != null ? String(obj.created_by) : null,
-    createdAt: String(obj.created_at),
-    roomBlocks,
-    schedules,
-    allDay: schedules.some((s) => s.allDay) || inferredAllDay,
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Validate a raw schedule payload element and return normalised block
 //
@@ -249,6 +208,64 @@ export function validateAndNormaliseSchedule(
   }
 }
 
+/** Sort normalised schedule blocks chronologically and return the earliest — mirrors
+ *  create_event_with_blocks'/update_event_with_blocks' anchor-derivation ORDER BY. */
+function deriveAnchorFromBlocks(blocks: NormalisedEventSchedule[]): NormalisedEventSchedule {
+  const sorted = [...blocks].sort((a, b) => {
+    const d = a.date.localeCompare(b.date)
+    return d !== 0 ? d : a.start_time.localeCompare(b.start_time)
+  })
+  return sorted[0]
+}
+
+/** Maps a NeonDbError from an events/event_room_blocks write to the same 400/500
+ *  split the old create_event_with_blocks/update_event_with_blocks RPC error handling used. */
+function mapEventWriteError(error: unknown): never {
+  if (
+    error instanceof NeonDbError &&
+    (error.code === '23514' || error.code === '22P02' || error.code === '23502')
+  ) {
+    serviceError('Invalid event data', 400)
+  }
+  serviceError('Internal server error', 500)
+}
+
+/** Cancels active/pending reservations overlapping a room block, mirroring the
+ *  "SELECT ARRAY(table ids) ... UPDATE reservations SET status='cancelled'" fragment
+ *  shared by all four legacy RPCs. */
+async function cancelOverlappingReservationsForRoom(
+  roomId: string,
+  date: string,
+  startTime: string,
+  endTime: string,
+): Promise<void> {
+  let tableRows: Array<{ id: string }>
+  try {
+    tableRows = await sql`
+      SELECT id FROM tables WHERE room_id = ${roomId}
+    ` as Array<{ id: string }>
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+
+  const tableIds = tableRows.map((t) => t.id)
+  if (tableIds.length === 0) return
+
+  try {
+    await sql`
+      UPDATE reservations
+      SET status = 'cancelled'
+      WHERE table_id = ANY(${tableIds})
+        AND date = ${date}
+        AND start_time < ${endTime}
+        AND end_time > ${startTime}
+        AND status IN ('active', 'pending')
+    `
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 //
@@ -270,34 +287,33 @@ export function validateAndNormaliseSchedule(
 // ---------------------------------------------------------------------------
 
 export async function listEvents(): Promise<AdminEvent[]> {
-  const supabase = await createSupabaseServerClient()
-  const { data: events, error: eventsError } = await supabase
-    .from('events')
-    .select('id, title, description, date, start_time, end_time, created_by, created_at')
-    // Exclude public "club event" landing rows (OIR-203): a row becomes
-    // landing content once both bilingual titles are populated (see
-    // lib/server/club-events-service.ts). Those are managed exclusively via
-    // the dedicated "Club events" dashboard section, not this legacy
-    // internal room-booking view.
-    .or('title_es.is.null,title_en.is.null')
-    .order('date', { ascending: true })
-    .order('start_time', { ascending: true })
+  let rows: EventRow[]
+  try {
+    rows = await sql`
+      SELECT id, title, description, date, start_time, end_time, created_by, created_at
+      FROM events
+      WHERE title_es IS NULL OR title_en IS NULL
+      ORDER BY date ASC, start_time ASC
+    ` as EventRow[]
+  } catch {
+    serviceError('Internal server error', 500)
+  }
 
-  if (eventsError) serviceError('Internal server error', 500)
-
-  const rows = (events ?? []) as EventRow[]
   if (rows.length === 0) return []
 
-  const admin = createSupabaseServerAdminClient()
-  const { data: blocks, error: blocksError } = await admin
-    .from('event_room_blocks')
-    .select('id, event_id, room_id, date, start_time, end_time, all_day')
-    .in('event_id', rows.map((r) => r.id))
-
-  if (blocksError) serviceError('Internal server error', 500)
+  let blocks: EventRoomBlockRow[]
+  try {
+    blocks = await sql`
+      SELECT id, event_id, room_id, date, start_time, end_time, all_day
+      FROM event_room_blocks
+      WHERE event_id = ANY(${rows.map((r) => r.id)})
+    ` as EventRoomBlockRow[]
+  } catch {
+    serviceError('Internal server error', 500)
+  }
 
   const blocksByEvent = new Map<string, EventRoomBlockRow[]>()
-  for (const block of (blocks ?? []) as EventRoomBlockRow[]) {
+  for (const block of blocks) {
     const list = blocksByEvent.get(block.event_id) ?? []
     list.push(block)
     blocksByEvent.set(block.event_id, list)
@@ -307,25 +323,32 @@ export async function listEvents(): Promise<AdminEvent[]> {
 }
 
 export async function getEvent(id: string): Promise<AdminEvent> {
-  const supabase = await createSupabaseServerClient()
-  const { data: event, error: eventError } = await supabase
-    .from('events')
-    .select('id, title, description, date, start_time, end_time, created_by, created_at')
-    .eq('id', id)
-    .maybeSingle()
-
-  if (eventError) serviceError('Internal server error', 500)
+  let eventRows: EventRow[]
+  try {
+    eventRows = await sql`
+      SELECT id, title, description, date, start_time, end_time, created_by, created_at
+      FROM events
+      WHERE id = ${id}
+      LIMIT 1
+    ` as EventRow[]
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+  const event = eventRows[0]
   if (!event) serviceError('Event not found', 404)
 
-  const admin = createSupabaseServerAdminClient()
-  const { data: blocks, error: blocksError } = await admin
-    .from('event_room_blocks')
-    .select('id, event_id, room_id, date, start_time, end_time, all_day')
-    .eq('event_id', id)
+  let blocks: EventRoomBlockRow[]
+  try {
+    blocks = await sql`
+      SELECT id, event_id, room_id, date, start_time, end_time, all_day
+      FROM event_room_blocks
+      WHERE event_id = ${id}
+    ` as EventRoomBlockRow[]
+  } catch {
+    serviceError('Internal server error', 500)
+  }
 
-  if (blocksError) serviceError('Internal server error', 500)
-
-  return toAdminEvent(event as EventRow, (blocks ?? []) as EventRoomBlockRow[])
+  return toAdminEvent(event, blocks)
 }
 
 export async function createEvent(body: {
@@ -351,31 +374,45 @@ export async function createEvent(body: {
     if (body.schedules.length > 366) serviceError('Too many schedule blocks', 400)
 
     const normBlocks = body.schedules.map((s, i) => validateAndNormaliseSchedule(s, i))
+    const anchor = deriveAnchorFromBlocks(normBlocks)
+    const createdBy = body.createdBy ? String(body.createdBy) : null
 
-    const blocksPayload = normBlocks.map((b) => ({
-      room_id: b.room_id,
-      date: b.date,
-      start_time: b.start_time,
-      end_time: b.end_time,
-      all_day: b.all_day,
-    }))
-
-    const admin = createSupabaseServerAdminClient()
-    const { data: result, error: rpcError } = await admin.rpc('create_event_with_blocks', {
-      p_title: title,
-      p_description: description,
-      p_blocks: blocksPayload,
-      p_created_by: body.createdBy ? String(body.createdBy) : null,
-    })
-
-    if (rpcError) {
-      const pgCode = (rpcError as { code?: string }).code
-      if (pgCode === '23514' || pgCode === '22P02' || pgCode === '23502') {
-        serviceError('Invalid event data', 400)
-      }
-      serviceError('Internal server error', 500)
+    let eventRows: EventRow[]
+    try {
+      eventRows = await sql`
+        INSERT INTO events (title, description, date, start_time, end_time, created_by)
+        VALUES (${title}, ${description}, ${anchor.date}, ${anchor.start_time}, ${anchor.end_time}, ${createdBy})
+        RETURNING id, title, description, date, start_time, end_time, created_by, created_at
+      ` as EventRow[]
+    } catch (error) {
+      mapEventWriteError(error)
     }
-    return jsonToAdminEvent(result as Record<string, unknown>)
+
+    const event = eventRows[0]
+    if (!event) serviceError('Internal server error', 500)
+
+    const roomBlocks: EventRoomBlockRow[] = []
+    for (const block of normBlocks) {
+      if (block.room_id === null) continue
+
+      let blockRows: EventRoomBlockRow[]
+      try {
+        blockRows = await sql`
+          INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day)
+          VALUES (${event.id}, ${block.room_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day})
+          RETURNING id, event_id, room_id, date, start_time, end_time, all_day
+        ` as EventRoomBlockRow[]
+      } catch (error) {
+        mapEventWriteError(error)
+      }
+
+      const blockRow = blockRows[0]
+      if (blockRow) roomBlocks.push(blockRow)
+
+      await cancelOverlappingReservationsForRoom(block.room_id, block.date, block.start_time, block.end_time)
+    }
+
+    return toAdminEvent(event, roomBlocks)
   }
 
   // --- Legacy single-block path (preserved for existing callers / tests) ---
@@ -384,21 +421,40 @@ export async function createEvent(body: {
   const resolvedTimes = resolveBlockTimes(date, String(body.startTime ?? '').trim(), String(body.endTime ?? '').trim(), allDay)
   const roomId = body.roomId ? String(body.roomId).trim() : null
 
-  const admin = createSupabaseServerAdminClient()
+  let eventRows: EventRow[]
+  try {
+    eventRows = await sql`
+      INSERT INTO events (title, description, date, start_time, end_time)
+      VALUES (${title}, ${description}, ${date}, ${resolvedTimes.startTime}, ${resolvedTimes.endTime})
+      RETURNING id, title, description, date, start_time, end_time, created_by, created_at
+    ` as EventRow[]
+  } catch {
+    serviceError('Internal server error', 500)
+  }
 
-  const { data: result, error: rpcError } = await admin.rpc('create_event_atomic', {
-    p_title: title,
-    p_description: description,
-    p_date: date,
-    p_start_time: resolvedTimes.startTime,
-    p_end_time: resolvedTimes.endTime,
-    p_room_id: roomId,
-    p_all_day: allDay,
-  })
+  const event = eventRows[0]
+  if (!event) serviceError('Internal server error', 500)
 
-  if (rpcError) serviceError('Internal server error', 500)
+  const roomBlocks: EventRoomBlockRow[] = []
+  if (roomId) {
+    let blockRows: EventRoomBlockRow[]
+    try {
+      blockRows = await sql`
+        INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day)
+        VALUES (${event.id}, ${roomId}, ${date}, ${resolvedTimes.startTime}, ${resolvedTimes.endTime}, ${allDay})
+        RETURNING id, event_id, room_id, date, start_time, end_time, all_day
+      ` as EventRoomBlockRow[]
+    } catch {
+      serviceError('Internal server error', 500)
+    }
 
-  return jsonToAdminEvent(result as Record<string, unknown>)
+    const blockRow = blockRows[0]
+    if (blockRow) roomBlocks.push(blockRow)
+
+    await cancelOverlappingReservationsForRoom(roomId, date, resolvedTimes.startTime, resolvedTimes.endTime)
+  }
+
+  return toAdminEvent(event, roomBlocks)
 }
 
 export async function updateEvent(
@@ -415,22 +471,21 @@ export async function updateEvent(
     allDay?: unknown
   },
 ): Promise<AdminEvent> {
-  const admin = createSupabaseServerAdminClient()
-
   // Load current event to fill in any fields not provided in the body
-  const { data: current, error: fetchError } = await admin
-    .from('events')
-    .select('title, description, date, start_time, end_time, title_es, title_en')
-    .eq('id', id)
-    .maybeSingle()
+  let currentRows: Array<Pick<EventRow, 'title' | 'description' | 'date' | 'start_time' | 'end_time' | 'title_es' | 'title_en'>>
+  try {
+    currentRows = await sql`
+      SELECT title, description, date, start_time, end_time, title_es, title_en
+      FROM events
+      WHERE id = ${id}
+      LIMIT 1
+    ` as typeof currentRows
+  } catch {
+    serviceError('Internal server error', 500)
+  }
 
-  if (fetchError) serviceError('Internal server error', 500)
-  if (!current) serviceError('Event not found', 404)
-
-  const currentRow = current as Pick<
-    EventRow,
-    'title' | 'description' | 'date' | 'start_time' | 'end_time' | 'title_es' | 'title_en'
-  >
+  const currentRow = currentRows[0]
+  if (!currentRow) serviceError('Event not found', 404)
 
   // Finding 3: a club-event (landing) row is out of scope for this legacy
   // internal surface — treat it as not found, same as listEvents' filter.
@@ -450,33 +505,56 @@ export async function updateEvent(
     if (body.schedules.length > 366) serviceError('Too many schedule blocks', 400)
 
     const normBlocks = body.schedules.map((s, i) => validateAndNormaliseSchedule(s, i))
+    const anchor = deriveAnchorFromBlocks(normBlocks)
 
-    const blocksPayload = normBlocks.map((b) => ({
-      room_id: b.room_id,
-      date: b.date,
-      start_time: b.start_time,
-      end_time: b.end_time,
-      all_day: b.all_day,
-    }))
+    let updatedRows: EventRow[]
+    try {
+      updatedRows = await sql`
+        UPDATE events
+        SET
+          title       = ${title},
+          description = ${description},
+          date        = ${anchor.date},
+          start_time  = ${anchor.start_time},
+          end_time    = ${anchor.end_time}
+        WHERE id = ${id}
+        RETURNING id, title, description, date, start_time, end_time, created_by, created_at
+      ` as EventRow[]
+    } catch (error) {
+      mapEventWriteError(error)
+    }
 
-    const { data: result, error: rpcError } = await admin.rpc('update_event_with_blocks', {
-      p_id: id,
-      p_title: title,
-      p_description: description,
-      p_blocks: blocksPayload,
-    })
+    const event = updatedRows[0]
+    if (!event) serviceError('Event not found', 404)
 
-    if (rpcError) {
-      const pgCode = (rpcError as { code?: string }).code
-      if (pgCode === 'P0001') {
-        serviceError('Event not found', 404)
-      }
-      if (pgCode === '23514' || pgCode === '22P02' || pgCode === '23502') {
-        serviceError('Invalid event data', 400)
-      }
+    try {
+      await sql`DELETE FROM event_room_blocks WHERE event_id = ${id}`
+    } catch {
       serviceError('Internal server error', 500)
     }
-    return jsonToAdminEvent(result as Record<string, unknown>)
+
+    const roomBlocks: EventRoomBlockRow[] = []
+    for (const block of normBlocks) {
+      if (block.room_id === null) continue
+
+      let blockRows: EventRoomBlockRow[]
+      try {
+        blockRows = await sql`
+          INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day)
+          VALUES (${id}, ${block.room_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day})
+          RETURNING id, event_id, room_id, date, start_time, end_time, all_day
+        ` as EventRoomBlockRow[]
+      } catch (error) {
+        mapEventWriteError(error)
+      }
+
+      const blockRow = blockRows[0]
+      if (blockRow) roomBlocks.push(blockRow)
+
+      await cancelOverlappingReservationsForRoom(block.room_id, block.date, block.start_time, block.end_time)
+    }
+
+    return toAdminEvent(event, roomBlocks)
   }
 
   // --- Legacy single-block path ---
@@ -489,12 +567,19 @@ export async function updateEvent(
   let roomId: string | null
   let currentAllDay = false
   if (body.roomId === undefined || body.allDay === undefined) {
-    const { data: existingBlocks } = await admin
-      .from('event_room_blocks')
-      .select('room_id, all_day')
-      .eq('event_id', id)
-      .limit(1)
-    const firstBlock = (existingBlocks ?? [])[0] as { room_id: string; all_day: boolean } | undefined
+    let existingBlocks: Array<{ room_id: string; all_day: boolean }>
+    try {
+      existingBlocks = await sql`
+        SELECT room_id, all_day
+        FROM event_room_blocks
+        WHERE event_id = ${id}
+        LIMIT 1
+      ` as Array<{ room_id: string; all_day: boolean }>
+    } catch {
+      serviceError('Internal server error', 500)
+    }
+
+    const firstBlock = existingBlocks[0]
     currentAllDay = firstBlock?.all_day ?? false
     roomId = body.roomId !== undefined
       ? (body.roomId ? String(body.roomId).trim() : null)
@@ -505,40 +590,74 @@ export async function updateEvent(
   const allDay = body.allDay !== undefined ? parseAllDay(body.allDay) : currentAllDay
   const resolvedTimes = resolveBlockTimes(date, inputStartTime, inputEndTime, allDay)
 
-  const { data: result, error: rpcError } = await admin.rpc('update_event_atomic', {
-    p_id: id,
-    p_title: title,
-    p_description: description,
-    p_date: date,
-    p_start_time: resolvedTimes.startTime,
-    p_end_time: resolvedTimes.endTime,
-    p_room_id: roomId,
-    p_all_day: allDay,
-  })
+  let updatedRows: EventRow[]
+  try {
+    updatedRows = await sql`
+      UPDATE events
+      SET
+        title       = ${title},
+        description = ${description},
+        date        = ${date},
+        start_time  = ${resolvedTimes.startTime},
+        end_time    = ${resolvedTimes.endTime}
+      WHERE id = ${id}
+      RETURNING id, title, description, date, start_time, end_time, created_by, created_at
+    ` as EventRow[]
+  } catch {
+    serviceError('Internal server error', 500)
+  }
 
-  if (rpcError) serviceError('Internal server error', 500)
+  const event = updatedRows[0]
+  if (!event) serviceError('Internal server error', 500)
 
-  return jsonToAdminEvent(result as Record<string, unknown>)
+  try {
+    await sql`DELETE FROM event_room_blocks WHERE event_id = ${id}`
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+
+  const roomBlocks: EventRoomBlockRow[] = []
+  if (roomId) {
+    let blockRows: EventRoomBlockRow[]
+    try {
+      blockRows = await sql`
+        INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day)
+        VALUES (${id}, ${roomId}, ${date}, ${resolvedTimes.startTime}, ${resolvedTimes.endTime}, ${allDay})
+        RETURNING id, event_id, room_id, date, start_time, end_time, all_day
+      ` as EventRoomBlockRow[]
+    } catch {
+      serviceError('Internal server error', 500)
+    }
+
+    const blockRow = blockRows[0]
+    if (blockRow) roomBlocks.push(blockRow)
+
+    await cancelOverlappingReservationsForRoom(roomId, date, resolvedTimes.startTime, resolvedTimes.endTime)
+  }
+
+  return toAdminEvent(event, roomBlocks)
 }
 
 export async function deleteEvent(id: string): Promise<void> {
-  const admin = createSupabaseServerAdminClient()
+  let eventRows: Array<Pick<EventRow, 'id' | 'title_es' | 'title_en'>>
+  try {
+    eventRows = await sql`
+      SELECT id, title_es, title_en FROM events WHERE id = ${id} LIMIT 1
+    ` as Array<Pick<EventRow, 'id' | 'title_es' | 'title_en'>>
+  } catch {
+    serviceError('Internal server error', 500)
+  }
 
-  const { data: eventData } = await admin
-    .from('events')
-    .select('id, title_es, title_en')
-    .eq('id', id)
-    .maybeSingle()
-
+  const eventData = eventRows[0]
   if (!eventData) serviceError('Event not found', 404)
 
   // Finding 3: a club-event (landing) row is out of scope for this legacy
   // internal surface — treat it as not found, same as listEvents' filter.
-  if (isClubEventRow(eventData as Pick<EventRow, 'id' | 'title_es' | 'title_en'>)) {
+  if (isClubEventRow(eventData)) {
     serviceError('Event not found', 404)
   }
 
-  await deleteEventCascade(admin, id)
+  await deleteEventCascade(undefined, id)
 }
 
 /**
@@ -549,31 +668,42 @@ export async function deleteEvent(id: string): Promise<void> {
  * own club-event-row validation — the inverse of the guard above — before
  * calling this directly, so it must NOT go through the `isClubEventRow`
  * check in `deleteEvent`).
+ *
+ * The first parameter used to be the Supabase admin client (still-Supabase
+ * `club-events-service.ts` passes its own `admin` instance). It is now
+ * unused — this cascade always operates against Neon — but is kept so that
+ * call site (out of scope, #304) keeps compiling unchanged.
  */
 export async function deleteEventCascade(
-  admin: ReturnType<typeof createSupabaseServerAdminClient>,
+  _admin: unknown,
   id: string,
 ): Promise<void> {
-  const { data: blocks } = await admin
-    .from('event_room_blocks')
-    .select('room_id, date, start_time, end_time')
-    .eq('event_id', id)
+  let blocks: Array<{ room_id: string; date: string; start_time: string; end_time: string }>
+  try {
+    blocks = await sql`
+      SELECT room_id, date, start_time, end_time
+      FROM event_room_blocks
+      WHERE event_id = ${id}
+    ` as Array<{ room_id: string; date: string; start_time: string; end_time: string }>
+  } catch {
+    serviceError('Internal server error', 500)
+  }
 
   // Collect distinct room_ids and pre-fetch their table ids into a Map to avoid N+1 round trips
-  const distinctRoomIds = [...new Set(
-    ((blocks ?? []) as (EventRoomBlockRow & { date: string; start_time: string; end_time: string })[])
-      .map((b) => b.room_id)
-      .filter(Boolean),
-  )]
+  const distinctRoomIds = [...new Set(blocks.map((b) => b.room_id).filter(Boolean))]
 
   const roomTableMap = new Map<string, string[]>()
   if (distinctRoomIds.length > 0) {
-    const { data: tables } = await admin
-      .from('tables')
-      .select('id, room_id')
-      .in('room_id', distinctRoomIds)
+    let tables: Array<{ id: string; room_id: string }>
+    try {
+      tables = await sql`
+        SELECT id, room_id FROM tables WHERE room_id = ANY(${distinctRoomIds})
+      ` as Array<{ id: string; room_id: string }>
+    } catch {
+      serviceError('Internal server error', 500)
+    }
 
-    for (const t of (tables ?? []) as { id: string; room_id: string }[]) {
+    for (const t of tables) {
       const list = roomTableMap.get(t.room_id) ?? []
       list.push(t.id)
       roomTableMap.set(t.room_id, list)
@@ -581,25 +711,31 @@ export async function deleteEventCascade(
   }
 
   // Cancel overlapping reservations for every block (multi-day aware)
-  for (const block of (blocks ?? []) as (EventRoomBlockRow & { date: string; start_time: string; end_time: string })[]) {
+  for (const block of blocks) {
     const tableIds = roomTableMap.get(block.room_id) ?? []
 
     if (tableIds.length > 0) {
-      const { error: cancelError } = await admin
-        .from('reservations')
-        .update({ status: 'cancelled' })
-        .in('table_id', tableIds)
-        .eq('date', block.date)
-        .lt('start_time', block.end_time)
-        .gt('end_time', block.start_time)
-        .in('status', ['active', 'pending'])
-
-      if (cancelError) serviceError('Internal server error', 500)
+      try {
+        await sql`
+          UPDATE reservations
+          SET status = 'cancelled'
+          WHERE table_id = ANY(${tableIds})
+            AND date = ${block.date}
+            AND start_time < ${block.end_time}
+            AND end_time > ${block.start_time}
+            AND status IN ('active', 'pending')
+        `
+      } catch {
+        serviceError('Internal server error', 500)
+      }
     }
   }
 
-  const { error } = await admin.from('events').delete().eq('id', id)
-  if (error) serviceError('Internal server error', 500)
+  try {
+    await sql`DELETE FROM events WHERE id = ${id}`
+  } catch {
+    serviceError('Internal server error', 500)
+  }
 }
 
 export interface EventConflictBlock {
@@ -631,20 +767,20 @@ export async function previewEventConflicts(body: {
     return { total: 0, blocks: [] }
   }
 
-  const admin = createSupabaseServerAdminClient()
-
   // Pre-fetch table ids for all distinct rooms in one round-trip (avoids N+1)
   const distinctRoomIds = [...new Set(roomedBlocks.map((b) => b.room_id))]
 
-  const { data: tables, error: tablesError } = await admin
-    .from('tables')
-    .select('id, room_id')
-    .in('room_id', distinctRoomIds)
-
-  if (tablesError) serviceError('Internal server error', 500)
+  let tables: Array<{ id: string; room_id: string }>
+  try {
+    tables = await sql`
+      SELECT id, room_id FROM tables WHERE room_id = ANY(${distinctRoomIds})
+    ` as Array<{ id: string; room_id: string }>
+  } catch {
+    serviceError('Internal server error', 500)
+  }
 
   const roomTableMap = new Map<string, string[]>()
-  for (const t of (tables ?? []) as { id: string; room_id: string }[]) {
+  for (const t of tables) {
     const list = roomTableMap.get(t.room_id) ?? []
     list.push(t.id)
     roomTableMap.set(t.room_id, list)
@@ -661,18 +797,22 @@ export async function previewEventConflicts(body: {
       continue
     }
 
-    const { count, error: countError } = await admin
-      .from('reservations')
-      .select('id', { count: 'exact', head: true })
-      .in('table_id', tableIds)
-      .eq('date', block.date)
-      .lt('start_time', block.end_time)
-      .gt('end_time', block.start_time)
-      .in('status', ['active', 'pending'])
+    let countRows: Array<{ count: string | number }>
+    try {
+      countRows = await sql`
+        SELECT COUNT(*) AS count
+        FROM reservations
+        WHERE table_id = ANY(${tableIds})
+          AND date = ${block.date}
+          AND start_time < ${block.end_time}
+          AND end_time > ${block.start_time}
+          AND status IN ('active', 'pending')
+      ` as Array<{ count: string | number }>
+    } catch {
+      serviceError('Internal server error', 500)
+    }
 
-    if (countError) serviceError('Internal server error', 500)
-
-    const blockCount = count ?? 0
+    const blockCount = Number(countRows[0]?.count ?? 0)
     total += blockCount
     resultBlocks.push({ date: block.date, roomId: block.room_id, count: blockCount })
   }
@@ -686,27 +826,33 @@ export async function listEventsBlockingRoom(
   start: string,
   end: string,
 ): Promise<AdminEvent[]> {
-  const admin = createSupabaseServerAdminClient()
+  let blocks: Array<{ event_id: string }>
+  try {
+    blocks = await sql`
+      SELECT event_id
+      FROM event_room_blocks
+      WHERE room_id = ${roomId}
+        AND date = ${date}
+        AND start_time < ${end}
+        AND end_time > ${start}
+    ` as Array<{ event_id: string }>
+  } catch {
+    serviceError('Internal server error', 500)
+  }
 
-  const { data: blocks, error } = await admin
-    .from('event_room_blocks')
-    .select('event_id')
-    .eq('room_id', roomId)
-    .eq('date', date)
-    .lt('start_time', end)
-    .gt('end_time', start)
-
-  if (error) serviceError('Internal server error', 500)
-
-  const eventIds = ((blocks ?? []) as { event_id: string }[]).map((b) => b.event_id)
+  const eventIds = [...new Set(blocks.map((b) => b.event_id))]
   if (eventIds.length === 0) return []
 
-  const { data: events, error: eventsError } = await admin
-    .from('events')
-    .select('id, title, description, date, start_time, end_time, created_by, created_at')
-    .in('id', eventIds)
+  let events: EventRow[]
+  try {
+    events = await sql`
+      SELECT id, title, description, date, start_time, end_time, created_by, created_at
+      FROM events
+      WHERE id = ANY(${eventIds})
+    ` as EventRow[]
+  } catch {
+    serviceError('Internal server error', 500)
+  }
 
-  if (eventsError) serviceError('Internal server error', 500)
-
-  return ((events ?? []) as EventRow[]).map((row) => toAdminEvent(row, []))
+  return events.map((row) => toAdminEvent(row, []))
 }
