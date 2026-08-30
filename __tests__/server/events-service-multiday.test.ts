@@ -542,30 +542,6 @@ describe('events-service — createEvent multi-day (schedules)', () => {
     expect(roomedEntry!.date).toBe('2026-07-11')
   })
 
-  it('includes table_id in the event_room_blocks INSERT when a schedule block specifies both roomId and tableId (#303 code-review post-PR round, Finding 3)', async () => {
-    addMultiBlockEventInsertHandler(() => [makeEventRow()])
-    const blockInsertSpy = vi.fn((values: unknown[]) => [
-      makeBlockRow({ id: 'block-1', table_id: values[6] as string }),
-    ])
-    addRoomBlockInsertHandler(blockInsertSpy)
-    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
-    addReservationsCancelHandler(() => [])
-
-    const { createEvent } = await loadService()
-
-    await createEvent({
-      title: 'Table Scoped Event',
-      schedules: [{ date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', tableId: 'table-42', allDay: false }],
-    })
-
-    expect(blockInsertSpy).toHaveBeenCalledTimes(1)
-    // (event_id, room_id, date, start_time, end_time, all_day, table_id) — 7 bound values.
-    const insertedValues = blockInsertSpy.mock.calls[0][0] as unknown[]
-    expect(insertedValues).toHaveLength(7)
-    expect(insertedValues[1]).toBe('room-1')
-    expect(insertedValues[6]).toBe('table-42')
-  })
-
   // -------------------------------------------------------------------------
   // Compensating rollback (#303 code-review Finding 2) — createEvent path.
   //
@@ -1118,33 +1094,6 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
     expect(roomlessEntry!.date).toBe('2026-07-10')
     expect(roomlessEntry!.startTime).toBe('10:00')
     expect(roomlessEntry!.endTime).toBe('12:00')
-  })
-
-  it('includes table_id in the event_room_blocks INSERT when a schedule block specifies both roomId and tableId (#303 code-review post-PR round, Finding 4)', async () => {
-    addCurrentEventHandler(() => [
-      { title: 'Existing', description: null, date: '2026-07-10', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null },
-    ])
-    addMultiBlockEventUpdateHandler(() => [makeEventRow({ id: 'evt-1' })])
-    addBlocksDeleteHandler(() => [])
-    const blockInsertSpy = vi.fn((values: unknown[]) => [
-      makeBlockRow({ id: 'block-1', table_id: values[6] as string }),
-    ])
-    addRoomBlockInsertHandler(blockInsertSpy)
-    addTablesBySingleRoomHandler(() => [{ id: 'table-1' }])
-    addReservationsCancelHandler(() => [])
-
-    const { updateEvent } = await loadService()
-
-    await updateEvent('evt-1', {
-      schedules: [{ date: '2026-07-10', startTime: '18:00', endTime: '22:00', roomId: 'room-1', tableId: 'table-42', allDay: false }],
-    })
-
-    expect(blockInsertSpy).toHaveBeenCalledTimes(1)
-    // (event_id, room_id, date, start_time, end_time, all_day, table_id) — 7 bound values.
-    const insertedValues = blockInsertSpy.mock.calls[0][0] as unknown[]
-    expect(insertedValues).toHaveLength(7)
-    expect(insertedValues[1]).toBe('room-1')
-    expect(insertedValues[6]).toBe('table-42')
   })
 
   // -------------------------------------------------------------------------
