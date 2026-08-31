@@ -232,8 +232,12 @@ function deriveAnchorFromBlocks(blocks: NormalisedEventSchedule[]): NormalisedEv
 }
 
 /** Maps a NeonDbError from an events/event_room_blocks write to the same 400/500
- *  split the old create_event_with_blocks/update_event_with_blocks RPC error handling used. */
-function mapEventWriteError(error: unknown): never {
+ *  split the old create_event_with_blocks/update_event_with_blocks RPC error handling used.
+ *  Exported (#304 code-review, medium effort) — `club-events-service.ts`'s
+ *  `applyClubEventBlocksAndMaterials` writes to the same events/
+ *  event_room_blocks/event_equipment tables and hit the exact same 5 Postgres
+ *  error codes, so it reuses this instead of keeping a verbatim duplicate. */
+export function mapEventWriteError(error: unknown): never {
   if (
     error instanceof NeonDbError &&
     (error.code === '23514' || error.code === '22P02' || error.code === '23502' ||
@@ -1006,8 +1010,12 @@ export async function deleteEvent(id: string): Promise<void> {
  * `rollbackPartialMultiBlockWrite` — #303 code-review post-PR round, Finding
  * 5). Errors here are logged and swallowed, matching the compensating-
  * rollback pattern used throughout this file.
+ *
+ * Exported (#304 code-review, medium effort) — `club-events-service.ts`'s
+ * `rollbackClubEventBlocksWrite` needs the identical status-aware restore for
+ * its own `cancelledReservations` and previously reimplemented it verbatim.
  */
-async function restoreCancelledReservations(cancelled: CancelledReservation[]): Promise<void> {
+export async function restoreCancelledReservations(cancelled: CancelledReservation[]): Promise<void> {
   if (cancelled.length === 0) return
   try {
     const pendingIds = cancelled.filter((r) => r.status === 'pending').map((r) => r.id)

@@ -9,7 +9,6 @@ import type {
   ClubEventStatus,
 } from '@/lib/types'
 import { sql } from '@/lib/db/client'
-import { NeonDbError } from '@neondatabase/serverless'
 import { serviceError, ServiceError } from '@/lib/server/service-error'
 import { getCurrentClubDate } from '@/lib/club-time'
 import type { Tables } from '@/lib/supabase/types'
@@ -17,6 +16,8 @@ import type { SessionUser } from '@/lib/server/auth'
 import {
   deleteEventCascade,
   isClubEventRow,
+  mapEventWriteError,
+  restoreCancelledReservations,
   validateAndNormaliseSchedule,
   type CancelledReservation,
   type NormalisedEventSchedule,
@@ -479,35 +480,6 @@ function toAdminClubEvent(
   }
 }
 
-/** Maps a NeonDbError from an events/event_room_blocks/event_equipment write to
- *  the same 400/500 split the old apply_club_event_room_blocks RPC error
- *  handling used. Mirrors events-service.ts's mapEventWriteError (#303
- *  code-review, high-effort round): 23503 (foreign_key_violation — e.g. an
- *  invalid room/table/equipment id slipping past the pre-write validation)
- *  and 23505 (unique_violation — e.g. a duplicate schedule block hitting
- *  event_room_blocks' unique index) both map to 400, same as the other
- *  input-shape errors below. */
-function mapClubEventWriteError(error: unknown): never {
-  if (
-    error instanceof NeonDbError &&
-    (error.code === '23514' || error.code === '22P02' || error.code === '23502' ||
-      error.code === '23503' || error.code === '23505')
-  ) {
-    serviceError('Invalid event data', 400)
-  }
-  serviceError('Internal server error', 500)
-}
-
-async function fetchTableIdsForRoom(roomId: string): Promise<string[]> {
-  let rows: Array<{ id: string }>
-  try {
-    rows = await sql`SELECT id FROM tables WHERE room_id = ${roomId}` as Array<{ id: string }>
-  } catch {
-    serviceError('Internal server error', 500)
-  }
-  return rows.map((r) => r.id)
-}
-
 /**
  * Compensating rollback for `applyClubEventBlocksAndMaterials` (#304, mirrors
  * `events-service.ts`'s `rollbackPartialMultiBlockWrite`/
@@ -531,25 +503,11 @@ async function rollbackClubEventBlocksWrite(params: {
       await sql`DELETE FROM event_room_blocks WHERE id = ANY(${insertedBlockIds})`
     }
     // Restore each cancelled reservation to its own captured pre-cancellation
-    // status ('active' or 'pending') rather than assuming 'active' — mirrors
-    // events-service.ts's rollbackPartialMultiBlockWrite (#303 code-review
-    // post-PR round, Finding 5).
-    const pendingIds = cancelledReservations.filter((r) => r.status === 'pending').map((r) => r.id)
-    const activeIds = cancelledReservations.filter((r) => r.status !== 'pending').map((r) => r.id)
-    if (activeIds.length > 0) {
-      await sql`
-        UPDATE reservations
-        SET status = 'active'
-        WHERE id = ANY(${activeIds}) AND status = 'cancelled'
-      `
-    }
-    if (pendingIds.length > 0) {
-      await sql`
-        UPDATE reservations
-        SET status = 'pending'
-        WHERE id = ANY(${pendingIds}) AND status = 'cancelled'
-      `
-    }
+    // status ('active' or 'pending') rather than assuming 'active' — reuses
+    // events-service.ts's restoreCancelledReservations (#304 code-review,
+    // medium effort) instead of a second copy of the same status-aware
+    // split/UPDATE logic that function already implements.
+    await restoreCancelledReservations(cancelledReservations)
     for (const block of deletedBlocks) {
       await sql`
         INSERT INTO event_room_blocks (id, event_id, room_id, table_id, date, start_time, end_time, all_day)
@@ -638,6 +596,35 @@ async function applyClubEventBlocksAndMaterials(
   const insertedBlockIds: string[] = []
   const cancelledReservations: CancelledReservation[] = []
 
+  // Batch the room->table id lookups for every block that needs one (no
+  // table_id, so the whole room's tables are cancelled), instead of one
+  // round trip per block inside the loop below (#304 code-review, medium
+  // effort) — mirrors events-service.ts's deleteEventCascade, which
+  // pre-fetches all rooms' table ids into a Map before its own block loop.
+  const roomTableMap = new Map<string, string[]>()
+  if (blocks !== null) {
+    const distinctRoomIds = [...new Set(
+      blocks
+        .filter((b): b is NormalisedEventSchedule & { room_id: string } => b.room_id !== null && b.table_id === null)
+        .map((b) => b.room_id),
+    )]
+    if (distinctRoomIds.length > 0) {
+      let tables: Array<{ id: string; room_id: string }>
+      try {
+        tables = await sql`
+          SELECT id, room_id FROM tables WHERE room_id = ANY(${distinctRoomIds})
+        ` as Array<{ id: string; room_id: string }>
+      } catch {
+        serviceError('Internal server error', 500)
+      }
+      for (const t of tables) {
+        const list = roomTableMap.get(t.room_id) ?? []
+        list.push(t.id)
+        roomTableMap.set(t.room_id, list)
+      }
+    }
+  }
+
   if (blocks !== null) {
     for (const block of blocks) {
       if (block.room_id === null) continue
@@ -668,7 +655,7 @@ async function applyClubEventBlocksAndMaterials(
         // cancels reservations for that single table; a null table_id
         // cancels reservations across every table of the room (unchanged
         // behavior).
-        const tableIds = block.table_id ? [block.table_id] : await fetchTableIdsForRoom(block.room_id)
+        const tableIds = block.table_id ? [block.table_id] : (roomTableMap.get(block.room_id) ?? [])
 
         if (tableIds.length > 0) {
           // Capture each cancelled reservation's id AND pre-cancellation
@@ -701,7 +688,7 @@ async function applyClubEventBlocksAndMaterials(
           insertedBlockIds, cancelledReservations, deletedBlocks, deletedMaterials,
         })
         if (error instanceof ServiceError) throw error
-        mapClubEventWriteError(error)
+        mapEventWriteError(error)
       }
     }
   }
@@ -718,7 +705,7 @@ async function applyClubEventBlocksAndMaterials(
         await rollbackClubEventBlocksWrite({
           insertedBlockIds, cancelledReservations, deletedBlocks, deletedMaterials,
         })
-        mapClubEventWriteError(error)
+        mapEventWriteError(error)
       }
     }
   }
@@ -1038,7 +1025,7 @@ export async function createClubEvent(session: SessionUser, body: ClubEventInput
       RETURNING ${sql.unsafe(ADMIN_CLUB_EVENT_RETURNING)}
     ` as EventRow[]
   } catch (error) {
-    mapClubEventWriteError(error)
+    mapEventWriteError(error)
   }
 
   const row = insertedRows[0]
@@ -1198,7 +1185,7 @@ export async function updateClubEvent(session: SessionUser, id: string, body: Cl
       RETURNING ${sql.unsafe(ADMIN_CLUB_EVENT_RETURNING)}
     ` as EventRow[]
   } catch (error) {
-    mapClubEventWriteError(error)
+    mapEventWriteError(error)
   }
 
   const row = updatedRows[0]
