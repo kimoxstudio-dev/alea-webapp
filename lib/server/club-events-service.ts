@@ -492,12 +492,14 @@ function toAdminClubEvent(
  * swallowed, so the caller's original failure is always what surfaces.
  */
 async function rollbackClubEventBlocksWrite(params: {
+  eventId: string
   insertedBlockIds: string[]
   cancelledReservations: CancelledReservation[]
   deletedBlocks: EventRoomBlockRow[]
   deletedMaterials: EventEquipmentRow[]
+  insertedMaterialEquipmentIds: string[]
 }): Promise<void> {
-  const { insertedBlockIds, cancelledReservations, deletedBlocks, deletedMaterials } = params
+  const { eventId, insertedBlockIds, cancelledReservations, deletedBlocks, deletedMaterials, insertedMaterialEquipmentIds } = params
   try {
     if (insertedBlockIds.length > 0) {
       await sql`DELETE FROM event_room_blocks WHERE id = ANY(${insertedBlockIds})`
@@ -514,6 +516,19 @@ async function rollbackClubEventBlocksWrite(params: {
         VALUES (${block.id}, ${block.event_id}, ${block.room_id}, ${block.table_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day})
       `
     }
+    // #304 code-review round 4: undo everything THIS call's materials loop
+    // inserted before restoring the pre-delete rows — otherwise a brand-new
+    // equipment_id (one that had no prior row, so it's absent from
+    // deletedMaterials) that this call successfully inserted before a later
+    // material failed would survive the rollback and stay silently attached
+    // to the event.
+    if (insertedMaterialEquipmentIds.length > 0) {
+      await sql`
+        DELETE FROM event_equipment
+        WHERE event_id = ${eventId}
+          AND equipment_id = ANY(${insertedMaterialEquipmentIds})
+      `
+    }
     // #304 code-review (medium): idempotent against this same call's own
     // partial progress — the insert loop in applyClubEventBlocksAndMaterials
     // may have already re-inserted a row for this (event_id, equipment_id)
@@ -521,7 +536,8 @@ async function rollbackClubEventBlocksWrite(params: {
     // captured pre-delete row would hit a PRIMARY KEY violation here.
     // ON CONFLICT DO UPDATE (mirroring the main insert loop above) restores
     // the pre-delete quantity regardless of whether a fresh row already
-    // exists.
+    // exists. The DELETE above already removed conflicting fresh rows, but
+    // this stays as defense-in-depth.
     for (const material of deletedMaterials) {
       await sql`
         INSERT INTO event_equipment (event_id, equipment_id, quantity)
@@ -587,7 +603,8 @@ async function applyClubEventBlocksAndMaterials(
       // before surfacing this failure so the event doesn't silently lose its
       // room blocks alongside a 500 for an unrelated materials-delete error.
       await rollbackClubEventBlocksWrite({
-        insertedBlockIds: [], cancelledReservations: [], deletedBlocks, deletedMaterials: [],
+        eventId, insertedBlockIds: [], cancelledReservations: [], deletedBlocks, deletedMaterials: [],
+        insertedMaterialEquipmentIds: [],
       })
       serviceError('Internal server error', 500)
     }
@@ -595,6 +612,7 @@ async function applyClubEventBlocksAndMaterials(
 
   const insertedBlockIds: string[] = []
   const cancelledReservations: CancelledReservation[] = []
+  const insertedMaterialEquipmentIds: string[] = []
 
   // Batch the room->table id lookups for every block that needs one (no
   // table_id, so the whole room's tables are cancelled), instead of one
@@ -685,7 +703,8 @@ async function applyClubEventBlocksAndMaterials(
         }
       } catch (error) {
         await rollbackClubEventBlocksWrite({
-          insertedBlockIds, cancelledReservations, deletedBlocks, deletedMaterials,
+          eventId, insertedBlockIds, cancelledReservations, deletedBlocks, deletedMaterials,
+          insertedMaterialEquipmentIds,
         })
         if (error instanceof ServiceError) throw error
         mapEventWriteError(error)
@@ -701,9 +720,11 @@ async function applyClubEventBlocksAndMaterials(
           VALUES (${eventId}, ${material.equipment_id}, ${material.quantity})
           ON CONFLICT (event_id, equipment_id) DO UPDATE SET quantity = EXCLUDED.quantity
         `
+        insertedMaterialEquipmentIds.push(material.equipment_id)
       } catch (error) {
         await rollbackClubEventBlocksWrite({
-          insertedBlockIds, cancelledReservations, deletedBlocks, deletedMaterials,
+          eventId, insertedBlockIds, cancelledReservations, deletedBlocks, deletedMaterials,
+          insertedMaterialEquipmentIds,
         })
         mapEventWriteError(error)
       }
