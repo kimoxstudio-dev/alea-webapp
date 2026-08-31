@@ -556,10 +556,19 @@ async function rollbackClubEventBlocksWrite(params: {
         VALUES (${block.id}, ${block.event_id}, ${block.room_id}, ${block.table_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day})
       `
     }
+    // #304 code-review (medium): idempotent against this same call's own
+    // partial progress — the insert loop in applyClubEventBlocksAndMaterials
+    // may have already re-inserted a row for this (event_id, equipment_id)
+    // pair before failing on a later material, so a plain re-INSERT of the
+    // captured pre-delete row would hit a PRIMARY KEY violation here.
+    // ON CONFLICT DO UPDATE (mirroring the main insert loop above) restores
+    // the pre-delete quantity regardless of whether a fresh row already
+    // exists.
     for (const material of deletedMaterials) {
       await sql`
         INSERT INTO event_equipment (event_id, equipment_id, quantity)
         VALUES (${material.event_id}, ${material.equipment_id}, ${material.quantity})
+        ON CONFLICT (event_id, equipment_id) DO UPDATE SET quantity = EXCLUDED.quantity
       `
     }
   } catch (rollbackError) {
