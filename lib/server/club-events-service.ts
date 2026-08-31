@@ -51,7 +51,7 @@ type EventRow = Tables<'events'>
 type EventRoomBlockRow = Tables<'event_room_blocks'>
 type EventEquipmentRow = Tables<'event_equipment'>
 
-const ADMIN_CLUB_EVENT_RETURNING = `id, title_es, title_en, blurb_es, blurb_en, description_es, description_en,
+const ADMIN_CLUB_EVENT_RETURNING = `id, title, title_es, title_en, blurb_es, blurb_en, description_es, description_en,
         date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url,
         category_es, category_en`
 
