@@ -180,9 +180,7 @@ export async function listSavedGamesForSession(session: SessionUser): Promise<Sa
   let rows: SavedGameJoinedRow[]
   try {
     rows = await sql`
-      SELECT sg.id, sg.table_id, sg.user_id, sg.start_date, sg.end_date, sg.status,
-        sg.attendance_count, sg.renewed_from_id, sg.created_at, sg.updated_at,
-        t.name AS table_name, rooms.name AS room_name
+      SELECT ${sql.unsafe(SAVED_GAME_JOINED_COLUMNS)}
       FROM saved_games sg
       LEFT JOIN tables t ON t.id = sg.table_id
       LEFT JOIN rooms ON rooms.id = t.room_id
@@ -208,8 +206,10 @@ export async function createSavedGameForSession(
   const startDate = parseDate(body.startDate, 'startDate')
   const endDate = parseDate(body.endDate, 'endDate')
   validateDateRange(startDate, endDate)
-  await assertTableAndEventAvailability(tableId, startDate, endDate)
-  await assertNoBottomReservationConflict(tableId, startDate, endDate)
+  await Promise.all([
+    assertTableAndEventAvailability(tableId, startDate, endDate),
+    assertNoBottomReservationConflict(tableId, startDate, endDate),
+  ])
 
   // Member isolation is enforced by writing `user_id: session.id` explicitly
   // into the insert — the authenticated user can only create rows for
@@ -265,8 +265,10 @@ export async function renewSavedGameForSession(session: SessionUser, id: string)
 
   const startDate = addDays(current.end_date, 1)
   const endDate = getMaxEndDate(startDate)
-  await assertTableAndEventAvailability(current.table_id, startDate, endDate)
-  await assertNoBottomReservationConflict(current.table_id, startDate, endDate)
+  await Promise.all([
+    assertTableAndEventAvailability(current.table_id, startDate, endDate),
+    assertNoBottomReservationConflict(current.table_id, startDate, endDate),
+  ])
 
   let rows: SavedGameJoinedRow[]
   try {
