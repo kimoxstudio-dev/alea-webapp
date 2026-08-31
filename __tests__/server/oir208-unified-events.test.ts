@@ -108,7 +108,7 @@ const TABLE_ROOM_MAP: Record<string, string> = {
 // ---------------------------------------------------------------------------
 
 const ADMIN_RETURNING_COLUMNS =
-  'id, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url, category_es, category_en'
+  'id, title, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url, category_es, category_en'
 
 const ROOM_BLOCK_COLUMNS = 'id, event_id, room_id, table_id, date, start_time, end_time, all_day'
 

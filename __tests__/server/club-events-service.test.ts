@@ -93,6 +93,13 @@ async function loadEventsService() {
 // ---------------------------------------------------------------------------
 
 const ADMIN_RETURNING_COLUMNS =
+  'id, title, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url, category_es, category_en'
+
+// listAdminClubEvents's own SELECT is a separate literal column list (not
+// built from ADMIN_CLUB_EVENT_RETURNING) and does NOT include `title` —
+// only the create/update RETURNING clause (and updateClubEvent's currentRows
+// fetch) gained `title` in the #304 fix.
+const ADMIN_LIST_COLUMNS =
   'id, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url, category_es, category_en'
 
 const PUBLIC_RETURNING_COLUMNS =
@@ -223,7 +230,7 @@ function addListAdminEventsSelectHandler(rows: unknown[] = []) {
   sqlMock.addHandler({
     name: 'SELECT events ORDER BY date ASC (listAdminClubEvents)',
     verb: 'select',
-    match: (stmt) => stmt.table === 'events' && hasExactSelectColumns(stmt, ADMIN_RETURNING_COLUMNS) && !stmt.whereClause,
+    match: (stmt) => stmt.table === 'events' && hasExactSelectColumns(stmt, ADMIN_LIST_COLUMNS) && !stmt.whereClause,
     respond: () => rows,
   })
 }
@@ -1123,6 +1130,46 @@ describe('club-events-service', () => {
       )
 
       consoleErrorSpy.mockRestore()
+    })
+
+    it('updates a non-title field (visibleOnLanding toggle) on an internal-only event (title_es null) without a spurious "titleEs is required" error (regression, club-events-service.ts:1165)', async () => {
+      // updateClubEvent's pre-update snapshot (resolveClubEventFields({},
+      // current)) and toAdminClubEvent's response mapping both fall back to
+      // current.title_es ?? current.title. Before the fix, ADMIN_CLUB_EVENT_
+      // RETURNING never selected `title`, so ANY update to an internal-only
+      // event (title_es null) 400'd on "titleEs is required" even when the
+      // update never touched the title — reproduced here with a blurbEs-only
+      // change on a row that's internal-only (title_es/title_en null,
+      // legacy `title` populated).
+      addCurrentEventSelectHandler(currentEventRow({
+        title_es: null,
+        title_en: null,
+        title: 'Evento Interno Legado',
+        blurb_es: 'Resumen viejo',
+      }))
+      addUpdateEventHandler((values) => [currentEventRow({
+        title_es: null,
+        title_en: null,
+        title: 'Evento Interno Legado',
+        blurb_es: values[2] as string,
+      })])
+      addEventRoomBlocksSelectHandler([])
+      addEventMaterialsSelectHandler([])
+
+      const { updateClubEvent } = await loadClubEventsService()
+
+      const result = await updateClubEvent(createAdminSession(), 'evt-1', {
+        blurbEs: 'Resumen nuevo',
+      })
+
+      expect(result.blurbEs).toBe('Resumen nuevo')
+      // `title` (the legacy fallback column) is now selected by both the
+      // currentRows fetch and the RETURNING clause, so the response's
+      // titleEs/titleEn fall back to the row's `title` instead of coming
+      // back `undefined` for an internal-only event.
+      expect(result.titleEs).toBe('Evento Interno Legado')
+      expect(result.titleEn).toBe('Evento Interno Legado')
+      expect(result.visibleOnLanding).toBe(false)
     })
   })
 
