@@ -96,11 +96,12 @@ const ADMIN_RETURNING_COLUMNS =
   'id, title, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url, category_es, category_en'
 
 // listAdminClubEvents's own SELECT is a separate literal column list (not
-// built from ADMIN_CLUB_EVENT_RETURNING) and does NOT include `title` —
-// only the create/update RETURNING clause (and updateClubEvent's currentRows
-// fetch) gained `title` in the #304 fix.
+// built from ADMIN_CLUB_EVENT_RETURNING). PR #354 review: it must also
+// select `title` — toAdminClubEvent falls back to it via
+// `row.title_es ?? row.title` for internal-only events (title_es null),
+// so omitting it here silently broke that fallback.
 const ADMIN_LIST_COLUMNS =
-  'id, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url, category_es, category_en'
+  'id, title, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url, category_es, category_en'
 
 const PUBLIC_RETURNING_COLUMNS =
   'id, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url'
@@ -1039,6 +1040,54 @@ describe('club-events-service', () => {
       expect(updateSpy).not.toHaveBeenCalled()
     })
 
+    it('surfaces a clear 400 (not an unhandled rejection) when room, table, AND equipment validation all fail concurrently (PR #354 Promise.all fix)', async () => {
+      // validateRoomsExist/validateTablesExist/validateEquipmentExists now
+      // run via Promise.all instead of sequential awaits — with all three
+      // failing at once, Promise.all rejects with the first settled
+      // rejection while the other two rejections must not escape as
+      // unhandled promise rejections.
+      addCurrentEventSelectHandler(currentEventRow())
+      addRoomsExistHandler(['room-unknown'])
+      addTablesHandler({ missingTableIds: ['table-unknown'] })
+      addEquipmentExistsHandler(['equip-unknown'])
+      const updateSpy = vi.fn()
+      sqlMock.addHandler({
+        name: 'UPDATE events (should never be called)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'events',
+        respond: (stmt) => {
+          updateSpy(stmt.values)
+          return [currentEventRow()]
+        },
+      })
+
+      const unhandledRejections: unknown[] = []
+      const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason)
+      process.on('unhandledRejection', onUnhandledRejection)
+
+      const { updateClubEvent } = await loadClubEventsService()
+
+      try {
+        await expect(
+          updateClubEvent(createAdminSession(), 'evt-1', {
+            blocksRooms: true,
+            schedules: [
+              { date: '2026-04-20', startTime: '18:00', endTime: '22:00', allDay: false, roomId: 'room-unknown', tableId: 'table-unknown' },
+            ],
+            materials: [{ equipmentId: 'equip-unknown', quantity: 1 }],
+          })
+        ).rejects.toMatchObject({ statusCode: 400 })
+      } finally {
+        // Let any pending microtasks (the other two rejected validations)
+        // flush before asserting no unhandled rejection escaped.
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        process.off('unhandledRejection', onUnhandledRejection)
+      }
+
+      expect(updateSpy).not.toHaveBeenCalled()
+      expect(unhandledRejections).toHaveLength(0)
+    })
+
     it('rejects an unknown equipment id in materials with 400 BEFORE updating the event fields (PR #154 review)', async () => {
       addCurrentEventSelectHandler(currentEventRow())
       addEquipmentExistsHandler(['equip-unknown'])
@@ -1251,6 +1300,32 @@ describe('club-events-service', () => {
         listAdminClubEvents(createMemberSession())
       ).rejects.toMatchObject({ statusCode: 403 })
     })
+
+    it('falls back to the legacy `title` column for an internal-only event (title_es/title_en null) (PR #354 fix)', async () => {
+      // toAdminClubEvent does `row.title_es ?? row.title` / `row.title_en ??
+      // row.title` — listAdminClubEvents's SELECT must fetch `title` or that
+      // fallback silently resolves to undefined for internal-only rows.
+      addListAdminEventsSelectHandler([
+        currentEventRow({
+          id: 'evt-internal-1',
+          title_es: null,
+          title_en: null,
+          title: 'Evento Interno Legado',
+          date: '2026-05-01',
+        }),
+      ])
+      addEventRoomBlocksSelectHandler([])
+      addEventMaterialsSelectHandler([])
+
+      const { listAdminClubEvents } = await loadClubEventsService()
+
+      const result = await listAdminClubEvents(createAdminSession())
+
+      const event = [...result.upcoming, ...result.past].find((e) => e.id === 'evt-internal-1')
+      expect(event).toBeDefined()
+      expect(event?.titleEs).toBe('Evento Interno Legado')
+      expect(event?.titleEn).toBe('Evento Interno Legado')
+    })
   })
 
   describe('listClubEvents', () => {
@@ -1281,6 +1356,56 @@ describe('club-events-service', () => {
       expect(result).toHaveProperty('upcoming')
       expect(result).toHaveProperty('past')
       expect(result.upcoming.map((e) => e.id)).toContain('evt-upcoming-1')
+    })
+
+    it('filters out a row with a null title_es/title_en via assertPublicClubEventRowsHaveBilingualTitles (defense-in-depth, PR #354 fix)', async () => {
+      // The WHERE clause is the primary guarantee, but this guard is the
+      // application-layer backstop for a regression in that query (RLS was
+      // dropped in the Neon migration). Simulate that regression by having
+      // the mocked SELECT hand back one bilingual row and one row that
+      // slipped past the WHERE clause with a null title_en.
+      addListClubEventsSelectHandler([
+        {
+          id: 'evt-bilingual',
+          title_es: 'Evento Bilingue',
+          title_en: 'Bilingual Event',
+          blurb_es: null,
+          blurb_en: null,
+          description_es: null,
+          description_en: null,
+          date_kind: 'single',
+          date: '2026-05-01',
+          end_date: null,
+          recurrence_label_es: null,
+          recurrence_label_en: null,
+          image_url: null,
+          link_url: null,
+        },
+        {
+          id: 'evt-leaked-internal',
+          title_es: 'Titulo interno filtrado',
+          title_en: null, // simulates a query-layer regression
+          blurb_es: null,
+          blurb_en: null,
+          description_es: null,
+          description_en: null,
+          date_kind: 'single',
+          date: '2026-05-02',
+          end_date: null,
+          recurrence_label_es: null,
+          recurrence_label_en: null,
+          image_url: null,
+          link_url: null,
+        },
+      ])
+
+      const { listClubEvents } = await loadClubEventsService()
+
+      const result = await listClubEvents()
+
+      const allIds = [...result.upcoming, ...result.past].map((e) => e.id)
+      expect(allIds).toContain('evt-bilingual')
+      expect(allIds).not.toContain('evt-leaked-internal')
     })
   })
 
