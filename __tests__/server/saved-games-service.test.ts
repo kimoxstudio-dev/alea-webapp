@@ -412,6 +412,32 @@ describe('saved games service', () => {
     ).rejects.toMatchObject({ message: 'SAVED_GAME_EVENT_CONFLICT', statusCode: 409 })
   })
 
+  it('deterministically surfaces the availability error on create when both checks would fail (#301 round-3 fix)', async () => {
+    // Sequential-await regression test: assertTableAndEventAvailability and
+    // assertNoBottomReservationConflict used to run via Promise.all, so when
+    // both would reject, which error won the race was nondeterministic. The
+    // fix awaits availability first, then the conflict check — so the
+    // availability error (SAVED_GAME_EVENT_CONFLICT) must always win when
+    // both conditions are present, and the reservation-conflict handler must
+    // never even be reached.
+    blocksState.push({ id: 'event-1', room_id: 'room-1', table_id: null, date: '2026-07-01' })
+    reservationConflictsState.push({
+      id: 'res-1',
+      table_id: 'double',
+      status: 'active',
+      surface: 'bottom',
+      date: '2026-07-01',
+    })
+    const { createSavedGameForSession } = await import('@/lib/server/saved-games-service')
+    await expect(
+      createSavedGameForSession(member, {
+        tableId: 'double',
+        startDate: '2026-06-20',
+        endDate: '2026-09-19',
+      }),
+    ).rejects.toMatchObject({ message: 'SAVED_GAME_EVENT_CONFLICT', statusCode: 409 })
+  })
+
   it('maps an exclusion-constraint conflict (23P01) on create to SAVED_GAME_CONFLICT/409', async () => {
     createInsertError = neonDbError('23P01', 'exclusion violation', 'saved_games_no_active_overlap')
     const { createSavedGameForSession } = await import('@/lib/server/saved-games-service')
@@ -482,6 +508,36 @@ describe('saved games service', () => {
     const { renewSavedGameForSession } = await import('@/lib/server/saved-games-service')
     await expect(renewSavedGameForSession(member, 'sg-1')).rejects.toMatchObject({
       message: 'SAVED_GAME_BOTTOM_RESERVATION_CONFLICT',
+      statusCode: 409,
+    })
+  })
+
+  it('deterministically surfaces the availability error on renew when both checks would fail (#301 round-3 fix)', async () => {
+    // Same sequential-await regression as the create test above, applied to
+    // renewSavedGameForSession's own availability/conflict pair. Next period
+    // is 2026-07-01..2026-09-30 (see the renewal tests below) — seed both an
+    // event block and a bottom-reservation conflict inside that range so the
+    // availability error must be the one that wins deterministically.
+    savedGamesState.push(
+      makeSavedGame({
+        id: 'sg-1',
+        table_id: 'double',
+        user_id: 'user-1',
+        start_date: '2026-04-01',
+        end_date: '2026-06-30',
+      }),
+    )
+    blocksState.push({ id: 'event-1', room_id: 'room-1', table_id: null, date: '2026-07-15' })
+    reservationConflictsState.push({
+      id: 'res-1',
+      table_id: 'double',
+      status: 'active',
+      surface: 'bottom',
+      date: '2026-07-15',
+    })
+    const { renewSavedGameForSession } = await import('@/lib/server/saved-games-service')
+    await expect(renewSavedGameForSession(member, 'sg-1')).rejects.toMatchObject({
+      message: 'SAVED_GAME_EVENT_CONFLICT',
       statusCode: 409,
     })
   })
