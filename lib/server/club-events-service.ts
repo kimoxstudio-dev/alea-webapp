@@ -683,11 +683,16 @@ async function applyClubEventBlocksAndMaterials(
   // round trip per block inside the loop below (#304 code-review, medium
   // effort) — mirrors events-service.ts's deleteEventCascade, which
   // pre-fetches all rooms' table ids into a Map before its own block loop.
+  // The same query also covers every distinct room referenced by a block
+  // that DOES have a table_id, so the per-block table_id/room_id mismatch
+  // guard below can be answered from an in-memory Map instead of issuing a
+  // redundant per-block SELECT (#354 code-review).
   const roomTableMap = new Map<string, string[]>()
+  const tableRoomMap = new Map<string, string>()
   if (blocks !== null) {
     const distinctRoomIds = [...new Set(
       blocks
-        .filter((b): b is NormalisedEventSchedule & { room_id: string } => b.room_id !== null && b.table_id === null)
+        .filter((b): b is NormalisedEventSchedule & { room_id: string } => b.room_id !== null)
         .map((b) => b.room_id),
     )]
     if (distinctRoomIds.length > 0) {
@@ -712,6 +717,7 @@ async function applyClubEventBlocksAndMaterials(
         const list = roomTableMap.get(t.room_id) ?? []
         list.push(t.id)
         roomTableMap.set(t.room_id, list)
+        tableRoomMap.set(t.id, t.room_id)
       }
     }
   }
@@ -723,14 +729,11 @@ async function applyClubEventBlocksAndMaterials(
       try {
         // Guard against a table_id/room_id mismatch (mirrors the RPC's own
         // in-function check): independent FKs alone would let a caller pair
-        // a table_id from one room with a room_id from another.
-        if (block.table_id !== null) {
-          const tableCheck = await sql`
-            SELECT id FROM tables WHERE id = ${block.table_id} AND room_id = ${block.room_id} LIMIT 1
-          ` as Array<{ id: string }>
-          if (tableCheck.length === 0) {
-            serviceError('Invalid event data', 400)
-          }
+        // a table_id from one room with a room_id from another. Answered
+        // from the batched tableRoomMap built above instead of a redundant
+        // per-block SELECT (#354 code-review).
+        if (block.table_id !== null && tableRoomMap.get(block.table_id) !== block.room_id) {
+          serviceError('Invalid event data', 400)
         }
 
         const blockRows = await sql`
