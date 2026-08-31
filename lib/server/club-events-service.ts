@@ -27,6 +27,23 @@ import { validateOptionalUrl } from '@/lib/validations/url'
 export type { AdminClubEvent, AdminListClubEventsResult }
 
 /**
+ * #304 code-review (high): marks a failure of the post-write read-back
+ * SELECT inside `applyClubEventBlocksAndMaterials` — thrown only after every
+ * block/material write for the call has already committed successfully.
+ * Callers (`createClubEvent`/`updateClubEvent`) special-case this via
+ * `instanceof` to skip their own compensating rollback/revert, since there is
+ * nothing to compensate: the underlying writes genuinely succeeded and
+ * reverting metadata or deleting the event row here would turn a read-only
+ * failure into data loss on top of it.
+ */
+class ClubEventReadBackError extends ServiceError {
+  constructor(message: string, statusCode: number) {
+    super(message, statusCode)
+    this.name = 'ClubEventReadBackError'
+  }
+}
+
+/**
  * Raw-SQL Neon port of the unified "Club events" admin service (#304).
  *
  * Ported off Supabase (`createSupabaseServerAdminClient`/
@@ -500,22 +517,46 @@ async function rollbackClubEventBlocksWrite(params: {
   insertedMaterialEquipmentIds: string[]
 }): Promise<void> {
   const { eventId, insertedBlockIds, cancelledReservations, deletedBlocks, deletedMaterials, insertedMaterialEquipmentIds } = params
+
+  // #304 code-review (high): each compensating step below gets its own
+  // try/catch instead of one shared try wrapping the whole function. These
+  // steps are independent restorations (block cleanup, reservation restore,
+  // block reinsert, material rollback) — if an early one throws, the later
+  // ones must still run, or a single failure (e.g. the block-delete) silently
+  // skips restoring cancelled reservations and deleted materials too. Every
+  // step is still best-effort: errors are logged and swallowed so the
+  // caller's original failure is always what surfaces.
   try {
     if (insertedBlockIds.length > 0) {
       await sql`DELETE FROM event_room_blocks WHERE id = ANY(${insertedBlockIds})`
     }
+  } catch (rollbackError) {
+    console.error('club-events-service: compensating rollback failed (non-fatal) — deleting inserted blocks:', rollbackError)
+  }
+
+  try {
     // Restore each cancelled reservation to its own captured pre-cancellation
     // status ('active' or 'pending') rather than assuming 'active' — reuses
     // events-service.ts's restoreCancelledReservations (#304 code-review,
     // medium effort) instead of a second copy of the same status-aware
     // split/UPDATE logic that function already implements.
     await restoreCancelledReservations(cancelledReservations)
+  } catch (rollbackError) {
+    console.error('club-events-service: compensating rollback failed (non-fatal) — restoring cancelled reservations:', rollbackError)
+  }
+
+  try {
     for (const block of deletedBlocks) {
       await sql`
         INSERT INTO event_room_blocks (id, event_id, room_id, table_id, date, start_time, end_time, all_day)
         VALUES (${block.id}, ${block.event_id}, ${block.room_id}, ${block.table_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day})
       `
     }
+  } catch (rollbackError) {
+    console.error('club-events-service: compensating rollback failed (non-fatal) — reinserting deleted blocks:', rollbackError)
+  }
+
+  try {
     // #304 code-review round 4: undo everything THIS call's materials loop
     // inserted before restoring the pre-delete rows — otherwise a brand-new
     // equipment_id (one that had no prior row, so it's absent from
@@ -529,6 +570,11 @@ async function rollbackClubEventBlocksWrite(params: {
           AND equipment_id = ANY(${insertedMaterialEquipmentIds})
       `
     }
+  } catch (rollbackError) {
+    console.error('club-events-service: compensating rollback failed (non-fatal) — deleting inserted materials:', rollbackError)
+  }
+
+  try {
     // #304 code-review (medium): idempotent against this same call's own
     // partial progress — the insert loop in applyClubEventBlocksAndMaterials
     // may have already re-inserted a row for this (event_id, equipment_id)
@@ -546,7 +592,7 @@ async function rollbackClubEventBlocksWrite(params: {
       `
     }
   } catch (rollbackError) {
-    console.error('club-events-service: compensating rollback failed (non-fatal):', rollbackError)
+    console.error('club-events-service: compensating rollback failed (non-fatal) — reinserting deleted materials:', rollbackError)
   }
 }
 
@@ -633,6 +679,15 @@ async function applyClubEventBlocksAndMaterials(
           SELECT id, room_id FROM tables WHERE room_id = ANY(${distinctRoomIds})
         ` as Array<{ id: string; room_id: string }>
       } catch {
+        // #304 code-review (high): this batched lookup runs after the DELETEs
+        // above have already captured deletedBlocks/deletedMaterials — on
+        // failure here those rows must be restored just like every other
+        // failure branch in this function, or they stay deleted with nothing
+        // to put them back.
+        await rollbackClubEventBlocksWrite({
+          eventId, insertedBlockIds: [], cancelledReservations: [], deletedBlocks, deletedMaterials,
+          insertedMaterialEquipmentIds: [],
+        })
         serviceError('Internal server error', 500)
       }
       for (const t of tables) {
@@ -739,8 +794,18 @@ async function applyClubEventBlocksAndMaterials(
       WHERE event_id = ${eventId}
       ORDER BY date ASC, start_time ASC
     ` as EventRoomBlockRow[]
-  } catch {
-    serviceError('Internal server error', 500)
+  } catch (error) {
+    // #304 code-review (high): every write above has already committed
+    // successfully by this point — this SELECT only re-reads what was just
+    // written. A failure here is a read-only failure, not a write failure:
+    // throwing a plain ServiceError would make the caller's catch treat it
+    // exactly like a failed write and trigger revertClubEventFieldsOnFailure
+    // / the compensating event delete, undoing metadata that was never
+    // actually wrong and leaving old metadata paired with the new (correctly
+    // committed) blocks/materials. ClubEventReadBackError lets the callers
+    // skip that compensation while still surfacing a 500 to the client.
+    console.error('club-events-service: post-write read-back failed after successful block/material write:', eventId, error)
+    throw new ClubEventReadBackError('Internal server error', 500)
   }
 
   return resultBlocks
@@ -1057,6 +1122,13 @@ export async function createClubEvent(session: SessionUser, body: ClubEventInput
     try {
       blocks = await applyClubEventBlocksAndMaterials(row.id, schedules, materials.length > 0 ? materials : null)
     } catch (err) {
+      // #304 code-review (high): a ClubEventReadBackError means every
+      // block/material write already committed successfully — only the
+      // post-write SELECT failed. Deleting the event row here would destroy
+      // a genuinely-successful write on top of a read failure, so skip the
+      // compensating delete and just surface the error.
+      if (err instanceof ClubEventReadBackError) throw err
+
       // Compensating delete (PR #149 review): the block/material-write step
       // failed after the event row was already inserted (validated room ids
       // notwithstanding — e.g. a transient DB error). Remove the now-orphaned
@@ -1240,6 +1312,14 @@ export async function updateClubEvent(session: SessionUser, id: string, body: Cl
     try {
       blocks = await applyClubEventBlocksAndMaterials(id, blocksParam, materialsParam)
     } catch (err) {
+      // #304 code-review (high): a ClubEventReadBackError means the
+      // block/material write itself already committed successfully — only
+      // the post-write SELECT failed. Reverting the event fields here would
+      // leave old metadata paired with the new (correctly committed)
+      // blocks/materials, an inconsistent state worse than just surfacing
+      // the read failure, so skip the revert in that case.
+      if (err instanceof ClubEventReadBackError) throw err
+
       // Compensating revert (PR #149 / PR #154 review): the block/material
       // replacement step failed after the event fields UPDATE above had
       // already committed. Room/table/equipment ids were pre-validated

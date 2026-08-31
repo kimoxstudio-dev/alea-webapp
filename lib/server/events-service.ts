@@ -384,28 +384,12 @@ async function rollbackPartialMultiBlockWrite(params: {
     if (insertedBlockIds.length > 0) {
       await sql`DELETE FROM event_room_blocks WHERE id = ANY(${insertedBlockIds})`
     }
-    // Group by original status so each reservation is restored to exactly
-    // what it had before cancellation, not a hardcoded 'active' (#303
-    // code-review post-PR round, Finding 5). The status is written as a
-    // literal per branch (not interpolated as a bound param) so the
-    // all-'active' case — by far the common one — keeps the exact same
-    // single-bound-param query shape this statement always had.
-    const pendingIds = cancelledReservations.filter((r) => r.status === 'pending').map((r) => r.id)
-    const activeIds = cancelledReservations.filter((r) => r.status !== 'pending').map((r) => r.id)
-    if (activeIds.length > 0) {
-      await sql`
-        UPDATE reservations
-        SET status = 'active'
-        WHERE id = ANY(${activeIds}) AND status = 'cancelled'
-      `
-    }
-    if (pendingIds.length > 0) {
-      await sql`
-        UPDATE reservations
-        SET status = 'pending'
-        WHERE id = ANY(${pendingIds}) AND status = 'cancelled'
-      `
-    }
+    // Restore each cancelled reservation to its own captured
+    // pre-cancellation status ('active' or 'pending') rather than a
+    // hardcoded 'active' (#303 code-review post-PR round, Finding 5) — reuses
+    // restoreCancelledReservations (#304 code-review, optional cleanup)
+    // instead of inlining the same status-aware split/UPDATE logic here.
+    await restoreCancelledReservations(cancelledReservations)
     if (deleteEvent) {
       await sql`DELETE FROM events WHERE id = ${eventId}`
     }
