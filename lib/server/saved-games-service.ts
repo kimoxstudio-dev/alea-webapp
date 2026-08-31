@@ -60,10 +60,9 @@ function getMaxEndDate(startDate: string) {
   return addDays(addMonthsClamped(startDate, 3), -1)
 }
 
-function mapSavedGame(row: SavedGameRow | SavedGameJoinedRow, today = getCurrentClubDate()): SavedGame {
+function mapSavedGame(row: SavedGameJoinedRow, today = getCurrentClubDate()): SavedGame {
   const renewalOpensOn = addDays(row.end_date, -14)
   const status = row.status === 'active' && row.end_date < today ? 'completed' : row.status
-  const joined = row as SavedGameJoinedRow
   return {
     id: row.id,
     tableId: row.table_id,
@@ -75,8 +74,8 @@ function mapSavedGame(row: SavedGameRow | SavedGameJoinedRow, today = getCurrent
     renewedFromId: row.renewed_from_id,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    roomName: joined.room_name ?? null,
-    tableName: joined.table_name ?? null,
+    roomName: row.room_name ?? null,
+    tableName: row.table_name ?? null,
     renewalOpensOn,
     canRenew: status === 'active' && today >= renewalOpensOn && today <= row.end_date,
   }
@@ -206,10 +205,8 @@ export async function createSavedGameForSession(
   const startDate = parseDate(body.startDate, 'startDate')
   const endDate = parseDate(body.endDate, 'endDate')
   validateDateRange(startDate, endDate)
-  await Promise.all([
-    assertTableAndEventAvailability(tableId, startDate, endDate),
-    assertNoBottomReservationConflict(tableId, startDate, endDate),
-  ])
+  await assertTableAndEventAvailability(tableId, startDate, endDate)
+  await assertNoBottomReservationConflict(tableId, startDate, endDate)
 
   // Member isolation is enforced by writing `user_id: session.id` explicitly
   // into the insert — the authenticated user can only create rows for
@@ -265,10 +262,8 @@ export async function renewSavedGameForSession(session: SessionUser, id: string)
 
   const startDate = addDays(current.end_date, 1)
   const endDate = getMaxEndDate(startDate)
-  await Promise.all([
-    assertTableAndEventAvailability(current.table_id, startDate, endDate),
-    assertNoBottomReservationConflict(current.table_id, startDate, endDate),
-  ])
+  await assertTableAndEventAvailability(current.table_id, startDate, endDate)
+  await assertNoBottomReservationConflict(current.table_id, startDate, endDate)
 
   let rows: SavedGameJoinedRow[]
   try {
