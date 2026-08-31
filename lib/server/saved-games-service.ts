@@ -30,6 +30,11 @@ type SavedGameJoinedRow = SavedGameRow & {
 }
 
 const SAVED_GAME_COLUMNS = 'id, table_id, user_id, start_date, end_date, status, attendance_count, renewed_from_id, created_at, updated_at'
+// Same shape as SAVED_GAME_COLUMNS plus the table/room join used by
+// `listSavedGamesForSession` — used to select back out of the `ins` CTE in
+// create/renew so the response includes real roomName/tableName instead of
+// nulls (RETURNING alone has no access to joined tables).
+const SAVED_GAME_JOINED_COLUMNS = 'sg.id, sg.table_id, sg.user_id, sg.start_date, sg.end_date, sg.status, sg.attendance_count, sg.renewed_from_id, sg.created_at, sg.updated_at, t.name AS table_name, rooms.name AS room_name'
 
 function parseDate(value: unknown, field: string) {
   const date = String(value ?? '')
@@ -134,6 +139,31 @@ async function assertTableAndEventAvailability(tableId: string, startDate: strin
   if (hasConflict) serviceError(ERROR_CODES.SAVED_GAME_EVENT_CONFLICT, 409)
 }
 
+async function assertNoBottomReservationConflict(tableId: string, startDate: string, endDate: string) {
+  // Reverse direction of `hasSavedGameBottomConflict` in reservations-service.ts:
+  // the pre-migration `validate_saved_game()` DB trigger also blocked creating a
+  // saved game that overlaps an active/pending bottom reservation on the same
+  // table. That trigger is intentionally out of scope for the Neon schema (see
+  // lib/db/schema/014_saved_games.sql) and must be replicated at the app layer.
+  let rows: Array<{ id: string }>
+  try {
+    rows = await sql`
+      SELECT id
+      FROM reservations
+      WHERE table_id = ${tableId}
+        AND status IN ('pending', 'active')
+        AND (surface IS NULL OR surface = 'bottom')
+        AND date >= ${startDate}
+        AND date <= ${endDate}
+      LIMIT 1
+    ` as Array<{ id: string }>
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+
+  if (rows.length > 0) serviceError(ERROR_CODES.SAVED_GAME_BOTTOM_RESERVATION_CONFLICT, 409)
+}
+
 function validateDateRange(startDate: string, endDate: string) {
   const today = getCurrentClubDate()
   if (startDate < today) serviceError(ERROR_CODES.SAVED_GAME_START_IN_PAST, 400)
@@ -179,17 +209,24 @@ export async function createSavedGameForSession(
   const endDate = parseDate(body.endDate, 'endDate')
   validateDateRange(startDate, endDate)
   await assertTableAndEventAvailability(tableId, startDate, endDate)
+  await assertNoBottomReservationConflict(tableId, startDate, endDate)
 
   // Member isolation is enforced by writing `user_id: session.id` explicitly
   // into the insert — the authenticated user can only create rows for
   // themselves.
-  let rows: SavedGameRow[]
+  let rows: SavedGameJoinedRow[]
   try {
     rows = await sql`
-      INSERT INTO saved_games (table_id, user_id, start_date, end_date)
-      VALUES (${tableId}, ${session.id}, ${startDate}, ${endDate})
-      RETURNING ${sql.unsafe(SAVED_GAME_COLUMNS)}
-    ` as SavedGameRow[]
+      WITH ins AS (
+        INSERT INTO saved_games (table_id, user_id, start_date, end_date)
+        VALUES (${tableId}, ${session.id}, ${startDate}, ${endDate})
+        RETURNING *
+      )
+      SELECT ${sql.unsafe(SAVED_GAME_JOINED_COLUMNS)}
+      FROM ins sg
+      LEFT JOIN tables t ON t.id = sg.table_id
+      LEFT JOIN rooms ON rooms.id = t.room_id
+    ` as SavedGameJoinedRow[]
   } catch (error) {
     if (isExclusionConflict(error)) serviceError(ERROR_CODES.SAVED_GAME_CONFLICT, 409)
     if (error instanceof NeonDbError && error.code === '23514') serviceError(error.message, 400)
@@ -229,14 +266,21 @@ export async function renewSavedGameForSession(session: SessionUser, id: string)
   const startDate = addDays(current.end_date, 1)
   const endDate = getMaxEndDate(startDate)
   await assertTableAndEventAvailability(current.table_id, startDate, endDate)
+  await assertNoBottomReservationConflict(current.table_id, startDate, endDate)
 
-  let rows: SavedGameRow[]
+  let rows: SavedGameJoinedRow[]
   try {
     rows = await sql`
-      INSERT INTO saved_games (table_id, user_id, start_date, end_date, renewed_from_id)
-      VALUES (${current.table_id}, ${current.user_id}, ${startDate}, ${endDate}, ${current.id})
-      RETURNING ${sql.unsafe(SAVED_GAME_COLUMNS)}
-    ` as SavedGameRow[]
+      WITH ins AS (
+        INSERT INTO saved_games (table_id, user_id, start_date, end_date, renewed_from_id)
+        VALUES (${current.table_id}, ${current.user_id}, ${startDate}, ${endDate}, ${current.id})
+        RETURNING *
+      )
+      SELECT ${sql.unsafe(SAVED_GAME_JOINED_COLUMNS)}
+      FROM ins sg
+      LEFT JOIN tables t ON t.id = sg.table_id
+      LEFT JOIN rooms ON rooms.id = t.room_id
+    ` as SavedGameJoinedRow[]
   } catch (error) {
     if (isRenewedFromConflict(error)) serviceError(ERROR_CODES.SAVED_GAME_ALREADY_RENEWED, 409)
     if (isExclusionConflict(error)) serviceError(ERROR_CODES.SAVED_GAME_CONFLICT, 409)
