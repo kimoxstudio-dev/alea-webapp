@@ -72,7 +72,7 @@ export type SqlVerb = 'select' | 'insert' | 'update' | 'delete'
 export interface ParsedStatement {
   /** Full statement text: lowercased, whitespace-collapsed, with `$1`/`$2`/… substituted for each interpolated value in order. */
   text: string
-  /** SQL verb anchored to the first token of the statement. `'unknown'` if the statement doesn't start with select/insert/update/delete. */
+  /** SQL verb anchored to the first token of the statement, or to the verb inside a leading `WITH ... AS ( ... )` CTE. `'unknown'` if neither is select/insert/update/delete. */
   verb: SqlVerb | 'unknown'
   /** Bound values, in the order the tagged template interpolated them. */
   values: unknown[]
@@ -187,7 +187,22 @@ export function parseStatement(
   const text = collapseWhitespace(raw.toLowerCase())
 
   const verbMatch = VERB_RE.exec(text)
-  const verb = (verbMatch?.[1] as SqlVerb | undefined) ?? 'unknown'
+  let verb = (verbMatch?.[1] as SqlVerb | undefined) ?? 'unknown'
+
+  // CTE support (#301 follow-up): `WITH <name> AS ( INSERT/UPDATE/DELETE/SELECT
+  // ... ) SELECT ...` — e.g. `WITH ins AS (INSERT INTO saved_games (...)
+  // RETURNING *) SELECT ... FROM ins sg LEFT JOIN tables ...`, used so a
+  // RETURNING clause can be re-selected joined against other tables. The
+  // outer statement literally starts with `with`, which VERB_RE never
+  // anchors on, so without this the mock would throw "could not anchor a SQL
+  // verb" for every CTE-wrapped statement. Anchoring to the verb *inside* the
+  // CTE parens instead treats the statement as that inner verb for handler
+  // matching (table/values extraction below already works unmodified against
+  // the CTE body since those regexes aren't start-anchored).
+  if (verb === 'unknown') {
+    const cteMatch = /^with\s+\w+\s+as\s*\(\s*(select|insert|update|delete)\b/i.exec(text)
+    if (cteMatch) verb = cteMatch[1] as SqlVerb
+  }
 
   let table: string | null = null
   if (verb === 'select' || verb === 'delete') {

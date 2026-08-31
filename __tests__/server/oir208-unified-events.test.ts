@@ -1434,6 +1434,20 @@ describe('OIR-208: Unified Events', () => {
         respond: () => [{ id: 'blk-8', table_id: 'sg-table-1' }],
       })
       roomsSqlMock.addHandler({
+        // assertNoBottomReservationConflict (security-review fix, #301):
+        // SELECT id FROM reservations WHERE table_id = $1 AND status IN
+        // (...) AND (surface IS NULL OR surface = 'bottom') AND date >= $2
+        // AND date <= $3 LIMIT 1 — no conflict for this test's scenario.
+        name: 'SELECT no bottom reservation conflict',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'reservations',
+        respond: () => [],
+      })
+      roomsSqlMock.addHandler({
+        // WITH ins AS (INSERT INTO saved_games ... RETURNING *) SELECT ...
+        // FROM ins sg LEFT JOIN tables/rooms — CTE-wrapped insert
+        // (security-review fix, #301), still anchored as verb='insert'/
+        // table='saved_games' by the sql-mock's CTE support.
         name: 'INSERT saved game',
         verb: 'insert',
         match: (stmt) => stmt.table === 'saved_games',
@@ -1450,6 +1464,8 @@ describe('OIR-208: Unified Events', () => {
             renewed_from_id: null,
             created_at: '2026-04-01T00:00:00.000Z',
             updated_at: '2026-04-01T00:00:00.000Z',
+            table_name: null,
+            room_name: null,
           }]
         },
       })

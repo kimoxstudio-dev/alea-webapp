@@ -15,11 +15,20 @@ import { createSqlMock, neonDbError, whereConditionCount } from '../helpers/sql-
  * Query shapes exercised here (see saved-games-service.ts):
  * - `assertTableAndEventAvailability`: SELECT tables by id (1 value),
  *   SELECT event_room_blocks by room_id/date range (3 values)
+ * - `assertNoBottomReservationConflict` (security-review fix, #301): SELECT
+ *   id FROM reservations WHERE table_id = $1 AND status IN ('pending',
+ *   'active') AND (surface IS NULL OR surface = 'bottom') AND date >= $2 AND
+ *   date <= $3 LIMIT 1 — 3 bound values, status/surface are literals
  * - `listSavedGamesForSession`: SELECT ... FROM saved_games sg LEFT JOIN
  *   tables/rooms WHERE (isAdmin OR sg.user_id = $2) — 2 bound values
- * - `createSavedGameForSession`: INSERT INTO saved_games (4 values) RETURNING
+ * - `createSavedGameForSession`: WITH ins AS (INSERT INTO saved_games (4
+ *   values) RETURNING *) SELECT ... FROM ins sg LEFT JOIN tables/rooms —
+ *   CTE-wrapped insert (security-review fix, #301) so the response includes
+ *   real roomName/tableName instead of null
  * - `renewSavedGameForSession`: SELECT saved_games by id (1 value), then
- *   INSERT INTO saved_games (5 values, includes renewed_from_id) RETURNING
+ *   WITH ins AS (INSERT INTO saved_games (5 values, includes
+ *   renewed_from_id) RETURNING *) SELECT ... FROM ins sg LEFT JOIN
+ *   tables/rooms — same CTE-wrapped shape as create
  * - `recordSavedGameAttendance`: SELECT active saved_games by
  *   table_id/user_id/date range (4 bound values, 5 WHERE conditions —
  *   `status = 'active'` is a literal, not bound), then INSERT INTO
@@ -51,12 +60,23 @@ type SavedGameRow = {
   updated_at: string
 }
 type AttendanceRow = { saved_game_id: string; play_reservation_id: string; attended_on: string }
+type ReservationConflictRow = { id: string; table_id: string; status: string; surface: string | null; date: string }
 
 const tablesState = new Map<string, TableRow>()
 const roomsState = new Map<string, RoomRow>()
 const blocksState: BlockRow[] = []
 const savedGamesState: SavedGameRow[] = []
 const attendancesState: AttendanceRow[] = []
+const reservationConflictsState: ReservationConflictRow[] = []
+
+/** Looks up the table/room names for a saved-games row, mirroring the LEFT
+ * JOIN tables/rooms the production `SAVED_GAME_JOINED_COLUMNS` re-select
+ * performs on the `ins` CTE for create/renew. */
+function withJoinedNames(row: SavedGameRow) {
+  const table = tablesState.get(row.table_id)
+  const room = table ? roomsState.get(table.room_id) : undefined
+  return { ...row, table_name: table?.name ?? null, room_name: room?.name ?? null }
+}
 
 let createInsertError: Error | null = null
 let renewInsertError: Error | null = null
@@ -78,6 +98,7 @@ function seedState() {
   blocksState.length = 0
   savedGamesState.length = 0
   attendancesState.length = 0
+  reservationConflictsState.length = 0
   createInsertError = null
   renewInsertError = null
   attendanceInsertError = null
@@ -123,6 +144,30 @@ describe('saved games service', () => {
         return blocksState
           .filter((block) => block.room_id === roomId && block.date >= startDate && block.date <= endDate)
           .map((block) => ({ id: block.id, table_id: block.table_id }))
+      },
+    })
+
+    // assertNoBottomReservationConflict: SELECT id FROM reservations WHERE
+    // table_id = $1 AND status IN ('pending','active') AND (surface IS NULL
+    // OR surface = 'bottom') AND date >= $2 AND date <= $3 LIMIT 1 — 3 bound
+    // values (status list and surface literal are not bound params).
+    // Defaults to no conflict ([]) so existing happy-path tests need no
+    // setup changes.
+    sqlMock.addHandler({
+      name: 'SELECT bottom reservation conflict',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'reservations' && stmt.values.length === 3,
+      respond: (stmt) => {
+        const [tableId, startDate, endDate] = stmt.values.map(String)
+        const conflict = reservationConflictsState.find(
+          (row) =>
+            row.table_id === tableId &&
+            (row.status === 'pending' || row.status === 'active') &&
+            (row.surface == null || row.surface === 'bottom') &&
+            row.date >= startDate &&
+            row.date <= endDate,
+        )
+        return conflict ? [{ id: conflict.id }] : []
       },
     })
 
@@ -183,8 +228,11 @@ describe('saved games service', () => {
       },
     })
 
-    // createSavedGameForSession: INSERT INTO saved_games (table_id, user_id,
-    // start_date, end_date) VALUES (...) RETURNING <cols> — 4 bound values.
+    // createSavedGameForSession: WITH ins AS (INSERT INTO saved_games
+    // (table_id, user_id, start_date, end_date) VALUES (...) RETURNING *)
+    // SELECT ... FROM ins sg LEFT JOIN tables/rooms — CTE-wrapped insert
+    // (security-review fix, #301), still anchored as verb='insert'/
+    // table='saved_games' by the sql-mock's CTE support. 4 bound values.
     sqlMock.addHandler({
       name: 'INSERT saved game (create)',
       verb: 'insert',
@@ -200,13 +248,14 @@ describe('saved games service', () => {
           end_date: endDate,
         })
         savedGamesState.push(row)
-        return [row]
+        return [withJoinedNames(row)]
       },
     })
 
-    // renewSavedGameForSession: INSERT INTO saved_games (table_id, user_id,
-    // start_date, end_date, renewed_from_id) VALUES (...) RETURNING <cols>
-    // — 5 bound values.
+    // renewSavedGameForSession: WITH ins AS (INSERT INTO saved_games
+    // (table_id, user_id, start_date, end_date, renewed_from_id) VALUES
+    // (...) RETURNING *) SELECT ... FROM ins sg LEFT JOIN tables/rooms —
+    // same CTE-wrapped shape as create. 5 bound values.
     sqlMock.addHandler({
       name: 'INSERT saved game (renew)',
       verb: 'insert',
@@ -223,7 +272,7 @@ describe('saved games service', () => {
           renewed_from_id: renewedFromId,
         })
         savedGamesState.push(row)
-        return [row]
+        return [withJoinedNames(row)]
       },
     })
 
@@ -258,7 +307,65 @@ describe('saved games service', () => {
       startDate: '2026-06-20',
       endDate: '2026-09-19',
       attendanceCount: 0,
+      // Security-review fix (#301): the CTE-wrapped INSERT re-selects joined
+      // table/room names, so the create response no longer has null names.
+      roomName: 'Sala',
+      tableName: 'Mesa doble',
     })
+  })
+
+  it('rejects create with a 409 when an active bottom reservation overlaps the requested range', async () => {
+    reservationConflictsState.push({
+      id: 'res-1',
+      table_id: 'double',
+      status: 'active',
+      surface: 'bottom',
+      date: '2026-07-01',
+    })
+    const { createSavedGameForSession } = await import('@/lib/server/saved-games-service')
+    await expect(
+      createSavedGameForSession(member, {
+        tableId: 'double',
+        startDate: '2026-06-20',
+        endDate: '2026-09-19',
+      }),
+    ).rejects.toMatchObject({ message: 'SAVED_GAME_BOTTOM_RESERVATION_CONFLICT', statusCode: 409 })
+  })
+
+  it('rejects create with a 409 when a pending bottom reservation overlaps the requested range', async () => {
+    reservationConflictsState.push({
+      id: 'res-2',
+      table_id: 'double',
+      status: 'pending',
+      surface: null,
+      date: '2026-08-15',
+    })
+    const { createSavedGameForSession } = await import('@/lib/server/saved-games-service')
+    await expect(
+      createSavedGameForSession(member, {
+        tableId: 'double',
+        startDate: '2026-06-20',
+        endDate: '2026-09-19',
+      }),
+    ).rejects.toMatchObject({ message: 'SAVED_GAME_BOTTOM_RESERVATION_CONFLICT', statusCode: 409 })
+  })
+
+  it('allows create when a bottom reservation exists but outside the requested date range', async () => {
+    reservationConflictsState.push({
+      id: 'res-3',
+      table_id: 'double',
+      status: 'active',
+      surface: 'bottom',
+      date: '2026-01-01',
+    })
+    const { createSavedGameForSession } = await import('@/lib/server/saved-games-service')
+    await expect(
+      createSavedGameForSession(member, {
+        tableId: 'double',
+        startDate: '2026-06-20',
+        endDate: '2026-09-19',
+      }),
+    ).resolves.toMatchObject({ tableId: 'double' })
   })
 
   it('rejects regular tables and durations over three months', async () => {
@@ -332,6 +439,36 @@ describe('saved games service', () => {
       startDate: '2026-07-01',
       endDate: '2026-09-30',
       renewedFromId: 'sg-1',
+      // Security-review fix (#301): the CTE-wrapped INSERT re-selects joined
+      // table/room names, so the renew response no longer has null names.
+      roomName: 'Sala',
+      tableName: 'Mesa doble',
+    })
+  })
+
+  it('rejects renewal with a 409 when a bottom reservation overlaps the next period', async () => {
+    savedGamesState.push(
+      makeSavedGame({
+        id: 'sg-1',
+        table_id: 'double',
+        user_id: 'user-1',
+        start_date: '2026-04-01',
+        end_date: '2026-06-30',
+      }),
+    )
+    // Next period is 2026-07-01..2026-09-30 (see the happy-path renewal test
+    // above) — put the conflicting bottom reservation inside that range.
+    reservationConflictsState.push({
+      id: 'res-1',
+      table_id: 'double',
+      status: 'active',
+      surface: 'bottom',
+      date: '2026-07-15',
+    })
+    const { renewSavedGameForSession } = await import('@/lib/server/saved-games-service')
+    await expect(renewSavedGameForSession(member, 'sg-1')).rejects.toMatchObject({
+      message: 'SAVED_GAME_BOTTOM_RESERVATION_CONFLICT',
+      statusCode: 409,
     })
   })
 
