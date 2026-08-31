@@ -197,6 +197,7 @@
       "errors": {
         "maxDuration": "Una partida guardada no puede durar más de tres meses.",
         "eventConflict": "Un evento bloquea esta sala durante las fechas elegidas.",
+        "bottomReservationConflict": "La superficie inferior ya tiene una reserva durante esas fechas.",
         "conflict": "La superficie inferior ya tiene una partida guardada durante esas fechas."
       }
     },

@@ -97,6 +97,14 @@ function isRenewedFromConflict(error: unknown) {
   )
 }
 
+function isAttendanceConflict(error: unknown) {
+  return (
+    error instanceof NeonDbError &&
+    error.code === '23505' &&
+    (error.constraint == null || error.constraint === 'saved_game_attendances_play_reservation_id_key')
+  )
+}
+
 async function assertTableAndEventAvailability(tableId: string, startDate: string, endDate: string) {
   // Table and event-block lookups span all users/rooms; no member isolation
   // needed — these are global availability checks.
@@ -226,7 +234,16 @@ export async function createSavedGameForSession(
     ` as SavedGameJoinedRow[]
   } catch (error) {
     if (isExclusionConflict(error)) serviceError(ERROR_CODES.SAVED_GAME_CONFLICT, 409)
-    if (error instanceof NeonDbError && error.code === '23514') serviceError(error.message, 400)
+    if (error instanceof NeonDbError && error.code === '23514') {
+      // Defense-in-depth: these checks are also validated at the app layer
+      // (validateDateRange) before the insert runs, so a violation here
+      // normally indicates a race or a caller bypassing that validation.
+      // Map to the matching normalized code by constraint name instead of
+      // leaking the raw Postgres error.message to the client.
+      if (error.constraint === 'saved_games_max_duration') serviceError(ERROR_CODES.SAVED_GAME_MAX_DURATION, 400)
+      if (error.constraint === 'saved_games_valid_dates') serviceError(ERROR_CODES.SAVED_GAME_INVALID_RANGE, 400)
+      serviceError('Internal server error', 500)
+    }
     serviceError('Internal server error', 500)
   }
 
@@ -326,7 +343,7 @@ export async function recordSavedGameAttendance(playReservation: Tables<'reserva
       WHERE id = (SELECT saved_game_id FROM ins)
     `
   } catch (error) {
-    if (error instanceof NeonDbError && error.code === '23505') return
+    if (isAttendanceConflict(error)) return
     serviceError('Internal server error', 500)
   }
 }

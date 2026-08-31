@@ -197,6 +197,7 @@
       "errors": {
         "maxDuration": "A Saved Game can last no more than three months.",
         "eventConflict": "An event blocks this room during the selected dates.",
+        "bottomReservationConflict": "The lower surface already has a reservation during these dates.",
         "conflict": "The lower surface already has a Saved Game during these dates."
       }
     },
