@@ -69,6 +69,9 @@ type EventRow = Tables<'events'>
 type EventRoomBlockRow = Tables<'event_room_blocks'>
 type EventEquipmentRow = Tables<'event_equipment'>
 
+// Includes the legacy `title` column: toAdminClubEvent falls back to it via
+// `row.title_es ?? row.title` for internal-only events (title_es is null),
+// so it must be fetched here or that fallback silently resolves to undefined.
 const ADMIN_CLUB_EVENT_RETURNING = `id, title, title_es, title_en, blurb_es, blurb_en, description_es, description_en,
         date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url,
         category_es, category_en`
@@ -104,6 +107,20 @@ function toClubEvent(row: EventRow, today: string): ClubEvent {
     linkUrl: row.link_url,
     status: statusFor(row, today),
   }
+}
+
+/**
+ * Defense-in-depth for the public club-events read. The "events_select_public"
+ * RLS policy used to guarantee anon visibility was restricted to rows with
+ * bilingual copy populated; the Neon migration dropped RLS, so the `.not()`
+ * filters on the query above are now the only thing enforcing that. Re-check
+ * the invariant at the application layer (same pattern as
+ * assertMemberRowsScoped in lib/server/data-scoping.ts) so a regression in
+ * the query can't leak a row with a null title_es/title_en into
+ * toClubEvent's `row.title_es ?? row.title` fallback.
+ */
+function assertPublicClubEventRowsHaveBilingualTitles(rows: EventRow[]): EventRow[] {
+  return rows.filter((row) => row.title_es !== null && row.title_en !== null)
 }
 
 export interface ListClubEventsOptions {
@@ -145,6 +162,7 @@ export async function listClubEvents(options: ListClubEventsOptions = {}): Promi
     serviceError('Internal server error', 500)
   }
 
+  rows = assertPublicClubEventRowsHaveBilingualTitles(rows)
   const events = rows.map((row) => toClubEvent(row, today))
 
   const upcoming = events.filter((event) => event.status === 'upcoming')
@@ -1025,8 +1043,11 @@ export async function listAdminClubEvents(session: SessionUser): Promise<AdminLi
 
   let rows: EventRow[]
   try {
+    // Finding (PR #354 review): `title` must be selected here — toAdminClubEvent
+    // falls back to it via `row.title_es ?? row.title` for internal-only events
+    // (title_es is null), so omitting it silently breaks that fallback.
     rows = await sql`
-      SELECT id, title_es, title_en, blurb_es, blurb_en, description_es, description_en,
+      SELECT id, title, title_es, title_en, blurb_es, blurb_en, description_es, description_en,
         date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url,
         category_es, category_en
       FROM events
@@ -1239,13 +1260,15 @@ export async function updateClubEvent(session: SessionUser, id: string, body: Cl
   // replace step — by which point the event metadata UPDATE has already been
   // committed, leaving the event in a partially-updated state even though
   // the request as a whole failed.
-  if (validatedSchedules) {
-    await validateRoomsExist(validatedSchedules)
-    await validateTablesExist(validatedSchedules)
-  }
-  if (validatedMaterials) {
-    await validateEquipmentExists(validatedMaterials)
-  }
+  // Finding (PR #354 review): rooms/tables/equipment are independent
+  // validations against different tables with no data dependency between
+  // them (each is a plain read-only SELECT with no shared state), so run
+  // them concurrently instead of sequentially.
+  await Promise.all([
+    validatedSchedules ? validateRoomsExist(validatedSchedules) : Promise.resolve(),
+    validatedSchedules ? validateTablesExist(validatedSchedules) : Promise.resolve(),
+    validatedMaterials ? validateEquipmentExists(validatedMaterials) : Promise.resolve(),
+  ])
 
   // Snapshot of the pre-update field values (reconstructed the same way
   // resolveClubEventFields derives fields from `current`), used to revert
