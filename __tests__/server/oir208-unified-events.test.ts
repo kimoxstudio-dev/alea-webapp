@@ -190,10 +190,20 @@ function addRoomsExistHandler(missing: string[] = []) {
 }
 
 /**
- * Handles all three "tables" SELECT shapes club-events-service.ts issues:
- * - `WHERE id = ANY(...)` (validateTablesExist)
- * - `WHERE id = $1 AND room_id = $2` (table/room mismatch guard)
- * - `WHERE room_id = $1` (fetchTableIdsForRoom)
+ * Handles both "tables" SELECT shapes club-events-service.ts issues (#354
+ * folded the old per-block `id = $1 AND room_id = $2` mismatch guard and the
+ * single-room `room_id = $1` fetchTableIdsForRoom lookup into one batched
+ * query, so only two shapes remain):
+ * - `SELECT id FROM tables WHERE id = ANY(...)` (validateTablesExist)
+ * - `SELECT id, room_id FROM tables WHERE room_id = ANY(...)` (batched
+ *   room->table lookup: builds both `roomTableMap` for null-table_id blocks
+ *   AND `tableRoomMap` for the table_id/room_id mismatch guard, so it must
+ *   return `room_id` on every row — an `{ id }`-only row silently breaks the
+ *   mismatch guard for non-null-table_id blocks).
+ * These two shapes select different, non-overlapping column lists (`id` vs
+ * `id, room_id`), so they're distinguished by exact SELECT projection
+ * (`hasExactSelectColumns`) rather than by a shared `any(` substring check,
+ * which would conflate them since both queries use `= ANY(...)`.
  * Defaults `roomTableIds` to TABLE_ROOM_MAP inverted, matching this file's
  * fixed table->room ownership convention.
  */
@@ -207,21 +217,21 @@ function addTablesHandler(opts: { missingTableIds?: string[]; roomTableIds?: Rec
     {},
   )
   roomsSqlMock.addHandler({
-    name: 'SELECT id FROM tables (validateTablesExist / mismatch guard / fetchTableIdsForRoom)',
+    name: 'SELECT id FROM tables WHERE id = ANY(...) (validateTablesExist)',
     verb: 'select',
-    match: (stmt) => stmt.table === 'tables',
+    match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id') && whereHasColumn(stmt, 'id'),
     respond: (stmt) => {
-      if (stmt.whereClause?.includes('any(')) {
-        const ids = stmt.values[0] as string[]
-        return ids.filter((id) => !missingTableIds.includes(id)).map((id) => ({ id }))
-      }
-      if (whereHasColumn(stmt, 'id') && whereHasColumn(stmt, 'room_id')) {
-        const [tableId, roomId] = stmt.values as [string, string]
-        const valid = (roomTableIds[roomId] ?? []).includes(tableId)
-        return valid ? [{ id: tableId }] : []
-      }
-      const roomId = stmt.values[0] as string
-      return (roomTableIds[roomId] ?? []).map((id) => ({ id }))
+      const ids = stmt.values[0] as string[]
+      return ids.filter((id) => !missingTableIds.includes(id)).map((id) => ({ id }))
+    },
+  })
+  roomsSqlMock.addHandler({
+    name: 'SELECT id, room_id FROM tables WHERE room_id = ANY(...) (batched room->table lookup)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id, room_id') && whereHasColumn(stmt, 'room_id'),
+    respond: (stmt) => {
+      const roomIds = stmt.values[0] as string[]
+      return roomIds.flatMap((roomId) => (roomTableIds[roomId] ?? []).map((id) => ({ id, room_id: roomId })))
     },
   })
 }
