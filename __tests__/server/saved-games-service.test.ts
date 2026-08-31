@@ -276,10 +276,22 @@ describe('saved games service', () => {
       },
     })
 
-    // recordSavedGameAttendance: INSERT INTO saved_game_attendances
-    // (saved_game_id, play_reservation_id, attended_on) VALUES (...)
+    // recordSavedGameAttendance: WITH ins AS (INSERT INTO
+    // saved_game_attendances (saved_game_id, play_reservation_id,
+    // attended_on) VALUES (...) RETURNING saved_game_id) UPDATE saved_games
+    // SET attendance_count = attendance_count + 1, updated_at = now() WHERE
+    // id = (SELECT saved_game_id FROM ins) — a single combined CTE (#301
+    // round-3 fix, see saved-games-service.ts). The mock's CTE support
+    // anchors this as verb='insert'/table='saved_game_attendances' (the verb
+    // *inside* the WITH parens), so this one handler must model BOTH
+    // effects: the attendance insert AND the attendance_count increment,
+    // since the real UPDATE only ever runs as part of this same statement
+    // (there is no separate UPDATE statement in production to intercept).
+    // On a duplicate/idempotent retry (23505 on the INSERT), the increment
+    // must NOT happen — mirrors real Postgres: the UPDATE only executes
+    // after the INSERT (inside the same CTE) succeeds.
     sqlMock.addHandler({
-      name: 'INSERT saved game attendance',
+      name: 'INSERT saved game attendance + increment attendance_count',
       verb: 'insert',
       match: (stmt) => stmt.table === 'saved_game_attendances',
       respond: (stmt) => {
@@ -290,6 +302,8 @@ describe('saved games service', () => {
         }
         const row = { saved_game_id: savedGameId, play_reservation_id: playReservationId, attended_on: attendedOn }
         attendancesState.push(row)
+        const savedGame = savedGamesState.find((item) => item.id === savedGameId)
+        if (savedGame) savedGame.attendance_count += 1
         return []
       },
     })
@@ -588,6 +602,77 @@ describe('saved games service', () => {
     expect(attendancesState).toEqual([
       { saved_game_id: 'sg-1', play_reservation_id: 'r-1', attended_on: '2026-06-19' },
     ])
+    // Regression coverage (#301 round-3 fix): the combined
+    // `WITH ins AS (INSERT ...) UPDATE saved_games SET attendance_count =
+    // attendance_count + 1 ...` CTE must increment attendance_count exactly
+    // once for the real (first) attendance, and the second call — which
+    // hits the 23505 idempotency guard on the INSERT — must be a true
+    // no-op that never reaches the UPDATE, so attendance_count does not
+    // double-increment on a duplicate/retry.
+    expect(savedGamesState[0]!.attendance_count).toBe(1)
+  })
+
+  it('increments attendance_count by exactly 1 on a brand-new attendance record', async () => {
+    savedGamesState.push(
+      makeSavedGame({
+        id: 'sg-1',
+        table_id: 'double',
+        user_id: 'user-1',
+        start_date: '2026-06-01',
+        end_date: '2026-08-31',
+        attendance_count: 3,
+      }),
+    )
+    const { recordSavedGameAttendance } = await import('@/lib/server/saved-games-service')
+    await recordSavedGameAttendance({
+      id: 'r-9',
+      table_id: 'double',
+      user_id: 'user-1',
+      date: '2026-06-20',
+      start_time: '18:00',
+      end_time: '20:00',
+      surface: 'top' as const,
+      status: 'active' as const,
+      activated_at: '',
+      created_at: '',
+    })
+    expect(attendancesState).toEqual([
+      { saved_game_id: 'sg-1', play_reservation_id: 'r-9', attended_on: '2026-06-20' },
+    ])
+    expect(savedGamesState[0]!.attendance_count).toBe(4)
+  })
+
+  it('does not double-increment attendance_count on a simulated 23505 unique-violation retry', async () => {
+    savedGamesState.push(
+      makeSavedGame({
+        id: 'sg-1',
+        table_id: 'double',
+        user_id: 'user-1',
+        start_date: '2026-06-01',
+        end_date: '2026-08-31',
+      }),
+    )
+    // Pre-seed the attendance row directly (bypassing the service) so the
+    // very first call already hits the mock's 23505 duplicate-key branch —
+    // isolates the idempotency path from the "second call of two" shape of
+    // the test above, so this test fails if the no-op guard is ever removed
+    // or the UPDATE is hoisted outside the INSERT's success path.
+    attendancesState.push({ saved_game_id: 'sg-1', play_reservation_id: 'r-dup', attended_on: '2026-06-19' })
+    const { recordSavedGameAttendance } = await import('@/lib/server/saved-games-service')
+    await recordSavedGameAttendance({
+      id: 'r-dup',
+      table_id: 'double',
+      user_id: 'user-1',
+      date: '2026-06-19',
+      start_time: '18:00',
+      end_time: '20:00',
+      surface: 'top' as const,
+      status: 'active' as const,
+      activated_at: '',
+      created_at: '',
+    })
+    expect(attendancesState).toHaveLength(1)
+    expect(savedGamesState[0]!.attendance_count).toBe(0)
   })
 
   it('does not record attendance for a non-top or non-active reservation', async () => {
