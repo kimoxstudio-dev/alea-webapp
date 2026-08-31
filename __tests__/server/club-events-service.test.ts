@@ -1391,4 +1391,269 @@ describe('club-events-service', () => {
       expect(result.blurbEn).toBe('Nuevo resumen')
     })
   })
+
+  // ---------------------------------------------------------------------------
+  // #304 code-review regression coverage: applyClubEventBlocksAndMaterials'
+  // rollback/compensation paths (rollbackClubEventBlocksWrite, the batched
+  // room->table lookup's own rollback, per-step rollback resilience, and the
+  // ClubEventReadBackError read-back-after-commit path). None of these were
+  // covered by the tests above, which only exercise the block/material
+  // write-loop failures, not the lookup-before-the-loop or read-back-after
+  // failure branches.
+  // ---------------------------------------------------------------------------
+  describe('applyClubEventBlocksAndMaterials rollback resilience (#304 code-review)', () => {
+    it('restores deleted blocks and materials when the batched room->table lookup fails (high-effort finding)', async () => {
+      const deletedBlockRow = {
+        id: 'block-old-1', event_id: 'evt-1', room_id: 'room-old', table_id: null,
+        date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00', all_day: false,
+      }
+      const deletedMaterialRow = { event_id: 'evt-1', equipment_id: 'equip-old', quantity: 2 }
+
+      addCurrentEventSelectHandler(currentEventRow())
+      addRoomsExistHandler()
+      addUpdateEventHandler(() => [currentEventRow()])
+      // Comparison fetch (fetchEventRoomBlocks, no ORDER BY) — deliberately
+      // differs from the incoming schedule so the block-replace step runs.
+      sqlMock.addHandler({
+        name: 'SELECT event_room_blocks WHERE event_id (comparison fetch, no ORDER BY)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, ROOM_BLOCK_COLUMNS) && !stmt.orderBy,
+        respond: () => [{ ...deletedBlockRow }],
+      })
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([deletedBlockRow])
+      addMaterialsDeleteHandler([deletedMaterialRow])
+      // The batched room->table lookup itself fails — after both DELETEs
+      // above (with their RETURNING captures) have already committed.
+      sqlMock.addHandler({
+        name: 'SELECT id, room_id FROM tables WHERE room_id = ANY(...) (roomTableMap, throws)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id, room_id'),
+        respond: () => { throw new Error('room->table lookup failed') },
+      })
+      const blockReinsertSpy = vi.fn()
+      sqlMock.addHandler({
+        name: 'INSERT event_room_blocks (rollback reinsert, no RETURNING)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'event_room_blocks' && !stmt.returning,
+        respond: (stmt) => {
+          blockReinsertSpy(stmt.values)
+          return []
+        },
+      })
+      const materialReinsertSpy = vi.fn()
+      addMaterialsInsertHandler((values) => materialReinsertSpy(values))
+      addRevertEventHandler()
+
+      const { updateClubEvent } = await loadClubEventsService()
+
+      await expect(
+        updateClubEvent(createAdminSession(), 'evt-1', {
+          blocksRooms: true,
+          schedules: [
+            { date: '2026-04-20', startTime: '10:00', endTime: '14:00', allDay: false, roomId: 'room-1' },
+          ],
+          materials: [],
+        })
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      // The block DELETE'd earlier in the call must be reinserted…
+      expect(blockReinsertSpy).toHaveBeenCalledTimes(1)
+      expect(blockReinsertSpy.mock.calls[0][0]).toEqual([
+        'block-old-1', 'evt-1', 'room-old', null, '2026-04-20', '18:00:00', '22:00:00', false,
+      ])
+      // …and so must the material DELETE'd earlier in the same call.
+      expect(materialReinsertSpy).toHaveBeenCalledTimes(1)
+      expect(materialReinsertSpy.mock.calls[0][0]).toEqual(['evt-1', 'equip-old', 2])
+    })
+
+    it('per-step rollback resilience: a failure in one compensating step does not block later steps (high-effort finding)', async () => {
+      addCurrentEventSelectHandler(currentEventRow())
+      addRoomsExistHandler()
+      addEquipmentExistsHandler()
+      addUpdateEventHandler(() => [currentEventRow()])
+      sqlMock.addHandler({
+        name: 'SELECT event_room_blocks WHERE event_id (comparison fetch, no ORDER BY)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, ROOM_BLOCK_COLUMNS) && !stmt.orderBy,
+        respond: () => [{
+          id: 'block-other', event_id: 'evt-1', room_id: 'room-other', table_id: null,
+          date: '2026-04-20', start_time: '09:00:00', end_time: '10:00:00', all_day: false,
+        }],
+      })
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      addMaterialsDeleteHandler([{ event_id: 'evt-1', equipment_id: 'equip-old', quantity: 5 }])
+      sqlMock.addHandler({
+        name: 'SELECT id, room_id FROM tables WHERE room_id = ANY(...) (roomTableMap)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id, room_id'),
+        respond: () => [{ id: 'table-1', room_id: 'room-1' }],
+      })
+      addBlockInsertHandler('block-new')
+      addReservationsCancelHandler(() => [{ id: 'res-1', status: 'active' }])
+
+      // First material insert succeeds, second fails — triggers the
+      // compensating rollback mid-materials-loop, with one already-inserted
+      // block and one already-cancelled reservation from the earlier
+      // blocks loop still needing cleanup.
+      let materialInsertCount = 0
+      const materialInsertSpy = vi.fn()
+      sqlMock.addHandler({
+        name: 'INSERT event_equipment (second insert fails, mid-loop)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'event_equipment',
+        respond: (stmt) => {
+          materialInsertCount += 1
+          if (materialInsertCount === 2) throw new Error('material insert failed')
+          materialInsertSpy(stmt.values)
+          return []
+        },
+      })
+
+      // Rollback step 1 (delete THIS call's inserted blocks) fails — this
+      // must NOT prevent the later independent steps (reservation restore,
+      // material reinsert) from still running.
+      sqlMock.prependHandler({
+        name: 'DELETE event_room_blocks WHERE id = ANY(...) (rollback delete-inserted, throws)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'event_id'),
+        respond: () => { throw new Error('rollback delete-inserted-blocks failed') },
+      })
+
+      const reservationRestoreSpy = vi.fn()
+      sqlMock.addHandler({
+        name: 'UPDATE reservations SET status=active (restore, no table_id in WHERE)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'status') && !whereHasColumn(stmt, 'table_id'),
+        respond: (stmt) => {
+          reservationRestoreSpy(stmt.values)
+          return []
+        },
+      })
+
+      addRevertEventHandler()
+
+      const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      const { updateClubEvent } = await loadClubEventsService()
+
+      await expect(
+        updateClubEvent(createAdminSession(), 'evt-1', {
+          blocksRooms: true,
+          schedules: [
+            { date: '2026-04-20', startTime: '10:00', endTime: '14:00', allDay: false, roomId: 'room-1' },
+          ],
+          materials: [
+            { equipmentId: 'equip-a', quantity: 1 },
+            { equipmentId: 'equip-b', quantity: 1 },
+          ],
+        })
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      // Step 1 (delete this call's inserted blocks) failed (logged, non-fatal)
+      // — but the reservation-restore step still ran despite that.
+      expect(reservationRestoreSpy).toHaveBeenCalledTimes(1)
+      expect(reservationRestoreSpy.mock.calls[0][0][0]).toEqual(['res-1'])
+      // …and so did the material-reinsert step: one forward-loop insert
+      // (equip-a, before the failure) plus one rollback reinsert (equip-old,
+      // the pre-existing material this call had deleted).
+      expect(materialInsertSpy).toHaveBeenCalledTimes(2)
+      expect(materialInsertSpy.mock.calls[0][0]).toEqual(['evt-1', 'equip-a', 1])
+      expect(materialInsertSpy.mock.calls[1][0]).toEqual(['evt-1', 'equip-old', 5])
+
+      consoleErrorSpy.mockRestore()
+    })
+
+    it('createClubEvent surfaces a ClubEventReadBackError as a failure WITHOUT deleting the successfully-written event row (high-effort finding)', async () => {
+      addCreateInsertHandler()
+      addRoomsExistHandler()
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      sqlMock.addHandler({
+        name: 'SELECT id, room_id FROM tables WHERE room_id = ANY(...) (roomTableMap)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id, room_id'),
+        respond: () => [{ id: 'table-1', room_id: 'room-1' }],
+      })
+      addBlockInsertHandler('block')
+      addReservationsCancelHandler(() => [])
+      // The final read-back SELECT fails AFTER every write above has
+      // already committed successfully.
+      sqlMock.addHandler({
+        name: 'SELECT event_room_blocks WHERE event_id ORDER BY ... (read-back, throws)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, ROOM_BLOCK_COLUMNS) && Boolean(stmt.orderBy),
+        respond: () => { throw new Error('read-back failed') },
+      })
+      const deleteSpy = vi.fn()
+      addEventsDeleteHandler(deleteSpy)
+
+      const { createClubEvent } = await loadClubEventsService()
+
+      await expect(
+        createClubEvent(createAdminSession(), {
+          titleEs: 'Torneo',
+          titleEn: 'Tournament',
+          date: '2026-05-01',
+          dateKind: 'single',
+          blocksRooms: true,
+          schedules: [
+            { date: '2026-05-01', startTime: '18:00', endTime: '22:00', allDay: false, roomId: 'room-1' },
+          ],
+        })
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      // The event row and its already-committed block write must be left
+      // alone — a read-only failure must never trigger the orphan-row
+      // compensating delete.
+      expect(deleteSpy).not.toHaveBeenCalled()
+    })
+
+    it('updateClubEvent surfaces a ClubEventReadBackError as a failure WITHOUT reverting the successfully-written metadata (high-effort finding)', async () => {
+      addCurrentEventSelectHandler(currentEventRow())
+      addRoomsExistHandler()
+      addUpdateEventHandler(() => [currentEventRow()])
+      sqlMock.addHandler({
+        name: 'SELECT event_room_blocks WHERE event_id (comparison fetch, no ORDER BY)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, ROOM_BLOCK_COLUMNS) && !stmt.orderBy,
+        respond: () => [{
+          id: 'block-other', event_id: 'evt-1', room_id: 'room-other', table_id: null,
+          date: '2026-04-20', start_time: '09:00:00', end_time: '10:00:00', all_day: false,
+        }],
+      })
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      sqlMock.addHandler({
+        name: 'SELECT id, room_id FROM tables WHERE room_id = ANY(...) (roomTableMap)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id, room_id'),
+        respond: () => [{ id: 'table-1', room_id: 'room-1' }],
+      })
+      addBlockInsertHandler('block')
+      addReservationsCancelHandler(() => [])
+      sqlMock.addHandler({
+        name: 'SELECT event_room_blocks WHERE event_id ORDER BY ... (read-back, throws)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, ROOM_BLOCK_COLUMNS) && Boolean(stmt.orderBy),
+        respond: () => { throw new Error('read-back failed') },
+      })
+      const revertSpy = vi.fn()
+      addRevertEventHandler(revertSpy)
+
+      const { updateClubEvent } = await loadClubEventsService()
+
+      await expect(
+        updateClubEvent(createAdminSession(), 'evt-1', {
+          blocksRooms: true,
+          schedules: [
+            { date: '2026-04-20', startTime: '10:00', endTime: '14:00', allDay: false, roomId: 'room-1' },
+          ],
+        })
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      expect(revertSpy).not.toHaveBeenCalled()
+    })
+  })
 })
