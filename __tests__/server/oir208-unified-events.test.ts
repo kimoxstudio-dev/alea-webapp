@@ -1408,52 +1408,51 @@ describe('OIR-208: Unified Events', () => {
     })
 
     it('assertTableAndEventAvailability respects table_id scoping', async () => {
+      // saved-games-service.ts (#301) uses the raw-SQL `sql` client, not
+      // Supabase — register handlers on the shared `roomsSqlMock` (the mock
+      // bound to `@/lib/db/client` for this whole file) instead of the old
+      // Supabase admin-client mock.
       const savedGameTables: Record<string, MockTable> = {
         'sg-table-1': { id: 'sg-table-1', room_id: RESERVATION_ROOM, type: 'removable_top' },
         'sg-table-2': { id: 'sg-table-2', room_id: RESERVATION_ROOM, type: 'removable_top' },
       }
-      const admin = {
-        from: vi.fn((table: string) => {
-          if (table === 'tables') {
-            return {
-              select: vi.fn(() => ({
-                eq: vi.fn((_col: string, value: string) => ({
-                  maybeSingle: vi.fn(async () => ({ data: savedGameTables[value] ?? null, error: null })),
-                })),
-              })),
-            }
-          }
-          if (table === 'event_room_blocks') {
-            // Block is scoped ONLY to sg-table-1.
-            return { select: vi.fn(() => chainThen({ data: [{ id: 'blk-8', table_id: 'sg-table-1' }], error: null })) }
-          }
-          if (table === 'saved_games') {
-            return {
-              insert: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  single: vi.fn(async () => ({
-                    data: {
-                      id: 'sg-1',
-                      table_id: 'sg-table-2',
-                      user_id: 'user-1',
-                      start_date: '2026-04-20',
-                      end_date: '2026-05-20',
-                      status: 'active',
-                      attendance_count: 0,
-                      renewed_from_id: null,
-                      created_at: '2026-04-01T00:00:00.000Z',
-                      updated_at: '2026-04-01T00:00:00.000Z',
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            }
-          }
-          return {}
-        }),
-      }
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(admin as any)
+      roomsSqlMock.reset()
+      roomsSqlMock.addHandler({
+        name: 'SELECT saved-game table by id',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'tables' && whereColumnHasOperator(stmt, 'id', '=') && whereConditionCount(stmt) === 1,
+        respond: (stmt) => {
+          const table = savedGameTables[String(stmt.values[0])]
+          return table ? [table] : []
+        },
+      })
+      roomsSqlMock.addHandler({
+        name: 'SELECT saved-game event blocks',
+        verb: 'select',
+        // Block is scoped ONLY to sg-table-1.
+        match: (stmt) => stmt.table === 'event_room_blocks',
+        respond: () => [{ id: 'blk-8', table_id: 'sg-table-1' }],
+      })
+      roomsSqlMock.addHandler({
+        name: 'INSERT saved game',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'saved_games',
+        respond: (stmt) => {
+          const [tableId, userId, startDate, endDate] = stmt.values.map(String)
+          return [{
+            id: 'sg-1',
+            table_id: tableId,
+            user_id: userId,
+            start_date: startDate,
+            end_date: endDate,
+            status: 'active',
+            attendance_count: 0,
+            renewed_from_id: null,
+            created_at: '2026-04-01T00:00:00.000Z',
+            updated_at: '2026-04-01T00:00:00.000Z',
+          }]
+        },
+      })
 
       const { createSavedGameForSession } = await import('@/lib/server/saved-games-service')
 
