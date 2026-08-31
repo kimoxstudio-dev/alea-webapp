@@ -321,8 +321,14 @@ export async function recordSavedGameAttendance(playReservation: Tables<'reserva
 
   try {
     await sql`
-      INSERT INTO saved_game_attendances (saved_game_id, play_reservation_id, attended_on)
-      VALUES (${savedGame.id}, ${playReservation.id}, ${playReservation.date})
+      WITH ins AS (
+        INSERT INTO saved_game_attendances (saved_game_id, play_reservation_id, attended_on)
+        VALUES (${savedGame.id}, ${playReservation.id}, ${playReservation.date})
+        RETURNING saved_game_id
+      )
+      UPDATE saved_games
+      SET attendance_count = attendance_count + 1, updated_at = now()
+      WHERE id = (SELECT saved_game_id FROM ins)
     `
   } catch (error) {
     if (error instanceof NeonDbError && error.code === '23505') return
