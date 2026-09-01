@@ -1,17 +1,43 @@
 import 'server-only'
+import { sql } from '@/lib/db/client'
+import { NeonDbError } from '@neondatabase/serverless'
 import type { AdminLibraryGame, LibraryGame } from '@/lib/types'
-import { createSupabaseServerClient, createSupabaseServerAdminClient } from '@/lib/supabase/server'
 import { serviceError } from '@/lib/server/service-error'
-import type { Tables } from '@/lib/supabase/types'
 import type { SessionUser } from '@/lib/server/auth'
 import { validateOptionalUrl } from '@/lib/validations/url'
 
-type LibraryGameRow = Tables<'library_games'>
+/**
+ * Raw-SQL Neon port of the library-games service (#306), matching the
+ * established style from `equipment-service.ts` (#305), `events-service.ts`
+ * (#303) and `reservations-service.ts` (#301).
+ *
+ * `public.library_games` (see `lib/db/schema/017_library_games.sql` and the
+ * legacy `supabase/migrations/20260704000003_oir205_library_games_table.sql`
+ * / `20260704000005_oir207_landing_media_bucket.sql`) carries no
+ * `CREATE TRIGGER`, no CHECK constraint, and no other table implicitly
+ * referencing it — it is a standalone table with no DB-side business logic
+ * to port into the app layer (unlike #301's reservations, which had a
+ * symmetric conflict check and a counter increment done implicitly by
+ * Postgres). The `23514`/`22P02`/`23502` Postgres error mapping below is
+ * retained defensively (NOT NULL / type-cast failures still surface as
+ * `23502`/`22P02`), even though there is currently no CHECK constraint that
+ * would raise `23514`.
+ */
 
-const PUBLIC_LIBRARY_GAME_COLUMNS = 'id, title, category_es, category_en, players, play_time, weight, sort_order, img_url'
-const ADMIN_LIBRARY_GAME_COLUMNS = 'id, title, category_es, category_en, players, play_time, weight, sort_order, active, img_url'
+type LibraryGameRow = {
+  id: string
+  title: string
+  category_es: string
+  category_en: string
+  players: string
+  play_time: string
+  weight: string | number
+  sort_order: number
+  active: boolean
+  img_url: string | null
+}
 
-function toLibraryGame(row: Pick<LibraryGameRow, 'id' | 'title' | 'category_es' | 'category_en' | 'players' | 'play_time' | 'weight' | 'sort_order' | 'img_url'>): LibraryGame {
+function toLibraryGame(row: Omit<LibraryGameRow, 'active'>): LibraryGame {
   return {
     id: row.id,
     title: row.title,
@@ -31,22 +57,24 @@ function toAdminLibraryGame(row: LibraryGameRow): AdminLibraryGame {
 
 /**
  * Public read of active library games (ludoteca highlights) for the landing
- * page, ordered the same way the board arranges them in the dashboard. Uses
- * the RLS-respecting client since this is unauthenticated, publicly readable
- * content — the "library_games_select_active" RLS policy additionally
- * restricts anon/authenticated visibility to active rows.
+ * page, ordered the same way the board arranges them in the dashboard.
+ * `library_games` has no RLS in Neon (that's a Supabase-only concept), so
+ * the "active"-only visibility that the old "library_games_select_active"
+ * RLS policy enforced is now an explicit `WHERE active = true` here.
  */
 export async function listLibraryGames(): Promise<LibraryGame[]> {
-  const supabase = await createSupabaseServerClient()
-  const { data, error } = await supabase
-    .from('library_games')
-    .select(PUBLIC_LIBRARY_GAME_COLUMNS)
-    .order('sort_order', { ascending: true })
-    .order('title', { ascending: true })
+  let rows: Array<Omit<LibraryGameRow, 'active'>>
+  try {
+    rows = await sql`
+      SELECT id, title, category_es, category_en, players, play_time, weight, sort_order, img_url
+      FROM library_games
+      WHERE active = true
+      ORDER BY sort_order ASC, title ASC
+    ` as Array<Omit<LibraryGameRow, 'active'>>
+  } catch {
+    return serviceError('Internal server error', 500)
+  }
 
-  if (error) serviceError('Internal server error', 500)
-
-  const rows = (data ?? []) as LibraryGameRow[]
   return rows.map((row) => toLibraryGame(row))
 }
 
@@ -216,20 +244,31 @@ function resolveLibraryGameFields(body: LibraryGameInput, current: LibraryGameRo
   }
 }
 
+function mapWriteError(error: unknown): never {
+  if (
+    error instanceof NeonDbError &&
+    (error.code === '23514' || error.code === '22P02' || error.code === '23502')
+  ) {
+    serviceError('Invalid library game data', 400)
+  }
+  serviceError('Internal server error', 500)
+}
+
 /** Admin read of every library game (active + inactive), ordered by sort_order. */
 export async function listAdminLibraryGames(session: SessionUser): Promise<AdminLibraryGame[]> {
   requireAdminSession(session)
 
-  const admin = createSupabaseServerAdminClient()
-  const { data, error } = await admin
-    .from('library_games')
-    .select(ADMIN_LIBRARY_GAME_COLUMNS)
-    .order('sort_order', { ascending: true })
-    .order('title', { ascending: true })
+  let rows: LibraryGameRow[]
+  try {
+    rows = await sql`
+      SELECT id, title, category_es, category_en, players, play_time, weight, sort_order, active, img_url
+      FROM library_games
+      ORDER BY sort_order ASC, title ASC
+    ` as LibraryGameRow[]
+  } catch {
+    return serviceError('Internal server error', 500)
+  }
 
-  if (error) serviceError('Internal server error', 500)
-
-  const rows = (data ?? []) as LibraryGameRow[]
   return rows.map((row) => toAdminLibraryGame(row))
 }
 
@@ -239,74 +278,93 @@ export async function createLibraryGame(session: SessionUser, body: LibraryGameI
   // Validate EVERYTHING before any DB write.
   const fields = resolveLibraryGameFields(body, null)
 
-  const admin = createSupabaseServerAdminClient()
-  const { data, error } = await admin
-    .from('library_games')
-    .insert(fields)
-    .select(ADMIN_LIBRARY_GAME_COLUMNS)
-    .maybeSingle()
-
-  if (error) {
-    const pgCode = (error as { code?: string }).code
-    if (pgCode === '23514' || pgCode === '22P02' || pgCode === '23502') {
-      serviceError('Invalid library game data', 400)
-    }
-    serviceError('Internal server error', 500)
+  let rows: LibraryGameRow[]
+  try {
+    rows = await sql`
+      INSERT INTO library_games (title, category_es, category_en, players, play_time, weight, sort_order, active, img_url)
+      VALUES (
+        ${fields.title},
+        ${fields.category_es},
+        ${fields.category_en},
+        ${fields.players},
+        ${fields.play_time},
+        ${fields.weight},
+        ${fields.sort_order},
+        ${fields.active},
+        ${fields.img_url}
+      )
+      RETURNING id, title, category_es, category_en, players, play_time, weight, sort_order, active, img_url
+    ` as LibraryGameRow[]
+  } catch (error) {
+    mapWriteError(error)
   }
-  if (!data) serviceError('Internal server error', 500)
 
-  return toAdminLibraryGame(data as LibraryGameRow)
+  const game = rows[0]
+  if (!game) return serviceError('Internal server error', 500)
+
+  return toAdminLibraryGame(game)
 }
 
 export async function updateLibraryGame(session: SessionUser, id: string, body: LibraryGameInput): Promise<AdminLibraryGame> {
   requireAdminSession(session)
 
-  const admin = createSupabaseServerAdminClient()
-  const { data: currentData, error: fetchError } = await admin
-    .from('library_games')
-    .select(ADMIN_LIBRARY_GAME_COLUMNS)
-    .eq('id', id)
-    .maybeSingle()
-
-  if (fetchError) serviceError('Internal server error', 500)
-  const current = currentData as LibraryGameRow | null
-  if (!current) serviceError('Library game not found', 404)
+  let currentRows: LibraryGameRow[]
+  try {
+    currentRows = await sql`
+      SELECT id, title, category_es, category_en, players, play_time, weight, sort_order, active, img_url
+      FROM library_games
+      WHERE id = ${id}
+    ` as LibraryGameRow[]
+  } catch {
+    return serviceError('Internal server error', 500)
+  }
+  const current = currentRows[0] ?? null
+  if (!current) return serviceError('Library game not found', 404)
 
   // Validate EVERYTHING before the UPDATE below.
   const fields = resolveLibraryGameFields(body, current)
 
-  const { data, error } = await admin
-    .from('library_games')
-    .update(fields)
-    .eq('id', id)
-    .select(ADMIN_LIBRARY_GAME_COLUMNS)
-    .maybeSingle()
-
-  if (error) {
-    const pgCode = (error as { code?: string }).code
-    if (pgCode === '23514' || pgCode === '22P02' || pgCode === '23502') {
-      serviceError('Invalid library game data', 400)
-    }
-    serviceError('Internal server error', 500)
+  let rows: LibraryGameRow[]
+  try {
+    rows = await sql`
+      UPDATE library_games
+      SET
+        title = ${fields.title},
+        category_es = ${fields.category_es},
+        category_en = ${fields.category_en},
+        players = ${fields.players},
+        play_time = ${fields.play_time},
+        weight = ${fields.weight},
+        sort_order = ${fields.sort_order},
+        active = ${fields.active},
+        img_url = ${fields.img_url},
+        updated_at = now()
+      WHERE id = ${id}
+      RETURNING id, title, category_es, category_en, players, play_time, weight, sort_order, active, img_url
+    ` as LibraryGameRow[]
+  } catch (error) {
+    mapWriteError(error)
   }
-  if (!data) serviceError('Library game not found', 404)
 
-  return toAdminLibraryGame(data as LibraryGameRow)
+  const game = rows[0]
+  if (!game) return serviceError('Library game not found', 404)
+
+  return toAdminLibraryGame(game)
 }
 
 export async function deleteLibraryGame(session: SessionUser, id: string): Promise<void> {
   requireAdminSession(session)
 
-  const admin = createSupabaseServerAdminClient()
-  const { data, error } = await admin
-    .from('library_games')
-    .select('id')
-    .eq('id', id)
-    .maybeSingle()
+  let rows: Array<{ id: string }>
+  try {
+    rows = await sql`
+      DELETE FROM library_games
+      WHERE id = ${id}
+      RETURNING id
+    ` as Array<{ id: string }>
+  } catch {
+    return serviceError('Internal server error', 500)
+  }
 
-  if (error) serviceError('Internal server error', 500)
-  if (!data) serviceError('Library game not found', 404)
-
-  const { error: deleteError } = await admin.from('library_games').delete().eq('id', id)
-  if (deleteError) serviceError('Internal server error', 500)
+  if (!rows[0]) serviceError('Library game not found', 404)
 }
