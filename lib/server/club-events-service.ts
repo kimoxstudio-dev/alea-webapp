@@ -63,6 +63,20 @@ class ClubEventReadBackError extends ServiceError {
  * that aren't wrapped in a real `sql.transaction()` (Neon's HTTP driver only
  * batches queries built up-front, not ones that branch on a prior query's
  * runtime result).
+ *
+ * #334: the legacy `cancel_saved_games_for_event_block()` trigger function
+ * (`supabase/migrations/20260619000010_kim384_event_cancels_saved_games.sql`,
+ * wired via the `event_blocks_cancel_saved_games` AFTER INSERT OR UPDATE OF
+ * room_id, date trigger in `..._trigger.sql`) auto-cancelled active
+ * `saved_games` rows conflicting with a newly written `event_room_blocks`
+ * row and had no app-layer equivalent — the audit in #309 flagged it as the
+ * one real gap. `cancelActiveSavedGamesForRoomBlock` below ports it
+ * verbatim (see its own doc comment for the exact semantics preserved),
+ * called alongside the existing reservation-cancellation step per inserted
+ * block, since this function only ever inserts new `event_room_blocks` rows
+ * (never updates room_id/date on an existing row in place), which is the
+ * INSERT half of the original trigger's "AFTER INSERT OR UPDATE OF room_id,
+ * date" firing condition.
  */
 
 type EventRow = Tables<'events'>
@@ -516,25 +530,99 @@ function toAdminClubEvent(
 }
 
 /**
+ * #334 — port of the legacy `cancel_saved_games_for_event_block()` trigger
+ * function. Exact semantics preserved from the original SQL:
+ *   - Fires per newly-written `event_room_blocks` row (`NEW`), matched here
+ *     to a single inserted block (`roomId`/`date` = that row's room_id/date).
+ *   - Cancels `saved_games` rows whose `table_id` belongs to ANY table in
+ *     `roomId` — this ignores the block's own `table_id` (single-table
+ *     scoping) entirely, because the trigger predates OIR-208's per-table
+ *     event_room_blocks scoping and was never updated for it. This is a
+ *     deliberate 1:1 port of the original room-wide behavior, not the
+ *     table-scoped behavior `applyClubEventBlocksAndMaterials` uses for
+ *     reservations.
+ *   - Only rows with `status = 'active'` are eligible.
+ *   - Overlap condition: `date BETWEEN saved.start_date AND saved.end_date`
+ *     (inclusive on both ends), where `date` is the block's date — not a
+ *     start/end-time overlap, since saved_games are whole-day date ranges.
+ * The original function also took an advisory xact lock per table in the
+ * room before the UPDATE, guarding concurrent saved-game inserts/renewals
+ * inside the same DB transaction. That lock has no equivalent here: this
+ * codebase's existing reservation-cancellation step (right above this call
+ * site) carries no such lock either, and Neon's HTTP driver does not run
+ * these sequential statements inside one shared transaction to begin with.
+ *
+ * Captures each cancelled row's id (via `UPDATE ... RETURNING`) so a later
+ * failure in the same call can restore it exactly, mirroring
+ * `cancelOverlappingReservationsForRoomCapturing`. Every cancelled row's
+ * pre-cancellation status was always `'active'` (the trigger's own WHERE
+ * clause), so — unlike `CancelledReservation` — no status needs capturing.
+ */
+async function cancelActiveSavedGamesForRoomBlock(roomId: string, date: string): Promise<string[]> {
+  let cancelledRows: Array<{ id: string }>
+  try {
+    cancelledRows = await sql`
+      UPDATE saved_games AS saved
+      SET status = 'cancelled', updated_at = now()
+      FROM tables AS game_table
+      WHERE saved.table_id = game_table.id
+        AND game_table.room_id = ${roomId}
+        AND saved.status = 'active'
+        AND ${date} BETWEEN saved.start_date AND saved.end_date
+      RETURNING saved.id
+    ` as Array<{ id: string }>
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+  return cancelledRows.map((row) => row.id)
+}
+
+/**
+ * Compensating restore for `cancelActiveSavedGamesForRoomBlock` (#334,
+ * mirrors `restoreCancelledReservations`). Every row cancelled by that
+ * function was `'active'` beforehand, so restoration is a plain status flip
+ * back — no per-row status needs to be tracked, unlike reservations (which
+ * can be 'active' or 'pending'). Best-effort: errors are logged and
+ * swallowed, matching every other compensating step in this file.
+ */
+async function restoreCancelledSavedGames(cancelledIds: string[]): Promise<void> {
+  if (cancelledIds.length === 0) return
+  try {
+    await sql`
+      UPDATE saved_games
+      SET status = 'active'
+      WHERE id = ANY(${cancelledIds}) AND status = 'cancelled'
+    `
+  } catch (rollbackError) {
+    console.error('club-events-service: compensating saved-game restore failed (non-fatal):', rollbackError)
+  }
+}
+
+/**
  * Compensating rollback for `applyClubEventBlocksAndMaterials` (#304, mirrors
  * `events-service.ts`'s `rollbackPartialMultiBlockWrite`/
  * `restoreDeletedBlocksOnUpdateFailure`). If a later step in that function's
  * block/material loops fails, this restores what the call has done so far:
  * deletes any `event_room_blocks` rows this call itself inserted, reactivates
- * any reservations this call itself cancelled, and reinserts the exact rows
- * this call deleted from `event_room_blocks` / `event_equipment` (captured
- * via each DELETE's own `RETURNING`). Best-effort: errors here are logged and
- * swallowed, so the caller's original failure is always what surfaces.
+ * any reservations AND saved games this call itself cancelled, and reinserts
+ * the exact rows this call deleted from `event_room_blocks` / `event_equipment`
+ * (captured via each DELETE's own `RETURNING`). Best-effort: errors here are
+ * logged and swallowed, so the caller's original failure is always what
+ * surfaces.
  */
 async function rollbackClubEventBlocksWrite(params: {
   eventId: string
   insertedBlockIds: string[]
   cancelledReservations: CancelledReservation[]
+  cancelledSavedGameIds: string[]
   deletedBlocks: EventRoomBlockRow[]
   deletedMaterials: EventEquipmentRow[]
   insertedMaterialEquipmentIds: string[]
 }): Promise<void> {
-  const { eventId, insertedBlockIds, cancelledReservations, deletedBlocks, deletedMaterials, insertedMaterialEquipmentIds } = params
+  const {
+    eventId, insertedBlockIds, cancelledReservations, cancelledSavedGameIds, deletedBlocks, deletedMaterials,
+    insertedMaterialEquipmentIds,
+  } = params
 
   // #304 code-review (high): each compensating step below gets its own
   // try/catch instead of one shared try wrapping the whole function. These
@@ -561,6 +649,15 @@ async function rollbackClubEventBlocksWrite(params: {
     await restoreCancelledReservations(cancelledReservations)
   } catch (rollbackError) {
     console.error('club-events-service: compensating rollback failed (non-fatal) — restoring cancelled reservations:', rollbackError)
+  }
+
+  try {
+    // #334: restore any saved_games this call cancelled via
+    // cancelActiveSavedGamesForRoomBlock, same best-effort convention as the
+    // reservation restore above.
+    await restoreCancelledSavedGames(cancelledSavedGameIds)
+  } catch (rollbackError) {
+    console.error('club-events-service: compensating rollback failed (non-fatal) — restoring cancelled saved games:', rollbackError)
   }
 
   try {
@@ -667,7 +764,7 @@ async function applyClubEventBlocksAndMaterials(
       // before surfacing this failure so the event doesn't silently lose its
       // room blocks alongside a 500 for an unrelated materials-delete error.
       await rollbackClubEventBlocksWrite({
-        eventId, insertedBlockIds: [], cancelledReservations: [], deletedBlocks, deletedMaterials: [],
+        eventId, insertedBlockIds: [], cancelledReservations: [], cancelledSavedGameIds: [], deletedBlocks, deletedMaterials: [],
         insertedMaterialEquipmentIds: [],
       })
       serviceError('Internal server error', 500)
@@ -676,6 +773,7 @@ async function applyClubEventBlocksAndMaterials(
 
   const insertedBlockIds: string[] = []
   const cancelledReservations: CancelledReservation[] = []
+  const cancelledSavedGameIds: string[] = []
   const insertedMaterialEquipmentIds: string[] = []
 
   // Batch the room->table id lookups for every block that needs one (no
@@ -708,7 +806,7 @@ async function applyClubEventBlocksAndMaterials(
         // failure branch in this function, or they stay deleted with nothing
         // to put them back.
         await rollbackClubEventBlocksWrite({
-          eventId, insertedBlockIds: [], cancelledReservations: [], deletedBlocks, deletedMaterials,
+          eventId, insertedBlockIds: [], cancelledReservations: [], cancelledSavedGameIds: [], deletedBlocks, deletedMaterials,
           insertedMaterialEquipmentIds: [],
         })
         serviceError('Internal server error', 500)
@@ -777,9 +875,17 @@ async function applyClubEventBlocksAndMaterials(
           }
           cancelledReservations.push(...cancelledRows)
         }
+
+        // #334: port of the legacy cancel_saved_games_for_event_block()
+        // trigger — cancels active saved_games conflicting with this block,
+        // room-wide (not table-scoped; see cancelActiveSavedGamesForRoomBlock's
+        // doc comment for why this intentionally differs from the reservation
+        // cancellation above).
+        const cancelledSavedGames = await cancelActiveSavedGamesForRoomBlock(block.room_id, block.date)
+        cancelledSavedGameIds.push(...cancelledSavedGames)
       } catch (error) {
         await rollbackClubEventBlocksWrite({
-          eventId, insertedBlockIds, cancelledReservations, deletedBlocks, deletedMaterials,
+          eventId, insertedBlockIds, cancelledReservations, cancelledSavedGameIds, deletedBlocks, deletedMaterials,
           insertedMaterialEquipmentIds,
         })
         if (error instanceof ServiceError) throw error
@@ -799,7 +905,7 @@ async function applyClubEventBlocksAndMaterials(
         insertedMaterialEquipmentIds.push(material.equipment_id)
       } catch (error) {
         await rollbackClubEventBlocksWrite({
-          eventId, insertedBlockIds, cancelledReservations, deletedBlocks, deletedMaterials,
+          eventId, insertedBlockIds, cancelledReservations, cancelledSavedGameIds, deletedBlocks, deletedMaterials,
           insertedMaterialEquipmentIds,
         })
         mapEventWriteError(error)
