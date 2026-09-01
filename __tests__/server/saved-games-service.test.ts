@@ -450,8 +450,8 @@ describe('saved games service', () => {
     ).rejects.toMatchObject({ message: 'SAVED_GAME_CONFLICT', statusCode: 409 })
   })
 
-  it('maps a check-constraint violation (23514) on create to 400', async () => {
-    createInsertError = neonDbError('23514', 'check constraint violated')
+  it('maps a check-constraint violation (23514) on saved_games_max_duration to SAVED_GAME_MAX_DURATION/400 without leaking error.message (#301 round-4 fix)', async () => {
+    createInsertError = neonDbError('23514', 'new row for relation "saved_games" violates check constraint "saved_games_max_duration"', 'saved_games_max_duration')
     const { createSavedGameForSession } = await import('@/lib/server/saved-games-service')
     await expect(
       createSavedGameForSession(member, {
@@ -459,7 +459,31 @@ describe('saved games service', () => {
         startDate: '2026-06-20',
         endDate: '2026-09-19',
       }),
-    ).rejects.toMatchObject({ message: 'check constraint violated', statusCode: 400 })
+    ).rejects.toMatchObject({ message: 'SAVED_GAME_MAX_DURATION', statusCode: 400 })
+  })
+
+  it('maps a check-constraint violation (23514) on saved_games_valid_dates to SAVED_GAME_INVALID_RANGE/400 without leaking error.message (#301 round-4 fix)', async () => {
+    createInsertError = neonDbError('23514', 'new row for relation "saved_games" violates check constraint "saved_games_valid_dates"', 'saved_games_valid_dates')
+    const { createSavedGameForSession } = await import('@/lib/server/saved-games-service')
+    await expect(
+      createSavedGameForSession(member, {
+        tableId: 'double',
+        startDate: '2026-06-20',
+        endDate: '2026-09-19',
+      }),
+    ).rejects.toMatchObject({ message: 'SAVED_GAME_INVALID_RANGE', statusCode: 400 })
+  })
+
+  it('maps a check-constraint violation (23514) on an unrecognized constraint name to a generic 500, never leaking error.message (#301 round-4 fix)', async () => {
+    createInsertError = neonDbError('23514', 'new row violates check constraint "some_future_constraint"', 'some_future_constraint')
+    const { createSavedGameForSession } = await import('@/lib/server/saved-games-service')
+    await expect(
+      createSavedGameForSession(member, {
+        tableId: 'double',
+        startDate: '2026-06-20',
+        endDate: '2026-09-19',
+      }),
+    ).rejects.toMatchObject({ message: 'Internal server error', statusCode: 500 })
   })
 
   it('allows renewal only during the final fifteen days and creates the next period', async () => {
@@ -729,6 +753,69 @@ describe('saved games service', () => {
     })
     expect(attendancesState).toHaveLength(1)
     expect(savedGamesState[0]!.attendance_count).toBe(0)
+  })
+
+  it('treats a 23505 scoped to the attendance constraint as the expected idempotent conflict, even without pre-existing state (#301 round-4 fix)', async () => {
+    // Forces the INSERT handler itself to throw a 23505 explicitly scoped to
+    // saved_game_attendances_play_reservation_id_key, independent of the
+    // `attendancesState` duplicate-detection branch already covered above —
+    // isolates isAttendanceConflict()'s constraint-name check itself.
+    savedGamesState.push(
+      makeSavedGame({
+        id: 'sg-1',
+        table_id: 'double',
+        user_id: 'user-1',
+        start_date: '2026-06-01',
+        end_date: '2026-08-31',
+      }),
+    )
+    attendanceInsertError = neonDbError('23505', 'duplicate key', 'saved_game_attendances_play_reservation_id_key')
+    const { recordSavedGameAttendance } = await import('@/lib/server/saved-games-service')
+    await expect(
+      recordSavedGameAttendance({
+        id: 'r-scoped',
+        table_id: 'double',
+        user_id: 'user-1',
+        date: '2026-06-19',
+        start_time: '18:00',
+        end_time: '20:00',
+        surface: 'top' as const,
+        status: 'active' as const,
+        activated_at: '',
+        created_at: '',
+      }),
+    ).resolves.toBeUndefined()
+  })
+
+  it('does NOT swallow a 23505 on an unrelated constraint as the attendance conflict — propagates as a 500 (#301 round-4 fix, key regression)', async () => {
+    savedGamesState.push(
+      makeSavedGame({
+        id: 'sg-1',
+        table_id: 'double',
+        user_id: 'user-1',
+        start_date: '2026-06-01',
+        end_date: '2026-08-31',
+      }),
+    )
+    // Same SQLSTATE (23505) but a different constraint name — before the
+    // #301 round-4 fix, `error.code === '23505'` alone would have swallowed
+    // this as the expected idempotent conflict and silently returned.
+    attendanceInsertError = neonDbError('23505', 'unrelated unique violation', 'some_other_unique_constraint')
+    const { recordSavedGameAttendance } = await import('@/lib/server/saved-games-service')
+    await expect(
+      recordSavedGameAttendance({
+        id: 'r-unrelated',
+        table_id: 'double',
+        user_id: 'user-1',
+        date: '2026-06-19',
+        start_time: '18:00',
+        end_time: '20:00',
+        surface: 'top' as const,
+        status: 'active' as const,
+        activated_at: '',
+        created_at: '',
+      }),
+    ).rejects.toMatchObject({ message: 'Internal server error', statusCode: 500 })
   })
 
   it('does not record attendance for a non-top or non-active reservation', async () => {

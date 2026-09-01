@@ -586,6 +586,50 @@ describe('ReservationDialog', () => {
     })
   })
 
+  it('displays the bottomReservationConflict i18n message when saved-game creation throws SAVED_GAME_BOTTOM_RESERVATION_CONFLICT (#301 round-4 fix)', async () => {
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    const removableTable = { ...mockTable, type: 'removable_top' as const }
+    mockSavedGameMutateAsync.fn = vi.fn().mockRejectedValueOnce({
+      message: 'SAVED_GAME_BOTTOM_RESERVATION_CONFLICT',
+      statusCode: 409,
+    })
+
+    render(<ReservationDialog table={removableTable} open onClose={vi.fn()} />)
+
+    await user.click(screen.getByRole('radio', { name: 'savedGame.name' }))
+    await user.click(screen.getByRole('button', { name: 'savedGame.create' }))
+
+    await waitFor(() => {
+      const alert = screen.getByRole('alert')
+      expect(alert).toBeInTheDocument()
+      // next-intl is mocked to `(key) => key`, so the rendered text is the
+      // raw i18n key path — this proves the new branch (added ahead of the
+      // pre-existing SAVED_GAME_CONFLICT branch) picks the distinct
+      // `bottomReservationConflict` key and not `conflict` or `generic`.
+      expect(alert).toHaveTextContent('savedGame.errors.bottomReservationConflict')
+    })
+  })
+
+  it('falls through to the generic SAVED_GAME_CONFLICT message for a plain conflict code (regression guard for the new branch ordering)', async () => {
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    const removableTable = { ...mockTable, type: 'removable_top' as const }
+    mockSavedGameMutateAsync.fn = vi.fn().mockRejectedValueOnce({
+      message: 'SAVED_GAME_CONFLICT',
+      statusCode: 409,
+    })
+
+    render(<ReservationDialog table={removableTable} open onClose={vi.fn()} />)
+
+    await user.click(screen.getByRole('radio', { name: 'savedGame.name' }))
+    await user.click(screen.getByRole('button', { name: 'savedGame.create' }))
+
+    await waitFor(() => {
+      const alert = screen.getByRole('alert')
+      expect(alert).toBeInTheDocument()
+      expect(alert).toHaveTextContent('savedGame.errors.conflict')
+    })
+  })
+
   it('creates a Saved Game from dates without selecting a time range', async () => {
     const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
     const removableTable = { ...mockTable, type: 'removable_top' as const }
