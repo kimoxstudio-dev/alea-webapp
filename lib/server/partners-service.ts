@@ -1,17 +1,38 @@
 import 'server-only'
+import { sql } from '@/lib/db/client'
+import { NeonDbError } from '@neondatabase/serverless'
 import type { AdminPartner, Partner } from '@/lib/types'
-import { createSupabaseServerClient, createSupabaseServerAdminClient } from '@/lib/supabase/server'
 import { serviceError } from '@/lib/server/service-error'
-import type { Tables } from '@/lib/supabase/types'
 import type { SessionUser } from '@/lib/server/auth'
 import { validateOptionalUrl } from '@/lib/validations/url'
 
-type PartnerRow = Tables<'partners'>
+/**
+ * Raw-SQL Neon port of the partners service (#307), matching the established
+ * style from `library-games-service.ts` (#306), `equipment-service.ts`
+ * (#305) and `events-service.ts` (#303).
+ *
+ * `public.partners` (see `lib/db/schema/016_partners.sql` and the legacy
+ * `supabase/migrations/20260704000002_oir204_partners_table.sql`) carries no
+ * `CREATE TRIGGER`, no CHECK constraint, and no other table implicitly
+ * referencing it — it is a standalone table with no DB-side business logic
+ * to port into the app layer. The `23514`/`22P02`/`23502` Postgres error
+ * mapping below is retained defensively (NOT NULL / type-cast failures
+ * still surface as `23502`/`22P02`), even though there is currently no CHECK
+ * constraint that would raise `23514`.
+ */
 
-const PUBLIC_PARTNER_COLUMNS = 'id, name, img_url, link_url, desc_es, desc_en, sort_order'
-const ADMIN_PARTNER_COLUMNS = 'id, name, img_url, link_url, desc_es, desc_en, sort_order, active'
+type PartnerRow = {
+  id: string
+  name: string
+  img_url: string
+  link_url: string | null
+  desc_es: string | null
+  desc_en: string | null
+  sort_order: number
+  active: boolean
+}
 
-function toPartner(row: Pick<PartnerRow, 'id' | 'name' | 'img_url' | 'link_url' | 'desc_es' | 'desc_en' | 'sort_order'>): Partner {
+function toPartner(row: Omit<PartnerRow, 'active'>): Partner {
   return {
     id: row.id,
     name: row.name,
@@ -29,22 +50,24 @@ function toAdminPartner(row: PartnerRow): AdminPartner {
 
 /**
  * Public read of active partners (colaboradores) for the landing page,
- * ordered the same way the board arranges them in the dashboard. Uses the
- * RLS-respecting client since this is unauthenticated, publicly readable
- * content — the "partners_select_active" RLS policy additionally restricts
- * anon/authenticated visibility to active rows.
+ * ordered the same way the board arranges them in the dashboard.
+ * `partners` has no RLS in Neon (that's a Supabase-only concept), so the
+ * "active"-only visibility that the old "partners_select_active" RLS policy
+ * enforced is now an explicit `WHERE active = true` here.
  */
 export async function listPartners(): Promise<Partner[]> {
-  const supabase = await createSupabaseServerClient()
-  const { data, error } = await supabase
-    .from('partners')
-    .select(PUBLIC_PARTNER_COLUMNS)
-    .order('sort_order', { ascending: true })
-    .order('name', { ascending: true })
+  let rows: Array<Omit<PartnerRow, 'active'>>
+  try {
+    rows = await sql`
+      SELECT id, name, img_url, link_url, desc_es, desc_en, sort_order
+      FROM partners
+      WHERE active = true
+      ORDER BY sort_order ASC, name ASC
+    ` as Array<Omit<PartnerRow, 'active'>>
+  } catch {
+    return serviceError('Internal server error', 500)
+  }
 
-  if (error) serviceError('Internal server error', 500)
-
-  const rows = (data ?? []) as PartnerRow[]
   return rows.map((row) => toPartner(row))
 }
 
@@ -197,20 +220,31 @@ function resolvePartnerFields(body: PartnerInput, current: PartnerRow | null): P
   }
 }
 
+function mapWriteError(error: unknown): never {
+  if (
+    error instanceof NeonDbError &&
+    (error.code === '23514' || error.code === '22P02' || error.code === '23502')
+  ) {
+    serviceError('Invalid partner data', 400)
+  }
+  serviceError('Internal server error', 500)
+}
+
 /** Admin read of every partner (active + inactive), ordered by sort_order. */
 export async function listAdminPartners(session: SessionUser): Promise<AdminPartner[]> {
   requireAdminSession(session)
 
-  const admin = createSupabaseServerAdminClient()
-  const { data, error } = await admin
-    .from('partners')
-    .select(ADMIN_PARTNER_COLUMNS)
-    .order('sort_order', { ascending: true })
-    .order('name', { ascending: true })
+  let rows: PartnerRow[]
+  try {
+    rows = await sql`
+      SELECT id, name, img_url, link_url, desc_es, desc_en, sort_order, active
+      FROM partners
+      ORDER BY sort_order ASC, name ASC
+    ` as PartnerRow[]
+  } catch {
+    return serviceError('Internal server error', 500)
+  }
 
-  if (error) serviceError('Internal server error', 500)
-
-  const rows = (data ?? []) as PartnerRow[]
   return rows.map((row) => toAdminPartner(row))
 }
 
@@ -220,74 +254,89 @@ export async function createPartner(session: SessionUser, body: PartnerInput): P
   // Validate EVERYTHING — fields and the URL allowlist — before any DB write.
   const fields = resolvePartnerFields(body, null)
 
-  const admin = createSupabaseServerAdminClient()
-  const { data, error } = await admin
-    .from('partners')
-    .insert(fields)
-    .select(ADMIN_PARTNER_COLUMNS)
-    .maybeSingle()
-
-  if (error) {
-    const pgCode = (error as { code?: string }).code
-    if (pgCode === '23514' || pgCode === '22P02' || pgCode === '23502') {
-      serviceError('Invalid partner data', 400)
-    }
-    serviceError('Internal server error', 500)
+  let rows: PartnerRow[]
+  try {
+    rows = await sql`
+      INSERT INTO partners (name, img_url, link_url, desc_es, desc_en, sort_order, active)
+      VALUES (
+        ${fields.name},
+        ${fields.img_url},
+        ${fields.link_url},
+        ${fields.desc_es},
+        ${fields.desc_en},
+        ${fields.sort_order},
+        ${fields.active}
+      )
+      RETURNING id, name, img_url, link_url, desc_es, desc_en, sort_order, active
+    ` as PartnerRow[]
+  } catch (error) {
+    mapWriteError(error)
   }
-  if (!data) serviceError('Internal server error', 500)
 
-  return toAdminPartner(data as PartnerRow)
+  const partner = rows[0]
+  if (!partner) return serviceError('Internal server error', 500)
+
+  return toAdminPartner(partner)
 }
 
 export async function updatePartner(session: SessionUser, id: string, body: PartnerInput): Promise<AdminPartner> {
   requireAdminSession(session)
 
-  const admin = createSupabaseServerAdminClient()
-  const { data: currentData, error: fetchError } = await admin
-    .from('partners')
-    .select(ADMIN_PARTNER_COLUMNS)
-    .eq('id', id)
-    .maybeSingle()
-
-  if (fetchError) serviceError('Internal server error', 500)
-  const current = currentData as PartnerRow | null
-  if (!current) serviceError('Partner not found', 404)
+  let currentRows: PartnerRow[]
+  try {
+    currentRows = await sql`
+      SELECT id, name, img_url, link_url, desc_es, desc_en, sort_order, active
+      FROM partners
+      WHERE id = ${id}
+    ` as PartnerRow[]
+  } catch {
+    return serviceError('Internal server error', 500)
+  }
+  const current = currentRows[0] ?? null
+  if (!current) return serviceError('Partner not found', 404)
 
   // Validate EVERYTHING before the UPDATE below.
   const fields = resolvePartnerFields(body, current)
 
-  const { data, error } = await admin
-    .from('partners')
-    .update(fields)
-    .eq('id', id)
-    .select(ADMIN_PARTNER_COLUMNS)
-    .maybeSingle()
-
-  if (error) {
-    const pgCode = (error as { code?: string }).code
-    if (pgCode === '23514' || pgCode === '22P02' || pgCode === '23502') {
-      serviceError('Invalid partner data', 400)
-    }
-    serviceError('Internal server error', 500)
+  let rows: PartnerRow[]
+  try {
+    rows = await sql`
+      UPDATE partners
+      SET
+        name = ${fields.name},
+        img_url = ${fields.img_url},
+        link_url = ${fields.link_url},
+        desc_es = ${fields.desc_es},
+        desc_en = ${fields.desc_en},
+        sort_order = ${fields.sort_order},
+        active = ${fields.active},
+        updated_at = now()
+      WHERE id = ${id}
+      RETURNING id, name, img_url, link_url, desc_es, desc_en, sort_order, active
+    ` as PartnerRow[]
+  } catch (error) {
+    mapWriteError(error)
   }
-  if (!data) serviceError('Partner not found', 404)
 
-  return toAdminPartner(data as PartnerRow)
+  const partner = rows[0]
+  if (!partner) return serviceError('Partner not found', 404)
+
+  return toAdminPartner(partner)
 }
 
 export async function deletePartner(session: SessionUser, id: string): Promise<void> {
   requireAdminSession(session)
 
-  const admin = createSupabaseServerAdminClient()
-  const { data, error } = await admin
-    .from('partners')
-    .select('id')
-    .eq('id', id)
-    .maybeSingle()
+  let rows: Array<{ id: string }>
+  try {
+    rows = await sql`
+      DELETE FROM partners
+      WHERE id = ${id}
+      RETURNING id
+    ` as Array<{ id: string }>
+  } catch {
+    return serviceError('Internal server error', 500)
+  }
 
-  if (error) serviceError('Internal server error', 500)
-  if (!data) serviceError('Partner not found', 404)
-
-  const { error: deleteError } = await admin.from('partners').delete().eq('id', id)
-  if (deleteError) serviceError('Internal server error', 500)
+  if (!rows[0]) serviceError('Partner not found', 404)
 }
