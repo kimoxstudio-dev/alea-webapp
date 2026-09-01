@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "project": "alea",
+  "files": {
+    ".claude/agents/kx-developer.md": "93550cb858fc88a9",
+    ".claude/agents/kx-documenter.md": "928695648be1409d",
+    ".claude/agents/kx-reviewer.md": "c323e2860e8059ff",
+    ".claude/agents/kx-tech-debt.md": "8a84af903cd62f53",
+    ".claude/skills/kx-cli/SKILL.md": "ad62919d74ce9780",
+    ".claude/skills/kx-commit/SKILL.md": "e827bfc2266203ef",
+    ".claude/skills/kx-design/SKILL.md": "5541779b24b3647e",
+    ".claude/skills/kx-design/assets/tokens.css": "a6ffbca56f9fafe2",
+    ".claude/skills/kx-design/references/diagnose.md": "cd562c5c7caa9702",
+    ".claude/skills/kx-design/references/systems.md": "357938569b2d5ca0",
+    ".claude/skills/kx-design/references/techniques.md": "b1b15b4b41bed453",
+    ".claude/skills/kx-nextjs/SKILL.md": "cdb9fd79267327c7",
+    ".claude/skills/kx-reporting/SKILL.md": "2007f7788c1f2b13",
+    ".claude/skills/kx-session/SKILL.md": "7589235f79d44ec0",
+    ".claude/skills/kx-standards/SKILL.md": "dfbc09b424647c5a",
+    ".claude/skills/kx-style/SKILL.md": "23ddc7baf7e9ba40",
+    ".claude/skills/kx-tailwind/SKILL.md": "0e2045748f70bc88",
+    ".claude/skills/kx-typescript/SKILL.md": "c19494095f7c34f9",
+    ".claude/skills/kx-update-readme/SKILL.md": "e2dca1d7ae2143c9",
+    ".claude/skills/kx-ux/SKILL.md": "72b1ae3924f07001",
+    ".claude/skills/kx-ux/references/guidelines.md": "d8383b13cb5d3e92",
+    ".claude/skills/kx-vercel/GUIDE.md": "3f56323afa5c6441",
+    ".claude/skills/kx-vercel/SKILL.md": "5527a343cd257d42",
+    ".env.op": "2c08620c17325596"
+  }
+}

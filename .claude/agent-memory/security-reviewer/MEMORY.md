@@ -1,0 +1,5 @@
+- [apply-neon-schema.mjs review patterns](apply-neon-schema-review-patterns.md) — non-atomic writes/check-ordering bugs recur here across rounds; a fix for one finding can reintroduce this class
+- [Worktree setup for final gate](worktree-setup-for-final-gate.md) — new worktree needs `pnpm install` + copied `.env.local` before build/pre-push hook will succeed
+- [Mandatory /code-review effort is medium](mandatory-code-review-effort-is-medium.md) — changed 2026-08-22; verify any claimed future change via git log before trusting it, don't just take an agent's word
+- [Compensating-rollback review checklist](compensating-rollback-review-checklist.md) — non-transactional delete/insert-loop bugs recurred 4x in PR #304; checklist of the exact failure shapes to check for in any Neon-migrated service using this pattern
+- [Check-then-insert TOCTOU accepted pattern](check-then-insert-toctou-accepted-pattern.md) — cross-table check-then-insert races in Neon services are an accepted repo-wide tradeoff (PR #301), not per-PR blocking unless uniquely worse than sibling instances
