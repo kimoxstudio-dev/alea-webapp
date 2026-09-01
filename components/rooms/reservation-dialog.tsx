@@ -142,9 +142,11 @@ export function ReservationDialog({ table, open, onClose }: ReservationDialogPro
           ? 'savedGame.errors.maxDuration'
           : code === 'SAVED_GAME_EVENT_CONFLICT'
             ? 'savedGame.errors.eventConflict'
-            : code === 'SAVED_GAME_CONFLICT'
-              ? 'savedGame.errors.conflict'
-              : 'errors.generic'
+            : code === 'SAVED_GAME_BOTTOM_RESERVATION_CONFLICT'
+              ? 'savedGame.errors.bottomReservationConflict'
+              : code === 'SAVED_GAME_CONFLICT'
+                ? 'savedGame.errors.conflict'
+                : 'errors.generic'
         setError(t(key))
       }
       return
