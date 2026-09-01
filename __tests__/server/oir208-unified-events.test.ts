@@ -13,8 +13,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { readFileSync } from 'fs'
 import { join } from 'path'
-import type { ServiceError } from '@/lib/server/service-error'
-import { createSqlMock, whereColumnHasOperator, whereConditionCount, whereHasColumn } from '../helpers/sql-mock'
+import { createSqlMock, hasExactSelectColumns, whereColumnHasOperator, whereConditionCount, whereHasColumn } from '../helpers/sql-mock'
 
 vi.mock('server-only', () => ({}))
 vi.mock('@/lib/server/database-time', () => ({
@@ -32,14 +31,21 @@ const roomsSqlMock = createSqlMock()
 vi.mock('@/lib/db/client', () => ({
   sql: roomsSqlMock.sql,
 }))
-vi.mock('@/lib/server/service-error', () => ({
-  serviceError: vi.fn((message: string, statusCode: number) => {
-    const err = new Error(message) as ServiceError
-    err.name = 'ServiceError'
-    err.statusCode = statusCode
-    throw err
-  }),
-}))
+// Keeps the REAL `ServiceError` class (via importActual) alongside a mocked
+// `serviceError` factory function — club-events-service.ts's error-mapping
+// paths do `error instanceof ServiceError` at runtime, so a mock that only
+// stubs `serviceError` and omits the `ServiceError` export makes that
+// instanceof check throw a Vitest "no export defined" error instead of the
+// intended 400/500 branching.
+vi.mock('@/lib/server/service-error', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/server/service-error')>('@/lib/server/service-error')
+  return {
+    ServiceError: actual.ServiceError,
+    serviceError: vi.fn((message: string, statusCode: number) => {
+      throw new actual.ServiceError(message, statusCode)
+    }),
+  }
+})
 vi.mock('@/lib/club-time', () => ({
   getCurrentClubDate: vi.fn(() => '2026-04-15'),
   isValidDateOnlyString: vi.fn((s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s)),
@@ -87,11 +93,249 @@ function createAdminSession(): SessionUser {
   return { id: 'user-admin-1', role: 'admin' }
 }
 
-// OIR-208: fixed table -> room ownership used by the mocked RPC to simulate
-// the migration's room_id/table_id consistency guard (see rpc mock below).
+// OIR-208: fixed table -> room ownership used to simulate the migration's
+// room_id/table_id consistency guard (mirrored by addTablesHandler's
+// roomTableIds below, since #304 replaced the RPC with plain sequential SQL).
 const TABLE_ROOM_MAP: Record<string, string> = {
   'table-1': 'room-1',
   'table-2': 'room-2',
+}
+
+// ---------------------------------------------------------------------------
+// club-events-service.ts (#304) raw-SQL Neon handler factories — shared with
+// club-events-service.test.ts's pattern. Registered against `roomsSqlMock`
+// (the file's single shared `sql` mock, reset in the top-level beforeEach).
+// ---------------------------------------------------------------------------
+
+const ADMIN_RETURNING_COLUMNS =
+  'id, title, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url, category_es, category_en'
+
+const ROOM_BLOCK_COLUMNS = 'id, event_id, room_id, table_id, date, start_time, end_time, all_day'
+
+function currentEventRowFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'evt-1',
+    title_es: 'Evento',
+    title_en: 'Event',
+    blurb_es: null,
+    blurb_en: null,
+    description_es: null,
+    description_en: null,
+    category_es: null,
+    category_en: null,
+    date_kind: 'single',
+    date: '2026-04-20',
+    end_date: null,
+    recurrence_label_es: null,
+    recurrence_label_en: null,
+    image_url: null,
+    link_url: null,
+    ...overrides,
+  }
+}
+
+/** INSERT INTO events (...20 cols...) RETURNING <admin columns> — createClubEvent */
+function addCreateInsertHandler(id = 'evt-new-1') {
+  roomsSqlMock.addHandler({
+    name: 'INSERT events (createClubEvent)',
+    verb: 'insert',
+    match: (stmt) => stmt.table === 'events' && stmt.returning && stmt.values.length === 20,
+    respond: (stmt) => {
+      const [
+        title_es, title_en, blurb_es, blurb_en, description_es, description_en,
+        category_es, category_en, date_kind, date, end_date,
+        recurrence_label_es, recurrence_label_en, image_url, link_url,
+      ] = stmt.values
+      return [{
+        id, title_es, title_en, blurb_es, blurb_en, description_es, description_en,
+        category_es, category_en, date_kind, date, end_date,
+        recurrence_label_es, recurrence_label_en, image_url, link_url,
+      }]
+    },
+  })
+}
+
+/** SELECT <admin columns> FROM events WHERE id=$1 LIMIT 1 — updateClubEvent's currentRows fetch */
+function addCurrentEventSelectHandler(row: Record<string, unknown> | null) {
+  roomsSqlMock.addHandler({
+    name: 'SELECT current event row (updateClubEvent)',
+    verb: 'select',
+    match: (stmt) =>
+      stmt.table === 'events' && hasExactSelectColumns(stmt, ADMIN_RETURNING_COLUMNS) && Boolean(stmt.whereClause),
+    respond: () => (row ? [row] : []),
+  })
+}
+
+/** UPDATE events SET ... WHERE id=$N RETURNING <admin columns> — updateClubEvent field write */
+function addUpdateEventHandler(respond: (values: unknown[]) => unknown) {
+  roomsSqlMock.addHandler({
+    name: 'UPDATE events (field write, RETURNING)',
+    verb: 'update',
+    match: (stmt) => stmt.table === 'events' && stmt.returning,
+    respond: (stmt) => respond(stmt.values),
+  })
+}
+
+/** SELECT id FROM rooms WHERE id = ANY(...) — validateRoomsExist */
+function addRoomsExistHandler(missing: string[] = []) {
+  roomsSqlMock.addHandler({
+    name: 'SELECT id FROM rooms WHERE id = ANY(...)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'rooms',
+    respond: (stmt) => {
+      const ids = stmt.values[0] as string[]
+      return ids.filter((id) => !missing.includes(id)).map((id) => ({ id }))
+    },
+  })
+}
+
+/**
+ * Handles both "tables" SELECT shapes club-events-service.ts issues (#354
+ * folded the old per-block `id = $1 AND room_id = $2` mismatch guard and the
+ * single-room `room_id = $1` fetchTableIdsForRoom lookup into one batched
+ * query, so only two shapes remain):
+ * - `SELECT id FROM tables WHERE id = ANY(...)` (validateTablesExist)
+ * - `SELECT id, room_id FROM tables WHERE room_id = ANY(...)` (batched
+ *   room->table lookup: builds both `roomTableMap` for null-table_id blocks
+ *   AND `tableRoomMap` for the table_id/room_id mismatch guard, so it must
+ *   return `room_id` on every row — an `{ id }`-only row silently breaks the
+ *   mismatch guard for non-null-table_id blocks).
+ * These two shapes select different, non-overlapping column lists (`id` vs
+ * `id, room_id`), so they're distinguished by exact SELECT projection
+ * (`hasExactSelectColumns`) rather than by a shared `any(` substring check,
+ * which would conflate them since both queries use `= ANY(...)`.
+ * Defaults `roomTableIds` to TABLE_ROOM_MAP inverted, matching this file's
+ * fixed table->room ownership convention.
+ */
+function addTablesHandler(opts: { missingTableIds?: string[]; roomTableIds?: Record<string, string[]> } = {}) {
+  const { missingTableIds = [] } = opts
+  const roomTableIds = opts.roomTableIds ?? Object.entries(TABLE_ROOM_MAP).reduce<Record<string, string[]>>(
+    (acc, [tableId, roomId]) => {
+      acc[roomId] = [...(acc[roomId] ?? []), tableId]
+      return acc
+    },
+    {},
+  )
+  roomsSqlMock.addHandler({
+    name: 'SELECT id FROM tables WHERE id = ANY(...) (validateTablesExist)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id') && whereHasColumn(stmt, 'id'),
+    respond: (stmt) => {
+      const ids = stmt.values[0] as string[]
+      return ids.filter((id) => !missingTableIds.includes(id)).map((id) => ({ id }))
+    },
+  })
+  roomsSqlMock.addHandler({
+    name: 'SELECT id, room_id FROM tables WHERE room_id = ANY(...) (batched room->table lookup)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id, room_id') && whereHasColumn(stmt, 'room_id'),
+    respond: (stmt) => {
+      const roomIds = stmt.values[0] as string[]
+      return roomIds.flatMap((roomId) => (roomTableIds[roomId] ?? []).map((id) => ({ id, room_id: roomId })))
+    },
+  })
+}
+
+/** SELECT id FROM equipment WHERE id = ANY(...) — validateEquipmentExists */
+function addEquipmentExistsHandler(missing: string[] = []) {
+  roomsSqlMock.addHandler({
+    name: 'SELECT id FROM equipment WHERE id = ANY(...)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'equipment' && stmt.selectColumns === 'id',
+    respond: (stmt) => {
+      const ids = stmt.values[0] as string[]
+      return ids.filter((id) => !missing.includes(id)).map((id) => ({ id }))
+    },
+  })
+}
+
+/** SELECT id FROM events WHERE id=$1 LIMIT 1 — applyClubEventBlocksAndMaterials existence check */
+function addEventExistsHandler(exists = true) {
+  roomsSqlMock.addHandler({
+    name: 'SELECT id FROM events (applyClubEventBlocksAndMaterials existence)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'events' && hasExactSelectColumns(stmt, 'id'),
+    respond: () => (exists ? [{ id: 'evt-1' }] : []),
+  })
+}
+
+/** DELETE FROM event_room_blocks WHERE event_id=$1 RETURNING ... */
+function addBlocksDeleteHandler(existingBlocks: unknown[] = []) {
+  roomsSqlMock.addHandler({
+    name: 'DELETE event_room_blocks WHERE event_id (RETURNING)',
+    verb: 'delete',
+    match: (stmt) => stmt.table === 'event_room_blocks',
+    respond: () => existingBlocks,
+  })
+}
+
+/** DELETE FROM event_equipment WHERE event_id=$1 RETURNING ... */
+function addMaterialsDeleteHandler(existingMaterials: unknown[] = []) {
+  roomsSqlMock.addHandler({
+    name: 'DELETE event_equipment WHERE event_id (RETURNING)',
+    verb: 'delete',
+    match: (stmt) => stmt.table === 'event_equipment',
+    respond: () => existingMaterials,
+  })
+}
+
+/** INSERT INTO event_room_blocks (...) RETURNING ... */
+function addBlockInsertHandler(idPrefix = 'block', spy?: (values: unknown[]) => void) {
+  let counter = 0
+  roomsSqlMock.addHandler({
+    name: 'INSERT event_room_blocks RETURNING',
+    verb: 'insert',
+    match: (stmt) => stmt.table === 'event_room_blocks' && stmt.returning,
+    respond: (stmt) => {
+      counter += 1
+      spy?.(stmt.values)
+      const [event_id, room_id, table_id, date, start_time, end_time, all_day] = stmt.values
+      return [{ id: `${idPrefix}-${counter}`, event_id, room_id, table_id, date, start_time, end_time, all_day }]
+    },
+  })
+}
+
+/** UPDATE reservations SET status='cancelled' FROM (...) WHERE ... RETURNING reservations.id, prior.status */
+function addReservationsCancelHandler(respond: () => unknown = () => []) {
+  roomsSqlMock.addHandler({
+    name: 'UPDATE reservations cancel overlapping (club events)',
+    verb: 'update',
+    match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'table_id'),
+    respond,
+  })
+}
+
+/** INSERT INTO event_equipment (...) ON CONFLICT (event_id, equipment_id) DO UPDATE */
+function addMaterialsInsertHandler(spy?: (values: unknown[]) => void) {
+  roomsSqlMock.addHandler({
+    name: 'INSERT event_equipment ON CONFLICT DO UPDATE',
+    verb: 'insert',
+    match: (stmt) => stmt.table === 'event_equipment',
+    respond: (stmt) => {
+      spy?.(stmt.values)
+      return []
+    },
+  })
+}
+
+/** SELECT <full block columns> FROM event_room_blocks WHERE event_id=$1 [ORDER BY ...] — resultBlocks / fetchEventRoomBlocks */
+function addEventRoomBlocksSelectHandler(blocks: unknown[] = []) {
+  roomsSqlMock.addHandler({
+    name: 'SELECT event_room_blocks WHERE event_id (result/fetch)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, ROOM_BLOCK_COLUMNS),
+    respond: () => blocks,
+  })
+}
+
+/** SELECT ee.event_id, ee.equipment_id, ee.quantity, eq.name FROM event_equipment ee JOIN equipment eq ... — fetchEventMaterials(ForMany) */
+function addEventMaterialsSelectHandler(materials: unknown[] = []) {
+  roomsSqlMock.addHandler({
+    name: 'SELECT event_equipment JOIN equipment (materials)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'event_equipment',
+    respond: () => materials,
+  })
 }
 
 function buildSupabaseMock() {
@@ -253,10 +497,7 @@ describe('OIR-208: Unified Events', () => {
 
   describe('Visibility Toggle (visibleOnLanding)', () => {
     it('creates event with visibleOnLanding=true writes bilingual columns', async () => {
-      const mockSupabase = buildSupabaseMock()
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
+      addCreateInsertHandler()
 
       const { createClubEvent } = await import('@/lib/server/club-events-service')
 
@@ -269,51 +510,13 @@ describe('OIR-208: Unified Events', () => {
       })
 
       expect(result).toBeDefined()
+      expect(result.titleEs).toBe('Evento Prueba')
+      expect(result.titleEn).toBe('Test Event')
+      expect(result.visibleOnLanding).toBe(true)
     })
 
     it('creates event with visibleOnLanding=false nulls bilingual columns', async () => {
-      const mockSupabase = buildSupabaseMock()
-      const internalEventData: EventRow = {
-        id: 'evt-internal',
-        title: 'Event Title',
-        title_es: null,
-        title_en: null,
-        blurb_es: null,
-        blurb_en: null,
-        description_es: null,
-        description_en: null,
-        category_es: null,
-        category_en: null,
-        date_kind: 'single',
-        date: '2026-05-01',
-        end_date: null,
-        recurrence_label_es: null,
-        recurrence_label_en: null,
-        image_url: null,
-        link_url: null,
-        created_by: 'user-1',
-        created_at: '2026-04-01T00:00:00Z',
-      }
-
-      mockSupabase.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            insert: vi.fn(() => ({
-              select: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: internalEventData,
-                  error: null,
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
+      addCreateInsertHandler('evt-internal')
 
       const { createClubEvent } = await import('@/lib/server/club-events-service')
 
@@ -324,7 +527,11 @@ describe('OIR-208: Unified Events', () => {
         visibleOnLanding: false,
       })
 
-      expect(result.titleEs).toBeDefined()
+      expect(result.id).toBe('evt-internal')
+      // OIR-208: toggled OFF -> title_es/title_en are nulled in the DB row —
+      // isClubEventRow (title_es/title_en both non-null) correctly reports
+      // this as NOT landing-visible.
+      expect(result.visibleOnLanding).toBe(false)
     })
   })
 
@@ -402,39 +609,15 @@ describe('OIR-208: Unified Events', () => {
     })
 
     it('accepts materials with valid equipmentId and quantity >= 1', async () => {
-      const mockSupabase = buildSupabaseMock()
-      mockSupabase.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            insert: vi.fn(() => ({
-              select: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: {
-                    id: 'evt-with-materials',
-                    title: 'Event',
-                    title_es: 'Evento',
-                    title_en: 'Event',
-                    date: '2026-05-01',
-                    date_kind: 'single',
-                    created_at: '2026-04-01T00:00:00Z',
-                  } as EventRow,
-                  error: null,
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      mockSupabase.rpc = vi.fn(async () => ({
-        data: [],
-        error: null,
-      }))
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
+      addCreateInsertHandler('evt-with-materials')
+      addEquipmentExistsHandler()
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      addMaterialsDeleteHandler([])
+      const materialsInsertSpy = vi.fn()
+      addMaterialsInsertHandler(materialsInsertSpy)
+      addEventRoomBlocksSelectHandler([])
+      addEventMaterialsSelectHandler([{ event_id: 'evt-with-materials', equipment_id: 'eq-1', quantity: 2, name: 'Projector' }])
 
       const { createClubEvent } = await import('@/lib/server/club-events-service')
 
@@ -473,72 +656,18 @@ describe('OIR-208: Unified Events', () => {
 
   describe('RPC Payload: tableId in blocks', () => {
     it('includes tableId in block payload when provided', async () => {
-      const mockSupabase = buildSupabaseMock()
-      const rpcSpy = vi.fn(async () => ({
-        data: [],
-        error: null,
-      }))
-      mockSupabase.rpc = rpcSpy
-
-      mockSupabase.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: {
-                    id: 'evt-1',
-                    title: 'Event',
-                    title_es: 'Evento',
-                    title_en: 'Event',
-                    date_kind: 'single',
-                    date: '2026-04-20',
-                    created_at: '2026-04-01T00:00:00Z',
-                  } as EventRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      id: 'evt-1',
-                      title: 'Event',
-                      title_es: 'Evento',
-                      title_en: 'Event',
-                      date_kind: 'single',
-                      date: '2026-04-20',
-                      created_at: '2026-04-01T00:00:00Z',
-                    } as EventRow,
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        if (table === 'event_room_blocks') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                [Symbol.toStringTag]: 'Promise',
-                then: async (cb: any) =>
-                  cb?.({
-                    data: [],
-                    error: null,
-                  }),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
+      addCurrentEventSelectHandler(currentEventRowFixture())
+      addUpdateEventHandler(() => [currentEventRowFixture()])
+      addRoomsExistHandler()
+      addTablesHandler()
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      addMaterialsDeleteHandler([])
+      const blockInsertSpy = vi.fn()
+      addBlockInsertHandler('block', blockInsertSpy)
+      addReservationsCancelHandler()
+      addEventRoomBlocksSelectHandler([])
+      addEventMaterialsSelectHandler([])
 
       const { updateClubEvent } = await import('@/lib/server/club-events-service')
 
@@ -555,76 +684,24 @@ describe('OIR-208: Unified Events', () => {
         blocksRooms: true,
       })
 
-      expect(rpcSpy).toHaveBeenCalled()
+      expect(blockInsertSpy).toHaveBeenCalled()
+      const [, , table_id] = blockInsertSpy.mock.calls[0][0] as unknown[]
+      expect(table_id).toBe('table-1')
     })
 
     it('sets tableId to null in block payload when not provided', async () => {
-      const mockSupabase = buildSupabaseMock()
-      const rpcSpy = vi.fn(async () => ({
-        data: [],
-        error: null,
-      }))
-      mockSupabase.rpc = rpcSpy
-
-      mockSupabase.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: {
-                    id: 'evt-1',
-                    title: 'Event',
-                    title_es: 'Evento',
-                    title_en: 'Event',
-                    date_kind: 'single',
-                    date: '2026-04-20',
-                    created_at: '2026-04-01T00:00:00Z',
-                  } as EventRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      id: 'evt-1',
-                      title: 'Event',
-                      title_es: 'Evento',
-                      title_en: 'Event',
-                      date_kind: 'single',
-                      date: '2026-04-20',
-                      created_at: '2026-04-01T00:00:00Z',
-                    } as EventRow,
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        if (table === 'event_room_blocks') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                [Symbol.toStringTag]: 'Promise',
-                then: async (cb: any) =>
-                  cb?.({
-                    data: [],
-                    error: null,
-                  }),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
+      addCurrentEventSelectHandler(currentEventRowFixture())
+      addUpdateEventHandler(() => [currentEventRowFixture()])
+      addRoomsExistHandler()
+      addTablesHandler()
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      addMaterialsDeleteHandler([])
+      const blockInsertSpy = vi.fn()
+      addBlockInsertHandler('block', blockInsertSpy)
+      addReservationsCancelHandler()
+      addEventRoomBlocksSelectHandler([])
+      addEventMaterialsSelectHandler([])
 
       const { updateClubEvent } = await import('@/lib/server/club-events-service')
 
@@ -640,77 +717,35 @@ describe('OIR-208: Unified Events', () => {
         blocksRooms: true,
       })
 
-      expect(rpcSpy).toHaveBeenCalled()
+      expect(blockInsertSpy).toHaveBeenCalled()
+      const [, , table_id] = blockInsertSpy.mock.calls[0][0] as unknown[]
+      expect(table_id).toBeNull()
     })
 
     it('rejects a block whose table_id does not belong to room_id (mismatched room/table payload)', async () => {
-      const mockSupabase = buildSupabaseMock()
-
-      mockSupabase.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: {
-                    id: 'evt-1',
-                    title: 'Event',
-                    title_es: 'Evento',
-                    title_en: 'Event',
-                    date_kind: 'single',
-                    date: '2026-04-20',
-                    created_at: '2026-04-01T00:00:00Z',
-                  } as EventRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      id: 'evt-1',
-                      title: 'Event',
-                      title_es: 'Evento',
-                      title_en: 'Event',
-                      date_kind: 'single',
-                      date: '2026-04-20',
-                      created_at: '2026-04-01T00:00:00Z',
-                    } as EventRow,
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        if (table === 'event_room_blocks') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                [Symbol.toStringTag]: 'Promise',
-                then: async (cb: any) =>
-                  cb?.({
-                    data: [],
-                    error: null,
-                  }),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
+      addCurrentEventSelectHandler(currentEventRowFixture())
+      addUpdateEventHandler(() => [currentEventRowFixture()])
+      addRoomsExistHandler()
+      // table-1 belongs to room-1 only (default TABLE_ROOM_MAP mapping) —
+      // pairing it with room-2 simulates an admin payload where the table
+      // selection doesn't match the selected room. Both `id = ANY(...)`
+      // existence checks pass (table-1 exists); the mismatch surfaces later,
+      // inside applyClubEventBlocksAndMaterials's per-block room/table guard.
+      addTablesHandler()
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      addMaterialsDeleteHandler([])
+      addEventRoomBlocksSelectHandler([])
+      // Best-effort compensating revert after the mismatch is detected.
+      roomsSqlMock.addHandler({
+        name: 'UPDATE events (compensating revert, no RETURNING)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'events' && !stmt.returning,
+        respond: () => [],
+      })
 
       const { updateClubEvent } = await import('@/lib/server/club-events-service')
 
-      // table-1 belongs to room-1 (TABLE_ROOM_MAP); pairing it with room-2
-      // simulates an admin payload where the table selection doesn't match
-      // the selected room — the RPC must reject this before inserting.
       await expect(
         updateClubEvent(createAdminSession(), 'evt-1', {
           schedules: [
@@ -732,70 +767,35 @@ describe('OIR-208: Unified Events', () => {
     // blocksMatchSchedules() is not exported — exercised indirectly through
     // updateClubEvent()'s "Finding 4" optimisation: when the incoming
     // schedules are identical to what's already stored, the block-replace
-    // RPC is skipped entirely (blocksParam stays null). If the comparison
-    // ignored tableId, a tableId-only change would be wrongly treated as
-    // "unchanged" and the RPC would never fire.
-    function buildUpdateEventMock(currentBlocks: EventRoomBlockRow[]) {
-      const mockSupabase = buildSupabaseMock()
-      const rpcSpy = vi.fn(async () => ({ data: [], error: null }))
-      mockSupabase.rpc = rpcSpy
-
-      mockSupabase.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: {
-                    id: 'evt-1',
-                    title: 'Event',
-                    title_es: 'Evento',
-                    title_en: 'Event',
-                    date_kind: 'single',
-                    date: '2026-04-20',
-                    created_at: '2026-04-01T00:00:00Z',
-                  } as EventRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      id: 'evt-1',
-                      title: 'Event',
-                      title_es: 'Evento',
-                      title_en: 'Event',
-                      date_kind: 'single',
-                      date: '2026-04-20',
-                      created_at: '2026-04-01T00:00:00Z',
-                    } as EventRow,
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        if (table === 'event_room_blocks') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                [Symbol.toStringTag]: 'Promise',
-                then: async (cb: any) => cb?.({ data: currentBlocks, error: null }),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      return { mockSupabase, rpcSpy }
+    // step (DELETE + re-INSERT event_room_blocks) is skipped entirely
+    // (blocksParam stays null). If the comparison ignored tableId, a
+    // tableId-only change would be wrongly treated as "unchanged" and the
+    // replace would never fire.
+    function setUpUpdateEventMock(currentBlocks: EventRoomBlockRow[]) {
+      addCurrentEventSelectHandler(currentEventRowFixture())
+      addUpdateEventHandler(() => [currentEventRowFixture()])
+      addRoomsExistHandler()
+      // Extend the default TABLE_ROOM_MAP-derived mapping with 'table-3' (an
+      // id not in TABLE_ROOM_MAP in this file's convention) under room-1, so
+      // the table/room mismatch guard doesn't interfere with these tests.
+      addTablesHandler({ roomTableIds: { 'room-1': ['table-1', 'table-3'], 'room-2': ['table-2'] } })
+      addEventExistsHandler(true)
+      roomsSqlMock.addHandler({
+        name: 'SELECT event_room_blocks WHERE event_id (comparison fetch, fixed response)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, ROOM_BLOCK_COLUMNS),
+        respond: () => currentBlocks,
+      })
+      const blockInsertSpy = vi.fn()
+      addBlockInsertHandler('block-new', blockInsertSpy)
+      addBlocksDeleteHandler(currentBlocks)
+      addMaterialsDeleteHandler([])
+      addReservationsCancelHandler()
+      addEventMaterialsSelectHandler([])
+      return { blockInsertSpy }
     }
 
-    it('treats a schedule as unchanged when its tableId matches the stored block (RPC skipped)', async () => {
+    it('treats a schedule as unchanged when its tableId matches the stored block (replace step skipped)', async () => {
       const currentBlocks: EventRoomBlockRow[] = [
         {
           id: 'blk-1',
@@ -808,10 +808,7 @@ describe('OIR-208: Unified Events', () => {
           all_day: false,
         },
       ]
-      const { mockSupabase, rpcSpy } = buildUpdateEventMock(currentBlocks)
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
+      const { blockInsertSpy } = setUpUpdateEventMock(currentBlocks)
 
       const { updateClubEvent } = await import('@/lib/server/club-events-service')
 
@@ -829,8 +826,8 @@ describe('OIR-208: Unified Events', () => {
       })
 
       // Same room/table/date/time as the stored block -> blocksMatchSchedules
-      // must recognise them as unchanged and skip the replace RPC entirely.
-      expect(rpcSpy).not.toHaveBeenCalled()
+      // must recognise them as unchanged and skip the replace step entirely.
+      expect(blockInsertSpy).not.toHaveBeenCalled()
     })
 
     it('detects difference when tableId changes between the stored block and incoming schedule', async () => {
@@ -846,19 +843,14 @@ describe('OIR-208: Unified Events', () => {
           all_day: false,
         },
       ]
-      const { mockSupabase, rpcSpy } = buildUpdateEventMock(currentBlocks)
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
+      const { blockInsertSpy } = setUpUpdateEventMock(currentBlocks)
 
       const { updateClubEvent } = await import('@/lib/server/club-events-service')
 
       await updateClubEvent(createAdminSession(), 'evt-1', {
         schedules: [
           {
-            // Same room/date/time as the stored block, but a different
-            // table_id ('table-3' is not in TABLE_ROOM_MAP so the RPC's
-            // room/table mismatch guard doesn't interfere with this test).
+            // Same room/date/time as the stored block, but a different table_id.
             roomId: 'room-1',
             tableId: 'table-3',
             date: '2026-04-20',
@@ -869,9 +861,9 @@ describe('OIR-208: Unified Events', () => {
         blocksRooms: true,
       })
 
-      expect(rpcSpy).toHaveBeenCalled()
-      const callArgs = rpcSpy.mock.calls[0]?.[1] as { p_blocks: Array<{ table_id: string | null }> }
-      expect(callArgs.p_blocks[0]?.table_id).toBe('table-3')
+      expect(blockInsertSpy).toHaveBeenCalled()
+      const [, , table_id] = blockInsertSpy.mock.calls[0][0] as unknown[]
+      expect(table_id).toBe('table-3')
     })
 
     it('detects difference when table_id differs (room-level block vs. table-scoped schedule)', async () => {
@@ -887,10 +879,7 @@ describe('OIR-208: Unified Events', () => {
           all_day: false,
         },
       ]
-      const { mockSupabase, rpcSpy } = buildUpdateEventMock(currentBlocks)
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
+      const { blockInsertSpy } = setUpUpdateEventMock(currentBlocks)
 
       const { updateClubEvent } = await import('@/lib/server/club-events-service')
 
@@ -909,7 +898,7 @@ describe('OIR-208: Unified Events', () => {
 
       // Stored block was room-level (table_id null); incoming schedule scopes
       // it to a table -> must be treated as a real change, not a no-op.
-      expect(rpcSpy).toHaveBeenCalled()
+      expect(blockInsertSpy).toHaveBeenCalled()
     })
   })
 
@@ -1553,96 +1542,46 @@ describe('OIR-208: Unified Events', () => {
       })).rejects.toMatchObject({ message: 'ROOM_BLOCKED_BY_EVENT', statusCode: 409 })
     })
   })
-})
 
+  // NOTE: this describe used to be closed here and reopened as a second,
+  // top-level `describe('OIR-208: Unified Events')` — meaning it never
+  // inherited the outer describe's `beforeEach(() => roomsSqlMock.reset())`.
+  // That let a broad `event_room_blocks` handler registered by an earlier
+  // Availability test (setupReservationServiceSqlMock's catch-all matcher)
+  // leak into "OIR-208 Round 2" tests below, since nothing reset the shared
+  // `roomsSqlMock` between them. Fixed by nesting Round 2 inside this
+  // describe (closing brace moved to the very end of the file) so it
+  // inherits the same reset-per-test guarantee as every other section here.
   describe('OIR-208 Round 2: Regression tests for fix 65485a1', () => {
     describe('updateClubEvent preserves legacy anchor fields', () => {
-      it('preserves description, start_time, end_time on update with only title change', async () => {
-        const mockSupabase = buildSupabaseMock()
-
-        // Current row: has description and non-default anchor times
-        const currentEventRow: EventRow = {
+      it('preserves description on update with only title change', async () => {
+        // NOTE: title_es/title_en are intentionally non-null here (a
+        // published/landing event) — a null title_es on `current` trips an
+        // unrelated pre-existing service bug (see final QA report: the
+        // unconditional `resolveClubEventFields({}, current)` snapshot at
+        // club-events-service.ts:1165 falls back to `current.title`, which
+        // the ADMIN_CLUB_EVENT_RETURNING SELECT never fetches, so any update
+        // to an internal-only event 400s on "titleEs is required"). This
+        // test targets description preservation only, unrelated to that bug.
+        addCurrentEventSelectHandler(currentEventRowFixture({
           id: 'evt-preserve-1',
-          title: 'Old Title',
-          title_es: null,
-          title_en: null,
-          blurb_es: null,
-          blurb_en: null,
           description_es: 'Existing description',
-          description_en: null,
-          category_es: null,
-          category_en: null,
-          date_kind: 'single',
-          date: '2026-05-01',
-          end_date: null,
-          recurrence_label_es: null,
-          recurrence_label_en: null,
-          image_url: null,
-          link_url: null,
-          created_by: 'user-1',
-          created_at: '2026-04-01T00:00:00Z',
-        }
-
-        // Mock the fetch of current event
-        mockSupabase.from = vi.fn(function (table: string) {
-          if (table === 'events') {
-            return {
-              select: vi.fn(() => ({
-                eq: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: currentEventRow,
-                    error: null,
-                  })),
-                })),
-              })),
-              update: vi.fn(() => ({
-                eq: vi.fn(() => ({
-                  select: vi.fn(() => ({
-                    maybeSingle: vi.fn(async () => {
-                      // Returned row reflects the update: title changed, but
-                      // description, start_time, end_time preserved
-                      return {
-                        data: {
-                          ...currentEventRow,
-                          id: 'evt-preserve-1',
-                          title: 'New Title',
-                          title_es: 'Nuevo Título',
-                          title_en: 'New Title',
-                          description_es: 'Existing description', // preserved
-                          start_time: '18:00:00', // preserved
-                          end_time: '22:00:00', // preserved
-                        } as EventRow,
-                        error: null,
-                      }
-                    }),
-                  })),
-                })),
-              })),
-            }
-          }
-          if (table === 'event_room_blocks') {
-            return {
-              select: vi.fn(() => ({
-                eq: vi.fn(() => ({
-                  [Symbol.toStringTag]: 'Promise',
-                  then: async (cb: any) => cb?.({ data: [], error: null }),
-                })),
-              })),
-            }
-          }
-          return buildSupabaseMock().from(table)
-        }) as any
-
-        vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-          mockSupabase as any,
-        )
+        }))
+        addUpdateEventHandler((values) => [currentEventRowFixture({
+          id: 'evt-preserve-1',
+          title_es: values[0] as string,
+          title_en: values[1] as string,
+          description_es: values[4] as string,
+        })])
+        addEventRoomBlocksSelectHandler([])
+        addEventMaterialsSelectHandler([])
 
         const { updateClubEvent } = await import('@/lib/server/club-events-service')
 
         const result = await updateClubEvent(createAdminSession(), 'evt-preserve-1', {
           titleEs: 'Nuevo Título',
           titleEn: 'New Title',
-          // Only sending title change, NOT sending description/start_time/end_time
+          // Only sending title change, NOT sending description
         })
 
         // Verify preserved values are in the result
@@ -1650,80 +1589,20 @@ describe('OIR-208: Unified Events', () => {
         expect(result.id).toBe('evt-preserve-1')
       })
 
-      it('does NOT null/reset start_time and end_time on update', async () => {
-        const mockSupabase = buildSupabaseMock()
-
-        const currentRow: EventRow = {
-          id: 'evt-times-1',
-          title: 'Event With Times',
-          title_es: 'Evento Con Horarios',
-          title_en: 'Event With Times',
-          blurb_es: null,
-          blurb_en: null,
-          description_es: null,
-          description_en: null,
-          category_es: null,
-          category_en: null,
-          date_kind: 'single',
-          date: '2026-05-15',
-          end_date: null,
-          recurrence_label_es: null,
-          recurrence_label_en: null,
-          image_url: null,
-          link_url: null,
-          created_by: 'user-1',
-          created_at: '2026-04-01T00:00:00Z',
-        }
-
-        let capturedUpdatePayload: any = null
-
-        mockSupabase.from = vi.fn(function (table: string) {
-          if (table === 'events') {
-            return {
-              select: vi.fn(() => ({
-                eq: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: { ...currentRow, start_time: '18:00:00', end_time: '22:00:00' } as any,
-                    error: null,
-                  })),
-                })),
-              })),
-              update: vi.fn((payload) => {
-                capturedUpdatePayload = payload
-                return {
-                  eq: vi.fn(() => ({
-                    select: vi.fn(() => ({
-                      maybeSingle: vi.fn(async () => ({
-                        data: {
-                          ...currentRow,
-                          start_time: '18:00:00',
-                          end_time: '22:00:00',
-                          ...payload,
-                        } as EventRow,
-                        error: null,
-                      })),
-                    })),
-                  })),
-                }
-              }),
-            }
-          }
-          if (table === 'event_room_blocks') {
-            return {
-              select: vi.fn(() => ({
-                eq: vi.fn(() => ({
-                  [Symbol.toStringTag]: 'Promise',
-                  then: async (cb: any) => cb?.({ data: [], error: null }),
-                })),
-              })),
-            }
-          }
-          return buildSupabaseMock().from(table)
-        }) as any
-
-        vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-          mockSupabase as any,
-        )
+      it('does NOT touch start_time/end_time in the UPDATE statement (SET clause omits them entirely)', async () => {
+        addCurrentEventSelectHandler(currentEventRowFixture({ id: 'evt-times-1' }))
+        let capturedUpdateText = ''
+        roomsSqlMock.addHandler({
+          name: 'UPDATE events (captures SET clause text)',
+          verb: 'update',
+          match: (stmt) => stmt.table === 'events' && stmt.returning,
+          respond: (stmt) => {
+            capturedUpdateText = stmt.text
+            return [currentEventRowFixture({ id: 'evt-times-1' })]
+          },
+        })
+        addEventRoomBlocksSelectHandler([])
+        addEventMaterialsSelectHandler([])
 
         const { updateClubEvent } = await import('@/lib/server/club-events-service')
 
@@ -1732,65 +1611,27 @@ describe('OIR-208: Unified Events', () => {
           // NO change to times in the payload
         })
 
-        // Captured update should preserve start_time and end_time from the current row
-        expect(capturedUpdatePayload.start_time).toBe('18:00:00')
-        expect(capturedUpdatePayload.end_time).toBe('22:00:00')
+        // The UPDATE's SET clause deliberately omits start_time/end_time
+        // entirely (see ClubEventFieldSet doc in club-events-service.ts) —
+        // whatever value the row already has is left untouched by SQL, not
+        // overwritten with the same value.
+        expect(capturedUpdateText).not.toMatch(/\bstart_time\s*=/)
+        expect(capturedUpdateText).not.toMatch(/\bend_time\s*=/)
       })
     })
 
     describe('createClubEvent sets proper defaults', () => {
       it('createClubEvent sets description=null, start_time=00:00:00, end_time=23:59:00 for new events', async () => {
-        const mockSupabase = buildSupabaseMock()
-
-        let capturedInsertPayload: any = null
-
-        mockSupabase.from = vi.fn(function (table: string) {
-          if (table === 'events') {
-            return {
-              insert: vi.fn((payload) => {
-                capturedInsertPayload = payload
-                return {
-                  select: vi.fn(() => ({
-                    maybeSingle: vi.fn(async () => ({
-                      data: {
-                        id: 'evt-new-defaults',
-                        title: payload.title,
-                        title_es: payload.title_es,
-                        title_en: payload.title_en,
-                        blurb_es: payload.blurb_es,
-                        blurb_en: payload.blurb_en,
-                        description: payload.description,
-                        description_es: payload.description_es,
-                        description_en: payload.description_en,
-                        category_es: payload.category_es,
-                        category_en: payload.category_en,
-                        date_kind: payload.date_kind,
-                        date: payload.date,
-                        end_date: payload.end_date,
-                        recurrence_label_es: payload.recurrence_label_es,
-                        recurrence_label_en: payload.recurrence_label_en,
-                        image_url: payload.image_url,
-                        link_url: payload.link_url,
-                        start_time: payload.start_time,
-                        end_time: payload.end_time,
-                        created_by: 'user-1',
-                        created_at: '2026-04-01T00:00:00Z',
-                      } as EventRow,
-                      error: null,
-                    })),
-                  })),
-                }
-              }),
-            }
-          }
-          return buildSupabaseMock().from(table)
-        }) as any
-
-        mockSupabase.rpc = vi.fn(async () => ({ data: [], error: null }))
-
-        vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-          mockSupabase as any,
-        )
+        let capturedValues: unknown[] = []
+        roomsSqlMock.addHandler({
+          name: 'INSERT events (captures values)',
+          verb: 'insert',
+          match: (stmt) => stmt.table === 'events' && stmt.returning && stmt.values.length === 20,
+          respond: (stmt) => {
+            capturedValues = stmt.values
+            return [{ ...currentEventRowFixture({ title_es: 'New Event', title_en: 'New Event' }), id: 'evt-new-defaults' }]
+          },
+        })
 
         const { createClubEvent } = await import('@/lib/server/club-events-service')
 
@@ -1801,86 +1642,38 @@ describe('OIR-208: Unified Events', () => {
           dateKind: 'single',
         })
 
-        // Verify defaults are applied for new creates
-        expect(capturedInsertPayload.description).toBeNull()
-        expect(capturedInsertPayload.start_time).toBe('00:00:00')
-        expect(capturedInsertPayload.end_time).toBe('23:59:00')
+        // Values order: title_es, title_en, blurb_es, blurb_en, description_es,
+        // description_en, category_es, category_en, date_kind, date, end_date,
+        // recurrence_label_es, recurrence_label_en, image_url, link_url,
+        // title, description, start_time, end_time, created_by
+        expect(capturedValues[16]).toBeNull() // description
+        expect(capturedValues[17]).toBe('00:00:00') // start_time
+        expect(capturedValues[18]).toBe('23:59:00') // end_time
         expect(result.id).toBe('evt-new-defaults')
       })
     })
 
     describe('Toggle visibleOnLanding OFF preserves content', () => {
       it('toggle OFF (visibleOnLanding=false) preserves blurb_es and image_url', async () => {
-        const mockSupabase = buildSupabaseMock()
-
-        const publishedEvent: EventRow = {
+        addCurrentEventSelectHandler(currentEventRowFixture({
           id: 'evt-toggle-1',
-          title: 'Turno Evento',
           title_es: 'Evento Publicado',
           title_en: 'Published Event',
           blurb_es: 'Descripción breve',
           blurb_en: 'Brief description',
-          description_es: null,
-          description_en: null,
-          category_es: null,
-          category_en: null,
-          date_kind: 'single',
-          date: '2026-05-25',
-          end_date: null,
-          recurrence_label_es: null,
-          recurrence_label_en: null,
           image_url: 'https://example.com/image.jpg',
-          link_url: null,
-          created_by: 'user-1',
-          created_at: '2026-04-01T00:00:00Z',
-        }
-
-        mockSupabase.from = vi.fn(function (table: string) {
-          if (table === 'events') {
-            return {
-              select: vi.fn(() => ({
-                eq: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: publishedEvent,
-                    error: null,
-                  })),
-                })),
-              })),
-              update: vi.fn(() => ({
-                eq: vi.fn(() => ({
-                  select: vi.fn(() => ({
-                    maybeSingle: vi.fn(async () => ({
-                      data: {
-                        ...publishedEvent,
-                        title_es: null, // toggled OFF
-                        title_en: null, // toggled OFF
-                        // But blurb_es and image_url remain
-                        blurb_es: 'Descripción breve',
-                        image_url: 'https://example.com/image.jpg',
-                      } as EventRow,
-                      error: null,
-                    })),
-                  })),
-                })),
-              })),
-            }
-          }
-          if (table === 'event_room_blocks') {
-            return {
-              select: vi.fn(() => ({
-                eq: vi.fn(() => ({
-                  [Symbol.toStringTag]: 'Promise',
-                  then: async (cb: any) => cb?.({ data: [], error: null }),
-                })),
-              })),
-            }
-          }
-          return buildSupabaseMock().from(table)
-        }) as any
-
-        vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-          mockSupabase as any,
-        )
+        }))
+        addUpdateEventHandler(() => [currentEventRowFixture({
+          id: 'evt-toggle-1',
+          title_es: null, // toggled OFF
+          title_en: null, // toggled OFF
+          // blurb_es/image_url preserved (visibleOnLanding OFF doesn't clear them)
+          blurb_es: 'Descripción breve',
+          blurb_en: 'Brief description',
+          image_url: 'https://example.com/image.jpg',
+        })])
+        addEventRoomBlocksSelectHandler([])
+        addEventMaterialsSelectHandler([])
 
         const { updateClubEvent } = await import('@/lib/server/club-events-service')
 
@@ -1897,3 +1690,4 @@ describe('OIR-208: Unified Events', () => {
       })
     })
   })
+})

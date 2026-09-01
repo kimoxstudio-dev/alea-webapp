@@ -1,13 +1,19 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import type { ServiceError } from '@/lib/server/service-error'
-import { createSqlMock, hasExactSelectColumns } from '../helpers/sql-mock'
+import { createSqlMock, hasExactSelectColumns, whereHasColumn } from '../helpers/sql-mock'
 
 /**
- * CLUB EVENTS SERVICE TEST COVERAGE (OIR-203)
+ * CLUB EVENTS SERVICE TEST COVERAGE (OIR-203, raw-SQL Neon port #304)
  *
  * Tests for admin CRUD operations on public club events
  * Implementation: lib/server/club-events-service.ts
+ *
+ * Rewritten off the old Supabase-client/`apply_club_event_room_blocks` RPC
+ * mocks to the raw-SQL Neon implementation (#304) — that RPC no longer
+ * exists; `applyClubEventBlocksAndMaterials` in club-events-service.ts now
+ * runs the same behavior as plain sequential `sql` statements. Uses the
+ * shared `createSqlMock` helper (#332), same pattern as events-service.test.ts
+ * (#303).
  *
  * Key scenarios tested:
  * - createClubEvent with bilingual titles and optional room blocks (admin-only)
@@ -22,249 +28,34 @@ import { createSqlMock, hasExactSelectColumns } from '../helpers/sql-mock'
 
 vi.mock('server-only', () => ({}))
 
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseServerAdminClient: vi.fn(),
-  createSupabaseServerClient: vi.fn(),
-}))
-
-vi.mock('@/lib/server/service-error', () => ({
-  serviceError: vi.fn((message: string, statusCode: number) => {
-    const err = new Error(message) as ServiceError
-    err.name = 'ServiceError'
-    err.statusCode = statusCode
-    throw err
-  }),
-}))
+// Keeps the REAL `ServiceError` class (via importActual) alongside a mocked
+// `serviceError` factory function — club-events-service.ts's error-mapping
+// paths do `error instanceof ServiceError` at runtime, so a mock that only
+// stubs `serviceError` and omits the `ServiceError` export makes that
+// instanceof check throw a Vitest "no export defined" error instead of the
+// intended 400/500 branching.
+vi.mock('@/lib/server/service-error', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/server/service-error')>('@/lib/server/service-error')
+  return {
+    ServiceError: actual.ServiceError,
+    serviceError: vi.fn((message: string, statusCode: number) => {
+      throw new actual.ServiceError(message, statusCode)
+    }),
+  }
+})
 
 vi.mock('@/lib/club-time', () => ({
   getCurrentClubDate: vi.fn(() => '2026-04-15'),
   isValidDateOnlyString: vi.fn((s: string) => /^\d{4}-\d{2}-\d{2}$/.test(s)),
 }))
 
-// club-events-service.ts (#304, still Supabase-based) reuses two functions
-// from events-service.ts (#303, migrated to raw Neon SQL) — `deleteEventCascade`
-// (called by deleteClubEvent) and `listEvents` (re-exported/tested directly
-// here). Both now hit the tagged-template `sql` client from lib/db/client.ts
-// instead of the Supabase admin client, so a Neon sql-mock is needed
-// alongside this file's existing Supabase mocks for those two code paths.
-const eventsServiceSqlMock = createSqlMock()
-vi.mock('@/lib/db/client', () => ({ sql: eventsServiceSqlMock.sql }))
-
-type EventRow = {
-  id: string
-  title: string
-  title_es: string | null
-  title_en: string | null
-  blurb_es: string | null
-  blurb_en: string | null
-  description_es: string | null
-  description_en: string | null
-  category_es: string | null
-  category_en: string | null
-  date_kind: string | null
-  date: string
-  end_date: string | null
-  recurrence_label_es: string | null
-  recurrence_label_en: string | null
-  image_url: string | null
-  link_url: string | null
-  created_by: string | null
-  created_at: string
-}
-
-type EventRoomBlockRow = {
-  id: string
-  event_id: string
-  room_id: string
-  date: string
-  start_time: string
-  end_time: string
-  all_day: boolean
-}
+const sqlMock = createSqlMock()
+vi.mock('@/lib/db/client', () => ({ sql: sqlMock.sql }))
 
 type SessionUser = {
   id: string
   role: 'admin' | 'member'
   email?: string
-}
-
-function buildSupabaseMock() {
-  return {
-    from: vi.fn(function (table: string) {
-      const state = { table, filters: {} as any, updateData: {} as any, data: null as any }
-
-      return {
-        select: vi.fn(function (cols?: string) {
-          return {
-            not: vi.fn(function (col: string, op: string, val: any) {
-              state.filters[`${col}_${op}`] = val
-              return {
-                not: vi.fn(function (col2: string, op2: string, val2: any) {
-                  state.filters[`${col2}_${op2}`] = val2
-                  return {
-                    order: vi.fn(function (col: string, opts: any) {
-                      return {
-                        [Symbol.toStringTag]: 'Promise',
-                        then: async (onFulfilled?: any) => {
-                          if (table === 'events') {
-                            // Return mock club events for listing
-                            const mockData = [
-                              {
-                                id: 'evt-upcoming-1',
-                                title: 'Tornero 2026',
-                                title_es: 'Tornero 2026',
-                                title_en: 'Tournament 2026',
-                                blurb_es: 'Torneo amistoso',
-                                blurb_en: 'Friendly tournament',
-                                description_es: null,
-                                description_en: null,
-                                category_es: 'Torneo',
-                                category_en: 'Tournament',
-                                date_kind: 'single',
-                                date: '2026-05-01',
-                                end_date: null,
-                                recurrence_label_es: null,
-                                recurrence_label_en: null,
-                                image_url: 'https://example.com/tournament.png',
-                                link_url: null,
-                                created_by: 'user-1',
-                                created_at: '2026-04-01T00:00:00Z',
-                              },
-                            ]
-                            return onFulfilled?.({ data: mockData, error: null })
-                          }
-                          return onFulfilled?.({ data: [], error: null })
-                        },
-                      }
-                    }),
-                  }
-                }),
-              }
-            }),
-            eq: vi.fn(function (col: string, val: any) {
-              state.filters[col] = val
-              return {
-                maybeSingle: vi.fn(async () => {
-                  if (table === 'events' && state.filters.id === 'evt-1') {
-                    return {
-                      data: {
-                        id: 'evt-1',
-                        title: 'Old Event',
-                        title_es: 'Evento Antiguo',
-                        title_en: 'Old Event',
-                        blurb_es: null,
-                        blurb_en: null,
-                        description_es: null,
-                        description_en: null,
-                        category_es: null,
-                        category_en: null,
-                        date_kind: 'single',
-                        date: '2026-04-20',
-                        end_date: null,
-                        recurrence_label_es: null,
-                        recurrence_label_en: null,
-                        image_url: null,
-                        link_url: null,
-                        created_by: 'user-1',
-                        created_at: '2026-04-01T00:00:00Z',
-                      },
-                      error: null,
-                    }
-                  }
-                  return { data: null, error: null }
-                }),
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({ data: null, error: null })),
-                })),
-              }
-            }),
-            in: vi.fn(function (col: string, vals: any[]) {
-              state.filters[col] = vals
-              return {
-                [Symbol.toStringTag]: 'Promise',
-                then: async (onFulfilled?: any) => {
-                  if (table === 'event_room_blocks') {
-                    return onFulfilled?.({ data: [], error: null })
-                  }
-                  if (table === 'rooms') {
-                    // Default: every referenced room id "exists" so tests that
-                    // don't specifically exercise the room-validation path
-                    // (PR #149 review, createClubEvent) keep passing unmodified.
-                    return onFulfilled?.({ data: vals.map((id: string) => ({ id })), error: null })
-                  }
-                  return onFulfilled?.({ data: [], error: null })
-                },
-              }
-            }),
-            or: vi.fn(function (filter: string) {
-              return {
-                order: vi.fn(function () {
-                  return {
-                    order: vi.fn(async () => ({
-                      data: [],
-                      error: null,
-                    })),
-                  }
-                }),
-              }
-            }),
-            order: vi.fn(function () {
-              return {
-                order: vi.fn(() => ({
-                  [Symbol.toStringTag]: 'Promise',
-                  then: async (onFulfilled?: any) => {
-                    return onFulfilled?.({ data: [], error: null })
-                  },
-                })),
-              }
-            }),
-          }
-        }),
-        insert: vi.fn(function (data: any) {
-          state.data = data
-          return {
-            select: vi.fn(() => ({
-              maybeSingle: vi.fn(async () => ({
-                data: {
-                  id: 'evt-new-1',
-                  ...data,
-                } as EventRow,
-                error: null,
-              })),
-            })),
-          }
-        }),
-        update: vi.fn(function (data: any) {
-          state.updateData = data
-          return {
-            eq: vi.fn(function (col: string, val: any) {
-              state.filters[col] = val
-              return {
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      id: state.filters.id,
-                      ...state.updateData,
-                    } as EventRow,
-                    error: null,
-                  })),
-                })),
-              }
-            }),
-          }
-        }),
-        delete: vi.fn(function () {
-          return {
-            eq: vi.fn(async () => ({
-              data: null,
-              error: null,
-            })),
-          }
-        }),
-      }
-    }),
-    rpc: vi.fn(),
-  }
 }
 
 function createAdminSession(): SessionUser {
@@ -295,23 +86,331 @@ async function loadEventsService() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Shared column-list constants (mirror lib/server/club-events-service.ts and
+// lib/server/events-service.ts exactly — used to disambiguate the several
+// SELECT/RETURNING shapes issued against the "events" table).
+// ---------------------------------------------------------------------------
+
+const ADMIN_RETURNING_COLUMNS =
+  'id, title, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url, category_es, category_en'
+
+// listAdminClubEvents's own SELECT is a separate literal column list (not
+// built from ADMIN_CLUB_EVENT_RETURNING). PR #354 review: it must also
+// select `title` — toAdminClubEvent falls back to it via
+// `row.title_es ?? row.title` for internal-only events (title_es null),
+// so omitting it here silently broke that fallback.
+const ADMIN_LIST_COLUMNS =
+  'id, title, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url, category_es, category_en'
+
+const PUBLIC_RETURNING_COLUMNS =
+  'id, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url'
+
+const ROOM_BLOCK_COLUMNS = 'id, event_id, room_id, table_id, date, start_time, end_time, all_day'
+
+// ---------------------------------------------------------------------------
+// Shared row fixtures
+// ---------------------------------------------------------------------------
+
+function currentEventRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'evt-1',
+    title_es: 'Evento Antiguo',
+    title_en: 'Old Event',
+    blurb_es: null,
+    blurb_en: null,
+    description_es: null,
+    description_en: null,
+    category_es: null,
+    category_en: null,
+    date_kind: 'single',
+    date: '2026-04-20',
+    end_date: null,
+    recurrence_label_es: null,
+    recurrence_label_en: null,
+    image_url: null,
+    link_url: null,
+    ...overrides,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shared handler factories
+// ---------------------------------------------------------------------------
+
+/** INSERT INTO events (...20 cols...) RETURNING <admin columns> — createClubEvent */
+function addCreateInsertHandler(id = 'evt-new-1') {
+  sqlMock.addHandler({
+    name: 'INSERT events (createClubEvent)',
+    verb: 'insert',
+    match: (stmt) => stmt.table === 'events' && stmt.returning && stmt.values.length === 20,
+    respond: (stmt) => {
+      const [
+        title_es, title_en, blurb_es, blurb_en, description_es, description_en,
+        category_es, category_en, date_kind, date, end_date,
+        recurrence_label_es, recurrence_label_en, image_url, link_url,
+      ] = stmt.values
+      return [{
+        id, title_es, title_en, blurb_es, blurb_en, description_es, description_en,
+        category_es, category_en, date_kind, date, end_date,
+        recurrence_label_es, recurrence_label_en, image_url, link_url,
+      }]
+    },
+  })
+}
+
+/** SELECT <admin columns> FROM events WHERE id=$1 LIMIT 1 — updateClubEvent's currentRows fetch */
+function addCurrentEventSelectHandler(row: Record<string, unknown> | null) {
+  sqlMock.addHandler({
+    name: 'SELECT current event row (updateClubEvent)',
+    verb: 'select',
+    match: (stmt) =>
+      stmt.table === 'events' && hasExactSelectColumns(stmt, ADMIN_RETURNING_COLUMNS) && Boolean(stmt.whereClause),
+    respond: () => (row ? [row] : []),
+  })
+}
+
+/** UPDATE events SET ... WHERE id=$N RETURNING <admin columns> — updateClubEvent field write */
+function addUpdateEventHandler(respond: (values: unknown[]) => unknown) {
+  sqlMock.addHandler({
+    name: 'UPDATE events (field write, RETURNING)',
+    verb: 'update',
+    match: (stmt) => stmt.table === 'events' && stmt.returning,
+    respond: (stmt) => respond(stmt.values),
+  })
+}
+
+/** UPDATE events SET ... WHERE id=$N (no RETURNING) — revertClubEventFieldsOnFailure */
+function addRevertEventHandler(spy?: (values: unknown[]) => void) {
+  sqlMock.addHandler({
+    name: 'UPDATE events (compensating revert, no RETURNING)',
+    verb: 'update',
+    match: (stmt) => stmt.table === 'events' && !stmt.returning,
+    respond: (stmt) => {
+      spy?.(stmt.values)
+      return []
+    },
+  })
+}
+
+/** DELETE FROM events WHERE id=$1 — createClubEvent compensating delete / deleteEventCascade final step */
+function addEventsDeleteHandler(spy?: (values: unknown[]) => void) {
+  sqlMock.addHandler({
+    name: 'DELETE events WHERE id',
+    verb: 'delete',
+    match: (stmt) => stmt.table === 'events',
+    respond: (stmt) => {
+      spy?.(stmt.values)
+      return []
+    },
+  })
+}
+
+/** SELECT id, title_es, title_en FROM events WHERE id=$1 LIMIT 1 — deleteClubEvent guard */
+function addDeleteGuardHandler(row: { id: string; title_es: string | null; title_en: string | null } | null) {
+  sqlMock.addHandler({
+    name: 'SELECT id, title_es, title_en FROM events (deleteClubEvent guard)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'events' && hasExactSelectColumns(stmt, 'id, title_es, title_en'),
+    respond: () => (row ? [row] : []),
+  })
+}
+
+/** SELECT id FROM events WHERE id=$1 LIMIT 1 — applyClubEventBlocksAndMaterials existence check */
+function addEventExistsHandler(exists = true) {
+  sqlMock.addHandler({
+    name: 'SELECT id FROM events (applyClubEventBlocksAndMaterials existence)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'events' && hasExactSelectColumns(stmt, 'id'),
+    respond: () => (exists ? [{ id: 'evt-1' }] : []),
+  })
+}
+
+/** SELECT <admin columns> FROM events ORDER BY date ASC (no WHERE) — listAdminClubEvents */
+function addListAdminEventsSelectHandler(rows: unknown[] = []) {
+  sqlMock.addHandler({
+    name: 'SELECT events ORDER BY date ASC (listAdminClubEvents)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'events' && hasExactSelectColumns(stmt, ADMIN_LIST_COLUMNS) && !stmt.whereClause,
+    respond: () => rows,
+  })
+}
+
+/** SELECT <public columns> FROM events WHERE title_es/title_en IS NOT NULL ORDER BY date ASC — listClubEvents (public) */
+function addListClubEventsSelectHandler(rows: unknown[] = []) {
+  sqlMock.addHandler({
+    name: 'SELECT events WHERE title_es/title_en IS NOT NULL (listClubEvents public)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'events' && hasExactSelectColumns(stmt, PUBLIC_RETURNING_COLUMNS),
+    respond: () => rows,
+  })
+}
+
+/** SELECT id FROM rooms WHERE id = ANY(...) — validateRoomsExist */
+function addRoomsExistHandler(missing: string[] = []) {
+  sqlMock.addHandler({
+    name: 'SELECT id FROM rooms WHERE id = ANY(...)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'rooms',
+    respond: (stmt) => {
+      const ids = stmt.values[0] as string[]
+      return ids.filter((id) => !missing.includes(id)).map((id) => ({ id }))
+    },
+  })
+}
+
+/**
+ * Handles all three "tables" SELECT shapes club-events-service.ts issues:
+ * - `WHERE id = ANY(...)` (validateTablesExist)
+ * - `WHERE id = $1 AND room_id = $2` (table/room mismatch guard)
+ * - `WHERE room_id = $1` (fetchTableIdsForRoom)
+ */
+function addTablesHandler(opts: { missingTableIds?: string[]; roomTableIds?: Record<string, string[]> } = {}) {
+  const { missingTableIds = [], roomTableIds = {} } = opts
+  sqlMock.addHandler({
+    name: 'SELECT id FROM tables (validateTablesExist / mismatch guard / fetchTableIdsForRoom)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'tables',
+    respond: (stmt) => {
+      if (stmt.whereClause?.includes('any(')) {
+        const ids = stmt.values[0] as string[]
+        return ids.filter((id) => !missingTableIds.includes(id)).map((id) => ({ id }))
+      }
+      if (whereHasColumn(stmt, 'id') && whereHasColumn(stmt, 'room_id')) {
+        const [tableId, roomId] = stmt.values as [string, string]
+        const valid = (roomTableIds[roomId] ?? []).includes(tableId)
+        return valid ? [{ id: tableId }] : []
+      }
+      const roomId = stmt.values[0] as string
+      return (roomTableIds[roomId] ?? []).map((id) => ({ id }))
+    },
+  })
+}
+
+/** SELECT id FROM equipment WHERE id = ANY(...) — validateEquipmentExists */
+function addEquipmentExistsHandler(missing: string[] = []) {
+  sqlMock.addHandler({
+    name: 'SELECT id FROM equipment WHERE id = ANY(...)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'equipment' && stmt.selectColumns === 'id',
+    respond: (stmt) => {
+      const ids = stmt.values[0] as string[]
+      return ids.filter((id) => !missing.includes(id)).map((id) => ({ id }))
+    },
+  })
+}
+
+/** DELETE FROM event_room_blocks WHERE event_id=$1 RETURNING ... */
+function addBlocksDeleteHandler(existingBlocks: unknown[] = []) {
+  sqlMock.addHandler({
+    name: 'DELETE event_room_blocks WHERE event_id (RETURNING)',
+    verb: 'delete',
+    match: (stmt) => stmt.table === 'event_room_blocks',
+    respond: () => existingBlocks,
+  })
+}
+
+/** DELETE FROM event_equipment WHERE event_id=$1 RETURNING ... */
+function addMaterialsDeleteHandler(existingMaterials: unknown[] = []) {
+  sqlMock.addHandler({
+    name: 'DELETE event_equipment WHERE event_id (RETURNING)',
+    verb: 'delete',
+    match: (stmt) => stmt.table === 'event_equipment',
+    respond: () => existingMaterials,
+  })
+}
+
+/** INSERT INTO event_room_blocks (...) RETURNING ... */
+function addBlockInsertHandler(idPrefix = 'block', spy?: (values: unknown[]) => void) {
+  let counter = 0
+  sqlMock.addHandler({
+    name: 'INSERT event_room_blocks RETURNING',
+    verb: 'insert',
+    match: (stmt) => stmt.table === 'event_room_blocks' && stmt.returning,
+    respond: (stmt) => {
+      counter += 1
+      spy?.(stmt.values)
+      const [event_id, room_id, table_id, date, start_time, end_time, all_day] = stmt.values
+      return [{ id: `${idPrefix}-${counter}`, event_id, room_id, table_id, date, start_time, end_time, all_day }]
+    },
+  })
+}
+
+/** UPDATE reservations SET status='cancelled' FROM (...) WHERE ... RETURNING reservations.id, prior.status */
+function addReservationsCancelHandler(respond: () => unknown = () => []) {
+  sqlMock.addHandler({
+    name: 'UPDATE reservations cancel overlapping',
+    verb: 'update',
+    match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'table_id'),
+    respond,
+  })
+}
+
+/** INSERT INTO event_equipment (...) ON CONFLICT (event_id, equipment_id) DO UPDATE */
+function addMaterialsInsertHandler(spy?: (values: unknown[]) => void) {
+  sqlMock.addHandler({
+    name: 'INSERT event_equipment ON CONFLICT DO UPDATE',
+    verb: 'insert',
+    match: (stmt) => stmt.table === 'event_equipment',
+    respond: (stmt) => {
+      spy?.(stmt.values)
+      return []
+    },
+  })
+}
+
+/** SELECT <full block columns> FROM event_room_blocks WHERE event_id=$1 [ORDER BY ...] — resultBlocks / fetchEventRoomBlocks */
+function addEventRoomBlocksSelectHandler(blocks: unknown[] = []) {
+  sqlMock.addHandler({
+    name: 'SELECT event_room_blocks WHERE event_id (result/fetch)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, ROOM_BLOCK_COLUMNS),
+    respond: () => blocks,
+  })
+}
+
+/** SELECT room_id, date, start_time, end_time FROM event_room_blocks WHERE event_id=$1 — deleteEventCascade's blocks fetch */
+function addCascadeBlocksFetchHandler(blocks: unknown[] = []) {
+  sqlMock.addHandler({
+    name: 'SELECT room_id, date, start_time, end_time FROM event_room_blocks (cascade)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, 'room_id, date, start_time, end_time'),
+    respond: () => blocks,
+  })
+}
+
+/** SELECT id, room_id FROM tables WHERE room_id = ANY(...) — deleteEventCascade's table fetch */
+function addCascadeTablesFetchHandler(tables: unknown[] = []) {
+  sqlMock.addHandler({
+    name: 'SELECT id, room_id FROM tables (cascade)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id, room_id'),
+    respond: () => tables,
+  })
+}
+
+/** SELECT ee.event_id, ee.equipment_id, ee.quantity, eq.name FROM event_equipment ee JOIN equipment eq ... — fetchEventMaterials(ForMany) */
+function addEventMaterialsSelectHandler(materials: unknown[] = []) {
+  sqlMock.addHandler({
+    name: 'SELECT event_equipment JOIN equipment (materials)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'event_equipment',
+    respond: () => materials,
+  })
+}
+
 describe('club-events-service', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    eventsServiceSqlMock.reset()
+    sqlMock.reset()
   })
 
   describe('createClubEvent', () => {
     it('admin can create a public club event without room blocks', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-
+      addCreateInsertHandler()
       const { createClubEvent } = await loadClubEventsService()
 
-      const result = await createClubEvent(adminSession, {
+      const result = await createClubEvent(createAdminSession(), {
         titleEs: 'Gastronómica Viernes',
         titleEn: 'Friday Gastro',
         blurbEs: 'Noche de comida',
@@ -336,22 +435,10 @@ describe('club-events-service', () => {
     })
 
     it('non-admin member gets 403 Forbidden', async () => {
-      const memberSession = createMemberSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
-
       const { createClubEvent } = await loadClubEventsService()
 
       await expect(
-        createClubEvent(memberSession, {
+        createClubEvent(createMemberSession(), {
           titleEs: 'Event',
           titleEn: 'Event',
           date: '2026-05-01',
@@ -361,22 +448,10 @@ describe('club-events-service', () => {
     })
 
     it('rejects javascript: URL in image_url', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
-
       const { createClubEvent } = await loadClubEventsService()
 
       await expect(
-        createClubEvent(adminSession, {
+        createClubEvent(createAdminSession(), {
           titleEs: 'Event',
           titleEn: 'Event',
           date: '2026-05-01',
@@ -387,22 +462,10 @@ describe('club-events-service', () => {
     })
 
     it('rejects data: URL in link_url', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
-
       const { createClubEvent } = await loadClubEventsService()
 
       await expect(
-        createClubEvent(adminSession, {
+        createClubEvent(createAdminSession(), {
           titleEs: 'Event',
           titleEn: 'Event',
           date: '2026-05-01',
@@ -413,22 +476,10 @@ describe('club-events-service', () => {
     })
 
     it('rejects relative URL in imageUrl', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
-
       const { createClubEvent } = await loadClubEventsService()
 
       await expect(
-        createClubEvent(adminSession, {
+        createClubEvent(createAdminSession(), {
           titleEs: 'Event',
           titleEn: 'Event',
           date: '2026-05-01',
@@ -439,15 +490,10 @@ describe('club-events-service', () => {
     })
 
     it('accepts empty/undefined imageUrl and linkUrl', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-
+      addCreateInsertHandler()
       const { createClubEvent } = await loadClubEventsService()
 
-      const result = await createClubEvent(adminSession, {
+      const result = await createClubEvent(createAdminSession(), {
         titleEs: 'Event',
         titleEn: 'Event',
         date: '2026-05-01',
@@ -461,15 +507,10 @@ describe('club-events-service', () => {
     })
 
     it('creates a club event with titleEn absent, succeeds with title_en === title_es in DB (OIR-206)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-
+      addCreateInsertHandler()
       const { createClubEvent } = await loadClubEventsService()
 
-      const result = await createClubEvent(adminSession, {
+      const result = await createClubEvent(createAdminSession(), {
         titleEs: 'Evento en Español',
         // titleEn absent — should fallback
         date: '2026-05-01',
@@ -482,15 +523,10 @@ describe('club-events-service', () => {
     })
 
     it('creates a club event with titleEn empty string, succeeds with fallback (OIR-206)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-
+      addCreateInsertHandler()
       const { createClubEvent } = await loadClubEventsService()
 
-      const result = await createClubEvent(adminSession, {
+      const result = await createClubEvent(createAdminSession(), {
         titleEs: 'Evento Viernes',
         titleEn: '', // Empty string — should fallback
         date: '2026-05-01',
@@ -501,15 +537,10 @@ describe('club-events-service', () => {
     })
 
     it('creates a club event with explicit titleEn, preserves EN value (OIR-206)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-
+      addCreateInsertHandler()
       const { createClubEvent } = await loadClubEventsService()
 
-      const result = await createClubEvent(adminSession, {
+      const result = await createClubEvent(createAdminSession(), {
         titleEs: 'Torneo de Ajedrez',
         titleEn: 'Chess Tournament',
         date: '2026-05-01',
@@ -520,15 +551,10 @@ describe('club-events-service', () => {
     })
 
     it('creates a club event with blurbEn absent, falls back to blurbEs (OIR-206)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-
+      addCreateInsertHandler()
       const { createClubEvent } = await loadClubEventsService()
 
-      const result = await createClubEvent(adminSession, {
+      const result = await createClubEvent(createAdminSession(), {
         titleEs: 'Event',
         titleEn: 'Event',
         blurbEs: 'Descripción breve',
@@ -537,21 +563,15 @@ describe('club-events-service', () => {
         dateKind: 'single',
       })
 
-      // The mock builder returns the input data from insert, so verify via result mapping
       expect(result.blurbEs).toBe('Descripción breve')
-      // result.blurbEn would also be 'Descripción breve' due to fallback
+      expect(result.blurbEn).toBe('Descripción breve')
     })
 
     it('creates a club event with categoryEn absent, falls back to categoryEs (OIR-206)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-
+      addCreateInsertHandler()
       const { createClubEvent } = await loadClubEventsService()
 
-      const result = await createClubEvent(adminSession, {
+      const result = await createClubEvent(createAdminSession(), {
         titleEs: 'Event',
         titleEn: 'Event',
         categoryEs: 'Torneo',
@@ -560,27 +580,16 @@ describe('club-events-service', () => {
         dateKind: 'single',
       })
 
-      // Fallback behavior: categoryEn should equal categoryEs when absent
       expect(result.id).toBe('evt-new-1')
+      expect(result.categoryEs).toBe('Torneo')
+      expect(result.categoryEn).toBe('Torneo')
     })
 
     it('rejects categoryEn as non-string object (still 400, not fallback) (OIR-206)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
-
       const { createClubEvent } = await loadClubEventsService()
 
       await expect(
-        createClubEvent(adminSession, {
+        createClubEvent(createAdminSession(), {
           titleEs: 'Event',
           titleEn: 'Event',
           categoryEs: 'Torneo',
@@ -591,171 +600,31 @@ describe('club-events-service', () => {
       ).rejects.toMatchObject({ statusCode: 400, message: expect.stringContaining('must be a string') })
     })
 
-    it('updates club event: auto-copied titleEn follows new titleEs when ES changes (OIR-206)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      // Current row has title_en === title_es (auto-copied)
-      const currentRow = {
-        id: 'evt-1',
-        title: 'Old Event',
-        title_es: 'Evento Viejo',
-        title_en: 'Evento Viejo', // Was auto-copied (equals ES)
-        blurb_es: null,
-        blurb_en: null,
-        description_es: null,
-        description_en: null,
-        category_es: null,
-        category_en: null,
-        date_kind: 'single',
-        date: '2026-04-20',
-        end_date: null,
-        recurrence_label_es: null,
-        recurrence_label_en: null,
-        image_url: null,
-        link_url: null,
-        created_by: 'user-1',
-        created_at: '2026-04-01T00:00:00Z',
-      }
-
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: currentRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      ...currentRow,
-                      title_es: 'Evento Nuevo',
-                      title_en: 'Evento Nuevo', // Should follow ES
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-
-      const { updateClubEvent } = await loadClubEventsService()
-
-      const result = await updateClubEvent(adminSession, 'evt-1', {
-        titleEs: 'Evento Nuevo',
-        // titleEn absent — should re-copy from new ES value
+    it('creates a club event with blocksRooms:true, inserting a room block via the sequential SQL flow (Finding 1)', async () => {
+      addCreateInsertHandler()
+      addRoomsExistHandler()
+      addTablesHandler()
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      addMaterialsDeleteHandler([])
+      const insertedBlocks: unknown[] = []
+      addBlockInsertHandler('block', (values) => {
+        const [event_id, room_id, table_id, date, start_time, end_time, all_day] = values
+        insertedBlocks.push({ id: `block-${insertedBlocks.length + 1}`, event_id, room_id, table_id, date, start_time, end_time, all_day })
       })
-
-      expect(result.titleEn).toBe('Evento Nuevo')
-    })
-
-    it('updates club event: explicitly different titleEn is preserved when ES changes (OIR-206)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      // Current row has title_en !== title_es (explicitly set)
-      const currentRow = {
-        id: 'evt-1',
-        title: 'Old Event',
-        title_es: 'Evento Viejo',
-        title_en: 'Old Event Tournament', // Explicit EN (different from ES)
-        blurb_es: null,
-        blurb_en: null,
-        description_es: null,
-        description_en: null,
-        category_es: null,
-        category_en: null,
-        date_kind: 'single',
-        date: '2026-04-20',
-        end_date: null,
-        recurrence_label_es: null,
-        recurrence_label_en: null,
-        image_url: null,
-        link_url: null,
-        created_by: 'user-1',
-        created_at: '2026-04-01T00:00:00Z',
-      }
-
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: currentRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      ...currentRow,
-                      title_es: 'Evento Nuevo',
-                      title_en: 'Old Event Tournament', // Preserved (explicitly set)
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-
-      const { updateClubEvent } = await loadClubEventsService()
-
-      const result = await updateClubEvent(adminSession, 'evt-1', {
-        titleEs: 'Evento Nuevo',
-        // titleEn absent — but should preserve the explicit value
+      addReservationsCancelHandler()
+      addMaterialsInsertHandler()
+      sqlMock.addHandler({
+        name: 'SELECT event_room_blocks WHERE event_id (result, tracks inserted)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, ROOM_BLOCK_COLUMNS),
+        respond: () => insertedBlocks,
       })
-
-      expect(result.titleEn).toBe('Old Event Tournament') // Preserved
-    })
-
-    it('calls apply_club_event_room_blocks RPC with normalized payload on create with blocksRooms:true (Finding 1)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      mockSupabaseAdmin.rpc = vi.fn(async () => ({
-        data: [
-          {
-            id: 'block-1',
-            event_id: 'evt-new-1',
-            room_id: 'room-1',
-            date: '2026-05-01',
-            start_time: '18:00:00',
-            end_time: '22:00:00',
-            all_day: false,
-          },
-        ],
-        error: null,
-      }))
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      addEventMaterialsSelectHandler([])
 
       const { createClubEvent } = await loadClubEventsService()
 
-      const result = await createClubEvent(adminSession, {
+      const result = await createClubEvent(createAdminSession(), {
         titleEs: 'Torneo con Bloques',
         titleEn: 'Tournament with Blocks',
         date: '2026-05-01',
@@ -772,62 +641,26 @@ describe('club-events-service', () => {
         ],
       })
 
-      expect(mockSupabaseAdmin.rpc).toHaveBeenCalledWith(
-        'apply_club_event_room_blocks',
-        expect.objectContaining({
-          p_event_id: 'evt-new-1',
-          p_blocks: expect.arrayContaining([
-            expect.objectContaining({
-              room_id: 'room-1',
-              date: '2026-05-01',
-              all_day: false,
-              start_time: '18:00',
-              end_time: '22:00',
-            }),
-          ]),
-        })
-      )
-
       expect(result.blocksRooms).toBe(true)
       expect(result.roomBlocks.length).toBe(1)
+      expect(result.roomBlocks[0].roomId).toBe('room-1')
+      expect(result.roomBlocks[0].startTime).toBe('18:00')
+      expect(result.roomBlocks[0].endTime).toBe('22:00')
     })
 
-    it('rolls back (deletes) the created event when apply_club_event_room_blocks RPC fails, leaving no orphan row (PR #149 review)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      // Simulate a block-replacement RPC failure that happens AFTER the
-      // event row has already been inserted (e.g. a transient DB error, not
-      // necessarily a bad room id — room ids are validated separately and
-      // still pass here).
-      mockSupabaseAdmin.rpc = vi.fn(async () => ({
-        data: null,
-        error: { message: 'transient failure', code: 'XX000' },
-      }))
-
-      const deleteEq = vi.fn(async () => ({ data: null, error: null }))
-      const baseFrom = mockSupabaseAdmin.from
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        const result = baseFrom(table)
-        if (table === 'events') {
-          return { ...result, delete: vi.fn(() => ({ eq: deleteEq })) }
-        }
-        return result
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
+    it('rolls back (deletes) the created event when the block/material write fails, leaving no orphan row (PR #149 review)', async () => {
+      addCreateInsertHandler()
+      addRoomsExistHandler()
+      // Simulate a transient failure in the block-write step (after the event
+      // row already exists) — the existence check itself fails.
+      addEventExistsHandler(false)
+      const deleteSpy = vi.fn()
+      addEventsDeleteHandler(deleteSpy)
 
       const { createClubEvent } = await loadClubEventsService()
 
       await expect(
-        createClubEvent(adminSession, {
+        createClubEvent(createAdminSession(), {
           titleEs: 'Torneo con Bloques',
           titleEn: 'Tournament with Blocks',
           date: '2026-05-01',
@@ -843,54 +676,35 @@ describe('club-events-service', () => {
             },
           ],
         })
-      ).rejects.toMatchObject({ statusCode: 500 })
+      ).rejects.toMatchObject({ statusCode: 404 })
 
-      // The event row created by the earlier insert (id: evt-new-1, per the
-      // shared mock) must be deleted once the block RPC fails — no orphan
-      // club event should ever be left behind.
-      expect(deleteEq).toHaveBeenCalledWith('id', 'evt-new-1')
+      // The event row created by the earlier insert (id: evt-new-1) must be
+      // deleted once the block-write step fails — no orphan club event
+      // should ever be left behind.
+      expect(deleteSpy).toHaveBeenCalledWith(['evt-new-1'])
     })
 
-    it('logs the orphaned event id when BOTH the block RPC and the compensating delete fail, and still rethrows the original RPC error (PR #149 review round 2)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      // Block-replacement RPC fails after the event row was already inserted.
-      mockSupabaseAdmin.rpc = vi.fn(async () => ({
-        data: null,
-        error: { message: 'transient failure', code: 'XX000' },
-      }))
-
-      // The compensating delete ALSO fails — this is the silent-orphan gap:
-      // without the fix, this failure is discarded and never logged.
-      const deleteEq = vi.fn(async () => ({
-        data: null,
-        error: { message: 'delete failed', code: 'XX000' },
-      }))
-      const baseFrom = mockSupabaseAdmin.from
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        const result = baseFrom(table)
-        if (table === 'events') {
-          return { ...result, delete: vi.fn(() => ({ eq: deleteEq })) }
-        }
-        return result
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
+    it('logs the orphaned event id when BOTH the block write and the compensating delete fail, and still rethrows the original error (PR #149 review round 2)', async () => {
+      addCreateInsertHandler()
+      addRoomsExistHandler()
+      addEventExistsHandler(false)
+      const deleteSpy = vi.fn()
+      sqlMock.addHandler({
+        name: 'DELETE events WHERE id (fails)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'events',
+        respond: (stmt) => {
+          deleteSpy(stmt.values)
+          throw new Error('delete failed')
+        },
+      })
 
       const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
       const { createClubEvent } = await loadClubEventsService()
 
       await expect(
-        createClubEvent(adminSession, {
+        createClubEvent(createAdminSession(), {
           titleEs: 'Torneo con Bloques',
           titleEn: 'Tournament with Blocks',
           date: '2026-05-01',
@@ -906,50 +720,39 @@ describe('club-events-service', () => {
             },
           ],
         })
-        // The ORIGINAL RPC error (from apply_club_event_room_blocks) must
+        // The ORIGINAL error (from applyClubEventBlocksAndMaterials) must
         // still be what the client sees — never the compensating delete's
-        // own error — since the delete error is only a logging concern.
-      ).rejects.toMatchObject({ statusCode: 500, message: 'Internal server error' })
+        // own error, which is only a logging concern.
+      ).rejects.toMatchObject({ statusCode: 404 })
 
-      expect(deleteEq).toHaveBeenCalledWith('id', 'evt-new-1')
+      expect(deleteSpy).toHaveBeenCalledWith(['evt-new-1'])
       expect(consoleErrorSpy).toHaveBeenCalledWith(
         expect.stringContaining('orphaned event row requires manual cleanup'),
         'evt-new-1',
+        expect.anything(),
       )
 
       consoleErrorSpy.mockRestore()
     })
 
     it('rejects an unknown room id in schedules with 400 BEFORE inserting the event row (PR #149 review)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      const baseFrom = mockSupabaseAdmin.from
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'rooms') {
-          // No rooms exist — every referenced room id is "unknown".
-          return {
-            select: vi.fn(() => ({
-              in: vi.fn(() => Promise.resolve({ data: [], error: null })),
-            })),
-          }
-        }
-        return baseFrom(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
+      // No rooms "exist" — every referenced room id is unknown.
+      addRoomsExistHandler(['room-does-not-exist'])
+      const insertSpy = vi.fn()
+      sqlMock.addHandler({
+        name: 'INSERT events (should never be called)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'events',
+        respond: (stmt) => {
+          insertSpy(stmt.values)
+          return [{ id: 'evt-new-1', ...currentEventRow() }]
+        },
+      })
 
       const { createClubEvent } = await loadClubEventsService()
 
       await expect(
-        createClubEvent(adminSession, {
+        createClubEvent(createAdminSession(), {
           titleEs: 'Torneo con Bloques',
           titleEn: 'Tournament with Blocks',
           date: '2026-05-01',
@@ -967,27 +770,25 @@ describe('club-events-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      const eventsFromCalls = mockSupabaseAdmin.from.mock.calls.filter((call: any[]) => call[0] === 'events')
-      expect(eventsFromCalls.length).toBe(0)
+      expect(insertSpy).not.toHaveBeenCalled()
     })
 
     it('rejects malformed schedules with 400 and no insert on events table (Finding 2)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
+      const insertSpy = vi.fn()
+      sqlMock.addHandler({
+        name: 'INSERT events (should never be called)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'events',
+        respond: (stmt) => {
+          insertSpy(stmt.values)
+          return [{ id: 'evt-new-1', ...currentEventRow() }]
+        },
+      })
 
       const { createClubEvent } = await loadClubEventsService()
 
       await expect(
-        createClubEvent(adminSession, {
+        createClubEvent(createAdminSession(), {
           titleEs: 'Event',
           titleEn: 'Event',
           date: '2026-05-01',
@@ -997,29 +798,14 @@ describe('club-events-service', () => {
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      const fromCalls = mockSupabaseAdmin.from.mock.calls
-      const hasInsertCall = fromCalls.some(call => call[0] === 'events') && 
-                           mockSupabaseAdmin.from('events').insert.mock.calls.length > 0
-      expect(hasInsertCall).toBe(false)
+      expect(insertSpy).not.toHaveBeenCalled()
     })
 
     it('rejects blurbEs as object with 400 (Finding 5)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
-
       const { createClubEvent } = await loadClubEventsService()
 
       await expect(
-        createClubEvent(adminSession, {
+        createClubEvent(createAdminSession(), {
           titleEs: 'Event',
           titleEn: 'Event',
           date: '2026-05-01',
@@ -1030,22 +816,10 @@ describe('club-events-service', () => {
     })
 
     it('rejects categoryEn as array with 400 (Finding 5)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
-
       const { createClubEvent } = await loadClubEventsService()
 
       await expect(
-        createClubEvent(adminSession, {
+        createClubEvent(createAdminSession(), {
           titleEs: 'Event',
           titleEn: 'Event',
           date: '2026-05-01',
@@ -1056,15 +830,10 @@ describe('club-events-service', () => {
     })
 
     it('accepts null and undefined for optional string fields', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-
+      addCreateInsertHandler()
       const { createClubEvent } = await loadClubEventsService()
 
-      const result = await createClubEvent(adminSession, {
+      const result = await createClubEvent(createAdminSession(), {
         titleEs: 'Event',
         titleEn: 'Event',
         date: '2026-05-01',
@@ -1083,15 +852,14 @@ describe('club-events-service', () => {
 
   describe('updateClubEvent', () => {
     it('admin can update a club event', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      addCurrentEventSelectHandler(currentEventRow())
+      addUpdateEventHandler((values) => [currentEventRow({ blurb_en: values[3] as string })])
+      addEventRoomBlocksSelectHandler([])
+      addEventMaterialsSelectHandler([])
 
       const { updateClubEvent } = await loadClubEventsService()
 
-      const result = await updateClubEvent(adminSession, 'evt-1', {
+      const result = await updateClubEvent(createAdminSession(), 'evt-1', {
         titleEs: 'Updated Event ES',
         blurbEn: 'Updated blurb',
       })
@@ -1100,1096 +868,486 @@ describe('club-events-service', () => {
     })
 
     it('non-admin member gets 403 Forbidden on update', async () => {
-      const memberSession = createMemberSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
-
       const { updateClubEvent } = await loadClubEventsService()
 
       await expect(
-        updateClubEvent(memberSession, 'evt-1', { titleEs: 'Updated' })
+        updateClubEvent(createMemberSession(), 'evt-1', { titleEs: 'Updated' })
       ).rejects.toMatchObject({ statusCode: 403 })
     })
 
-    it('returns 404 for non-existent or non-landing club event', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
+    it('returns 404 for non-existent club event', async () => {
+      addCurrentEventSelectHandler(null)
 
       const { updateClubEvent } = await loadClubEventsService()
 
-      mockSupabaseAdmin.from = vi.fn(() => ({
-        select: vi.fn(() => ({
-          eq: vi.fn(() => ({
-            maybeSingle: vi.fn(async () => ({ data: null, error: null })),
-          })),
-        })),
-      })) as any
-
       await expect(
-        updateClubEvent(adminSession, 'nonexistent-evt', { titleEs: 'Test' })
+        updateClubEvent(createAdminSession(), 'nonexistent-evt', { titleEs: 'Test' })
       ).rejects.toMatchObject({ statusCode: 404 })
     })
 
     it('rejects malformed schedules with 400 and no update on events table (Finding 2)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
+      addCurrentEventSelectHandler(currentEventRow())
+      const updateSpy = vi.fn()
+      sqlMock.addHandler({
+        name: 'UPDATE events (should never be called)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'events',
+        respond: (stmt) => {
+          updateSpy(stmt.values)
+          return [currentEventRow()]
+        },
+      })
 
       const { updateClubEvent } = await loadClubEventsService()
 
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: {
-                    id: 'evt-1',
-                    title: 'Old Event',
-                    title_es: 'Evento Antiguo',
-                    title_en: 'Old Event',
-                    blurb_es: null,
-                    blurb_en: null,
-                    description_es: null,
-                    description_en: null,
-                    category_es: null,
-                    category_en: null,
-                    date_kind: 'single',
-                    date: '2026-04-20',
-                    end_date: null,
-                    recurrence_label_es: null,
-                    recurrence_label_en: null,
-                    image_url: null,
-                    link_url: null,
-                    created_by: 'user-1',
-                    created_at: '2026-04-01T00:00:00Z',
-                  },
-                  error: null,
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
       await expect(
-        updateClubEvent(adminSession, 'evt-1', {
+        updateClubEvent(createAdminSession(), 'evt-1', {
           blocksRooms: true,
           schedules: [],
         })
       ).rejects.toMatchObject({ statusCode: 400 })
+
+      expect(updateSpy).not.toHaveBeenCalled()
     })
 
-    it('skips RPC when schedules match current blocks (order-insensitive, Finding 4)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
+    it('skips the block-replace step when schedules match current blocks (order-insensitive, Finding 4)', async () => {
       const currentBlocks = [
-        {
-          id: 'block-1',
-          event_id: 'evt-1',
-          room_id: 'room-1',
-          date: '2026-04-20',
-          start_time: '18:00:00',
-          end_time: '22:00:00',
-          all_day: false,
-        },
-        {
-          id: 'block-2',
-          event_id: 'evt-1',
-          room_id: 'room-2',
-          date: '2026-04-20',
-          start_time: '10:00:00',
-          end_time: '14:00:00',
-          all_day: false,
-        },
+        { id: 'block-1', event_id: 'evt-1', room_id: 'room-1', table_id: null, date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00', all_day: false },
+        { id: 'block-2', event_id: 'evt-1', room_id: 'room-2', table_id: null, date: '2026-04-20', start_time: '10:00:00', end_time: '14:00:00', all_day: false },
       ]
 
-      mockSupabaseAdmin.rpc = vi.fn(async () => ({ data: currentBlocks, error: null }))
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      addCurrentEventSelectHandler(currentEventRow())
+      addUpdateEventHandler((values) => [currentEventRow({ blurb_en: values[3] as string })])
+      addRoomsExistHandler()
+      addTablesHandler()
+      addEventRoomBlocksSelectHandler(currentBlocks)
+      addEventMaterialsSelectHandler([])
+      const blockInsertSpy = vi.fn()
+      addBlockInsertHandler('block', blockInsertSpy)
 
       const { updateClubEvent } = await loadClubEventsService()
 
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        const baseFrom = buildSupabaseMock().from(table)
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: {
-                    id: 'evt-1',
-                    title: 'Event',
-                    title_es: 'Evento',
-                    title_en: 'Event',
-                    blurb_es: null,
-                    blurb_en: null,
-                    description_es: null,
-                    description_en: null,
-                    category_es: null,
-                    category_en: null,
-                    date_kind: 'single',
-                    date: '2026-04-20',
-                    end_date: null,
-                    recurrence_label_es: null,
-                    recurrence_label_en: null,
-                    image_url: null,
-                    link_url: null,
-                    created_by: 'user-1',
-                    created_at: '2026-04-01T00:00:00Z',
-                  },
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      id: 'evt-1',
-                      title: 'Event',
-                      title_es: 'Evento',
-                      title_en: 'Event',
-                      blurb_es: null,
-                      blurb_en: 'Updated blurb',
-                      description_es: null,
-                      description_en: null,
-                      category_es: null,
-                      category_en: null,
-                      date_kind: 'single',
-                      date: '2026-04-20',
-                      end_date: null,
-                      recurrence_label_es: null,
-                      recurrence_label_en: null,
-                      image_url: null,
-                      link_url: null,
-                      created_by: 'user-1',
-                      created_at: '2026-04-01T00:00:00Z',
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        if (table === 'event_room_blocks') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(async () => ({
-                data: currentBlocks,
-                error: null,
-              })),
-            })),
-          }
-        }
-        return baseFrom
-      }) as any
-
-      await updateClubEvent(adminSession, 'evt-1', {
+      await updateClubEvent(createAdminSession(), 'evt-1', {
         blurbEn: 'Updated blurb',
         blocksRooms: true,
         schedules: [
-          {
-            date: '2026-04-20',
-            startTime: '18:00',
-            endTime: '22:00',
-            allDay: false,
-            roomId: 'room-1',
-          },
-          {
-            date: '2026-04-20',
-            startTime: '10:00',
-            endTime: '14:00',
-            allDay: false,
-            roomId: 'room-2',
-          },
+          { date: '2026-04-20', startTime: '18:00', endTime: '22:00', allDay: false, roomId: 'room-1' },
+          { date: '2026-04-20', startTime: '10:00', endTime: '14:00', allDay: false, roomId: 'room-2' },
         ],
       })
 
-      expect(mockSupabaseAdmin.rpc).not.toHaveBeenCalled()
+      // Blocks are identical (order-insensitive) — the replace step (DELETE +
+      // re-INSERT) must never run.
+      expect(blockInsertSpy).not.toHaveBeenCalled()
     })
 
-    it('calls RPC when schedules differ from current blocks (Finding 4)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
+    it('replaces blocks when schedules differ from current blocks (Finding 4)', async () => {
       const currentBlocks = [
-        {
-          id: 'block-1',
-          event_id: 'evt-1',
-          room_id: 'room-1',
-          date: '2026-04-20',
-          start_time: '18:00:00',
-          end_time: '22:00:00',
-          all_day: false,
-        },
+        { id: 'block-1', event_id: 'evt-1', room_id: 'room-1', table_id: null, date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00', all_day: false },
       ]
 
-      const newBlocks = [
-        {
-          id: 'block-new-1',
-          event_id: 'evt-1',
-          room_id: 'room-2',
-          date: '2026-04-20',
-          start_time: '10:00:00',
-          end_time: '14:00:00',
-          all_day: false,
-        },
-      ]
-
-      mockSupabaseAdmin.rpc = vi.fn(async () => ({ data: newBlocks, error: null }))
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      addCurrentEventSelectHandler(currentEventRow())
+      addUpdateEventHandler(() => [currentEventRow()])
+      addRoomsExistHandler()
+      addTablesHandler()
+      addEventExistsHandler(true)
+      // First call to the "fetch current blocks" comparison SELECT returns
+      // the stale block; addEventRoomBlocksSelectHandler's fixed response
+      // covers both that call and the post-replace resultBlocks SELECT —
+      // register the DELETE (which returns the pre-existing rows) separately
+      // so the replace step actually runs.
+      sqlMock.addHandler({
+        name: 'SELECT event_room_blocks WHERE event_id (comparison fetch)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, ROOM_BLOCK_COLUMNS),
+        respond: () => currentBlocks,
+      })
+      addBlocksDeleteHandler(currentBlocks)
+      addMaterialsDeleteHandler([])
+      const blockInsertSpy = vi.fn()
+      addBlockInsertHandler('block-new', blockInsertSpy)
+      addReservationsCancelHandler()
+      addEventMaterialsSelectHandler([])
 
       const { updateClubEvent } = await loadClubEventsService()
 
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        const baseFrom = buildSupabaseMock().from(table)
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: {
-                    id: 'evt-1',
-                    title: 'Event',
-                    title_es: 'Evento',
-                    title_en: 'Event',
-                    blurb_es: null,
-                    blurb_en: null,
-                    description_es: null,
-                    description_en: null,
-                    category_es: null,
-                    category_en: null,
-                    date_kind: 'single',
-                    date: '2026-04-20',
-                    end_date: null,
-                    recurrence_label_es: null,
-                    recurrence_label_en: null,
-                    image_url: null,
-                    link_url: null,
-                    created_by: 'user-1',
-                    created_at: '2026-04-01T00:00:00Z',
-                  },
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      id: 'evt-1',
-                      title: 'Event',
-                      title_es: 'Evento',
-                      title_en: 'Event',
-                      blurb_es: null,
-                      blurb_en: null,
-                      description_es: null,
-                      description_en: null,
-                      category_es: null,
-                      category_en: null,
-                      date_kind: 'single',
-                      date: '2026-04-20',
-                      end_date: null,
-                      recurrence_label_es: null,
-                      recurrence_label_en: null,
-                      image_url: null,
-                      link_url: null,
-                      created_by: 'user-1',
-                      created_at: '2026-04-01T00:00:00Z',
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        if (table === 'event_room_blocks') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(async () => ({
-                data: currentBlocks,
-                error: null,
-              })),
-            })),
-          }
-        }
-        return baseFrom
-      }) as any
-
-      await updateClubEvent(adminSession, 'evt-1', {
+      await updateClubEvent(createAdminSession(), 'evt-1', {
         blocksRooms: true,
         schedules: [
-          {
-            date: '2026-04-20',
-            startTime: '10:00',
-            endTime: '14:00',
-            allDay: false,
-            roomId: 'room-2',
-          },
+          { date: '2026-04-20', startTime: '10:00', endTime: '14:00', allDay: false, roomId: 'room-2' },
         ],
       })
 
-      expect(mockSupabaseAdmin.rpc).toHaveBeenCalledWith(
-        'apply_club_event_room_blocks',
-        expect.anything()
-      )
+      expect(blockInsertSpy).toHaveBeenCalled()
+      const [, roomId] = blockInsertSpy.mock.calls[0][0] as unknown[]
+      expect(roomId).toBe('room-2')
     })
 
-    const ORIGINAL_ROW = {
-      id: 'evt-1',
-      title: 'Old Event',
-      title_es: 'Evento Antiguo',
-      title_en: 'Old Event',
-      blurb_es: null,
-      blurb_en: null,
-      description_es: null,
-      description_en: null,
-      category_es: null,
-      category_en: null,
-      date_kind: 'single',
-      date: '2026-04-20',
-      end_date: null,
-      recurrence_label_es: null,
-      recurrence_label_en: null,
-      image_url: null,
-      link_url: null,
-      created_by: 'user-1',
-      created_at: '2026-04-01T00:00:00Z',
-    }
-
     it('rejects an unknown room id in schedules with 400 BEFORE updating the event fields (PR #149 review)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
+      addCurrentEventSelectHandler(currentEventRow())
+      addRoomsExistHandler(['room-unknown'])
+      const updateSpy = vi.fn()
+      sqlMock.addHandler({
+        name: 'UPDATE events (should never be called)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'events',
+        respond: (stmt) => {
+          updateSpy(stmt.values)
+          return [currentEventRow()]
+        },
+      })
 
       const { updateClubEvent } = await loadClubEventsService()
 
-      const updateSpy = vi.fn(() => ({
-        eq: vi.fn(() => ({
-          select: vi.fn(() => ({
-            maybeSingle: vi.fn(async () => ({ data: null, error: null })),
-          })),
-        })),
-      }))
-
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({ data: ORIGINAL_ROW, error: null })),
-              })),
-            })),
-            update: updateSpy,
-          }
-        }
-        if (table === 'rooms') {
-          // Simulate an unknown room id: the "rooms" lookup returns nothing.
-          return {
-            select: vi.fn(() => ({
-              in: vi.fn(async () => ({ data: [], error: null })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
       await expect(
-        updateClubEvent(adminSession, 'evt-1', {
+        updateClubEvent(createAdminSession(), 'evt-1', {
           blocksRooms: true,
           schedules: [
-            {
-              date: '2026-04-20',
-              startTime: '18:00',
-              endTime: '22:00',
-              allDay: false,
-              roomId: 'room-unknown',
-            },
+            { date: '2026-04-20', startTime: '18:00', endTime: '22:00', allDay: false, roomId: 'room-unknown' },
           ],
         })
       ).rejects.toMatchObject({ statusCode: 400 })
 
-      // The event fields UPDATE must never run once an unknown room id is
-      // detected — the bad reference is rejected before any write happens.
       expect(updateSpy).not.toHaveBeenCalled()
     })
 
-    it('reverts the event fields UPDATE when apply_club_event_room_blocks RPC fails, leaving no partial update (PR #149 / PR #154 review)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      // Room ids validate fine — the RPC still fails for some other reason
-      // (e.g. a transient DB error), which is the case this fix targets.
-      mockSupabaseAdmin.rpc = vi.fn(async () => ({
-        data: null,
-        error: { message: 'transient failure', code: 'XX000' },
-      }))
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
+    it('rejects an unknown table id in schedules with 400 BEFORE updating the event fields (PR #154 review)', async () => {
+      addCurrentEventSelectHandler(currentEventRow())
+      addRoomsExistHandler()
+      addTablesHandler({ missingTableIds: ['table-unknown'] })
+      const updateSpy = vi.fn()
+      sqlMock.addHandler({
+        name: 'UPDATE events (should never be called)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'events',
+        respond: (stmt) => {
+          updateSpy(stmt.values)
+          return [currentEventRow()]
+        },
+      })
 
       const { updateClubEvent } = await loadClubEventsService()
 
-      const updateCalls: Record<string, unknown>[] = []
-      const revertEq = vi.fn(async () => ({ data: null, error: null }))
+      await expect(
+        updateClubEvent(createAdminSession(), 'evt-1', {
+          blocksRooms: true,
+          schedules: [
+            { date: '2026-04-20', startTime: '18:00', endTime: '22:00', allDay: false, roomId: 'room-1', tableId: 'table-unknown' },
+          ],
+        })
+      ).rejects.toMatchObject({ statusCode: 400 })
 
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({ data: ORIGINAL_ROW, error: null })),
-              })),
-            })),
-            update: vi.fn(function (data: Record<string, unknown>) {
-              updateCalls.push(data)
-              // First call = the field-update from the request body;
-              // second call = the compensating revert.
-              if (updateCalls.length === 1) {
-                return {
-                  eq: vi.fn(() => ({
-                    select: vi.fn(() => ({
-                      maybeSingle: vi.fn(async () => ({
-                        data: { ...ORIGINAL_ROW, ...data },
-                        error: null,
-                      })),
-                    })),
-                  })),
-                }
-              }
-              return { eq: revertEq }
-            }),
-          }
-        }
-        if (table === 'rooms') {
-          return {
-            select: vi.fn(() => ({
-              in: vi.fn(async (_col: string, vals: string[]) => ({
-                data: vals.map((id) => ({ id })),
-                error: null,
-              })),
-            })),
-          }
-        }
-        if (table === 'event_room_blocks') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(async () => ({ data: [], error: null })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
+      expect(updateSpy).not.toHaveBeenCalled()
+    })
+
+    it('surfaces a clear 400 (not an unhandled rejection) when room, table, AND equipment validation all fail concurrently (PR #354 Promise.all fix)', async () => {
+      // validateRoomsExist/validateTablesExist/validateEquipmentExists now
+      // run via Promise.all instead of sequential awaits — with all three
+      // failing at once, Promise.all rejects with the first settled
+      // rejection while the other two rejections must not escape as
+      // unhandled promise rejections.
+      addCurrentEventSelectHandler(currentEventRow())
+      addRoomsExistHandler(['room-unknown'])
+      addTablesHandler({ missingTableIds: ['table-unknown'] })
+      addEquipmentExistsHandler(['equip-unknown'])
+      const updateSpy = vi.fn()
+      sqlMock.addHandler({
+        name: 'UPDATE events (should never be called)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'events',
+        respond: (stmt) => {
+          updateSpy(stmt.values)
+          return [currentEventRow()]
+        },
+      })
+
+      const unhandledRejections: unknown[] = []
+      const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason)
+      process.on('unhandledRejection', onUnhandledRejection)
+
+      const { updateClubEvent } = await loadClubEventsService()
+
+      try {
+        await expect(
+          updateClubEvent(createAdminSession(), 'evt-1', {
+            blocksRooms: true,
+            schedules: [
+              { date: '2026-04-20', startTime: '18:00', endTime: '22:00', allDay: false, roomId: 'room-unknown', tableId: 'table-unknown' },
+            ],
+            materials: [{ equipmentId: 'equip-unknown', quantity: 1 }],
+          })
+        ).rejects.toMatchObject({ statusCode: 400 })
+      } finally {
+        // Let any pending microtasks (the other two rejected validations)
+        // flush before asserting no unhandled rejection escaped.
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        process.off('unhandledRejection', onUnhandledRejection)
+      }
+
+      expect(updateSpy).not.toHaveBeenCalled()
+      expect(unhandledRejections).toHaveLength(0)
+    })
+
+    it('rejects an unknown equipment id in materials with 400 BEFORE updating the event fields (PR #154 review)', async () => {
+      addCurrentEventSelectHandler(currentEventRow())
+      addEquipmentExistsHandler(['equip-unknown'])
+      const updateSpy = vi.fn()
+      sqlMock.addHandler({
+        name: 'UPDATE events (should never be called)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'events',
+        respond: (stmt) => {
+          updateSpy(stmt.values)
+          return [currentEventRow()]
+        },
+      })
+
+      const { updateClubEvent } = await loadClubEventsService()
 
       await expect(
-        updateClubEvent(adminSession, 'evt-1', {
+        updateClubEvent(createAdminSession(), 'evt-1', {
+          materials: [{ equipmentId: 'equip-unknown', quantity: 1 }],
+        })
+      ).rejects.toMatchObject({ statusCode: 400 })
+
+      expect(updateSpy).not.toHaveBeenCalled()
+    })
+
+    it('reverts the event fields UPDATE when the block-replace step fails, leaving no partial update (PR #149 / PR #154 review)', async () => {
+      addCurrentEventSelectHandler(currentEventRow({ title_es: 'Evento Antiguo' }))
+      addRoomsExistHandler()
+      addTablesHandler()
+      addUpdateEventHandler((values) => [currentEventRow({ title_es: values[0] as string })])
+      // The block-write step fails: applyClubEventBlocksAndMaterials'
+      // existence check comes back empty (simulating a transient failure).
+      addEventExistsHandler(false)
+      const revertSpy = vi.fn()
+      addRevertEventHandler(revertSpy)
+      addEventRoomBlocksSelectHandler([])
+
+      const { updateClubEvent } = await loadClubEventsService()
+
+      await expect(
+        updateClubEvent(createAdminSession(), 'evt-1', {
           titleEs: 'Nuevo Titulo',
           blocksRooms: true,
           schedules: [
-            {
-              date: '2026-04-20',
-              startTime: '18:00',
-              endTime: '22:00',
-              allDay: false,
-              roomId: 'room-1',
-            },
+            { date: '2026-04-20', startTime: '18:00', endTime: '22:00', allDay: false, roomId: 'room-1' },
           ],
         })
-      ).rejects.toMatchObject({ statusCode: 500 })
+      ).rejects.toMatchObject({ statusCode: 404 })
 
-      // Two updates on "events": the initial (now-reverted) field write,
-      // then the compensating revert restoring the pre-update values — the
-      // original event fields must survive the failed request unchanged.
-      expect(updateCalls.length).toBe(2)
-      expect(updateCalls[0].title_es).toBe('Nuevo Titulo')
-      expect(updateCalls[1].title_es).toBe('Evento Antiguo')
-      expect(revertEq).toHaveBeenCalledWith('id', 'evt-1')
+      // The compensating revert must restore the original title_es value.
+      expect(revertSpy).toHaveBeenCalled()
+      expect(revertSpy.mock.calls[0][0][0]).toBe('Evento Antiguo')
     })
 
-    it('logs when both the block RPC and the compensating revert fail, and still rethrows the original RPC error (PR #149 / PR #154 review)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      mockSupabaseAdmin.rpc = vi.fn(async () => ({
-        data: null,
-        error: { message: 'transient failure', code: 'XX000' },
-      }))
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
-
-      const { updateClubEvent } = await loadClubEventsService()
+    it('logs when both the block-replace step and the compensating revert fail, and still rethrows the original error (PR #149 / PR #154 review)', async () => {
+      addCurrentEventSelectHandler(currentEventRow())
+      addRoomsExistHandler()
+      addTablesHandler()
+      addUpdateEventHandler((values) => [currentEventRow({ title_es: values[0] as string })])
+      addEventExistsHandler(false)
+      sqlMock.addHandler({
+        name: 'UPDATE events (compensating revert fails)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'events' && !stmt.returning,
+        respond: () => {
+          throw new Error('revert failed')
+        },
+      })
+      addEventRoomBlocksSelectHandler([])
 
       const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
-      // The FIRST "events".update call (field write) succeeds normally; the
-      // SECOND call (compensating revert) fails, simulating the revert
-      // itself being unable to complete.
-      let updateCallCount = 0
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({ data: ORIGINAL_ROW, error: null })),
-              })),
-            })),
-            update: vi.fn(function (data: Record<string, unknown>) {
-              updateCallCount += 1
-              if (updateCallCount === 1) {
-                return {
-                  eq: vi.fn(() => ({
-                    select: vi.fn(() => ({
-                      maybeSingle: vi.fn(async () => ({
-                        data: { ...ORIGINAL_ROW, ...data },
-                        error: null,
-                      })),
-                    })),
-                  })),
-                }
-              }
-              return {
-                eq: vi.fn(async () => ({
-                  data: null,
-                  error: { message: 'revert failed', code: 'XX000' },
-                })),
-              }
-            }),
-          }
-        }
-        if (table === 'rooms') {
-          return {
-            select: vi.fn(() => ({
-              in: vi.fn(async (_col: string, vals: string[]) => ({
-                data: vals.map((id) => ({ id })),
-                error: null,
-              })),
-            })),
-          }
-        }
-        if (table === 'event_room_blocks') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(async () => ({ data: [], error: null })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
+      const { updateClubEvent } = await loadClubEventsService()
 
       await expect(
-        updateClubEvent(adminSession, 'evt-1', {
+        updateClubEvent(createAdminSession(), 'evt-1', {
           titleEs: 'Nuevo Titulo',
           blocksRooms: true,
           schedules: [
-            {
-              date: '2026-04-20',
-              startTime: '18:00',
-              endTime: '22:00',
-              allDay: false,
-              roomId: 'room-1',
-            },
+            { date: '2026-04-20', startTime: '18:00', endTime: '22:00', allDay: false, roomId: 'room-1' },
           ],
         })
-        // The ORIGINAL RPC error must still be what the client sees — never
-        // the compensating revert's own error, which is only a logging concern.
-      ).rejects.toMatchObject({ statusCode: 500, message: 'Internal server error' })
+      ).rejects.toMatchObject({ statusCode: 404 })
 
       expect(consoleErrorSpy).toHaveBeenCalledWith(
         expect.stringContaining('event row left partially updated'),
         'evt-1',
+        expect.anything(),
       )
 
       consoleErrorSpy.mockRestore()
     })
 
-    it('rejects an unknown table id in schedules with 400 BEFORE updating the event fields (PR #154 review)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
+    it('updates a non-title field (visibleOnLanding toggle) on an internal-only event (title_es null) without a spurious "titleEs is required" error (regression, club-events-service.ts:1165)', async () => {
+      // updateClubEvent's pre-update snapshot (resolveClubEventFields({},
+      // current)) and toAdminClubEvent's response mapping both fall back to
+      // current.title_es ?? current.title. Before the fix, ADMIN_CLUB_EVENT_
+      // RETURNING never selected `title`, so ANY update to an internal-only
+      // event (title_es null) 400'd on "titleEs is required" even when the
+      // update never touched the title — reproduced here with a blurbEs-only
+      // change on a row that's internal-only (title_es/title_en null,
+      // legacy `title` populated).
+      addCurrentEventSelectHandler(currentEventRow({
+        title_es: null,
+        title_en: null,
+        title: 'Evento Interno Legado',
+        blurb_es: 'Resumen viejo',
+      }))
+      addUpdateEventHandler((values) => [currentEventRow({
+        title_es: null,
+        title_en: null,
+        title: 'Evento Interno Legado',
+        blurb_es: values[2] as string,
+      })])
+      addEventRoomBlocksSelectHandler([])
+      addEventMaterialsSelectHandler([])
 
       const { updateClubEvent } = await loadClubEventsService()
 
-      const updateSpy = vi.fn(() => ({
-        eq: vi.fn(() => ({
-          select: vi.fn(() => ({
-            maybeSingle: vi.fn(async () => ({ data: null, error: null })),
-          })),
-        })),
-      }))
+      const result = await updateClubEvent(createAdminSession(), 'evt-1', {
+        blurbEs: 'Resumen nuevo',
+      })
 
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({ data: ORIGINAL_ROW, error: null })),
-              })),
-            })),
-            update: updateSpy,
-          }
-        }
-        if (table === 'rooms') {
-          // The room id is valid — only the table id is unknown.
-          return {
-            select: vi.fn(() => ({
-              in: vi.fn(async (_col: string, vals: string[]) => ({
-                data: vals.map((id) => ({ id })),
-                error: null,
-              })),
-            })),
-          }
-        }
-        if (table === 'tables') {
-          // Simulate an unknown table id: the "tables" lookup returns nothing.
-          return {
-            select: vi.fn(() => ({
-              in: vi.fn(async () => ({ data: [], error: null })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      await expect(
-        updateClubEvent(adminSession, 'evt-1', {
-          blocksRooms: true,
-          schedules: [
-            {
-              date: '2026-04-20',
-              startTime: '18:00',
-              endTime: '22:00',
-              allDay: false,
-              roomId: 'room-1',
-              tableId: 'table-unknown',
-            },
-          ],
-        })
-      ).rejects.toMatchObject({ statusCode: 400 })
-
-      // The event fields UPDATE must never run once an unknown table id is
-      // detected — the bad reference is rejected before any write happens.
-      expect(updateSpy).not.toHaveBeenCalled()
-    })
-
-    it('rejects an unknown equipment id in materials with 400 BEFORE updating the event fields (PR #154 review)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
-
-      const { updateClubEvent } = await loadClubEventsService()
-
-      const updateSpy = vi.fn(() => ({
-        eq: vi.fn(() => ({
-          select: vi.fn(() => ({
-            maybeSingle: vi.fn(async () => ({ data: null, error: null })),
-          })),
-        })),
-      }))
-
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({ data: ORIGINAL_ROW, error: null })),
-              })),
-            })),
-            update: updateSpy,
-          }
-        }
-        if (table === 'equipment') {
-          // Simulate a missing equipment FK: the "equipment" lookup returns nothing.
-          return {
-            select: vi.fn(() => ({
-              in: vi.fn(async () => ({ data: [], error: null })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      await expect(
-        updateClubEvent(adminSession, 'evt-1', {
-          materials: [{ equipmentId: 'equip-unknown', quantity: 1 }],
-        })
-      ).rejects.toMatchObject({ statusCode: 400 })
-
-      // The event fields UPDATE must never run once a missing equipment id
-      // is detected — the bad reference is rejected before any write happens.
-      expect(updateSpy).not.toHaveBeenCalled()
-    })
-
-    it('reverts the event fields UPDATE when the RPC fails during a materials-only change, leaving no partial update (PR #154 review)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-
-      // Equipment ids validate fine — the RPC still fails for some other
-      // reason (e.g. a transient DB error), which is the case this fix targets.
-      mockSupabaseAdmin.rpc = vi.fn(async () => ({
-        data: null,
-        error: { message: 'transient failure', code: 'XX000' },
-      }))
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
-
-      const { updateClubEvent } = await loadClubEventsService()
-
-      const updateCalls: Record<string, unknown>[] = []
-      const revertEq = vi.fn(async () => ({ data: null, error: null }))
-
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({ data: ORIGINAL_ROW, error: null })),
-              })),
-            })),
-            update: vi.fn(function (data: Record<string, unknown>) {
-              updateCalls.push(data)
-              // First call = the field-update from the request body;
-              // second call = the compensating revert.
-              if (updateCalls.length === 1) {
-                return {
-                  eq: vi.fn(() => ({
-                    select: vi.fn(() => ({
-                      maybeSingle: vi.fn(async () => ({
-                        data: { ...ORIGINAL_ROW, ...data },
-                        error: null,
-                      })),
-                    })),
-                  })),
-                }
-              }
-              return { eq: revertEq }
-            }),
-          }
-        }
-        if (table === 'equipment') {
-          return {
-            select: vi.fn(() => ({
-              in: vi.fn(async (_col: string, vals: string[]) => ({
-                data: vals.map((id) => ({ id })),
-                error: null,
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      await expect(
-        updateClubEvent(adminSession, 'evt-1', {
-          titleEs: 'Nuevo Titulo',
-          materials: [{ equipmentId: 'equip-1', quantity: 2 }],
-        })
-      ).rejects.toMatchObject({ statusCode: 500 })
-
-      // Two updates on "events": the initial (now-reverted) field write,
-      // then the compensating revert restoring the pre-update values — even
-      // though only `materials` changed (no schedules), the event fields
-      // must survive the failed request unchanged.
-      expect(updateCalls.length).toBe(2)
-      expect(updateCalls[0].title_es).toBe('Nuevo Titulo')
-      expect(updateCalls[1].title_es).toBe('Evento Antiguo')
-      expect(revertEq).toHaveBeenCalledWith('id', 'evt-1')
+      expect(result.blurbEs).toBe('Resumen nuevo')
+      // `title` (the legacy fallback column) is now selected by both the
+      // currentRows fetch and the RETURNING clause, so the response's
+      // titleEs/titleEn fall back to the row's `title` instead of coming
+      // back `undefined` for an internal-only event.
+      expect(result.titleEs).toBe('Evento Interno Legado')
+      expect(result.titleEn).toBe('Evento Interno Legado')
+      expect(result.visibleOnLanding).toBe(false)
     })
   })
 
   describe('deleteClubEvent', () => {
-    it('admin can delete a club event', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
+    it('admin can delete a club event with no room blocks', async () => {
+      addDeleteGuardHandler({ id: 'evt-1', title_es: null, title_en: null })
+      addCascadeBlocksFetchHandler([])
+      const deleteSpy = vi.fn()
+      addEventsDeleteHandler(deleteSpy)
 
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-
-      // deleteClubEvent's own Supabase existence check (above) is satisfied by
-      // buildSupabaseMock's default 'events' handling for id 'evt-1'. It then
-      // calls `deleteEventCascade(admin, id)` — since a real Supabase admin
-      // client is passed, the #303 dual-path fix routes this through
-      // `deleteEventCascadeSupabase` (still Supabase-based, #304 not started),
-      // NOT the Neon `sql` path. `eventsServiceSqlMock` handlers are therefore
-      // irrelevant to this test — no `sql\`...\`` call is ever made — and
-      // asserting on the Supabase mock's own call sites is what actually
-      // proves the cascade ran.
       const { deleteClubEvent } = await loadClubEventsService()
 
-      await deleteClubEvent(adminSession, 'evt-1')
+      await deleteClubEvent(createAdminSession(), 'evt-1')
 
-      // `deleteEventCascadeSupabase` starts by fetching this event's room
-      // blocks (there are none, per buildSupabaseMock's default 'in' handler
-      // for `event_room_blocks`, so the reservation-cancellation loop and the
-      // 'tables' lookup are both skipped — see the dedicated test below for
-      // that branch) ...
-      expect(mockSupabaseAdmin.from).toHaveBeenCalledWith('event_room_blocks')
-      const blocksFromCall = mockSupabaseAdmin.from.mock.results[
-        mockSupabaseAdmin.from.mock.calls.findIndex((call) => call[0] === 'event_room_blocks')
-      ]
-      expect(blocksFromCall.value.select).toHaveBeenCalledWith('room_id, date, start_time, end_time')
-
-      // No blocks means no room lookup and no reservation cancellation.
-      expect(mockSupabaseAdmin.from).not.toHaveBeenCalledWith('tables')
-      expect(mockSupabaseAdmin.from).not.toHaveBeenCalledWith('reservations')
-
-      // ... then deletes the event row itself.
-      expect(mockSupabaseAdmin.from).toHaveBeenCalledWith('events')
-      const eventsFromCalls = mockSupabaseAdmin.from.mock.calls
-        .map((call, i) => ({ call, result: mockSupabaseAdmin.from.mock.results[i] }))
-        .filter(({ call }) => call[0] === 'events')
-      const deleteCall = eventsFromCalls.find(({ result }) => result.value.delete.mock.calls.length > 0)
-      expect(deleteCall).toBeDefined()
-      expect(deleteCall!.result.value.delete).toHaveBeenCalledTimes(1)
+      expect(deleteSpy).toHaveBeenCalledWith(['evt-1'])
     })
 
     it('non-admin member gets 403 Forbidden on delete', async () => {
-      const memberSession = createMemberSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
+      const { deleteClubEvent } = await loadClubEventsService()
 
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
+      await expect(
+        deleteClubEvent(createMemberSession(), 'evt-1')
+      ).rejects.toMatchObject({ statusCode: 403 })
+    })
+
+    it('returns 404 when the event does not exist', async () => {
+      addDeleteGuardHandler(null)
 
       const { deleteClubEvent } = await loadClubEventsService()
 
       await expect(
-        deleteClubEvent(memberSession, 'evt-1')
-      ).rejects.toMatchObject({ statusCode: 403 })
+        deleteClubEvent(createAdminSession(), 'nonexistent-evt')
+      ).rejects.toMatchObject({ statusCode: 404 })
     })
 
     it('cascades to cancel overlapping reservations for an event with a room block', async () => {
-      // `buildSupabaseMock`'s shared 'event_room_blocks' `.eq()` chain is not
-      // thenable (it always yields `undefined` data — see the note on the
-      // test above), so it can never exercise the reservation-cancellation
-      // branch of `deleteEventCascadeSupabase`. This test builds a dedicated,
-      // minimal admin mock — scoped to this test only — that returns a real
-      // room block and a real table id, so the reservations `.update()...`
-      // chain actually runs and can be asserted on.
-      const adminSession = createAdminSession()
-
-      const reservationsEqSpy = vi.fn()
-      const reservationsLtSpy = vi.fn()
-      const reservationsGtSpy = vi.fn()
-      const reservationsInSpy = vi.fn()
-      const reservationsUpdateSpy = vi.fn()
-      const eventsDeleteEqSpy = vi.fn(async () => ({ data: null, error: null }))
-
-      const reservationsChain: any = {
-        in: vi.fn((...args: unknown[]) => {
-          reservationsInSpy(...args)
-          return reservationsChain
-        }),
-        eq: vi.fn((...args: unknown[]) => {
-          reservationsEqSpy(...args)
-          return reservationsChain
-        }),
-        lt: vi.fn((...args: unknown[]) => {
-          reservationsLtSpy(...args)
-          return reservationsChain
-        }),
-        gt: vi.fn((...args: unknown[]) => {
-          reservationsGtSpy(...args)
-          return reservationsChain
-        }),
-        then: (onFulfilled: any) => onFulfilled({ data: null, error: null }),
-      }
-
-      const customAdmin = {
-        from: vi.fn((table: string) => {
-          if (table === 'events') {
-            return {
-              select: vi.fn(() => ({
-                eq: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: { id: 'evt-1', title_es: null, title_en: null },
-                    error: null,
-                  })),
-                })),
-              })),
-              delete: vi.fn(() => ({ eq: eventsDeleteEqSpy })),
-            }
-          }
-          if (table === 'event_room_blocks') {
-            return {
-              select: vi.fn(() => ({
-                eq: async () => ({
-                  data: [
-                    { room_id: 'room-1', date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00' },
-                  ],
-                  error: null,
-                }),
-              })),
-            }
-          }
-          if (table === 'tables') {
-            return {
-              select: vi.fn(() => ({
-                in: async () => ({ data: [{ id: 'table-1', room_id: 'room-1' }], error: null }),
-              })),
-            }
-          }
-          if (table === 'reservations') {
-            return {
-              update: vi.fn((data: unknown) => {
-                reservationsUpdateSpy(data)
-                return reservationsChain
-              }),
-            }
-          }
-          throw new Error(`customAdmin.from: unexpected table "${table}"`)
-        }),
-      }
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(customAdmin as any)
+      addDeleteGuardHandler({ id: 'evt-1', title_es: null, title_en: null })
+      addCascadeBlocksFetchHandler([
+        { room_id: 'room-1', date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00' },
+      ])
+      addCascadeTablesFetchHandler([{ id: 'table-1', room_id: 'room-1' }])
+      const cancelSpy = vi.fn(() => [])
+      addReservationsCancelHandler(cancelSpy)
+      const deleteSpy = vi.fn()
+      addEventsDeleteHandler(deleteSpy)
 
       const { deleteClubEvent } = await loadClubEventsService()
 
-      await deleteClubEvent(adminSession, 'evt-1')
+      await deleteClubEvent(createAdminSession(), 'evt-1')
 
-      // Cancellation update targets the room's table, the block's date/time
-      // window, and only active/pending reservations.
-      expect(reservationsUpdateSpy).toHaveBeenCalledWith({ status: 'cancelled' })
-      expect(reservationsInSpy).toHaveBeenCalledWith('table_id', ['table-1'])
-      expect(reservationsEqSpy).toHaveBeenCalledWith('date', '2026-04-20')
-      expect(reservationsLtSpy).toHaveBeenCalledWith('start_time', '22:00:00')
-      expect(reservationsGtSpy).toHaveBeenCalledWith('end_time', '18:00:00')
-      expect(reservationsInSpy).toHaveBeenCalledWith('status', ['active', 'pending'])
-
-      // The event row itself is still deleted afterwards.
-      expect(eventsDeleteEqSpy).toHaveBeenCalledWith('id', 'evt-1')
+      expect(cancelSpy).toHaveBeenCalledTimes(1)
+      expect(deleteSpy).toHaveBeenCalledWith(['evt-1'])
     })
   })
 
   describe('listAdminClubEvents', () => {
     it('admin gets upcoming and past events split by date', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      addListAdminEventsSelectHandler([
+        currentEventRow({ id: 'evt-upcoming', date: '2026-05-01' }),
+        currentEventRow({ id: 'evt-past', date: '2026-01-01' }),
+      ])
+      addEventRoomBlocksSelectHandler([])
+      addEventMaterialsSelectHandler([])
 
       const { listAdminClubEvents } = await loadClubEventsService()
 
-      const result = await listAdminClubEvents(adminSession)
+      const result = await listAdminClubEvents(createAdminSession())
 
       expect(result).toHaveProperty('upcoming')
       expect(result).toHaveProperty('past')
-      expect(Array.isArray(result.upcoming)).toBe(true)
-      expect(Array.isArray(result.past)).toBe(true)
+      expect(result.upcoming.map((e) => e.id)).toContain('evt-upcoming')
+      expect(result.past.map((e) => e.id)).toContain('evt-past')
     })
 
     it('non-admin member gets 403 Forbidden', async () => {
-      const memberSession = createMemberSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
-      vi.mocked(await import('@/lib/server/service-error')).serviceError
-        .mockImplementation((msg, code) => {
-          const err = new Error(msg) as ServiceError
-          err.statusCode = code
-          throw err
-        })
-
       const { listAdminClubEvents } = await loadClubEventsService()
 
       await expect(
-        listAdminClubEvents(memberSession)
+        listAdminClubEvents(createMemberSession())
       ).rejects.toMatchObject({ statusCode: 403 })
+    })
+
+    it('falls back to the legacy `title` column for an internal-only event (title_es/title_en null) (PR #354 fix)', async () => {
+      // toAdminClubEvent does `row.title_es ?? row.title` / `row.title_en ??
+      // row.title` — listAdminClubEvents's SELECT must fetch `title` or that
+      // fallback silently resolves to undefined for internal-only rows.
+      addListAdminEventsSelectHandler([
+        currentEventRow({
+          id: 'evt-internal-1',
+          title_es: null,
+          title_en: null,
+          title: 'Evento Interno Legado',
+          date: '2026-05-01',
+        }),
+      ])
+      addEventRoomBlocksSelectHandler([])
+      addEventMaterialsSelectHandler([])
+
+      const { listAdminClubEvents } = await loadClubEventsService()
+
+      const result = await listAdminClubEvents(createAdminSession())
+
+      const event = [...result.upcoming, ...result.past].find((e) => e.id === 'evt-internal-1')
+      expect(event).toBeDefined()
+      expect(event?.titleEs).toBe('Evento Interno Legado')
+      expect(event?.titleEn).toBe('Evento Interno Legado')
     })
   })
 
   describe('listClubEvents', () => {
     it('returns upcoming and past club events for public listing', async () => {
-      const mockSupabaseClient = buildSupabaseMock()
-      
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient
-        .mockResolvedValue(mockSupabaseClient as any)
+      addListClubEventsSelectHandler([
+        {
+          id: 'evt-upcoming-1',
+          title_es: 'Tornero 2026',
+          title_en: 'Tournament 2026',
+          blurb_es: 'Torneo amistoso',
+          blurb_en: 'Friendly tournament',
+          description_es: null,
+          description_en: null,
+          date_kind: 'single',
+          date: '2026-05-01',
+          end_date: null,
+          recurrence_label_es: null,
+          recurrence_label_en: null,
+          image_url: 'https://example.com/tournament.png',
+          link_url: null,
+        },
+      ])
 
       const { listClubEvents } = await loadClubEventsService()
 
@@ -2197,15 +1355,62 @@ describe('club-events-service', () => {
 
       expect(result).toHaveProperty('upcoming')
       expect(result).toHaveProperty('past')
+      expect(result.upcoming.map((e) => e.id)).toContain('evt-upcoming-1')
+    })
+
+    it('filters out a row with a null title_es/title_en via assertPublicClubEventRowsHaveBilingualTitles (defense-in-depth, PR #354 fix)', async () => {
+      // The WHERE clause is the primary guarantee, but this guard is the
+      // application-layer backstop for a regression in that query (RLS was
+      // dropped in the Neon migration). Simulate that regression by having
+      // the mocked SELECT hand back one bilingual row and one row that
+      // slipped past the WHERE clause with a null title_en.
+      addListClubEventsSelectHandler([
+        {
+          id: 'evt-bilingual',
+          title_es: 'Evento Bilingue',
+          title_en: 'Bilingual Event',
+          blurb_es: null,
+          blurb_en: null,
+          description_es: null,
+          description_en: null,
+          date_kind: 'single',
+          date: '2026-05-01',
+          end_date: null,
+          recurrence_label_es: null,
+          recurrence_label_en: null,
+          image_url: null,
+          link_url: null,
+        },
+        {
+          id: 'evt-leaked-internal',
+          title_es: 'Titulo interno filtrado',
+          title_en: null, // simulates a query-layer regression
+          blurb_es: null,
+          blurb_en: null,
+          description_es: null,
+          description_en: null,
+          date_kind: 'single',
+          date: '2026-05-02',
+          end_date: null,
+          recurrence_label_es: null,
+          recurrence_label_en: null,
+          image_url: null,
+          link_url: null,
+        },
+      ])
+
+      const { listClubEvents } = await loadClubEventsService()
+
+      const result = await listClubEvents()
+
+      const allIds = [...result.upcoming, ...result.past].map((e) => e.id)
+      expect(allIds).toContain('evt-bilingual')
+      expect(allIds).not.toContain('evt-leaked-internal')
     })
   })
 
   describe('listEvents (from events-service.ts)', () => {
     it('excludes landing-only rows (both title_es and title_en populated)', async () => {
-      // listEvents() (#303) no longer touches Supabase at all — it queries
-      // `WHERE title_es IS NULL OR title_en IS NULL` directly in Neon raw
-      // SQL, which is what actually implements the landing-row exclusion
-      // this test is named for (rather than a Supabase `.or()` filter).
       const eventsSelectSpy = vi.fn(() => [
         {
           id: 'evt-internal-1',
@@ -2218,7 +1423,7 @@ describe('club-events-service', () => {
           created_at: '2026-04-01T00:00:00Z',
         },
       ])
-      eventsServiceSqlMock.addHandler({
+      sqlMock.addHandler({
         name: 'SELECT events excluding landing rows (title_es/title_en IS NULL)',
         verb: 'select',
         match: (stmt) =>
@@ -2228,7 +1433,7 @@ describe('club-events-service', () => {
           Boolean(stmt.whereClause?.includes('title_en')),
         respond: eventsSelectSpy,
       })
-      eventsServiceSqlMock.addHandler({
+      sqlMock.addHandler({
         name: 'SELECT event_room_blocks for the listed events',
         verb: 'select',
         match: (stmt) => stmt.table === 'event_room_blocks',
@@ -2248,68 +1453,14 @@ describe('club-events-service', () => {
 
   describe('updateClubEvent with fallback semantics edge cases (OIR-206 round 2)', () => {
     it('rule 2: explicit different titleEn + blank titleEn payload = re-enable auto-copy to new ES', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      // Current row: title_en !== title_es (deliberately set)
-      const currentRow = {
-        id: 'evt-1',
-        title: 'Event',
-        title_es: 'Evento Antiguo',
-        title_en: 'Old Explicit Title', // Deliberately different from ES
-        blurb_es: null,
-        blurb_en: null,
-        description_es: null,
-        description_en: null,
-        category_es: null,
-        category_en: null,
-        date_kind: 'single',
-        date: '2026-04-20',
-        end_date: null,
-        recurrence_label_es: null,
-        recurrence_label_en: null,
-        image_url: null,
-        link_url: null,
-        created_by: 'user-1',
-        created_at: '2026-04-01T00:00:00Z',
-      }
-
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: currentRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      ...currentRow,
-                      title_es: 'Evento Nuevo',
-                      title_en: 'Evento Nuevo', // Should become new ES (rule 2)
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      addCurrentEventSelectHandler(currentEventRow({ title_es: 'Evento Antiguo', title_en: 'Old Explicit Title' }))
+      addUpdateEventHandler((values) => [currentEventRow({ title_es: values[0] as string, title_en: values[1] as string })])
+      addEventRoomBlocksSelectHandler([])
+      addEventMaterialsSelectHandler([])
 
       const { updateClubEvent } = await loadClubEventsService()
 
-      const result = await updateClubEvent(adminSession, 'evt-1', {
+      const result = await updateClubEvent(createAdminSession(), 'evt-1', {
         titleEs: 'Evento Nuevo',
         titleEn: '', // Blank = re-enable auto-copy
       })
@@ -2318,68 +1469,14 @@ describe('club-events-service', () => {
     })
 
     it('rule 1: resending identical titleEn (en === es deliberately) + ES change = EN preserved', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      // Current row: title_en === title_es (could be deliberate or auto-copied, but identical)
-      const currentRow = {
-        id: 'evt-1',
-        title: 'Event',
-        title_es: 'Evento Antiguo',
-        title_en: 'Evento Antiguo', // Same as ES (deliberately or auto-copied)
-        blurb_es: null,
-        blurb_en: null,
-        description_es: null,
-        description_en: null,
-        category_es: null,
-        category_en: null,
-        date_kind: 'single',
-        date: '2026-04-20',
-        end_date: null,
-        recurrence_label_es: null,
-        recurrence_label_en: null,
-        image_url: null,
-        link_url: null,
-        created_by: 'user-1',
-        created_at: '2026-04-01T00:00:00Z',
-      }
-
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: currentRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      ...currentRow,
-                      title_es: 'Evento Nuevo',
-                      title_en: 'Evento Antiguo', // Preserved because explicitly resent (rule 1)
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      addCurrentEventSelectHandler(currentEventRow({ title_es: 'Evento Antiguo', title_en: 'Evento Antiguo' }))
+      addUpdateEventHandler((values) => [currentEventRow({ title_es: values[0] as string, title_en: values[1] as string })])
+      addEventRoomBlocksSelectHandler([])
+      addEventMaterialsSelectHandler([])
 
       const { updateClubEvent } = await loadClubEventsService()
 
-      const result = await updateClubEvent(adminSession, 'evt-1', {
+      const result = await updateClubEvent(createAdminSession(), 'evt-1', {
         titleEs: 'Evento Nuevo',
         titleEn: 'Evento Antiguo', // Resend explicit identical value
       })
@@ -2388,67 +1485,14 @@ describe('club-events-service', () => {
     })
 
     it('rule 2: whitespace-only titleEn behaves as blank (re-enable auto-copy to new ES)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      const currentRow = {
-        id: 'evt-1',
-        title: 'Event',
-        title_es: 'Evento Antiguo',
-        title_en: 'Old Explicit Title',
-        blurb_es: null,
-        blurb_en: null,
-        description_es: null,
-        description_en: null,
-        category_es: null,
-        category_en: null,
-        date_kind: 'single',
-        date: '2026-04-20',
-        end_date: null,
-        recurrence_label_es: null,
-        recurrence_label_en: null,
-        image_url: null,
-        link_url: null,
-        created_by: 'user-1',
-        created_at: '2026-04-01T00:00:00Z',
-      }
-
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: currentRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      ...currentRow,
-                      title_es: 'Evento Nuevo',
-                      title_en: 'Evento Nuevo', // Should become new ES (whitespace trimmed = empty)
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      addCurrentEventSelectHandler(currentEventRow({ title_es: 'Evento Antiguo', title_en: 'Old Explicit Title' }))
+      addUpdateEventHandler((values) => [currentEventRow({ title_es: values[0] as string, title_en: values[1] as string })])
+      addEventRoomBlocksSelectHandler([])
+      addEventMaterialsSelectHandler([])
 
       const { updateClubEvent } = await loadClubEventsService()
 
-      const result = await updateClubEvent(adminSession, 'evt-1', {
+      const result = await updateClubEvent(createAdminSession(), 'evt-1', {
         titleEs: 'Evento Nuevo',
         titleEn: '   ', // Whitespace-only = treated as empty (rule 2)
       })
@@ -2457,72 +1501,284 @@ describe('club-events-service', () => {
     })
 
     it('rule 2: blank blurbEn (nullable) re-enables auto-copy to new ES (nullable field)', async () => {
-      const adminSession = createAdminSession()
-      const mockSupabaseAdmin = buildSupabaseMock()
-      
-      const currentRow = {
-        id: 'evt-1',
-        title: 'Event',
-        title_es: 'Evento',
-        title_en: 'Event',
-        blurb_es: 'Viejo resumen',
-        blurb_en: 'Old blurb summary', // Explicitly set
-        description_es: null,
-        description_en: null,
-        category_es: null,
-        category_en: null,
-        date_kind: 'single',
-        date: '2026-04-20',
-        end_date: null,
-        recurrence_label_es: null,
-        recurrence_label_en: null,
-        image_url: null,
-        link_url: null,
-        created_by: 'user-1',
-        created_at: '2026-04-01T00:00:00Z',
-      }
-
-      mockSupabaseAdmin.from = vi.fn(function (table: string) {
-        if (table === 'events') {
-          return {
-            select: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: currentRow,
-                  error: null,
-                })),
-              })),
-            })),
-            update: vi.fn(() => ({
-              eq: vi.fn(() => ({
-                select: vi.fn(() => ({
-                  maybeSingle: vi.fn(async () => ({
-                    data: {
-                      ...currentRow,
-                      blurb_es: 'Nuevo resumen',
-                      blurb_en: 'Nuevo resumen', // Becomes new ES (rule 2, nullable)
-                    },
-                    error: null,
-                  })),
-                })),
-              })),
-            })),
-          }
-        }
-        return buildSupabaseMock().from(table)
-      }) as any
-
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient
-        .mockReturnValue(mockSupabaseAdmin as any)
+      addCurrentEventSelectHandler(currentEventRow({ blurb_es: 'Viejo resumen', blurb_en: 'Old blurb summary' }))
+      addUpdateEventHandler((values) => [currentEventRow({ blurb_es: values[2] as string, blurb_en: values[3] as string })])
+      addEventRoomBlocksSelectHandler([])
+      addEventMaterialsSelectHandler([])
 
       const { updateClubEvent } = await loadClubEventsService()
 
-      const result = await updateClubEvent(adminSession, 'evt-1', {
+      const result = await updateClubEvent(createAdminSession(), 'evt-1', {
         blurbEs: 'Nuevo resumen',
         blurbEn: '', // Blank = re-enable auto-copy (rule 2)
       })
 
       expect(result.blurbEn).toBe('Nuevo resumen')
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // #304 code-review regression coverage: applyClubEventBlocksAndMaterials'
+  // rollback/compensation paths (rollbackClubEventBlocksWrite, the batched
+  // room->table lookup's own rollback, per-step rollback resilience, and the
+  // ClubEventReadBackError read-back-after-commit path). None of these were
+  // covered by the tests above, which only exercise the block/material
+  // write-loop failures, not the lookup-before-the-loop or read-back-after
+  // failure branches.
+  // ---------------------------------------------------------------------------
+  describe('applyClubEventBlocksAndMaterials rollback resilience (#304 code-review)', () => {
+    it('restores deleted blocks and materials when the batched room->table lookup fails (high-effort finding)', async () => {
+      const deletedBlockRow = {
+        id: 'block-old-1', event_id: 'evt-1', room_id: 'room-old', table_id: null,
+        date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00', all_day: false,
+      }
+      const deletedMaterialRow = { event_id: 'evt-1', equipment_id: 'equip-old', quantity: 2 }
+
+      addCurrentEventSelectHandler(currentEventRow())
+      addRoomsExistHandler()
+      addUpdateEventHandler(() => [currentEventRow()])
+      // Comparison fetch (fetchEventRoomBlocks, no ORDER BY) — deliberately
+      // differs from the incoming schedule so the block-replace step runs.
+      sqlMock.addHandler({
+        name: 'SELECT event_room_blocks WHERE event_id (comparison fetch, no ORDER BY)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, ROOM_BLOCK_COLUMNS) && !stmt.orderBy,
+        respond: () => [{ ...deletedBlockRow }],
+      })
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([deletedBlockRow])
+      addMaterialsDeleteHandler([deletedMaterialRow])
+      // The batched room->table lookup itself fails — after both DELETEs
+      // above (with their RETURNING captures) have already committed.
+      sqlMock.addHandler({
+        name: 'SELECT id, room_id FROM tables WHERE room_id = ANY(...) (roomTableMap, throws)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id, room_id'),
+        respond: () => { throw new Error('room->table lookup failed') },
+      })
+      const blockReinsertSpy = vi.fn()
+      sqlMock.addHandler({
+        name: 'INSERT event_room_blocks (rollback reinsert, no RETURNING)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'event_room_blocks' && !stmt.returning,
+        respond: (stmt) => {
+          blockReinsertSpy(stmt.values)
+          return []
+        },
+      })
+      const materialReinsertSpy = vi.fn()
+      addMaterialsInsertHandler((values) => materialReinsertSpy(values))
+      addRevertEventHandler()
+
+      const { updateClubEvent } = await loadClubEventsService()
+
+      await expect(
+        updateClubEvent(createAdminSession(), 'evt-1', {
+          blocksRooms: true,
+          schedules: [
+            { date: '2026-04-20', startTime: '10:00', endTime: '14:00', allDay: false, roomId: 'room-1' },
+          ],
+          materials: [],
+        })
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      // The block DELETE'd earlier in the call must be reinserted…
+      expect(blockReinsertSpy).toHaveBeenCalledTimes(1)
+      expect(blockReinsertSpy.mock.calls[0][0]).toEqual([
+        'block-old-1', 'evt-1', 'room-old', null, '2026-04-20', '18:00:00', '22:00:00', false,
+      ])
+      // …and so must the material DELETE'd earlier in the same call.
+      expect(materialReinsertSpy).toHaveBeenCalledTimes(1)
+      expect(materialReinsertSpy.mock.calls[0][0]).toEqual(['evt-1', 'equip-old', 2])
+    })
+
+    it('per-step rollback resilience: a failure in one compensating step does not block later steps (high-effort finding)', async () => {
+      addCurrentEventSelectHandler(currentEventRow())
+      addRoomsExistHandler()
+      addEquipmentExistsHandler()
+      addUpdateEventHandler(() => [currentEventRow()])
+      sqlMock.addHandler({
+        name: 'SELECT event_room_blocks WHERE event_id (comparison fetch, no ORDER BY)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, ROOM_BLOCK_COLUMNS) && !stmt.orderBy,
+        respond: () => [{
+          id: 'block-other', event_id: 'evt-1', room_id: 'room-other', table_id: null,
+          date: '2026-04-20', start_time: '09:00:00', end_time: '10:00:00', all_day: false,
+        }],
+      })
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      addMaterialsDeleteHandler([{ event_id: 'evt-1', equipment_id: 'equip-old', quantity: 5 }])
+      sqlMock.addHandler({
+        name: 'SELECT id, room_id FROM tables WHERE room_id = ANY(...) (roomTableMap)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id, room_id'),
+        respond: () => [{ id: 'table-1', room_id: 'room-1' }],
+      })
+      addBlockInsertHandler('block-new')
+      addReservationsCancelHandler(() => [{ id: 'res-1', status: 'active' }])
+
+      // First material insert succeeds, second fails — triggers the
+      // compensating rollback mid-materials-loop, with one already-inserted
+      // block and one already-cancelled reservation from the earlier
+      // blocks loop still needing cleanup.
+      let materialInsertCount = 0
+      const materialInsertSpy = vi.fn()
+      sqlMock.addHandler({
+        name: 'INSERT event_equipment (second insert fails, mid-loop)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'event_equipment',
+        respond: (stmt) => {
+          materialInsertCount += 1
+          if (materialInsertCount === 2) throw new Error('material insert failed')
+          materialInsertSpy(stmt.values)
+          return []
+        },
+      })
+
+      // Rollback step 1 (delete THIS call's inserted blocks) fails — this
+      // must NOT prevent the later independent steps (reservation restore,
+      // material reinsert) from still running.
+      sqlMock.prependHandler({
+        name: 'DELETE event_room_blocks WHERE id = ANY(...) (rollback delete-inserted, throws)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'event_id'),
+        respond: () => { throw new Error('rollback delete-inserted-blocks failed') },
+      })
+
+      const reservationRestoreSpy = vi.fn()
+      sqlMock.addHandler({
+        name: 'UPDATE reservations SET status=active (restore, no table_id in WHERE)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'status') && !whereHasColumn(stmt, 'table_id'),
+        respond: (stmt) => {
+          reservationRestoreSpy(stmt.values)
+          return []
+        },
+      })
+
+      addRevertEventHandler()
+
+      const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      const { updateClubEvent } = await loadClubEventsService()
+
+      await expect(
+        updateClubEvent(createAdminSession(), 'evt-1', {
+          blocksRooms: true,
+          schedules: [
+            { date: '2026-04-20', startTime: '10:00', endTime: '14:00', allDay: false, roomId: 'room-1' },
+          ],
+          materials: [
+            { equipmentId: 'equip-a', quantity: 1 },
+            { equipmentId: 'equip-b', quantity: 1 },
+          ],
+        })
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      // Step 1 (delete this call's inserted blocks) failed (logged, non-fatal)
+      // — but the reservation-restore step still ran despite that.
+      expect(reservationRestoreSpy).toHaveBeenCalledTimes(1)
+      expect(reservationRestoreSpy.mock.calls[0][0][0]).toEqual(['res-1'])
+      // …and so did the material-reinsert step: one forward-loop insert
+      // (equip-a, before the failure) plus one rollback reinsert (equip-old,
+      // the pre-existing material this call had deleted).
+      expect(materialInsertSpy).toHaveBeenCalledTimes(2)
+      expect(materialInsertSpy.mock.calls[0][0]).toEqual(['evt-1', 'equip-a', 1])
+      expect(materialInsertSpy.mock.calls[1][0]).toEqual(['evt-1', 'equip-old', 5])
+
+      consoleErrorSpy.mockRestore()
+    })
+
+    it('createClubEvent surfaces a ClubEventReadBackError as a failure WITHOUT deleting the successfully-written event row (high-effort finding)', async () => {
+      addCreateInsertHandler()
+      addRoomsExistHandler()
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      sqlMock.addHandler({
+        name: 'SELECT id, room_id FROM tables WHERE room_id = ANY(...) (roomTableMap)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id, room_id'),
+        respond: () => [{ id: 'table-1', room_id: 'room-1' }],
+      })
+      addBlockInsertHandler('block')
+      addReservationsCancelHandler(() => [])
+      // The final read-back SELECT fails AFTER every write above has
+      // already committed successfully.
+      sqlMock.addHandler({
+        name: 'SELECT event_room_blocks WHERE event_id ORDER BY ... (read-back, throws)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, ROOM_BLOCK_COLUMNS) && Boolean(stmt.orderBy),
+        respond: () => { throw new Error('read-back failed') },
+      })
+      const deleteSpy = vi.fn()
+      addEventsDeleteHandler(deleteSpy)
+
+      const { createClubEvent } = await loadClubEventsService()
+
+      await expect(
+        createClubEvent(createAdminSession(), {
+          titleEs: 'Torneo',
+          titleEn: 'Tournament',
+          date: '2026-05-01',
+          dateKind: 'single',
+          blocksRooms: true,
+          schedules: [
+            { date: '2026-05-01', startTime: '18:00', endTime: '22:00', allDay: false, roomId: 'room-1' },
+          ],
+        })
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      // The event row and its already-committed block write must be left
+      // alone — a read-only failure must never trigger the orphan-row
+      // compensating delete.
+      expect(deleteSpy).not.toHaveBeenCalled()
+    })
+
+    it('updateClubEvent surfaces a ClubEventReadBackError as a failure WITHOUT reverting the successfully-written metadata (high-effort finding)', async () => {
+      addCurrentEventSelectHandler(currentEventRow())
+      addRoomsExistHandler()
+      addUpdateEventHandler(() => [currentEventRow()])
+      sqlMock.addHandler({
+        name: 'SELECT event_room_blocks WHERE event_id (comparison fetch, no ORDER BY)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, ROOM_BLOCK_COLUMNS) && !stmt.orderBy,
+        respond: () => [{
+          id: 'block-other', event_id: 'evt-1', room_id: 'room-other', table_id: null,
+          date: '2026-04-20', start_time: '09:00:00', end_time: '10:00:00', all_day: false,
+        }],
+      })
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      sqlMock.addHandler({
+        name: 'SELECT id, room_id FROM tables WHERE room_id = ANY(...) (roomTableMap)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id, room_id'),
+        respond: () => [{ id: 'table-1', room_id: 'room-1' }],
+      })
+      addBlockInsertHandler('block')
+      addReservationsCancelHandler(() => [])
+      sqlMock.addHandler({
+        name: 'SELECT event_room_blocks WHERE event_id ORDER BY ... (read-back, throws)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, ROOM_BLOCK_COLUMNS) && Boolean(stmt.orderBy),
+        respond: () => { throw new Error('read-back failed') },
+      })
+      const revertSpy = vi.fn()
+      addRevertEventHandler(revertSpy)
+
+      const { updateClubEvent } = await loadClubEventsService()
+
+      await expect(
+        updateClubEvent(createAdminSession(), 'evt-1', {
+          blocksRooms: true,
+          schedules: [
+            { date: '2026-04-20', startTime: '10:00', endTime: '14:00', allDay: false, roomId: 'room-1' },
+          ],
+        })
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      expect(revertSpy).not.toHaveBeenCalled()
     })
   })
 })
