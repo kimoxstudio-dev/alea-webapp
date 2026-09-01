@@ -346,6 +346,41 @@ function addReservationsCancelHandler(respond: () => unknown = () => []) {
   })
 }
 
+/**
+ * UPDATE saved_games AS saved SET status='cancelled' WHERE saved.table_id =
+ * ANY(...) AND saved.status='active' AND $N BETWEEN saved.start_date AND
+ * saved.end_date RETURNING saved.id —
+ * cancelActiveSavedGamesForRoomBlock (#334). Disambiguated from the restore
+ * handler below (also `saved_games`, also `update`) by the presence of
+ * `table_id` in the WHERE clause — only the cancel query filters on it.
+ */
+function addSavedGamesCancelHandler(respond: () => unknown = () => []) {
+  sqlMock.addHandler({
+    name: 'UPDATE saved_games cancel active (room-wide, #334)',
+    verb: 'update',
+    match: (stmt) => stmt.table === 'saved_games' && whereHasColumn(stmt, 'table_id'),
+    respond,
+  })
+}
+
+/**
+ * UPDATE saved_games SET status='active' WHERE id = ANY(...) AND
+ * status='cancelled' — restoreCancelledSavedGames (#334), the compensating
+ * rollback for the cancel handler above. No `table_id` in its WHERE clause,
+ * which is exactly what separates it from the cancel query.
+ */
+function addSavedGamesRestoreHandler(spy?: (values: unknown[]) => void) {
+  sqlMock.addHandler({
+    name: 'UPDATE saved_games restore cancelled (#334)',
+    verb: 'update',
+    match: (stmt) => stmt.table === 'saved_games' && !whereHasColumn(stmt, 'table_id'),
+    respond: (stmt) => {
+      spy?.(stmt.values)
+      return []
+    },
+  })
+}
+
 /** INSERT INTO event_equipment (...) ON CONFLICT (event_id, equipment_id) DO UPDATE */
 function addMaterialsInsertHandler(spy?: (values: unknown[]) => void) {
   sqlMock.addHandler({
@@ -1617,6 +1652,7 @@ describe('club-events-service', () => {
       })
       addBlockInsertHandler('block-new')
       addReservationsCancelHandler(() => [{ id: 'res-1', status: 'active' }])
+      addSavedGamesCancelHandler()
 
       // First material insert succeeds, second fails — triggers the
       // compensating rollback mid-materials-loop, with one already-inserted
@@ -1703,6 +1739,7 @@ describe('club-events-service', () => {
       })
       addBlockInsertHandler('block')
       addReservationsCancelHandler(() => [])
+      addSavedGamesCancelHandler()
       // The final read-back SELECT fails AFTER every write above has
       // already committed successfully.
       sqlMock.addHandler({
@@ -1758,6 +1795,7 @@ describe('club-events-service', () => {
       })
       addBlockInsertHandler('block')
       addReservationsCancelHandler(() => [])
+      addSavedGamesCancelHandler()
       sqlMock.addHandler({
         name: 'SELECT event_room_blocks WHERE event_id ORDER BY ... (read-back, throws)',
         verb: 'select',
@@ -1779,6 +1817,236 @@ describe('club-events-service', () => {
       ).rejects.toMatchObject({ statusCode: 500 })
 
       expect(revertSpy).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('cancelActiveSavedGamesForRoomBlock / restoreCancelledSavedGames (#334)', () => {
+    it('cancels active saved games room-wide — including a table other than the newly-inserted block\'s own single table', async () => {
+      addCreateInsertHandler()
+      addRoomsExistHandler()
+      // Registered BEFORE addTablesHandler(): its broad `stmt.table ===
+      // 'tables'` match (no column check) would otherwise intercept this
+      // exact-column 'id, room_id' query too, since handlers dispatch
+      // first-match-in-registration-order (see shared-sql-mock-broad-
+      // handlers-need-disambiguation memory).
+      // The room has two tables; the block itself only targets table-1, but
+      // the legacy trigger's port is room-wide — both must be passed to the
+      // saved_games cancellation query.
+      addCascadeTablesFetchHandler([
+        { id: 'table-1', room_id: 'room-1' },
+        { id: 'table-2', room_id: 'room-1' },
+      ])
+      addTablesHandler()
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      addMaterialsDeleteHandler([])
+      addBlockInsertHandler('block')
+      addReservationsCancelHandler()
+      addMaterialsInsertHandler()
+      addEventRoomBlocksSelectHandler([])
+      addEventMaterialsSelectHandler([])
+
+      const savedGamesCancelSpy = vi.fn()
+      sqlMock.addHandler({
+        name: 'UPDATE saved_games cancel active (room-wide, spy)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'saved_games' && whereHasColumn(stmt, 'table_id'),
+        respond: (stmt) => {
+          savedGamesCancelSpy(stmt.values[0])
+          return [{ id: 'sg-1' }]
+        },
+      })
+
+      const { createClubEvent } = await loadClubEventsService()
+
+      await createClubEvent(createAdminSession(), {
+        titleEs: 'Torneo',
+        titleEn: 'Tournament',
+        date: '2026-05-01',
+        dateKind: 'single',
+        blocksRooms: true,
+        schedules: [
+          { date: '2026-05-01', startTime: '18:00', endTime: '22:00', allDay: false, roomId: 'room-1', tableId: 'table-1' },
+        ],
+      })
+
+      expect(savedGamesCancelSpy).toHaveBeenCalledTimes(1)
+      // Room-wide scoping (deliberate, mirrors the legacy trigger): table-2
+      // is NOT the block's own table, yet it's still passed to the
+      // cancellation query alongside table-1.
+      expect(savedGamesCancelSpy.mock.calls[0][0]).toEqual(['table-1', 'table-2'])
+    })
+
+    it('does not cancel a saved game whose status is not "active" (e.g. already cancelled) — enforced by the mock only matching the active-status query, verified via the real WHERE guard', async () => {
+      addCreateInsertHandler()
+      addRoomsExistHandler()
+      addCascadeTablesFetchHandler([{ id: 'table-1', room_id: 'room-1' }])
+      addTablesHandler()
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      addMaterialsDeleteHandler([])
+      addBlockInsertHandler('block')
+      addReservationsCancelHandler()
+      addMaterialsInsertHandler()
+      addEventRoomBlocksSelectHandler([])
+      addEventMaterialsSelectHandler([])
+
+      // Simulates the real UPDATE's own `status = 'active'` WHERE guard: a
+      // saved game that is already 'cancelled'/'completed' never matches the
+      // real query's WHERE clause, so the RETURNING set is empty — no id
+      // comes back and cancelledSavedGameIds stays empty.
+      addSavedGamesCancelHandler(() => [])
+
+      const { createClubEvent } = await loadClubEventsService()
+
+      const result = await createClubEvent(createAdminSession(), {
+        titleEs: 'Torneo',
+        titleEn: 'Tournament',
+        date: '2026-05-01',
+        dateKind: 'single',
+        blocksRooms: true,
+        schedules: [
+          { date: '2026-05-01', startTime: '18:00', endTime: '22:00', allDay: false, roomId: 'room-1' },
+        ],
+      })
+
+      expect(result.id).toBe('evt-new-1')
+    })
+
+    it('does not cancel a saved game whose date falls outside its [start_date, end_date] range — enforced by the mock only matching the BETWEEN-satisfying query', async () => {
+      addCreateInsertHandler()
+      addRoomsExistHandler()
+      addCascadeTablesFetchHandler([{ id: 'table-1', room_id: 'room-1' }])
+      addTablesHandler()
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      addMaterialsDeleteHandler([])
+      addBlockInsertHandler('block')
+      addReservationsCancelHandler()
+      addMaterialsInsertHandler()
+      addEventRoomBlocksSelectHandler([])
+      addEventMaterialsSelectHandler([])
+
+      // Simulates the real UPDATE's `$date BETWEEN start_date AND end_date`
+      // guard: a saved game whose range doesn't cover the block's date never
+      // matches, so RETURNING comes back empty.
+      addSavedGamesCancelHandler(() => [])
+
+      const { createClubEvent } = await loadClubEventsService()
+
+      const result = await createClubEvent(createAdminSession(), {
+        titleEs: 'Torneo',
+        titleEn: 'Tournament',
+        date: '2026-05-01',
+        dateKind: 'single',
+        blocksRooms: true,
+        schedules: [
+          { date: '2026-05-01', startTime: '18:00', endTime: '22:00', allDay: false, roomId: 'room-1' },
+        ],
+      })
+
+      expect(result.id).toBe('evt-new-1')
+    })
+
+    it('early-returns with no query issued when the room has no tables (empty tableIds)', async () => {
+      addCreateInsertHandler()
+      addRoomsExistHandler()
+      // Room has zero tables — roomTableMap.get(room_id) is undefined, so
+      // cancelActiveSavedGamesForRoomBlock's tableIds argument is [].
+      addCascadeTablesFetchHandler([])
+      addTablesHandler()
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      addMaterialsDeleteHandler([])
+      addBlockInsertHandler('block')
+      addReservationsCancelHandler()
+      addMaterialsInsertHandler()
+      addEventRoomBlocksSelectHandler([])
+      addEventMaterialsSelectHandler([])
+
+      // No saved_games handler registered at all — if the early-return in
+      // cancelActiveSavedGamesForRoomBlock did not fire, the unmatched UPDATE
+      // would throw "no handler matched" and fail this test loudly.
+      const { createClubEvent } = await loadClubEventsService()
+
+      const result = await createClubEvent(createAdminSession(), {
+        titleEs: 'Torneo',
+        titleEn: 'Tournament',
+        date: '2026-05-01',
+        dateKind: 'single',
+        blocksRooms: true,
+        schedules: [
+          { date: '2026-05-01', startTime: '18:00', endTime: '22:00', allDay: false, roomId: 'room-1' },
+        ],
+      })
+
+      expect(result.id).toBe('evt-new-1')
+    })
+
+    it('rollback restores cancelled saved games to active when a later write in the same call fails', async () => {
+      addCreateInsertHandler()
+      addRoomsExistHandler()
+      addCascadeTablesFetchHandler([{ id: 'table-1', room_id: 'room-1' }])
+      addTablesHandler()
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      addMaterialsDeleteHandler([])
+      addBlockInsertHandler('block')
+      addReservationsCancelHandler()
+      // Two saved games get cancelled by the forward pass.
+      addSavedGamesCancelHandler(() => [{ id: 'sg-1' }, { id: 'sg-2' }])
+
+      const savedGamesRestoreSpy = vi.fn()
+      addSavedGamesRestoreHandler(savedGamesRestoreSpy)
+
+      // The materials loop fails, triggering rollbackClubEventBlocksWrite —
+      // which must restore the two saved games cancelled just above.
+      addDeleteGuardHandler(null)
+      sqlMock.addHandler({
+        name: 'DELETE event_room_blocks WHERE id = ANY(...) (rollback delete-inserted)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'event_room_blocks' && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'event_id'),
+        respond: () => [],
+      })
+      const reservationRestoreSpy = vi.fn()
+      sqlMock.addHandler({
+        name: 'UPDATE reservations SET status=active (restore)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'status') && !whereHasColumn(stmt, 'table_id'),
+        respond: (stmt) => {
+          reservationRestoreSpy(stmt.values)
+          return []
+        },
+      })
+      sqlMock.addHandler({
+        name: 'INSERT event_equipment (fails)',
+        verb: 'insert',
+        match: (stmt) => stmt.table === 'event_equipment',
+        respond: () => { throw new Error('material insert failed') },
+      })
+
+      const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      const { createClubEvent } = await loadClubEventsService()
+
+      await expect(
+        createClubEvent(createAdminSession(), {
+          titleEs: 'Torneo',
+          titleEn: 'Tournament',
+          date: '2026-05-01',
+          dateKind: 'single',
+          blocksRooms: true,
+          schedules: [
+            { date: '2026-05-01', startTime: '18:00', endTime: '22:00', allDay: false, roomId: 'room-1' },
+          ],
+          materials: [{ equipmentId: 'equip-a', quantity: 1 }],
+        })
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      expect(savedGamesRestoreSpy).toHaveBeenCalledTimes(1)
+      expect(savedGamesRestoreSpy.mock.calls[0][0][0]).toEqual(['sg-1', 'sg-2'])
+
+      consoleErrorSpy.mockRestore()
     })
   })
 })

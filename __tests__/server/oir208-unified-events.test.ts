@@ -305,6 +305,22 @@ function addReservationsCancelHandler(respond: () => unknown = () => []) {
   })
 }
 
+/**
+ * UPDATE saved_games AS saved SET status='cancelled' WHERE saved.table_id =
+ * ANY(...) AND saved.status='active' AND $N BETWEEN saved.start_date AND
+ * saved.end_date RETURNING saved.id — cancelActiveSavedGamesForRoomBlock
+ * (#334). Disambiguated from the restore handler below by the presence of
+ * `table_id` in the WHERE clause — only the cancel query filters on it.
+ */
+function addSavedGamesCancelHandler(respond: () => unknown = () => []) {
+  roomsSqlMock.addHandler({
+    name: 'UPDATE saved_games cancel active (room-wide, #334)',
+    verb: 'update',
+    match: (stmt) => stmt.table === 'saved_games' && whereHasColumn(stmt, 'table_id'),
+    respond,
+  })
+}
+
 /** INSERT INTO event_equipment (...) ON CONFLICT (event_id, equipment_id) DO UPDATE */
 function addMaterialsInsertHandler(spy?: (values: unknown[]) => void) {
   roomsSqlMock.addHandler({
@@ -666,6 +682,7 @@ describe('OIR-208: Unified Events', () => {
       const blockInsertSpy = vi.fn()
       addBlockInsertHandler('block', blockInsertSpy)
       addReservationsCancelHandler()
+      addSavedGamesCancelHandler()
       addEventRoomBlocksSelectHandler([])
       addEventMaterialsSelectHandler([])
 
@@ -700,6 +717,7 @@ describe('OIR-208: Unified Events', () => {
       const blockInsertSpy = vi.fn()
       addBlockInsertHandler('block', blockInsertSpy)
       addReservationsCancelHandler()
+      addSavedGamesCancelHandler()
       addEventRoomBlocksSelectHandler([])
       addEventMaterialsSelectHandler([])
 
@@ -791,6 +809,7 @@ describe('OIR-208: Unified Events', () => {
       addBlocksDeleteHandler(currentBlocks)
       addMaterialsDeleteHandler([])
       addReservationsCancelHandler()
+      addSavedGamesCancelHandler()
       addEventMaterialsSelectHandler([])
       return { blockInsertSpy }
     }
