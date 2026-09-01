@@ -557,16 +557,23 @@ function toAdminClubEvent(
  * `cancelOverlappingReservationsForRoomCapturing`. Every cancelled row's
  * pre-cancellation status was always `'active'` (the trigger's own WHERE
  * clause), so — unlike `CancelledReservation` — no status needs capturing.
+ *
+ * Takes the room's already-resolved table ids (`tableIds`) rather than
+ * re-joining `tables` by `room_id` itself (code-review finding, high-effort
+ * pass) — the caller already batches every room's table ids into
+ * `roomTableMap` up front specifically to avoid a redundant per-block
+ * `tables` lookup (the #304/#354 code-review optimization); joining inline
+ * here would reintroduce exactly that redundant lookup, once per block.
  */
-async function cancelActiveSavedGamesForRoomBlock(roomId: string, date: string): Promise<string[]> {
+async function cancelActiveSavedGamesForRoomBlock(tableIds: string[], date: string): Promise<string[]> {
+  if (tableIds.length === 0) return []
+
   let cancelledRows: Array<{ id: string }>
   try {
     cancelledRows = await sql`
       UPDATE saved_games AS saved
       SET status = 'cancelled', updated_at = now()
-      FROM tables AS game_table
-      WHERE saved.table_id = game_table.id
-        AND game_table.room_id = ${roomId}
+      WHERE saved.table_id = ANY(${tableIds})
         AND saved.status = 'active'
         AND ${date} BETWEEN saved.start_date AND saved.end_date
       RETURNING saved.id
@@ -878,10 +885,15 @@ async function applyClubEventBlocksAndMaterials(
 
         // #334: port of the legacy cancel_saved_games_for_event_block()
         // trigger — cancels active saved_games conflicting with this block,
-        // room-wide (not table-scoped; see cancelActiveSavedGamesForRoomBlock's
-        // doc comment for why this intentionally differs from the reservation
-        // cancellation above).
-        const cancelledSavedGames = await cancelActiveSavedGamesForRoomBlock(block.room_id, block.date)
+        // room-wide (not table-scoped like the `tableIds` used for the
+        // reservation cancellation above; see cancelActiveSavedGamesForRoomBlock's
+        // doc comment for why). Uses the room's full table list from the
+        // already-batched roomTableMap (code-review finding, high-effort
+        // pass) instead of re-joining `tables` per block.
+        const cancelledSavedGames = await cancelActiveSavedGamesForRoomBlock(
+          roomTableMap.get(block.room_id) ?? [],
+          block.date,
+        )
         cancelledSavedGameIds.push(...cancelledSavedGames)
       } catch (error) {
         await rollbackClubEventBlocksWrite({
