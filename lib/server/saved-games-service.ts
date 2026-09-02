@@ -20,6 +20,7 @@ import { getCurrentClubDate, isValidDateOnlyString } from '@/lib/club-time'
 import { serviceError } from '@/lib/server/service-error'
 import { assertMemberRowsScoped } from '@/lib/server/data-scoping'
 import { sql } from '@/lib/db/client'
+import { runAdvisoryLockedTransaction } from '@/lib/db/transaction'
 import { NeonDbError } from '@neondatabase/serverless'
 import type { Tables } from '@/lib/supabase/types'
 
@@ -250,41 +251,43 @@ export async function createSavedGameForSession(
   // common non-racing case (clear 409 without attempting a write); this
   // re-check is the actual concurrency guard. Same treatment applies to
   // `renewSavedGameForSession` below — see its own comment.
+  // #350: this is the shared `runAdvisoryLockedTransaction` helper's proving
+  // call site — it encodes exactly this lock-then-guarded-write shape (see
+  // lib/db/transaction.ts), so `renewSavedGameForSession` below and
+  // club-events-service.ts's `cancelActiveSavedGamesForRoomBlock` still
+  // build their own `sql.transaction([...], { isolationLevel: 'ReadCommitted' })`
+  // calls directly rather than being retrofitted in this same change.
   let rows: SavedGameJoinedRow[]
   try {
-    const results = await sql.transaction(
-      [
-        sql`SELECT pg_advisory_xact_lock(hashtext(${tableId}::uuid::text))`,
-        sql`
-          WITH input AS (
-            SELECT ${tableId}::uuid AS table_id, ${session.id}::uuid AS user_id, ${startDate}::date AS start_date, ${endDate}::date AS end_date
-          ),
-          conflict AS (
-            SELECT 1
-            FROM event_room_blocks b
-            JOIN tables t ON t.room_id = b.room_id
-            CROSS JOIN input
-            WHERE t.id = input.table_id
-              AND b.date >= input.start_date
-              AND b.date <= input.end_date
-              AND (b.table_id IS NULL OR b.table_id = input.table_id)
-            LIMIT 1
-          ),
-          ins AS (
-            INSERT INTO saved_games (table_id, user_id, start_date, end_date)
-            SELECT table_id, user_id, start_date, end_date FROM input
-            WHERE NOT EXISTS (SELECT 1 FROM conflict)
-            RETURNING *
-          )
-          SELECT ${sql.unsafe(SAVED_GAME_JOINED_COLUMNS)}
-          FROM ins sg
-          LEFT JOIN tables t ON t.id = sg.table_id
-          LEFT JOIN rooms ON rooms.id = t.room_id
-        `,
-      ],
-      { isolationLevel: 'ReadCommitted' },
+    rows = await runAdvisoryLockedTransaction<SavedGameJoinedRow[]>(
+      sql`SELECT pg_advisory_xact_lock(hashtext(${tableId}::uuid::text))`,
+      sql`
+        WITH input AS (
+          SELECT ${tableId}::uuid AS table_id, ${session.id}::uuid AS user_id, ${startDate}::date AS start_date, ${endDate}::date AS end_date
+        ),
+        conflict AS (
+          SELECT 1
+          FROM event_room_blocks b
+          JOIN tables t ON t.room_id = b.room_id
+          CROSS JOIN input
+          WHERE t.id = input.table_id
+            AND b.date >= input.start_date
+            AND b.date <= input.end_date
+            AND (b.table_id IS NULL OR b.table_id = input.table_id)
+          LIMIT 1
+        ),
+        ins AS (
+          INSERT INTO saved_games (table_id, user_id, start_date, end_date)
+          SELECT table_id, user_id, start_date, end_date FROM input
+          WHERE NOT EXISTS (SELECT 1 FROM conflict)
+          RETURNING *
+        )
+        SELECT ${sql.unsafe(SAVED_GAME_JOINED_COLUMNS)}
+        FROM ins sg
+        LEFT JOIN tables t ON t.id = sg.table_id
+        LEFT JOIN rooms ON rooms.id = t.room_id
+      `,
     )
-    rows = results[1] as SavedGameJoinedRow[]
   } catch (error) {
     if (isExclusionConflict(error)) serviceError(ERROR_CODES.SAVED_GAME_CONFLICT, 409)
     if (error instanceof NeonDbError && error.code === '23514') {

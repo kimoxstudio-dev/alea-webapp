@@ -3,34 +3,51 @@ import { sql } from './client'
 /**
  * Shared atomic-transaction helper for multi-statement raw-SQL writes (#350).
  *
- * Every N1/N2 raw-SQL service that needed to write several related rows
- * atomically hand-rolled its own `sql.transaction([...])` call, and got a
- * subtle detail wrong each time — caught by code review, not by design:
+ * Two shapes of hand-rolled `sql.transaction([...])` call kept recurring
+ * across N1/N2 raw-SQL service migrations, each getting a subtle detail
+ * wrong at least once — caught by code review, not by design:
  *
- * - #300 (reservations-service.ts): a compensating DELETE rollback wasn't
- *   wrapped in try/catch, and the array cast was missing `::uuid[]`.
- * - #334 (club-events-service.ts / saved-games-service.ts): the identical
- *   `sql.transaction([lock, checkAndWrite], { isolationLevel: 'ReadCommitted' })`
- *   shape was written out three separate times across two files
+ * - A plain N-statements-atomically batch, no locking of its own. Only one
+ *   real instance of this exists in the codebase today:
+ *   `equipment-service.ts`'s `setRoomDefaultEquipment` (DELETE + INSERT, so
+ *   a failing INSERT never leaves a room's defaults deleted with nothing
+ *   replacing them) — now retrofitted onto `runTransaction` below.
+ * - #334 (`club-events-service.ts` / `saved-games-service.ts`): a leading
+ *   `pg_advisory_xact_lock(hashtext(id::uuid::text))` statement followed by
+ *   a guarded check+write, pinned to `isolationLevel: 'ReadCommitted'`. This
+ *   exact shape was hand-written three separate times across two files
  *   (`cancelActiveSavedGamesForRoomBlock`, `createSavedGameForSession`,
- *   `renewSavedGameForSession`), each with its own per-table advisory lock
- *   via `pg_advisory_xact_lock(hashtext(id::uuid::text))`.
+ *   `renewSavedGameForSession`). `saved-games-service.ts`'s
+ *   `createSavedGameForSession` — the smallest of the three — is retrofitted
+ *   onto `runAdvisoryLockedTransaction` below, as the proof this API fits a
+ *   real call site; `cancelActiveSavedGamesForRoomBlock` and
+ *   `renewSavedGameForSession` are not touched by this change (see retrofit
+ *   scope decision below).
  *
- * `runAdvisoryLockedTransaction` below encodes exactly that proven shape —
- * lock statement first, `ReadCommitted` pinned, only the guarded statement's
- * result returned — so isolation level and result-index are no longer
- * something each call site has to get right on its own. `runTransaction`
- * covers the simpler N-statements-atomically case (#300) with no locking of
- * its own.
+ * ## What this does NOT cover
+ *
+ * `sql.transaction([...])` batches already-invoked `sql` statements in one
+ * round trip — it cannot express a later statement that depends on an
+ * earlier statement's *result* decided outside the batch (e.g. a
+ * compensating DELETE keyed by an id an INSERT just returned). That shape —
+ * present in `reservations-service.ts` (the INSERT-then-conditional-DELETE
+ * around line 766) — isn't a `sql.transaction()` candidate as written; the
+ * fix there would be batching the original reservation + equipment INSERTs
+ * into one `runTransaction([...])` up front, so the compensating DELETE
+ * is never needed at all. That's a change to `reservations-service.ts`
+ * itself and this branch does not make it.
  *
  * ## Retrofit scope decision (#350 acceptance criteria)
  *
- * This helper is **not** retrofitted onto already-migrated services (#300
- * reservations, #302 rooms, #305 equipment, #333 tables, #303/#304 events,
- * #301/#306/#307 saved-games/library-games/partners, #334, #360). Those call
- * sites are already correct and already reviewed — converting them is broad,
- * low-value churn on working code, not a bug fix. This helper applies to new
- * multi-statement write work going forward.
+ * This helper gets exactly one real call site per shape in this change —
+ * enough to prove the API fits code that already works, not a full sweep.
+ * It is **not** retrofitted onto the rest of the already-migrated services
+ * (#300 reservations, #302 rooms, #305 the rest of equipment-service.ts,
+ * #333 tables, #303/#304 events, #301/#306/#307 the rest of
+ * saved-games/library-games/partners, #334's other two lock sites, #360).
+ * Converting all of those is broad, low-value churn on code that's already
+ * correct and reviewed. This helper applies to new multi-statement write
+ * work going forward, and to the two call sites above.
  *
  * ## Error handling stays with the caller
  *
@@ -39,8 +56,7 @@ import { sql } from './client'
  * conflicts, `23514` check-constraint violations, `23505` unique
  * violations) — a shared try/catch here would either have to guess at that
  * mapping or lose it. Callers wrap the call in their own try/catch exactly
- * as they do today; this helper only removes the parts of the shape that
- * were being copy-pasted (and occasionally copy-pasted wrong).
+ * as they do today.
  */
 
 export type TransactionIsolationLevel =
@@ -60,8 +76,7 @@ export type SqlStatement = ReturnType<typeof sql>
  * Runs N already-invoked `sql` statements as one atomic Neon transaction —
  * all succeed together, or the whole batch is reported as failed. Use this
  * for a multi-statement write with no locking/isolation need of its own
- * (the #300 reservations-service shape: an insert plus a compensating
- * cleanup on a later failure).
+ * (`equipment-service.ts`'s `setRoomDefaultEquipment` DELETE + INSERT).
  *
  * Returns the raw per-statement row arrays, in the same order as
  * `statements` — callers cast each element to the row shape they expect,
@@ -86,8 +101,12 @@ export async function runTransaction(
  * specific to each call site — this only fixes the two things that were
  * getting duplicated (and occasionally dropped): the `ReadCommitted`
  * isolation level, and always reading the second result.
+ *
+ * `T` is constrained to an array type since `results[1]` is always a row
+ * array at runtime — a caller passing a single-row type instead of a
+ * row-array type is a type error here rather than a silently wrong cast.
  */
-export async function runAdvisoryLockedTransaction<T = unknown[]>(
+export async function runAdvisoryLockedTransaction<T extends unknown[] = unknown[]>(
   lockStatement: SqlStatement,
   guardedStatement: SqlStatement,
 ): Promise<T> {

@@ -53,10 +53,15 @@ describe('lib/db/transaction — shared atomic-transaction helper (#350)', () =>
       const results = await runTransaction([insertStatement, deleteStatement])
 
       expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
-      expect(sqlMock.transaction).toHaveBeenCalledWith(
-        [insertStatement, deleteStatement],
-        undefined,
-      )
+      // Only the statements array is pinned here — the options arg (second
+      // param) isn't asserted on since passing `undefined` vs `{}` when no
+      // options are given is behaviorally identical, and the
+      // isolationLevel-passthrough test below already covers that argument's
+      // actual behavior.
+      expect(sqlMock.transaction.mock.calls[0]?.[0]).toEqual([
+        insertStatement,
+        deleteStatement,
+      ])
       expect(results).toEqual([[{ id: 'inserted-1' }], [{ id: 'deleted-1' }]])
     })
 
