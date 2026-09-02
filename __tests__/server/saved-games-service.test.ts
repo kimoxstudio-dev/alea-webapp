@@ -232,12 +232,12 @@ describe('saved games service', () => {
       },
     })
 
-    // createSavedGameForSession's advisory-lock statement (#334 code-review
+    // create + renew saved game's advisory-lock statement (#334 code-review
     // fix): SELECT pg_advisory_xact_lock(hashtext($1)) — the first statement
     // of its `sql.transaction([lock, checkAndInsert])`, coordinating with
     // cancelActiveSavedGamesForRoomBlock's own lock on the same table.
     sqlMock.addHandler({
-      name: 'SELECT pg_advisory_xact_lock (createSavedGameForSession, #334)',
+      name: 'SELECT pg_advisory_xact_lock (create + renew saved game, #334)',
       verb: 'select',
       match: (stmt) => stmt.text.includes('pg_advisory_xact_lock'),
       respond: () => [{ pg_advisory_xact_lock: null }],
