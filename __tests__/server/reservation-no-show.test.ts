@@ -4,6 +4,7 @@ import {
   whereColumnHasOperator,
   whereColumnHasNullCheck,
   hasExactSelectColumns,
+  hasWord,
   type ParsedStatement,
 } from '../helpers/sql-mock'
 import { isNoShowExpired } from '@/lib/server/reservation-no-show'
@@ -72,7 +73,14 @@ function registerSelectHandler(rows: ReservationSlotRow[]): { getStmt: () => Par
       // still accept, since it never verifies there's nothing else present.
       stmt.whereClause === `status = 'pending' and activated_at is null` &&
       whereColumnHasOperator(stmt, 'status', '=') &&
-      whereColumnHasNullCheck(stmt, 'activated_at', 'IS NULL'),
+      whereColumnHasNullCheck(stmt, 'activated_at', 'IS NULL') &&
+      // Guards against a clause appended AFTER the WHERE (e.g. a stray
+      // `LIMIT 100`), which the WHERE-clause regex above can't see — it
+      // terminates at `returning|order by|group by|limit`. An unbounded
+      // SELECT with no ORDER BY and a silently-added LIMIT would only ever
+      // evaluate an arbitrary first-N pending reservations, leaving the
+      // rest never checked for no-show.
+      !hasWord(stmt.text, 'limit'),
     respond: (stmt) => {
       matchedStmt = stmt
       return rows
@@ -88,18 +96,16 @@ function registerUpdateHandler(respond: (ids: string[]) => Array<{ id: string }>
     verb: 'update',
     match: (stmt) =>
       stmt.table === 'reservations' &&
-      // Pins the `id = any(` predicate: without this, inverting production's
-      // `WHERE id = ANY(${expiredIds}::uuid[])` to `WHERE id <> ALL(...)`
-      // (mass-updating every row EXCEPT the expired ones) still satisfies
-      // every other check here, since none of them look at the id predicate.
-      (stmt.whereClause?.includes('id = any(') ?? false) &&
+      // Exact WHERE shape, not a substring check on each condition: a
+      // substring check never verifies there's nothing ELSE in the clause.
+      // Appending `... AND activated_at IS NULL OR true` to production's
+      // WHERE still satisfies every individual `.includes()` check below it
+      // used to have, and since Postgres binds AND tighter than OR, that
+      // mutated clause becomes no WHERE at all — a table-wide `UPDATE
+      // reservations SET status = 'no_show'`. Pinning the full normalized
+      // clause catches that.
+      stmt.whereClause === `id = any($1::uuid[]) and status = 'pending' and activated_at is null` &&
       whereColumnHasOperator(stmt, 'status', '=') &&
-      // Pins the literal compared value, not just the operator: without this,
-      // mutating production's UPDATE `WHERE ... AND status = 'pending'` to a
-      // different status literal still satisfies whereColumnHasOperator
-      // (which only checks the `=` operator) and the mock would keep
-      // matching a query that no longer re-guards the row is still pending.
-      (stmt.whereClause?.includes(`status = 'pending'`) ?? false) &&
       whereColumnHasNullCheck(stmt, 'activated_at', 'IS NULL') &&
       // Pins RETURNING id: production's returned count comes entirely from
       // `updatedRows.length`, which depends on this clause. Without pinning
@@ -119,9 +125,20 @@ function expectSelectCastDateToText(select: { getStmt: () => ParsedStatement | u
   expect(select.getStmt()?.selectColumns).toContain('date::text')
 }
 
-/** Pins the SET clause: the WHERE-based match alone can't tell `SET status = 'no_show'` apart from `SET status = 'cancelled'`. Call after `markExpiredReservationsAsNoShow()` returns, never inside a `respond` callback. */
+/**
+ * Pins the SET clause's start AND end: the WHERE-based match alone can't
+ * tell `SET status = 'no_show'` apart from `SET status = 'cancelled'`, and a
+ * prefix-only substring check (`toContain("set status = 'no_show'")`) can't
+ * tell it apart from `SET status = 'no_show', activated_at = now()` — a
+ * second assignment appended after it. That would stamp `activated_at` on
+ * every no-show row, breaking the "pending and never activated" invariant
+ * the rest of this module's WHERE re-guards depend on. Anchoring to
+ * `... where` (the next clause) proves nothing else was appended to SET.
+ * Call after `markExpiredReservationsAsNoShow()` returns, never inside a
+ * `respond` callback.
+ */
 function expectUpdateSetsNoShowStatus(update: { getStmt: () => ParsedStatement | undefined }) {
-  expect(update.getStmt()?.text).toContain(`set status = 'no_show'`)
+  expect(update.getStmt()?.text).toContain(`set status = 'no_show' where`)
 }
 
 describe('reservation no-show lazy evaluation', () => {
