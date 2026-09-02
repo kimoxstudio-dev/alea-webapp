@@ -65,3 +65,7 @@ docs/AUDIT-*.md
 .claude/settings.local.json
 # Added by code-review-graph
 .code-review-graph/
+
+# kx — managed, do not edit between these markers
+.vercel
+# kx — end

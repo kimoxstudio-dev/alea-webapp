@@ -1,0 +1,62 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git fetch *)",
+      "Bash(git rev-list *)",
+      "mcp__linear-server__list_issues",
+      "Bash(pnpm typecheck*)",
+      "Bash(pnpm lint*)",
+      "Bash(pnpm test*)",
+      "Bash(pnpm build*)",
+      "Bash(pnpm install*)",
+      "Bash(pnpm exec tsc*)",
+      "Bash(pnpm exec vitest*)",
+      "Bash(pnpm exec drizzle-kit*)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git worktree add *)",
+      "Bash(git worktree remove *)",
+      "Bash(git worktree prune*)",
+      "Bash(git rebase *)",
+      "mcp__linear-server__save_issue",
+      "mcp__linear-server__get_issue"
+    ],
+    "deny": [
+      "Bash(git push --no-verify*)",
+      "Bash(git push *--no-verify*)",
+      "Bash(git commit --no-verify*)",
+      "Bash(git commit *--no-verify*)",
+      "Bash(git push -f*)",
+      "Bash(git push --force *)",
+      "Bash(supabase db push*)",
+      "Bash(supabase db pull*)",
+      "Bash(pnpm exec drizzle-kit push*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat >/dev/null || true; command -v code-review-graph >/dev/null 2>&1 || exit 0; git rev-parse --git-dir >/dev/null 2>&1 && code-review-graph update --skip-flows --repo \"$(git rev-parse --show-toplevel 2>/dev/null)\" || true",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat >/dev/null || true; command -v code-review-graph >/dev/null 2>&1 || exit 0; git rev-parse --git-dir >/dev/null 2>&1 && code-review-graph status --repo \"$(git rev-parse --show-toplevel 2>/dev/null)\" || echo 'Not a git repo, skipping'",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
