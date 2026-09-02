@@ -1914,6 +1914,22 @@ describe('club-events-service', () => {
       const batched = sqlMock.transaction.mock.calls[0]?.[0]
       expect(Array.isArray(batched)).toBe(true)
       expect(batched).toHaveLength(2)
+      // Order matters (LOW 3 code-review finding): batch length alone
+      // doesn't prove the lock runs first — [update, lock] would also have
+      // length 2 and would reopen the race silently. `createClubEvent`
+      // dispatches several more `sql` calls after this transaction
+      // (materials insert, final read-back SELECTs), so — unlike
+      // saved-games-service.ts's tests, where the transaction is the very
+      // last DB call — the last two entries in sqlMock.sql's call history
+      // are NOT necessarily this transaction's own two calls. Locate the
+      // cancel UPDATE by its distinctive text instead, and check what
+      // dispatched immediately before it.
+      const dispatchedTexts = sqlMock.sql.mock.calls.map((call) => String(call[0]))
+      const cancelUpdateIndex = dispatchedTexts.findIndex(
+        (text) => text.includes('saved_games') && text.includes("'cancelled'"),
+      )
+      expect(cancelUpdateIndex).toBeGreaterThan(0)
+      expect(dispatchedTexts[cancelUpdateIndex - 1]).toContain('pg_advisory_xact_lock')
     })
 
     it('cancels active saved games room-wide when the block has no table_id (room-wide block)', async () => {
@@ -1969,6 +1985,16 @@ describe('club-events-service', () => {
       const batched = sqlMock.transaction.mock.calls[0]?.[0]
       expect(Array.isArray(batched)).toBe(true)
       expect(batched).toHaveLength(2)
+      // Order matters (LOW 3 code-review finding) — see the table-scoped
+      // test's comment above for why batch length alone doesn't prove it,
+      // and why the check locates the cancel UPDATE by content instead of
+      // assuming it's among the last two dispatched calls.
+      const dispatchedTexts = sqlMock.sql.mock.calls.map((call) => String(call[0]))
+      const cancelUpdateIndex = dispatchedTexts.findIndex(
+        (text) => text.includes('saved_games') && text.includes("'cancelled'"),
+      )
+      expect(cancelUpdateIndex).toBeGreaterThan(0)
+      expect(dispatchedTexts[cancelUpdateIndex - 1]).toContain('pg_advisory_xact_lock')
     })
 
     it('does not cancel a saved game whose status is not "active" (e.g. already cancelled) — enforced by the mock only matching the active-status query, verified via the real WHERE guard', async () => {
@@ -2089,9 +2115,15 @@ describe('club-events-service', () => {
       addReservationsCancelHandler()
       // Two saved games get cancelled by the forward pass, each carrying its
       // own pre-cancellation `updated_at` (captured via the cancel query's
-      // `RETURNING saved.id, prior.updated_at`).
+      // `RETURNING saved.id, prior.updated_at`). sg-1's comes back as a real
+      // `Date` instance (code-review finding, LOW 4) — matching what
+      // @neondatabase/serverless actually returns for a `timestamptz`
+      // column in production, not the ISO string every other handler in
+      // this file returns for convenience — so the `instanceof Date`
+      // normalization branch in `cancelActiveSavedGamesForRoomBlock` is
+      // actually exercised, not just plumbed through untouched.
       addSavedGamesCancelHandler(() => [
-        { id: 'sg-1', updated_at: '2026-04-01T10:00:00.000Z' },
+        { id: 'sg-1', updated_at: new Date('2026-04-01T10:00:00.000Z') },
         { id: 'sg-2', updated_at: '2026-04-01T11:30:00.000Z' },
       ])
 
