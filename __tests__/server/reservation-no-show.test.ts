@@ -1,10 +1,6 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import {
-  whereColumnHasOperator,
-  whereColumnHasNullCheck,
-  type ParsedStatement,
-} from '../helpers/sql-mock'
+import { type ParsedStatement } from '../helpers/sql-mock'
 import { isNoShowExpired } from '@/lib/server/reservation-no-show'
 
 // vi.hoisted runs before the vi.mock factories below (which themselves run
@@ -98,8 +94,6 @@ function registerUpdateHandler(respond: (ids: string[]) => Array<{ id: string }>
       // reservations SET status = 'no_show'`. Pinning the full normalized
       // clause catches that.
       stmt.whereClause === `id = any($1::uuid[]) and status = 'pending' and activated_at is null` &&
-      whereColumnHasOperator(stmt, 'status', '=') &&
-      whereColumnHasNullCheck(stmt, 'activated_at', 'IS NULL') &&
       // Pins RETURNING id: production's returned count comes entirely from
       // `updatedRows.length`, which depends on this clause. Without pinning
       // it, removing `RETURNING id` from production still satisfies every
@@ -209,6 +203,32 @@ describe('reservation no-show lazy evaluation', () => {
 
       expect(result).toBe(1)
       expect(update.getStmt()?.values[0]).toEqual(['expired-1'])
+      expectSelectCastDateToText(select)
+      expectUpdateSetsNoShowStatus(update)
+    })
+
+    it('marks every expired reservation, not just the first one, and returns the full updated count', async () => {
+      // getDatabaseNowMock (set in beforeEach) is one millisecond past both
+      // rows' default 16:00-18:00 deadline. Two expired candidates are
+      // needed to catch a `.slice(0, 1)` on the expired-ids list (would only
+      // mark the first expired reservation per invocation, leaving the rest
+      // stuck pending indefinitely across page loads) and a
+      // `Math.min(updatedRows.length, 1)` on the returned count (under-reports
+      // the count to callers) — both pass every existing test here, which
+      // never feeds the UPDATE more than one expired id.
+      const expiredRow1 = makeRow({ id: 'expired-1' })
+      const expiredRow2 = makeRow({ id: 'expired-2' })
+      const select = registerSelectHandler([expiredRow1, expiredRow2])
+      const update = registerUpdateHandler((ids) => {
+        expect(ids).toEqual(['expired-1', 'expired-2'])
+        return [{ id: 'expired-1' }, { id: 'expired-2' }]
+      })
+
+      const { markExpiredReservationsAsNoShow } = await loadReservationNoShow()
+      const result = await markExpiredReservationsAsNoShow()
+
+      expect(result).toBe(2)
+      expect(update.getStmt()?.values[0]).toEqual(['expired-1', 'expired-2'])
       expectSelectCastDateToText(select)
       expectUpdateSetsNoShowStatus(update)
     })
