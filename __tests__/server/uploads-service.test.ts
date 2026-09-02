@@ -125,9 +125,10 @@ describe('uploads-service', () => {
   })
 
   describe('happy path — admin upload', () => {
-    it('admin uploads valid PNG file → put() called, returns { url }', async () => {
+    it('admin uploads valid PNG file → put() called, returns the URL put() resolved', async () => {
       const adminSession = createAdminSession()
       const mockFile = createMockFile(1024, 'image/png')
+      const expectedBytes = new Uint8Array(await mockFile.arrayBuffer())
 
       const { uploadLandingMediaImage } = await loadUploadsService()
 
@@ -136,14 +137,19 @@ describe('uploads-service', () => {
         folder: 'events',
       })
 
-      expect(result).toHaveProperty('url')
-      expect(result.url).toContain('landing-media/events/')
-
       expect(putMock).toHaveBeenCalledTimes(1)
-      const [pathname, , options] = putMock.mock.calls[0]
+      const [pathname, body, options] = putMock.mock.calls[0]
       expect(pathname).toMatch(/^landing-media\/events\/[0-9a-f-]+\.png$/)
+      // The exact bytes handed to put() must be the validated file body —
+      // a regression that uploads e.g. an empty or re-encoded buffer would
+      // still pass every other assertion here.
+      expect(new Uint8Array(body as ArrayBuffer)).toEqual(expectedBytes)
       expect(options.contentType).toBe('image/png')
       expect(options.access).toBe('public')
+
+      // The returned URL must be exactly what put() resolved, not just any
+      // string that happens to contain the expected path segments.
+      await expect(putMock.mock.results[0].value).resolves.toMatchObject({ url: result.url })
     })
 
     it('admin uploads valid JPEG file → extension .jpg derived from MIME', async () => {
@@ -501,6 +507,24 @@ describe('uploads-service', () => {
       const mockFile = createMockFile(1024, 'image/png')
 
       putMock.mockRejectedValueOnce(new Error('Blob store misconfigured'))
+
+      const { uploadLandingMediaImage } = await loadUploadsService()
+
+      await expect(
+        uploadLandingMediaImage(adminSession, {
+          file: mockFile,
+          folder: 'events',
+        })
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      expect(console.error).toHaveBeenCalled()
+    })
+
+    it('put() rejects with a non-Error value → 500 ServiceError and console.error called', async () => {
+      const adminSession = createAdminSession()
+      const mockFile = createMockFile(1024, 'image/png')
+
+      putMock.mockRejectedValueOnce('string failure')
 
       const { uploadLandingMediaImage } = await loadUploadsService()
 

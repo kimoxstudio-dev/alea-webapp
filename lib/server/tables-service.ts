@@ -1,7 +1,7 @@
 import qrcode from 'qrcode'
+import { put } from '@vercel/blob'
 import type { GameTable } from '@/lib/types'
 import { sql } from '@/lib/db/client'
-import { createSupabaseServerAdminClient } from '@/lib/supabase/server'
 import { serviceError } from '@/lib/server/service-error'
 import { resolveDate, buildAvailability } from '@/lib/server/availability'
 import type { Tables } from '@/lib/supabase/types'
@@ -13,27 +13,29 @@ type TableRow = Tables<'tables'>
 type ReservationRow = Tables<'reservations'>
 type EventBlockRow = Tables<'event_room_blocks'>
 
-// Relational reads/writes use Neon in this N1 migration. QR object storage
-// remains on Supabase until the dedicated storage migration (#310/#311).
-async function uploadQrCodeToStorage(
-  admin: ReturnType<typeof createSupabaseServerAdminClient>,
-  url: string,
-  storagePath: string,
-): Promise<string> {
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
-  if (!supabaseUrl) serviceError('NEXT_PUBLIC_SUPABASE_URL is not set — cannot build QR code storage URL', 500)
+const QR_CODE_PREFIX = 'table-qr-codes'
 
+async function uploadQrCodeToBlob(url: string, blobPath: string): Promise<string> {
   const buffer = await qrcode.toBuffer(url, { errorCorrectionLevel: 'M', width: 400, type: 'png' })
 
-  const { error: uploadError } = await admin.storage
-    .from('table-qr-codes')
-    .upload(storagePath, buffer, { contentType: 'image/png', upsert: true })
-
-  if (uploadError) {
+  try {
+    // allowOverwrite: true — regenerateQrCodes re-uploads the same
+    // `{tableId}.png` path on every regeneration (the old Supabase Storage
+    // call used upsert: true for the same reason).
+    const blob = await put(`${QR_CODE_PREFIX}/${blobPath}`, buffer, {
+      access: 'public',
+      contentType: 'image/png',
+      addRandomSuffix: false,
+      allowOverwrite: true,
+    })
+    return blob.url
+  } catch (error) {
+    console.error(
+      '[tables-service] Vercel Blob QR upload failed:',
+      error instanceof Error ? error.message : error
+    )
     serviceError('Failed to upload QR code to storage', 500)
   }
-
-  return `${supabaseUrl}/storage/v1/object/public/table-qr-codes/${storagePath}`
 }
 
 export async function generateTableQrCode(tableId: string): Promise<string> {
@@ -43,8 +45,7 @@ export async function generateTableQrCode(tableId: string): Promise<string> {
   const appUrl = (process.env.NEXT_PUBLIC_APP_URL ?? '').replace(/\/$/, '')
   if (!appUrl) serviceError('NEXT_PUBLIC_APP_URL is not set — cannot generate QR code URL', 500)
   const url = `${appUrl}/check-in/${tableId}`
-  const admin = createSupabaseServerAdminClient()
-  return uploadQrCodeToStorage(admin, url, `${tableId}.png`)
+  return uploadQrCodeToBlob(url, `${tableId}.png`)
 }
 
 export async function regenerateQrCodes(tableId: string): Promise<{ qr_code: string; qr_code_inf: string | null }> {
@@ -70,8 +71,7 @@ export async function regenerateQrCodes(tableId: string): Promise<{ qr_code: str
   const appUrl = (process.env.NEXT_PUBLIC_APP_URL ?? '').replace(/\/$/, '')
   if (!appUrl) serviceError('NEXT_PUBLIC_APP_URL is not set — cannot generate QR code URL', 500)
 
-  const admin = createSupabaseServerAdminClient()
-  const qr_code = await uploadQrCodeToStorage(admin, `${appUrl}/check-in/${tableId}`, `${tableId}.png`)
+  const qr_code = await uploadQrCodeToBlob(`${appUrl}/check-in/${tableId}`, `${tableId}.png`)
 
   try {
     await sql`

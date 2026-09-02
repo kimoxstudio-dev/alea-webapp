@@ -5,19 +5,17 @@ import { createSqlMock, hasColumn, whereColumnHasOperator, whereHasColumn } from
 const TABLE_ID = 'c3d4e5f6-a7b8-9012-cdef-012345678901'
 const LARGE_TABLE_ID = 'd4e5f6a7-b8c9-0123-def0-123456789012'
 const APP_URL = 'https://test.example.com'
-const SUPABASE_URL = 'https://supabase.example.com'
+const BLOB_BASE_URL = 'https://example-store.public.blob.vercel-storage.com'
 
 const sqlMock = createSqlMock()
 const getDatabaseNowMock = vi.fn(async () => new Date('2026-05-26T12:00:00.000Z'))
-const storageUploadMock = vi.fn()
+const putMock = vi.fn()
 const qrcodeToBufferMock = vi.fn()
 
 vi.mock('@/lib/db/client', () => ({ sql: sqlMock.sql }))
 vi.mock('@/lib/server/database-time', () => ({ getDatabaseNow: getDatabaseNowMock }))
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseServerAdminClient: vi.fn(() => ({
-    storage: { from: vi.fn(() => ({ upload: storageUploadMock })) },
-  })),
+vi.mock('@vercel/blob', () => ({
+  put: putMock,
 }))
 vi.mock('qrcode', () => ({ default: { toBuffer: qrcodeToBufferMock } }))
 
@@ -187,9 +185,15 @@ beforeEach(() => {
   getDatabaseNowMock.mockReset()
   getDatabaseNowMock.mockResolvedValue(new Date('2026-05-26T12:00:00.000Z'))
   vi.stubEnv('NEXT_PUBLIC_APP_URL', APP_URL)
-  vi.stubEnv('NEXT_PUBLIC_SUPABASE_URL', SUPABASE_URL)
   qrcodeToBufferMock.mockResolvedValue(Buffer.from('fake-png-data'))
-  storageUploadMock.mockResolvedValue({ data: { path: `${TABLE_ID}.png` }, error: null })
+  putMock.mockImplementation(async (pathname: string, _body: unknown, options: { contentType?: string }) => ({
+    url: `${BLOB_BASE_URL}/${pathname}`,
+    downloadUrl: `${BLOB_BASE_URL}/${pathname}?download=1`,
+    pathname,
+    contentType: options.contentType ?? 'application/octet-stream',
+    contentDisposition: `inline; filename="${pathname}"`,
+    etag: 'mock-etag',
+  }))
 })
 
 afterEach(() => {
@@ -306,11 +310,11 @@ describe('getTableAvailability (Neon raw SQL)', () => {
 })
 
 describe('generateTableQrCode', () => {
-  it('returns the Supabase Storage public URL containing the table id', async () => {
+  it('returns the Vercel Blob public URL containing the table id', async () => {
     const { generateTableQrCode } = await loadTablesService()
 
     await expect(generateTableQrCode(TABLE_ID)).resolves.toBe(
-      `${SUPABASE_URL}/storage/v1/object/public/table-qr-codes/${TABLE_ID}.png`,
+      `${BLOB_BASE_URL}/table-qr-codes/${TABLE_ID}.png`,
     )
   })
 
@@ -340,25 +344,25 @@ describe('generateTableQrCode', () => {
     await expect(generateTableQrCode(TABLE_ID)).rejects.toMatchObject({ statusCode: 500 })
   })
 
-  it('returns 500 when NEXT_PUBLIC_SUPABASE_URL is missing', async () => {
-    vi.stubEnv('NEXT_PUBLIC_SUPABASE_URL', '')
-    const { generateTableQrCode } = await loadTablesService()
-    await expect(generateTableQrCode(TABLE_ID)).rejects.toMatchObject({ statusCode: 500 })
-  })
-
   it('uploads the PNG buffer with the established path and options', async () => {
     const { generateTableQrCode } = await loadTablesService()
     await generateTableQrCode(TABLE_ID)
 
-    expect(storageUploadMock).toHaveBeenCalledWith(
-      `${TABLE_ID}.png`,
+    expect(putMock).toHaveBeenCalledWith(
+      `table-qr-codes/${TABLE_ID}.png`,
       Buffer.from('fake-png-data'),
-      { contentType: 'image/png', upsert: true },
+      { access: 'public', contentType: 'image/png', addRandomSuffix: false, allowOverwrite: true },
     )
   })
 
-  it('returns 500 when the Storage upload fails', async () => {
-    storageUploadMock.mockResolvedValueOnce({ data: null, error: { message: 'Bucket not found' } })
+  it('returns 500 when the Blob upload throws', async () => {
+    putMock.mockRejectedValueOnce(new Error('Blob store misconfigured'))
+    const { generateTableQrCode } = await loadTablesService()
+    await expect(generateTableQrCode(TABLE_ID)).rejects.toMatchObject({ statusCode: 500 })
+  })
+
+  it('returns 500 when the Blob upload throws a non-Error value', async () => {
+    putMock.mockRejectedValueOnce('string failure')
     const { generateTableQrCode } = await loadTablesService()
     await expect(generateTableQrCode(TABLE_ID)).rejects.toMatchObject({ statusCode: 500 })
   })
@@ -369,7 +373,7 @@ describe('generateTableQrCode', () => {
   })
 })
 
-describe('regenerateQrCodes (Neon raw SQL + existing Storage)', () => {
+describe('regenerateQrCodes (Neon raw SQL + Vercel Blob)', () => {
   it('updates a non-removable table with one generated QR URL', async () => {
     registerRegenerationHandlers()
     const { regenerateQrCodes } = await loadTablesService()
@@ -377,7 +381,7 @@ describe('regenerateQrCodes (Neon raw SQL + existing Storage)', () => {
     const result = await regenerateQrCodes(LARGE_TABLE_ID)
 
     expect(result).toEqual({
-      qr_code: `${SUPABASE_URL}/storage/v1/object/public/table-qr-codes/${LARGE_TABLE_ID}.png`,
+      qr_code: `${BLOB_BASE_URL}/table-qr-codes/${LARGE_TABLE_ID}.png`,
       qr_code_inf: null,
     })
   })
@@ -389,7 +393,7 @@ describe('regenerateQrCodes (Neon raw SQL + existing Storage)', () => {
     const result = await regenerateQrCodes(TABLE_ID)
 
     expect(result.qr_code_inf).toBeNull()
-    expect(storageUploadMock).toHaveBeenCalledTimes(1)
+    expect(putMock).toHaveBeenCalledTimes(1)
   })
 
   it('writes the generated URL and null inferior URL for the selected id', async () => {
@@ -400,7 +404,7 @@ describe('regenerateQrCodes (Neon raw SQL + existing Storage)', () => {
       match: (stmt) => stmt.table === 'tables' && whereHasColumn(stmt, 'id'),
       respond: (stmt) => {
         expect(stmt.values).toEqual([
-          `${SUPABASE_URL}/storage/v1/object/public/table-qr-codes/${LARGE_TABLE_ID}.png`,
+          `${BLOB_BASE_URL}/table-qr-codes/${LARGE_TABLE_ID}.png`,
           LARGE_TABLE_ID,
         ])
         expect(/qr_code_inf = null/.test(stmt.text)).toBe(true)
@@ -417,7 +421,7 @@ describe('regenerateQrCodes (Neon raw SQL + existing Storage)', () => {
     const { regenerateQrCodes } = await loadTablesService()
 
     await expect(regenerateQrCodes(TABLE_ID)).rejects.toMatchObject({ statusCode: 404 })
-    expect(storageUploadMock).not.toHaveBeenCalled()
+    expect(putMock).not.toHaveBeenCalled()
   })
 
   it('maps the table lookup failure to a 500 ServiceError', async () => {
@@ -452,9 +456,9 @@ describe('regenerateQrCodes (Neon raw SQL + existing Storage)', () => {
     await expect(regenerateQrCodes(LARGE_TABLE_ID)).rejects.toMatchObject({ statusCode: 500 })
   })
 
-  it('returns 500 when NEXT_PUBLIC_SUPABASE_URL is missing', async () => {
+  it('returns 500 when the Blob upload throws', async () => {
     registerRegenerationHandlers()
-    vi.stubEnv('NEXT_PUBLIC_SUPABASE_URL', '')
+    putMock.mockRejectedValueOnce(new Error('Blob store misconfigured'))
     const { regenerateQrCodes } = await loadTablesService()
     await expect(regenerateQrCodes(LARGE_TABLE_ID)).rejects.toMatchObject({ statusCode: 500 })
   })

@@ -161,7 +161,10 @@ export async function uploadLandingMediaImage(session: SessionUser, input: Uploa
   const objectPath = `${LANDING_MEDIA_PREFIX}/${folder}/${crypto.randomUUID()}.${extension}`
 
   try {
-    const blob = await put(objectPath, Buffer.from(bytes), {
+    // put() accepts ArrayBuffer directly — bytes.buffer is the same backing
+    // buffer `new Uint8Array(await file.arrayBuffer())` was constructed from,
+    // so this is a type-satisfying reinterpretation, not a copy.
+    const blob = await put(objectPath, bytes.buffer, {
       access: 'public',
       contentType: file.type,
       addRandomSuffix: false,
