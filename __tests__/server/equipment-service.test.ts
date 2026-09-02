@@ -283,8 +283,8 @@ describe('equipment-service (Neon raw SQL)', () => {
     describe('atomicity — replacement runs as a single transaction (rollback regression)', () => {
       it('batches the DELETE and INSERT into exactly one sql.transaction([...]) call, not two independent sql calls', async () => {
         addConflictHandler(() => [])
-        addRoomDefaultsDeleteHandler(() => [])
-        addRoomDefaultsInsertHandler(() => [])
+        addRoomDefaultsDeleteHandler(() => [{ marker: 'delete' }])
+        addRoomDefaultsInsertHandler(() => [{ marker: 'insert' }])
 
         const { setRoomDefaultEquipment } = await loadService()
         await expect(setRoomDefaultEquipment('room-1', ['eq-1', 'eq-2'])).resolves.toBeUndefined()
@@ -302,15 +302,22 @@ describe('equipment-service (Neon raw SQL)', () => {
         // INSERT — [insert, delete] would also have length 2, and would
         // silently wipe the room's defaults (INSERT then DELETE removes
         // both the old defaults AND the ones just inserted, leaving zero
-        // defaults with the endpoint still reporting success). Same
-        // technique as saved-games-service.test.ts's lock-then-insert
-        // dispatch-order check: sqlMock.sql dispatches eagerly at
-        // tagged-template call time, so its two most recent calls at this
-        // point are exactly this transaction's own [delete, insert], in
-        // order.
-        const dispatchOrder = sqlMock.sql.mock.calls.slice(-2).map((call) => String(call[0]))
-        expect(dispatchOrder[0]).toContain('DELETE FROM room_default_equipment')
-        expect(dispatchOrder[1]).toContain('INSERT INTO room_default_equipment')
+        // defaults with the endpoint still reporting success).
+        //
+        // `sqlMock.sql.mock.calls` order (a prior version of this test used
+        // that) is NOT proof of this: it records tagged-template
+        // CONSTRUCTION order in the service source, not the order of the
+        // array actually handed to `runTransaction([...])`/
+        // `sql.transaction([...])` — a refactor that keeps the two `sql`
+        // template calls in source order but reverses which order they're
+        // passed into `runTransaction([...])` would leave that call order
+        // unchanged and this assertion would miss it entirely, in
+        // production (real Neon driver) `sql\`...\`` only builds a query
+        // object, it doesn't execute — execution order comes only from the
+        // array order. Asserting on `batched` itself, resolved, is what
+        // actually pins that array's order.
+        const resolved = await Promise.all(batched as Array<Promise<unknown>>)
+        expect(resolved).toEqual([[{ marker: 'delete' }], [{ marker: 'insert' }]])
       })
 
       it('throws a 500 ServiceError when the transaction rejects, without ever un-batching into independent calls', async () => {
