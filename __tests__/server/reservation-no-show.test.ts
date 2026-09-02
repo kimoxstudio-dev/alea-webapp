@@ -1,6 +1,11 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { whereColumnHasOperator, whereColumnHasNullCheck, type ParsedStatement } from '../helpers/sql-mock'
+import {
+  whereColumnHasOperator,
+  whereColumnHasNullCheck,
+  hasExactSelectColumns,
+  type ParsedStatement,
+} from '../helpers/sql-mock'
 import { isNoShowExpired } from '@/lib/server/reservation-no-show'
 
 // vi.hoisted runs before the vi.mock factories below (which themselves run
@@ -59,13 +64,14 @@ function registerSelectHandler(rows: ReservationSlotRow[]): { getStmt: () => Par
     verb: 'select',
     match: (stmt) =>
       stmt.table === 'reservations' &&
+      // Exact SELECT projection: catches a production column dropped from
+      // (e.g. `end_time` missing) or added to the list, not just verb/table.
+      hasExactSelectColumns(stmt, 'id, date::text as date, start_time, end_time') &&
+      // Exact WHERE shape: catches a widened WHERE (e.g. `... OR true`
+      // appended) that a substring check on `status = 'pending'` alone would
+      // still accept, since it never verifies there's nothing else present.
+      stmt.whereClause === `status = 'pending' and activated_at is null` &&
       whereColumnHasOperator(stmt, 'status', '=') &&
-      // Pins the literal compared value, not just the operator: without this,
-      // mutating production's `WHERE status = 'pending'` to
-      // `WHERE status = 'active'` still satisfies whereColumnHasOperator
-      // (which only checks the `=` operator) and the mock would keep
-      // matching a query that no longer scopes to pending reservations.
-      (stmt.whereClause?.includes(`status = 'pending'`) ?? false) &&
       whereColumnHasNullCheck(stmt, 'activated_at', 'IS NULL'),
     respond: (stmt) => {
       matchedStmt = stmt
@@ -82,6 +88,11 @@ function registerUpdateHandler(respond: (ids: string[]) => Array<{ id: string }>
     verb: 'update',
     match: (stmt) =>
       stmt.table === 'reservations' &&
+      // Pins the `id = any(` predicate: without this, inverting production's
+      // `WHERE id = ANY(${expiredIds}::uuid[])` to `WHERE id <> ALL(...)`
+      // (mass-updating every row EXCEPT the expired ones) still satisfies
+      // every other check here, since none of them look at the id predicate.
+      (stmt.whereClause?.includes('id = any(') ?? false) &&
       whereColumnHasOperator(stmt, 'status', '=') &&
       // Pins the literal compared value, not just the operator: without this,
       // mutating production's UPDATE `WHERE ... AND status = 'pending'` to a
