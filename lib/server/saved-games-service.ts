@@ -410,14 +410,16 @@ export async function renewSavedGameForSession(session: SessionUser, id: string)
   }
 
   const data = rows[0]
-  // The `one`/`LEFT JOIN ins` shape above always returns exactly one row, so
-  // `data` itself is never undefined — `data.id == null` is what signals the
+  // The `one`/`LEFT JOIN ins` shape above always returns exactly one row from
+  // Postgres, so `data.id == null` (rather than `!data`) is what signals the
   // `ins` guard skipped the insert. `was_inactive` (computed from the same
   // `current_check` CTE the guard used, under the same lock) distinguishes
   // *why*: the source row lost its 'active' status to a concurrent
   // cancellation (`cancelActiveSavedGamesForRoomBlock`), vs. an event block
   // landing on the new period. No follow-up query needed — both facts come
-  // back from the one locked transaction.
+  // back from the one locked transaction. The optional chaining below is
+  // still real belt-and-braces against a malformed/empty mock or driver
+  // response, not a sign the "always one row" guarantee is in doubt.
   if (data?.id == null) {
     if (data?.was_inactive) serviceError(ERROR_CODES.SAVED_GAME_NOT_ACTIVE, 409)
     serviceError(ERROR_CODES.SAVED_GAME_EVENT_CONFLICT, 409)

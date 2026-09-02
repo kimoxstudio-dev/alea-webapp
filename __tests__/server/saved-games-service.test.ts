@@ -320,7 +320,16 @@ describe('saved games service', () => {
         // coverage) — only report a conflict when the statement actually
         // carries the re-check, and compute it from live state rather than
         // unconditionally.
-        const hasConflictGuard = stmt.text.includes('event_room_blocks') && stmt.text.includes('not exists')
+        // Anchored to the guard's own text (not a loose `includes('not
+        // exists')`), because this statement's final SELECT also carries a
+        // second, unrelated `NOT EXISTS` (the `was_inactive` projection
+        // below) — a substring-only match here would still report the guard
+        // present after someone deleted `AND EXISTS (SELECT 1 FROM
+        // current_check)` from the `ins` WHERE clause, since `NOT EXISTS
+        // (SELECT 1 FROM conflict)` alone still contains `not exists`
+        // (coordinator review finding, HIGH 2).
+        const hasConflictGuard =
+          stmt.text.includes('event_room_blocks') && stmt.text.includes('not exists (select 1 from conflict)')
         const table = tablesState.get(tableId!)
         const conflict =
           hasConflictGuard &&
@@ -338,7 +347,16 @@ describe('saved games service', () => {
         // actually carries it — same discipline as the conflict guard above
         // — so reverting the fix in production leaves this handler
         // computing nothing and the regression test below fails.
-        const hasCurrentCheckGuard = stmt.text.includes('current_check')
+        //
+        // Anchored to the guard's own clause, not a loose
+        // `includes('current_check')` — that substring also matches the CTE
+        // definition and the `was_inactive` projection, both of which stay
+        // in the statement even if someone deletes only `AND EXISTS (SELECT
+        // 1 FROM current_check)` from the `ins` WHERE clause. A loose match
+        // would keep this handler correctly rejecting the insert while the
+        // real production guard was gone — the regression test would stay
+        // green for the wrong reason (coordinator review finding, HIGH 1).
+        const hasCurrentCheckGuard = stmt.text.includes('and exists (select 1 from current_check)')
         const sourceRow = renewedFromId ? savedGamesState.find((item) => item.id === renewedFromId) : undefined
         const sourceInactive = hasCurrentCheckGuard && sourceRow?.status !== 'active'
         if (conflict || sourceInactive) {
