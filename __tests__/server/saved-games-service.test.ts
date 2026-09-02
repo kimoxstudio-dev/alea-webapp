@@ -21,14 +21,18 @@ import { createSqlMock, neonDbError, whereConditionCount } from '../helpers/sql-
  *   date <= $3 LIMIT 1 — 3 bound values, status/surface are literals
  * - `listSavedGamesForSession`: SELECT ... FROM saved_games sg LEFT JOIN
  *   tables/rooms WHERE (isAdmin OR sg.user_id = $2) — 2 bound values
- * - `createSavedGameForSession`: WITH ins AS (INSERT INTO saved_games (4
- *   values) RETURNING *) SELECT ... FROM ins sg LEFT JOIN tables/rooms —
- *   CTE-wrapped insert (security-review fix, #301) so the response includes
- *   real roomName/tableName instead of null
- * - `renewSavedGameForSession`: SELECT saved_games by id (1 value), then
- *   WITH ins AS (INSERT INTO saved_games (5 values, includes
- *   renewed_from_id) RETURNING *) SELECT ... FROM ins sg LEFT JOIN
- *   tables/rooms — same CTE-wrapped shape as create
+ * - `createSavedGameForSession`: SELECT pg_advisory_xact_lock(...), then WITH
+ *   input AS (SELECT 4 values), conflict AS (SELECT 1 FROM
+ *   event_room_blocks ... CROSS JOIN input), ins AS (INSERT INTO saved_games
+ *   SELECT ... FROM input WHERE NOT EXISTS (SELECT 1 FROM conflict)
+ *   RETURNING *) SELECT ... FROM ins sg LEFT JOIN tables/rooms — batched via
+ *   sql.transaction([lock, checkAndInsert]) (security-review fix, #301, for
+ *   the joined roomName/tableName; advisory-lock + conflict re-check added
+ *   #334 code-review to close a race with cancelActiveSavedGamesForRoomBlock
+ *   in club-events-service.ts)
+ * - `renewSavedGameForSession`: SELECT saved_games by id (1 value), then the
+ *   same lock + three-CTE (input/conflict/ins, 5 values, includes
+ *   renewed_from_id) shape as create — not a plain VALUES insert
  * - `recordSavedGameAttendance`: SELECT active saved_games by
  *   table_id/user_id/date range (4 bound values, 5 WHERE conditions —
  *   `status = 'active'` is a literal, not bound), then INSERT INTO
@@ -228,18 +232,58 @@ describe('saved games service', () => {
       },
     })
 
-    // createSavedGameForSession: WITH ins AS (INSERT INTO saved_games
-    // (table_id, user_id, start_date, end_date) VALUES (...) RETURNING *)
-    // SELECT ... FROM ins sg LEFT JOIN tables/rooms — CTE-wrapped insert
-    // (security-review fix, #301), still anchored as verb='insert'/
-    // table='saved_games' by the sql-mock's CTE support. 4 bound values.
+    // create + renew saved game's advisory-lock statement (#334 code-review
+    // fix): SELECT pg_advisory_xact_lock(hashtext($1)) — the first statement
+    // of its `sql.transaction([lock, checkAndInsert])`, coordinating with
+    // cancelActiveSavedGamesForRoomBlock's own lock on the same table.
     sqlMock.addHandler({
-      name: 'INSERT saved game (create)',
+      name: 'SELECT pg_advisory_xact_lock (create + renew saved game, #334)',
+      verb: 'select',
+      match: (stmt) => stmt.text.includes('pg_advisory_xact_lock'),
+      respond: () => [{ pg_advisory_xact_lock: null }],
+    })
+
+    // createSavedGameForSession: WITH input AS (SELECT $1,$2,$3,$4), conflict
+    // AS (SELECT 1 FROM event_room_blocks ... CROSS JOIN input WHERE ...),
+    // ins AS (INSERT INTO saved_games (...) SELECT ... FROM input WHERE NOT
+    // EXISTS (SELECT 1 FROM conflict) RETURNING *) SELECT ... FROM ins sg
+    // LEFT JOIN tables/rooms — CTE-wrapped insert (security-review fix,
+    // #301; conflict re-check under the advisory lock added #334
+    // code-review), anchored as verb='insert'/table='saved_games' by the
+    // sql-mock's multi-CTE support (picks the first data-modifying CTE, here
+    // `ins`, over the leading `input`/`conflict` SELECT CTEs). 4 bound
+    // values: table_id, user_id, start_date, end_date — each interpolated
+    // exactly once via the `input` CTE.
+    sqlMock.addHandler({
+      name: 'INSERT saved game (create, with lock-guarded conflict re-check)',
       verb: 'insert',
       match: (stmt) => stmt.table === 'saved_games' && stmt.values.length === 4,
       respond: (stmt) => {
         if (createInsertError) throw createInsertError
         const [tableId, userId, startDate, endDate] = stmt.values.map(String)
+        // Simulates the `WHERE NOT EXISTS (SELECT 1 FROM conflict)` guard:
+        // an event block conflicting with this table/date-range — found
+        // freshly under the advisory lock, independent of whatever
+        // assertTableAndEventAvailability's earlier precheck saw — skips the
+        // insert (0 rows), same as that precheck's own SAVED_GAME_EVENT_CONFLICT.
+        //
+        // Code-review finding (MEDIUM 3): only simulate the guard when the
+        // statement actually carries it — otherwise deleting the real
+        // `conflict`/`WHERE NOT EXISTS` CTE from production code would leave
+        // this handler still computing the conflict itself and this test
+        // would stay green despite the guard being gone.
+        const hasConflictGuard = stmt.text.includes('event_room_blocks') && stmt.text.includes('not exists')
+        const table = tablesState.get(tableId)
+        const conflict =
+          hasConflictGuard &&
+          blocksState.some(
+            (block) =>
+              block.room_id === table?.room_id &&
+              block.date >= startDate &&
+              block.date <= endDate &&
+              (block.table_id == null || block.table_id === tableId),
+          )
+        if (conflict) return []
         const row = makeSavedGame({
           id: `sg-${savedGamesState.length + 1}`,
           table_id: tableId,
@@ -252,17 +296,76 @@ describe('saved games service', () => {
       },
     })
 
-    // renewSavedGameForSession: WITH ins AS (INSERT INTO saved_games
-    // (table_id, user_id, start_date, end_date, renewed_from_id) VALUES
-    // (...) RETURNING *) SELECT ... FROM ins sg LEFT JOIN tables/rooms —
-    // same CTE-wrapped shape as create. 5 bound values.
+    // renewSavedGameForSession: WITH input AS (SELECT $1,$2,$3,$4,$5),
+    // conflict AS (...), current_check AS (...), ins AS (INSERT INTO
+    // saved_games (...) SELECT ... FROM input WHERE NOT EXISTS (SELECT 1
+    // FROM conflict) AND EXISTS (SELECT 1 FROM current_check) RETURNING *)
+    // SELECT ..., (SELECT NOT EXISTS(...) FROM current_check) AS was_inactive
+    // FROM (SELECT 1) AS one LEFT JOIN ins sg ON true LEFT JOIN tables/rooms
+    // — the `(SELECT 1) AS one LEFT JOIN ins` shape (#334 code-review, second
+    // finding: renew never rechecked the source row's status under the lock)
+    // means this always returns exactly one row, with every `sg.*` column
+    // null when the `ins` guard skipped the insert — never `[]`. 5 bound
+    // values: table_id, user_id, start_date, end_date, renewed_from_id —
+    // each interpolated exactly once via the `input` CTE.
     sqlMock.addHandler({
-      name: 'INSERT saved game (renew)',
+      name: 'INSERT saved game (renew, with lock-guarded conflict + status re-check)',
       verb: 'insert',
       match: (stmt) => stmt.table === 'saved_games' && stmt.values.length === 5,
       respond: (stmt) => {
         if (renewInsertError) throw renewInsertError
         const [tableId, userId, startDate, endDate, renewedFromId] = stmt.values.map((v) => (v == null ? null : String(v)))
+        // Same guard simulation as the create handler above (code-review
+        // finding: the renew guard previously had zero behavioural
+        // coverage) — only report a conflict when the statement actually
+        // carries the re-check, and compute it from live state rather than
+        // unconditionally.
+        // Anchored to the guard's own text (not a loose `includes('not
+        // exists')`), because this statement's final SELECT also carries a
+        // second, unrelated `NOT EXISTS` (the `was_inactive` projection
+        // below) — a substring-only match here would still report the guard
+        // present after someone deleted `AND EXISTS (SELECT 1 FROM
+        // current_check)` from the `ins` WHERE clause, since `NOT EXISTS
+        // (SELECT 1 FROM conflict)` alone still contains `not exists`
+        // (coordinator review finding, HIGH 2).
+        const hasConflictGuard =
+          stmt.text.includes('event_room_blocks') && stmt.text.includes('not exists (select 1 from conflict)')
+        const table = tablesState.get(tableId!)
+        const conflict =
+          hasConflictGuard &&
+          blocksState.some(
+            (block) =>
+              block.room_id === table?.room_id &&
+              block.date >= startDate! &&
+              block.date <= endDate! &&
+              (block.table_id == null || block.table_id === tableId),
+          )
+        // #334 code-review finding (renewal race with source-row
+        // cancellation): the `current_check` CTE re-reads the source row's
+        // live status under the lock and the insert is gated on it still
+        // being 'active'. Only simulate the guard when the statement
+        // actually carries it — same discipline as the conflict guard above
+        // — so reverting the fix in production leaves this handler
+        // computing nothing and the regression test below fails.
+        //
+        // Anchored to the guard's own clause, not a loose
+        // `includes('current_check')` — that substring also matches the CTE
+        // definition and the `was_inactive` projection, both of which stay
+        // in the statement even if someone deletes only `AND EXISTS (SELECT
+        // 1 FROM current_check)` from the `ins` WHERE clause. A loose match
+        // would keep this handler correctly rejecting the insert while the
+        // real production guard was gone — the regression test would stay
+        // green for the wrong reason (coordinator review finding, HIGH 1).
+        const hasCurrentCheckGuard = stmt.text.includes('and exists (select 1 from current_check)')
+        const sourceRow = renewedFromId ? savedGamesState.find((item) => item.id === renewedFromId) : undefined
+        const sourceInactive = hasCurrentCheckGuard && sourceRow?.status !== 'active'
+        if (conflict || sourceInactive) {
+          return [{
+            id: null, table_id: null, user_id: null, start_date: null, end_date: null,
+            status: null, attendance_count: null, renewed_from_id: null, created_at: null, updated_at: null,
+            table_name: null, room_name: null, was_inactive: sourceInactive,
+          }]
+        }
         const row = makeSavedGame({
           id: `sg-${savedGamesState.length + 1}`,
           table_id: tableId!,
@@ -272,7 +375,7 @@ describe('saved games service', () => {
           renewed_from_id: renewedFromId,
         })
         savedGamesState.push(row)
-        return [withJoinedNames(row)]
+        return [{ ...withJoinedNames(row), was_inactive: false }]
       },
     })
 
@@ -326,6 +429,25 @@ describe('saved games service', () => {
       roomName: 'Sala',
       tableName: 'Mesa doble',
     })
+
+    // Code-review finding (HIGH): structural proof the lock and the
+    // check+insert actually travel together as one sql.transaction([...])
+    // call — without this, someone could revert createSavedGameForSession
+    // back to two sequential `await sql` calls (fully reopening the #334
+    // race) and this test would stay green, since the handlers above match
+    // on statement shape regardless of how they were dispatched.
+    expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
+    const batched = sqlMock.transaction.mock.calls[0]?.[0]
+    expect(Array.isArray(batched)).toBe(true)
+    expect(batched).toHaveLength(2)
+    // Order matters (LOW 3 code-review finding): batch length alone doesn't
+    // prove the lock runs first — [checkAndInsert, lock] would also have
+    // length 2 and would reopen the race silently. sqlMock.sql dispatches
+    // eagerly at tagged-template call time, so its two most recent calls at
+    // this point are exactly this transaction's own [lock, insert], in order.
+    const dispatchOrder = sqlMock.sql.mock.calls.slice(-2).map((call) => String(call[0]))
+    expect(dispatchOrder[0]).toContain('pg_advisory_xact_lock')
+    expect(dispatchOrder[1]).not.toContain('pg_advisory_xact_lock')
   })
 
   it('rejects create with a 409 when an active bottom reservation overlaps the requested range', async () => {
@@ -410,6 +532,53 @@ describe('saved games service', () => {
         endDate: '2026-07-20',
       }),
     ).rejects.toMatchObject({ message: 'SAVED_GAME_EVENT_CONFLICT', statusCode: 409 })
+  })
+
+  it('rejects with SAVED_GAME_EVENT_CONFLICT/409 when an event block appears between the precheck and the lock-guarded insert (#334 code-review — race with cancelActiveSavedGamesForRoomBlock)', async () => {
+    // Simulates cancelActiveSavedGamesForRoomBlock's UPDATE winning the
+    // per-table advisory lock race and committing an event-block-driven
+    // cancellation right after assertTableAndEventAvailability's precheck
+    // ran clean, but before createSavedGameForSession's own insert (which
+    // re-checks the same event_room_blocks condition under the lock, inside
+    // the same statement as the insert) executes. The precheck's SELECT
+    // handler returns a clean room, then pushes the block as a side effect
+    // — visible only to the later re-check embedded in the INSERT's `conflict`
+    // CTE, not to the precheck itself.
+    sqlMock.prependHandler({
+      name: 'SELECT event_room_blocks in range (race: block lands after precheck)',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'event_room_blocks' && stmt.values.length === 3,
+      respond: (stmt) => {
+        const [roomId, startDate, endDate] = stmt.values.map(String)
+        const before = blocksState
+          .filter((block) => block.room_id === roomId && block.date >= startDate && block.date <= endDate)
+          .map((block) => ({ id: block.id, table_id: block.table_id }))
+        blocksState.push({ id: 'block-race', room_id: 'room-1', table_id: null, date: '2026-06-20' })
+        return before
+      },
+    })
+
+    const { createSavedGameForSession } = await import('@/lib/server/saved-games-service')
+    await expect(
+      createSavedGameForSession(member, {
+        tableId: 'double',
+        startDate: '2026-06-20',
+        endDate: '2026-07-20',
+      }),
+    ).rejects.toMatchObject({ message: 'SAVED_GAME_EVENT_CONFLICT', statusCode: 409 })
+
+    // Structural proof (HIGH finding, same as the happy-path test above):
+    // the lock and the re-check+insert still travelled together as one
+    // batched sql.transaction() call even on this rejection path.
+    expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
+    const batched = sqlMock.transaction.mock.calls[0]?.[0]
+    expect(Array.isArray(batched)).toBe(true)
+    expect(batched).toHaveLength(2)
+    // Order matters (LOW 3 code-review finding) — see the happy-path test's
+    // comment above for why batch length alone doesn't prove ordering.
+    const dispatchOrder = sqlMock.sql.mock.calls.slice(-2).map((call) => String(call[0]))
+    expect(dispatchOrder[0]).toContain('pg_advisory_xact_lock')
+    expect(dispatchOrder[1]).not.toContain('pg_advisory_xact_lock')
   })
 
   it('deterministically surfaces the availability error on create when both checks would fail (#301 round-3 fix)', async () => {
@@ -508,6 +677,116 @@ describe('saved games service', () => {
       roomName: 'Sala',
       tableName: 'Mesa doble',
     })
+
+    // #334 code-review (MEDIUM 2): renewSavedGameForSession now takes the
+    // same lock-guarded treatment as createSavedGameForSession — structural
+    // proof the lock and the re-check+insert travelled together as one
+    // batched sql.transaction() call.
+    expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
+    const batched = sqlMock.transaction.mock.calls[0]?.[0]
+    expect(Array.isArray(batched)).toBe(true)
+    expect(batched).toHaveLength(2)
+    // Order matters (LOW 3 code-review finding): the lock must be dispatched
+    // before the guarded insert, or the guard runs unlocked and the race it
+    // exists to close reopens silently. sqlMock.sql records dispatch order
+    // (it dispatches eagerly at tagged-template call time), so the two most
+    // recent calls at this point are exactly this transaction's [lock, insert].
+    const dispatchOrder = sqlMock.sql.mock.calls.slice(-2).map((call) => String(call[0]))
+    expect(dispatchOrder[0]).toContain('pg_advisory_xact_lock')
+    expect(dispatchOrder[1]).not.toContain('pg_advisory_xact_lock')
+  })
+
+  it('rejects with SAVED_GAME_EVENT_CONFLICT/409 on renewal when an event block appears between the precheck and the lock-guarded insert (#334 code-review — race with cancelActiveSavedGamesForRoomBlock, MEDIUM finding)', async () => {
+    savedGamesState.push(
+      makeSavedGame({
+        id: 'sg-1',
+        table_id: 'double',
+        user_id: 'user-1',
+        start_date: '2026-04-01',
+        end_date: '2026-06-30',
+      }),
+    )
+
+    // Same race simulation as createSavedGameForSession's analogous test
+    // above: the precheck sees a clean room, then pushes a conflicting block
+    // as a side effect — visible only to the later re-check embedded in the
+    // renew insert's `conflict` CTE, not to the precheck itself.
+    sqlMock.prependHandler({
+      name: 'SELECT event_room_blocks in range (race: block lands after renew precheck)',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'event_room_blocks' && stmt.values.length === 3,
+      respond: (stmt) => {
+        const [roomId, startDate, endDate] = stmt.values.map(String)
+        const before = blocksState
+          .filter((block) => block.room_id === roomId && block.date >= startDate && block.date <= endDate)
+          .map((block) => ({ id: block.id, table_id: block.table_id }))
+        blocksState.push({ id: 'block-race', room_id: 'room-1', table_id: null, date: '2026-07-01' })
+        return before
+      },
+    })
+
+    const { renewSavedGameForSession } = await import('@/lib/server/saved-games-service')
+    await expect(renewSavedGameForSession(member, 'sg-1')).rejects.toMatchObject({
+      message: 'SAVED_GAME_EVENT_CONFLICT',
+      statusCode: 409,
+    })
+
+    expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
+    const batched = sqlMock.transaction.mock.calls[0]?.[0]
+    expect(Array.isArray(batched)).toBe(true)
+    expect(batched).toHaveLength(2)
+    const dispatchOrder = sqlMock.sql.mock.calls.slice(-2).map((call) => String(call[0]))
+    expect(dispatchOrder[0]).toContain('pg_advisory_xact_lock')
+    expect(dispatchOrder[1]).not.toContain('pg_advisory_xact_lock')
+  })
+
+  it('rejects with SAVED_GAME_NOT_ACTIVE/409 on renewal when the source row is cancelled between the precheck and the lock-guarded insert (#334 code-review — race with cancelActiveSavedGamesForRoomBlock)', async () => {
+    savedGamesState.push(
+      makeSavedGame({
+        id: 'sg-1',
+        table_id: 'double',
+        user_id: 'user-1',
+        start_date: '2026-04-01',
+        end_date: '2026-06-30',
+      }),
+    )
+
+    // Same race shape as the event-block test above, but on the source
+    // row's own status: `renewSavedGameForSession`'s precheck reads it as
+    // 'active' and passes that snapshot through to `current`, then a
+    // concurrent `cancelActiveSavedGamesForRoomBlock` flips the live row to
+    // 'cancelled' before the lock-guarded insert's `current_check` CTE
+    // re-reads it. The precheck's stale `current.status` must never be what
+    // decides the insert — only the value read after the lock counts.
+    sqlMock.prependHandler({
+      name: 'SELECT saved game by id (race: cancelled after renew precheck)',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'saved_games' && stmt.values.length === 1 && whereConditionCount(stmt) === 1,
+      respond: (stmt) => {
+        const row = savedGamesState.find((item) => item.id === String(stmt.values[0]))
+        if (!row) return []
+        const snapshot = { ...row }
+        row.status = 'cancelled'
+        return [snapshot]
+      },
+    })
+
+    const { renewSavedGameForSession } = await import('@/lib/server/saved-games-service')
+    await expect(renewSavedGameForSession(member, 'sg-1')).rejects.toMatchObject({
+      message: 'SAVED_GAME_NOT_ACTIVE',
+      statusCode: 409,
+    })
+
+    // No renewal row was inserted — only the original (now cancelled) row exists.
+    expect(savedGamesState).toHaveLength(1)
+    expect(savedGamesState[0]?.status).toBe('cancelled')
+
+    // Structural proof the lock and the check+insert still travel together
+    // as one sql.transaction([...]) call, same guard as the tests above.
+    expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
+    const batched = sqlMock.transaction.mock.calls[0]?.[0]
+    expect(Array.isArray(batched)).toBe(true)
+    expect(batched).toHaveLength(2)
   })
 
   it('rejects renewal with a 409 when a bottom reservation overlaps the next period', async () => {

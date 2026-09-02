@@ -137,7 +137,15 @@ Progress logging (per `~/.claude/CLAUDE.md` Agent Progress Logging) applies here
 
 ## Team Coordination for Alea Webapp
 
+### Precedence: `kx-session` overrides this section when present
+
+Per the global rule (`~/.claude/CLAUDE.md`, "Precedence: `kx-session` overrides the product-manager pipeline when present"): if `.claude/skills/kx-session/` exists in this repo, `kx-session`'s own orchestration governs issue/task work here, and the "Always Use Product Manager" workflow below does NOT apply. If `kx-session` is ever removed from this repo, the section below applies again unchanged.
+
+As of 2026-09-02, this repo **does** have `kx-session` installed (`kx-developer`, `kx-reviewer`, `kx-documenter`, `kx-tech-debt` agents and the `kx-*` skill set were added by kx). This means `kx-session` is currently the governing workflow for issue work in this repo, not the product-manager pipeline below — until/unless `kx-session` is removed.
+
 ### Always Use Product Manager (Universal Entry Point)
+
+*(Applies only when `kx-session` is not present in this repo — see precedence note above.)*
 
 For **every issue** — regardless of size or scope:
 
