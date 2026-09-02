@@ -340,14 +340,16 @@ export async function renewSavedGameForSession(session: SessionUser, id: string)
   // row, `cancelActiveSavedGamesForRoomBlock`'s already-executed UPDATE
   // can't retroactively catch it either. Same fix: lock + re-check under the
   // lock, in the same statement as the insert. `current.table_id` is read
-  // back from the DB just above (always canonical), so no `::uuid::text`
-  // cast is needed before hashing for canonicalization, but the lock key
-  // itself must still match `cancelActiveSavedGamesForRoomBlock`'s.
+  // back from the DB just above, so it's already canonical and the
+  // `::uuid::text` cast below is a no-op for correctness — kept anyway so
+  // all three lock sites in this file/`club-events-service.ts` stay
+  // textually identical rather than relying on the reader noticing which
+  // ones can skip it.
   let rows: SavedGameJoinedRow[]
   try {
     const results = await sql.transaction(
       [
-        sql`SELECT pg_advisory_xact_lock(hashtext(${current.table_id}))`,
+        sql`SELECT pg_advisory_xact_lock(hashtext(${current.table_id}::uuid::text))`,
         sql`
           WITH input AS (
             SELECT ${current.table_id}::uuid AS table_id, ${current.user_id}::uuid AS user_id, ${startDate}::date AS start_date, ${endDate}::date AS end_date, ${current.id}::uuid AS renewed_from_id
