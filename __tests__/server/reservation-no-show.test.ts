@@ -3,8 +3,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   whereColumnHasOperator,
   whereColumnHasNullCheck,
-  hasExactSelectColumns,
-  hasWord,
   type ParsedStatement,
 } from '../helpers/sql-mock'
 import { isNoShowExpired } from '@/lib/server/reservation-no-show'
@@ -64,23 +62,18 @@ function registerSelectHandler(rows: ReservationSlotRow[]): { getStmt: () => Par
     name: 'select pending never-activated reservations',
     verb: 'select',
     match: (stmt) =>
-      stmt.table === 'reservations' &&
-      // Exact SELECT projection: catches a production column dropped from
-      // (e.g. `end_time` missing) or added to the list, not just verb/table.
-      hasExactSelectColumns(stmt, 'id, date::text as date, start_time, end_time') &&
-      // Exact WHERE shape: catches a widened WHERE (e.g. `... OR true`
-      // appended) that a substring check on `status = 'pending'` alone would
-      // still accept, since it never verifies there's nothing else present.
-      stmt.whereClause === `status = 'pending' and activated_at is null` &&
-      whereColumnHasOperator(stmt, 'status', '=') &&
-      whereColumnHasNullCheck(stmt, 'activated_at', 'IS NULL') &&
-      // Guards against a clause appended AFTER the WHERE (e.g. a stray
-      // `LIMIT 100`), which the WHERE-clause regex above can't see — it
-      // terminates at `returning|order by|group by|limit`. An unbounded
-      // SELECT with no ORDER BY and a silently-added LIMIT would only ever
-      // evaluate an arbitrary first-N pending reservations, leaving the
-      // rest never checked for no-show.
-      !hasWord(stmt.text, 'limit'),
+      // Full-statement pin, not a piecemeal stack of column/WHERE/LIMIT
+      // checks: those only close the specific gaps they name, and mutation
+      // testing found two more they didn't — appending `ORDER BY id OFFSET
+      // 50` (OFFSET isn't excluded from the WHERE-clause regex the way LIMIT
+      // is, and ORDER BY re-hides everything after it from that regex too),
+      // and joining in `profiles` (silently dropping any reservation with no
+      // matching profile row). `parseStatement` already lowercases and
+      // collapses whitespace on `stmt.text`, so this exact-text pin is safe
+      // against reindentation/formatting differences in production, while
+      // still catching anything appended, changed, or joined in.
+      stmt.text ===
+        "select id, date::text as date, start_time, end_time from reservations where status = 'pending' and activated_at is null",
     respond: (stmt) => {
       matchedStmt = stmt
       return rows
@@ -188,6 +181,34 @@ describe('reservation no-show lazy evaluation', () => {
       const result = await markExpiredReservationsAsNoShow()
 
       expect(result).toBe(1)
+      expectSelectCastDateToText(select)
+      expectUpdateSetsNoShowStatus(update)
+    })
+
+    it('only binds the expired row when the SELECT returns a mix of expired and fresh rows', async () => {
+      // getDatabaseNowMock (set in beforeEach) is one millisecond past the
+      // expired row's deadline. The fresh row's start_time is one minute
+      // later (16:01 vs 16:00), which pushes its own deadline to 15:00:00Z —
+      // one minute after "now" — so it stays inside the window at the exact
+      // same "now" this suite already uses. This is the only test in the
+      // file that feeds the SELECT more than one row, so it's the only one
+      // that actually exercises the filter step (only expired candidates get
+      // bound into the UPDATE) rather than a filter over a single-row list,
+      // where "filter everything" and "filter correctly" produce the same
+      // observable result.
+      const expiredRow = makeRow({ id: 'expired-1' })
+      const freshRow = makeRow({ id: 'fresh-1', start_time: '16:01:00' })
+      const select = registerSelectHandler([expiredRow, freshRow])
+      const update = registerUpdateHandler((ids) => {
+        expect(ids).toEqual(['expired-1'])
+        return [{ id: 'expired-1' }]
+      })
+
+      const { markExpiredReservationsAsNoShow } = await loadReservationNoShow()
+      const result = await markExpiredReservationsAsNoShow()
+
+      expect(result).toBe(1)
+      expect(update.getStmt()?.values[0]).toEqual(['expired-1'])
       expectSelectCastDateToText(select)
       expectUpdateSetsNoShowStatus(update)
     })
