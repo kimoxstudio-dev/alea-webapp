@@ -53,11 +53,6 @@ describe('lib/db/transaction — shared atomic-transaction helper (#350)', () =>
       const results = await runTransaction([insertStatement, deleteStatement])
 
       expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
-      // Only the statements array is pinned here — the options arg (second
-      // param) isn't asserted on since passing `undefined` vs `{}` when no
-      // options are given is behaviorally identical, and the
-      // isolationLevel-passthrough test below already covers that argument's
-      // actual behavior.
       expect(sqlMock.transaction.mock.calls[0]?.[0]).toEqual([
         insertStatement,
         deleteStatement,
@@ -65,36 +60,12 @@ describe('lib/db/transaction — shared atomic-transaction helper (#350)', () =>
       expect(results).toEqual([[{ id: 'inserted-1' }], [{ id: 'deleted-1' }]])
     })
 
-    it('passes isolationLevel through to sql.transaction unchanged', async () => {
-      sqlMock.addHandler({
-        name: 'select anything',
-        verb: 'select',
-        match: () => true,
-        respond: () => [{ ok: true }],
-      })
-
-      const { runTransaction } = await loadTransactionHelper()
-      const { sql } = await import('@/lib/db/client')
-
-      const statement = sql`SELECT 1 AS ok`
-      await runTransaction([statement], { isolationLevel: 'RepeatableRead' })
-
-      expect(sqlMock.transaction).toHaveBeenCalledWith([statement], {
-        isolationLevel: 'RepeatableRead',
-      })
-    })
-
-    it('rejects the whole call when one statement throws, and applies none of the others', async () => {
-      const applied: string[] = []
-
+    it('rejects when one statement throws, via sql.transaction actually rejecting', async () => {
       sqlMock.addHandler({
         name: 'insert that succeeds',
         verb: 'insert',
         match: () => true,
-        respond: () => {
-          applied.push('insert')
-          return [{ id: 'ok' }]
-        },
+        respond: () => [{ id: 'ok' }],
       })
       sqlMock.addHandler({
         name: 'update that fails',
@@ -115,11 +86,18 @@ describe('lib/db/transaction — shared atomic-transaction helper (#350)', () =>
         runTransaction([insertStatement, updateStatement]),
       ).rejects.toThrow('simulated write failure')
 
-      // The mock can't model real rollback (no network round-trip to defer),
-      // but the helper must still surface the rejection rather than
-      // resolving with a partial result — this is what callers depend on to
-      // treat the whole batch as failed.
-      expect(applied).toEqual(['insert'])
+      // The sql-mock dispatches each `sql\`...\`` tagged-template call
+      // eagerly, at statement-construction time — before runTransaction's
+      // body even runs — so a passing `applied`-array check on individual
+      // statement handlers can't prove runTransaction called sql.transaction
+      // at all (it would pass even if runTransaction's body were replaced
+      // with `throw new Error(...)` and never touched sql.transaction).
+      // Pinning that sql.transaction itself was called, and that its call
+      // actually rejected, is what makes this test fail if that happens.
+      expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
+      await expect(sqlMock.transaction.mock.results[0]?.value).rejects.toThrow(
+        'simulated write failure',
+      )
     })
   })
 
@@ -182,6 +160,18 @@ describe('lib/db/transaction — shared atomic-transaction helper (#350)', () =>
       await expect(
         runAdvisoryLockedTransaction(lockStatement, guardedStatement),
       ).rejects.toThrow('conflict detected')
+
+      // Same reasoning as runTransaction's rejection test above: the
+      // sql-mock dispatches eagerly at statement-construction time, so
+      // asserting only on the outer rejects.toThrow() can't distinguish
+      // "runAdvisoryLockedTransaction called sql.transaction and it
+      // rejected" from "runAdvisoryLockedTransaction never called
+      // sql.transaction at all". Pinning the call and its actual result
+      // closes that gap.
+      expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
+      await expect(sqlMock.transaction.mock.results[0]?.value).rejects.toThrow(
+        'conflict detected',
+      )
     })
   })
 })

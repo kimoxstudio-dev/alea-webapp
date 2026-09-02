@@ -59,16 +59,6 @@ import { sql } from './client'
  * as they do today.
  */
 
-export type TransactionIsolationLevel =
-  | 'ReadUncommitted'
-  | 'ReadCommitted'
-  | 'RepeatableRead'
-  | 'Serializable'
-
-export interface TransactionOptions {
-  isolationLevel?: TransactionIsolationLevel
-}
-
 /** A single already-invoked tagged-template `sql` call, as batched into `sql.transaction([...])`. */
 export type SqlStatement = ReturnType<typeof sql>
 
@@ -78,15 +68,17 @@ export type SqlStatement = ReturnType<typeof sql>
  * for a multi-statement write with no locking/isolation need of its own
  * (`equipment-service.ts`'s `setRoomDefaultEquipment` DELETE + INSERT).
  *
+ * No options parameter: no real caller needs to override isolation level
+ * for this shape today (the one that does — `runAdvisoryLockedTransaction`
+ * below — always pins `ReadCommitted` itself). Add one back if/when a real
+ * caller needs it.
+ *
  * Returns the raw per-statement row arrays, in the same order as
  * `statements` — callers cast each element to the row shape they expect,
  * the same way every existing `sql.transaction()` call site already does.
  */
-export async function runTransaction(
-  statements: SqlStatement[],
-  options?: TransactionOptions,
-): Promise<unknown[][]> {
-  return sql.transaction(statements, options)
+export async function runTransaction(statements: SqlStatement[]): Promise<unknown[][]> {
+  return sql.transaction(statements)
 }
 
 /**
