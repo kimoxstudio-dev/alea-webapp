@@ -53,10 +53,12 @@ describe('lib/db/transaction — shared atomic-transaction helper (#350)', () =>
       const results = await runTransaction([insertStatement, deleteStatement])
 
       expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
-      expect(sqlMock.transaction.mock.calls[0]?.[0]).toEqual([
-        insertStatement,
-        deleteStatement,
-      ])
+      // Batch statements are Promises — Vitest deep-equals distinct Promises
+      // as structurally identical, so comparing the raw array (as a prior
+      // version of this test did) can only ever prove arity, never order.
+      // `results` below is what actually pins order, since it's the
+      // resolved values in call order.
+      expect(sqlMock.transaction.mock.calls[0]?.[0]).toHaveLength(2)
       expect(results).toEqual([[{ id: 'inserted-1' }], [{ id: 'deleted-1' }]])
     })
 
@@ -128,10 +130,22 @@ describe('lib/db/transaction — shared atomic-transaction helper (#350)', () =>
       )
 
       expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
-      expect(sqlMock.transaction).toHaveBeenCalledWith(
-        [lockStatement, guardedStatement],
-        { isolationLevel: 'ReadCommitted' },
-      )
+      // Batch statements are Promises — Vitest deep-equals distinct
+      // Promises as structurally identical, so `toHaveBeenCalledWith([lock,
+      // guarded], {...})` (a prior version of this test) can never fail on
+      // statement order: [guarded, lock] would satisfy it just as well,
+      // silently reopening the exact #334 race this helper exists to
+      // prevent (guarded write running before the advisory lock). Resolving
+      // the actual batched array and asserting on the resolved values is
+      // what pins order.
+      expect(sqlMock.transaction).toHaveBeenCalledWith(expect.any(Array), {
+        isolationLevel: 'ReadCommitted',
+      })
+      const batched = sqlMock.transaction.mock.calls[0]?.[0] as Array<Promise<unknown>>
+      expect(await Promise.all(batched)).toEqual([
+        [{ pg_advisory_xact_lock: null }],
+        [{ id: 'guarded-row' }],
+      ])
       expect(result).toEqual([{ id: 'guarded-row' }])
     })
 
