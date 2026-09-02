@@ -60,6 +60,12 @@ function registerSelectHandler(rows: ReservationSlotRow[]): { getStmt: () => Par
     match: (stmt) =>
       stmt.table === 'reservations' &&
       whereColumnHasOperator(stmt, 'status', '=') &&
+      // Pins the literal compared value, not just the operator: without this,
+      // mutating production's `WHERE status = 'pending'` to
+      // `WHERE status = 'active'` still satisfies whereColumnHasOperator
+      // (which only checks the `=` operator) and the mock would keep
+      // matching a query that no longer scopes to pending reservations.
+      (stmt.whereClause?.includes(`status = 'pending'`) ?? false) &&
       whereColumnHasNullCheck(stmt, 'activated_at', 'IS NULL'),
     respond: (stmt) => {
       matchedStmt = stmt
@@ -77,7 +83,12 @@ function registerUpdateHandler(respond: (ids: string[]) => Array<{ id: string }>
     match: (stmt) =>
       stmt.table === 'reservations' &&
       whereColumnHasOperator(stmt, 'status', '=') &&
-      whereColumnHasNullCheck(stmt, 'activated_at', 'IS NULL'),
+      whereColumnHasNullCheck(stmt, 'activated_at', 'IS NULL') &&
+      // Pins RETURNING id: production's returned count comes entirely from
+      // `updatedRows.length`, which depends on this clause. Without pinning
+      // it, removing `RETURNING id` from production still satisfies every
+      // other condition here and the mock would keep matching.
+      stmt.text.includes('returning id'),
     respond: (stmt) => {
       matchedStmt = stmt
       return respond(stmt.values[0] as string[])
