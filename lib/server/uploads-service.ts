@@ -1,18 +1,19 @@
 import 'server-only'
-import { createSupabaseServerAdminClient } from '@/lib/supabase/server'
+import { put } from '@vercel/blob'
 import { serviceError } from '@/lib/server/service-error'
 import type { SessionUser } from '@/lib/server/auth'
 
 // ---------------------------------------------------------------------------
-// Image uploads to Supabase Storage (OIR-207)
+// Image uploads to Vercel Blob (#310, ported off Supabase Storage / OIR-207)
 //
 // Privilege checks (role === 'admin') live here in the service layer, not in
-// the route handler, same pattern as the other admin services. Writes always
-// go through the service_role client — the "landing-media" bucket has no
-// client INSERT policy (see supabase/migrations/20260704000005).
+// the route handler, same pattern as the other admin services. Vercel Blob
+// has no RLS-equivalent client policy layer — the write is authorized by
+// possessing BLOB_READ_WRITE_TOKEN (server-only env var), which the admin
+// check above gates access to.
 // ---------------------------------------------------------------------------
 
-const LANDING_MEDIA_BUCKET = 'landing-media'
+const LANDING_MEDIA_PREFIX = 'landing-media'
 const MAX_UPLOAD_SIZE_BYTES = 5 * 1024 * 1024 // 5 MB
 
 // Extension is derived from the (validated) MIME type, never from the
@@ -60,9 +61,9 @@ function requireValidFolder(folder: unknown): UploadFolder {
 //
 // `File.type` is a client-supplied MIME type — a caller can set it to
 // "image/png" while sending an arbitrary (or malicious) byte stream. Because
-// the uploaded object is written to a *public* bucket and later rendered
+// the uploaded object is written with public access and later rendered
 // directly (landing page / admin previews), we must not trust that value
-// alone. Before writing anything to Storage we re-derive the type from the
+// alone. Before writing anything to Blob we re-derive the type from the
 // first bytes of the actual body and require it to match one of the allowed
 // image formats *and* match the MIME type the client declared.
 //
@@ -110,7 +111,7 @@ function detectImageMimeFromBytes(bytes: Uint8Array): ImageMime | null {
 /**
  * Verifies the file body's magic bytes match a known image signature AND
  * match the MIME type the client declared via `File.type`. Must be called
- * with the already-read body bytes, before anything is written to Storage.
+ * with the already-read body bytes, before anything is written to Blob.
  */
 function requireMatchingMagicBytes(bytes: Uint8Array, declaredType: string): void {
   const detected = detectImageMimeFromBytes(bytes)
@@ -131,8 +132,8 @@ function requireValidFile(file: UploadFileLike | null): { file: UploadFileLike; 
   // the entire multipart body into memory — this check is a validation gate
   // on the parsed size, not a memory-exhaustion defense. Request size is
   // bounded upstream by requireAdmin() (auth-gated) and the adminMutation
-  // rate limit; the "landing-media" bucket's file_size_limit is what
-  // actually enforces the 5 MB cap at the storage layer.
+  // rate limit; this MAX_UPLOAD_SIZE_BYTES check is what enforces the 5 MB
+  // cap (Vercel Blob has no bucket-level size limit to also enforce it).
   if (file.size <= 0 || file.size > MAX_UPLOAD_SIZE_BYTES) {
     serviceError('file must be between 1 byte and 5 MB', 400)
   }
@@ -141,9 +142,9 @@ function requireValidFile(file: UploadFileLike | null): { file: UploadFileLike; 
 }
 
 /**
- * Validate and upload an admin-supplied image to the "landing-media" bucket,
- * returning its public URL. Used to back the image field of club events,
- * partners and library games from the admin dashboard.
+ * Validate and upload an admin-supplied image to Vercel Blob, returning its
+ * public URL. Used to back the image field of club events, partners and
+ * library games from the admin dashboard.
  */
 export async function uploadLandingMediaImage(session: SessionUser, input: UploadInput): Promise<{ url: string }> {
   requireAdminSession(session)
@@ -152,31 +153,28 @@ export async function uploadLandingMediaImage(session: SessionUser, input: Uploa
   const { file, extension } = requireValidFile(input.file)
 
   const bytes = new Uint8Array(await file.arrayBuffer())
-  // Re-verify the actual file signature BEFORE writing anything to Storage —
+  // Re-verify the actual file signature BEFORE writing anything to Blob —
   // the client-supplied `file.type` alone is not trustworthy (see
   // requireMatchingMagicBytes doc comment above).
   requireMatchingMagicBytes(bytes, file.type)
 
-  const objectPath = `${folder}/${crypto.randomUUID()}.${extension}`
+  const objectPath = `${LANDING_MEDIA_PREFIX}/${folder}/${crypto.randomUUID()}.${extension}`
 
-  const admin = createSupabaseServerAdminClient()
-  const { error } = await admin.storage
-    .from(LANDING_MEDIA_BUCKET)
-    .upload(objectPath, bytes, { contentType: file.type, upsert: false })
-
-  if (error) {
-    // Do NOT swallow the underlying storage error — log it server-side so
-    // failures (misconfigured bucket, storage outage, etc.) are diagnosable.
-    // Only a generic message is ever returned to the client.
-    console.error('[uploads-service] Supabase Storage upload failed:', error.message)
+  try {
+    const blob = await put(objectPath, Buffer.from(bytes), {
+      access: 'public',
+      contentType: file.type,
+      addRandomSuffix: false,
+    })
+    return { url: blob.url }
+  } catch (error) {
+    // Do NOT swallow the underlying Blob error — log it server-side so
+    // failures (missing token, store outage, etc.) are diagnosable. Only a
+    // generic message is ever returned to the client.
+    console.error(
+      '[uploads-service] Vercel Blob upload failed:',
+      error instanceof Error ? error.message : error
+    )
     serviceError('Internal server error', 500)
   }
-
-  const { data: publicUrlData } = admin.storage.from(LANDING_MEDIA_BUCKET).getPublicUrl(objectPath)
-  if (!publicUrlData?.publicUrl) {
-    console.error('[uploads-service] getPublicUrl returned no publicUrl for', objectPath)
-    serviceError('Internal server error', 500)
-  }
-
-  return { url: publicUrlData.publicUrl }
 }
