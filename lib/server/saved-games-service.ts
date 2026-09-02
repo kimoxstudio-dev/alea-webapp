@@ -241,19 +241,23 @@ export async function createSavedGameForSession(
     const results = await sql.transaction([
       sql`SELECT pg_advisory_xact_lock(hashtext(${tableId}))`,
       sql`
-        WITH conflict AS (
+        WITH input AS (
+          SELECT ${tableId}::uuid AS table_id, ${session.id}::uuid AS user_id, ${startDate}::date AS start_date, ${endDate}::date AS end_date
+        ),
+        conflict AS (
           SELECT 1
           FROM event_room_blocks b
           JOIN tables t ON t.room_id = b.room_id
-          WHERE t.id = ${tableId}
-            AND b.date >= ${startDate}
-            AND b.date <= ${endDate}
-            AND (b.table_id IS NULL OR b.table_id = ${tableId})
+          CROSS JOIN input
+          WHERE t.id = input.table_id
+            AND b.date >= input.start_date
+            AND b.date <= input.end_date
+            AND (b.table_id IS NULL OR b.table_id = input.table_id)
           LIMIT 1
         ),
         ins AS (
           INSERT INTO saved_games (table_id, user_id, start_date, end_date)
-          SELECT ${tableId}, ${session.id}, ${startDate}, ${endDate}
+          SELECT table_id, user_id, start_date, end_date FROM input
           WHERE NOT EXISTS (SELECT 1 FROM conflict)
           RETURNING *
         )
