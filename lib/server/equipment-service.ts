@@ -1,4 +1,5 @@
 import { sql } from '@/lib/db/client'
+import { runTransaction } from '@/lib/db/transaction'
 import { NeonDbError } from '@neondatabase/serverless'
 import { serviceError } from '@/lib/server/service-error'
 import { ERROR_CODES } from '@/lib/types/error-codes'
@@ -177,9 +178,10 @@ export async function setRoomDefaultEquipment(roomId: string, equipmentIds: stri
 
   try {
     // DELETE + INSERT run as a single non-interactive Postgres transaction
-    // over HTTP (Neon's sql.transaction) so a failing INSERT can never leave
-    // the room with its defaults deleted and nothing replacing them.
-    await sql.transaction([
+    // over HTTP (#350's shared `runTransaction` helper, wrapping Neon's
+    // sql.transaction) so a failing INSERT can never leave the room with its
+    // defaults deleted and nothing replacing them.
+    await runTransaction([
       sql`
         DELETE FROM room_default_equipment
         WHERE room_id = ${roomId}

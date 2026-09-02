@@ -437,6 +437,13 @@ describe('saved games service', () => {
     // race) and this test would stay green, since the handlers above match
     // on statement shape regardless of how they were dispatched.
     expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
+    // Confirm-clean review (LOW): pin ReadCommitted for this call site
+    // specifically, not just in lib/db/transaction.ts's own unit test —
+    // dropping the isolation level here would silently change concurrency
+    // semantics without any service-level test catching it.
+    expect(sqlMock.transaction).toHaveBeenCalledWith(expect.any(Array), {
+      isolationLevel: 'ReadCommitted',
+    })
     const batched = sqlMock.transaction.mock.calls[0]?.[0]
     expect(Array.isArray(batched)).toBe(true)
     expect(batched).toHaveLength(2)
