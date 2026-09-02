@@ -298,6 +298,19 @@ describe('equipment-service (Neon raw SQL)', () => {
         // ...which is what actually dispatches the 2 underlying statements
         // (conflict preflight + the 2 batched queries = 3 sql calls total).
         expect(sqlMock.sql).toHaveBeenCalledTimes(3)
+        // Order matters: length 2 alone doesn't prove DELETE runs before
+        // INSERT — [insert, delete] would also have length 2, and would
+        // silently wipe the room's defaults (INSERT then DELETE removes
+        // both the old defaults AND the ones just inserted, leaving zero
+        // defaults with the endpoint still reporting success). Same
+        // technique as saved-games-service.test.ts's lock-then-insert
+        // dispatch-order check: sqlMock.sql dispatches eagerly at
+        // tagged-template call time, so its two most recent calls at this
+        // point are exactly this transaction's own [delete, insert], in
+        // order.
+        const dispatchOrder = sqlMock.sql.mock.calls.slice(-2).map((call) => String(call[0]))
+        expect(dispatchOrder[0]).toContain('DELETE FROM room_default_equipment')
+        expect(dispatchOrder[1]).toContain('INSERT INTO room_default_equipment')
       })
 
       it('throws a 500 ServiceError when the transaction rejects, without ever un-batching into independent calls', async () => {
