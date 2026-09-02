@@ -66,6 +66,10 @@ Before `security-reviewer` opens a PR, it must run `/code-review` (medium effort
 
 **High effort — one pass, first, not per fix round, and not a redundant final check:** exactly one `high`/`max` pass per PR, and it runs **before** the medium loop, not after. Added 2026-08-30 after PR #351 (#303) burned excessive tokens re-running `high` as an intermediate gate on every small fix during an 11+ round medium loop; the user capped it at one `high` pass total per PR. Reordered 2026-09-01 (#307): the user pointed out that putting the one `high` pass *last*, as a pre-merge confirmation, defeats the purpose — findings should surface while still cheap to fix, not as an afterthought after the medium loop already declared things clean. The cap (one `high` per PR, rest stays `medium`) is unchanged; only its position moved to the front: `high → fix → medium (loop to clean) → open PR`. Never `high → fix → high → fix`.
 
+**"Clean" means zero findings of any severity — no LOW-severity skip.** Added 2026-09-02 (`~/.claude/CLAUDE.md` global rule, same date) after a confirm-clean pass returned one LOW finding that was skipped as "non-blocking." The user corrected this and made it a standing global rule: every real finding gets fixed in the same round, LOW included, with the single carve-out that it's already tracked by a separate open issue (see next point). Do not editorialize a finding as acceptable risk to justify skipping it — that call belongs to the user.
+
+**Every review round checks open issues first.** Added 2026-09-02 (same global rule set) — before finalizing any finding (internal `kx-reviewer`/`security-reviewer`, `/code-review`, or an external reviewer like `codex`), check `gh issue list --state open` for overlap. A finding already tracked by an open issue isn't new scope for the current PR — reference the issue instead of re-fixing or re-filing it. A finding with no match is genuinely new and gets fixed per the point above.
+
 ---
 
 ## Key conventions
