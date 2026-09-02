@@ -1,7 +1,7 @@
 import 'server-only'
 import { zonedDateTimeToUtc } from '@/lib/club-time'
 import { getDatabaseNow } from '@/lib/server/database-time'
-import { createSupabaseServerAdminClient } from '@/lib/supabase/server'
+import { sql } from '@/lib/db/client'
 
 /**
  * No-show threshold per #318's acceptance criteria: a pending, never-activated
@@ -56,39 +56,47 @@ type NoShowReservationRow = NoShowCandidateSlot & { id: string }
  * blocks page rendering or check-in — the next trigger point will retry.
  */
 export async function markExpiredReservationsAsNoShow(): Promise<number> {
-  const admin = createSupabaseServerAdminClient()
   const nowUtc = await getDatabaseNow()
 
-  const { data, error } = await admin
-    .from('reservations')
-    .select('id, date, start_time, end_time')
-    .eq('status', 'pending')
-    .is('activated_at', null)
+  // The `date::text` cast is load-bearing: without it the Neon driver parses
+  // the `date` column (OID 1082) into a JS `Date` object, not a string, and
+  // isNoShowExpired -> zonedDateTimeToUtc -> isValidDateOnlyString throws on
+  // that shape. The filter below stays inside this same try/catch — a throw
+  // there must stay as non-fatal as a failed SELECT, not escape and break
+  // every caller's page-load path.
+  let expiredIds: string[]
+  try {
+    const rows = await sql`
+      SELECT id, date::text AS date, start_time, end_time
+      FROM reservations
+      WHERE status = 'pending'
+        AND activated_at IS NULL
+    ` as NoShowReservationRow[]
 
-  if (error) {
+    expiredIds = rows.filter((row) => isNoShowExpired(row, nowUtc)).map((row) => row.id)
+  } catch (error) {
     console.error('markExpiredReservationsAsNoShow failed (non-fatal):', error)
     return 0
   }
 
-  const expiredIds = ((data ?? []) as NoShowReservationRow[])
-    .filter((row) => isNoShowExpired(row, nowUtc))
-    .map((row) => row.id)
-
-  let markedCount = 0
-  for (const id of expiredIds) {
-    const { error: updateError } = await admin
-      .from('reservations')
-      .update({ status: 'no_show' })
-      .eq('id', id)
-      .eq('status', 'pending')
-      .is('activated_at', null)
-
-    if (updateError) {
-      console.error('markExpiredReservationsAsNoShow failed (non-fatal):', updateError)
-      continue
-    }
-    markedCount += 1
+  if (expiredIds.length === 0) {
+    return 0
   }
 
-  return markedCount
+  let updatedRows: Array<{ id: string }>
+  try {
+    updatedRows = await sql`
+      UPDATE reservations
+      SET status = 'no_show'
+      WHERE id = ANY(${expiredIds}::uuid[])
+        AND status = 'pending'
+        AND activated_at IS NULL
+      RETURNING id
+    ` as Array<{ id: string }>
+  } catch (error) {
+    console.error('markExpiredReservationsAsNoShow failed (non-fatal):', error)
+    return 0
+  }
+
+  return updatedRows.length
 }
