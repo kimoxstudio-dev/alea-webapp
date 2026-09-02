@@ -80,6 +80,13 @@ kx env list                # what this project declares
 kx env remove OLD_THING
 ```
 
+**A repository that already has `.env` files.** `kx env migrate` reads
+`.env`, `.env.local` and `.env.<environment>`, and writes the declaration and
+the vault fields in one pass. It needs a terminal — every variable is a
+decision — and it deletes nothing. What decides secret from literal, and one field
+from one per environment, is under "A repository that already has `.env`
+files" in `docs/connections.md`, in the kx repository.
+
 It checks the shape before writing, so a mistyped key fails now rather than
 when something does not boot.
 
@@ -189,8 +196,11 @@ kx creds --project <id> --json
   uses. `kx creds --guide` carries it across; nobody needs to find it again.
 - `missingParams` — identifiers, not secrets: which Cloudflare zone, which
   Vercel project. Without them the `project` stage cannot run.
-- `readFailure` — the item could not be read. When this is set the lists are
-  empty because nothing was compared, **not** because nothing is missing.
+- `readFailure` — the item could not be read. When this is set, `missing`,
+  `unfilled` and `extra` are empty **because nothing was compared, not because
+  nothing is missing**. `required` is still right: it comes from the model.
+  Reporting the empty lists as "nothing is missing" tells someone their vault
+  is complete when it may hold nothing at all — say "unknown from here".
 - `staleCopy` — this install is behind the shared repository, so the answer may
   describe an older model than a colleague is working from.
 

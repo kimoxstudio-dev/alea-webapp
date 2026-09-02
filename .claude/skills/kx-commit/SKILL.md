@@ -93,6 +93,16 @@ to `head` would silently branch from local HEAD instead of origin.
 Bad: `update files`, `fix`, `chore: various changes`, or a body listing the
 files already visible in the diff.
 
+## The type decides the version
+
+In a repository that ships from its default branch — kx does — the type is not
+a label, it is the input to the release. `feat` means a minor, `fix` and `perf`
+mean a patch, and a `!` means a major. Calling a behaviour change `refactor` to
+avoid the paperwork ships it to everyone with no version and no changelog line.
+
+That is the real reason `refactor` and `chore` are the two people abuse. Pick
+the type that describes the change, and let the version follow.
+
 ## Before committing
 
 - `git status` and `git diff` — commit what you meant to, not what happened to
