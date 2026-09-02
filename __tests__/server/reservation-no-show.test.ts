@@ -83,6 +83,12 @@ function registerUpdateHandler(respond: (ids: string[]) => Array<{ id: string }>
     match: (stmt) =>
       stmt.table === 'reservations' &&
       whereColumnHasOperator(stmt, 'status', '=') &&
+      // Pins the literal compared value, not just the operator: without this,
+      // mutating production's UPDATE `WHERE ... AND status = 'pending'` to a
+      // different status literal still satisfies whereColumnHasOperator
+      // (which only checks the `=` operator) and the mock would keep
+      // matching a query that no longer re-guards the row is still pending.
+      (stmt.whereClause?.includes(`status = 'pending'`) ?? false) &&
       whereColumnHasNullCheck(stmt, 'activated_at', 'IS NULL') &&
       // Pins RETURNING id: production's returned count comes entirely from
       // `updatedRows.length`, which depends on this clause. Without pinning
