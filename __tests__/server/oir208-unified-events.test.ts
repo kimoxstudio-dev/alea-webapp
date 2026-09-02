@@ -306,15 +306,37 @@ function addReservationsCancelHandler(respond: () => unknown = () => []) {
 }
 
 /**
- * UPDATE saved_games AS saved SET status='cancelled' WHERE saved.table_id =
- * ANY(...) AND saved.status='active' AND $N BETWEEN saved.start_date AND
- * saved.end_date RETURNING saved.id — cancelActiveSavedGamesForRoomBlock
- * (#334). Disambiguated from the restore handler below by the presence of
- * `table_id` in the WHERE clause — only the cancel query filters on it.
+ * SELECT pg_advisory_xact_lock(hashtext(t)) FROM (...) — the first statement
+ * of the `sql.transaction([lock, update])` `cancelActiveSavedGamesForRoomBlock`
+ * now issues (#334 code-review: coordinates with `createSavedGameForSession`'s
+ * precheck+insert via the same per-table lock). The mock's `sql.transaction`
+ * runs every batched statement through this same handler set, so this must be
+ * registered wherever `addSavedGamesCancelHandler` below is used.
+ */
+function addSavedGamesLockHandler() {
+  roomsSqlMock.addHandler({
+    name: 'SELECT pg_advisory_xact_lock (saved-games cancel, #334)',
+    verb: 'select',
+    match: (stmt) => stmt.text.includes('pg_advisory_xact_lock'),
+    respond: () => [{ pg_advisory_xact_lock: null }],
+  })
+}
+
+/**
+ * UPDATE saved_games AS saved SET status='cancelled', updated_at=now() FROM
+ * (SELECT id, updated_at FROM saved_games WHERE table_id = ANY(...) AND
+ * status='active' AND $N BETWEEN start_date AND end_date) AS prior WHERE
+ * saved.id = prior.id RETURNING saved.id, prior.updated_at —
+ * cancelActiveSavedGamesForRoomBlock (#334), the second statement of its
+ * `sql.transaction()`. Disambiguated from the restore handler below by the
+ * presence of `table_id` in the WHERE clause — only the (nested) cancel
+ * query's WHERE filters on it. Also registers the lock handler above, since
+ * production code always issues both statements together.
  */
 function addSavedGamesCancelHandler(respond: () => unknown = () => []) {
+  addSavedGamesLockHandler()
   roomsSqlMock.addHandler({
-    name: 'UPDATE saved_games cancel active (room-wide, #334)',
+    name: 'UPDATE saved_games cancel active (#334)',
     verb: 'update',
     match: (stmt) => stmt.table === 'saved_games' && whereHasColumn(stmt, 'table_id'),
     respond,
@@ -1452,10 +1474,21 @@ describe('OIR-208: Unified Events', () => {
         respond: () => [],
       })
       roomsSqlMock.addHandler({
-        // WITH ins AS (INSERT INTO saved_games ... RETURNING *) SELECT ...
-        // FROM ins sg LEFT JOIN tables/rooms — CTE-wrapped insert
-        // (security-review fix, #301), still anchored as verb='insert'/
-        // table='saved_games' by the sql-mock's CTE support.
+        // createSavedGameForSession's advisory-lock statement (#334
+        // code-review fix): SELECT pg_advisory_xact_lock(hashtext($1)) — the
+        // first statement of its `sql.transaction([lock, checkAndInsert])`.
+        name: 'SELECT pg_advisory_xact_lock (createSavedGameForSession, #334)',
+        verb: 'select',
+        match: (stmt) => stmt.text.includes('pg_advisory_xact_lock'),
+        respond: () => [{ pg_advisory_xact_lock: null }],
+      })
+      roomsSqlMock.addHandler({
+        // WITH input AS (...), conflict AS (...), ins AS (INSERT INTO
+        // saved_games ... RETURNING *) SELECT ... FROM ins sg LEFT JOIN
+        // tables/rooms — CTE-wrapped insert with lock-guarded conflict
+        // re-check (security-review fix #301; re-check added #334
+        // code-review), still anchored as verb='insert'/table='saved_games'
+        // by the sql-mock's multi-CTE support.
         name: 'INSERT saved game',
         verb: 'insert',
         match: (stmt) => stmt.table === 'saved_games',

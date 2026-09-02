@@ -228,18 +228,49 @@ describe('saved games service', () => {
       },
     })
 
-    // createSavedGameForSession: WITH ins AS (INSERT INTO saved_games
-    // (table_id, user_id, start_date, end_date) VALUES (...) RETURNING *)
-    // SELECT ... FROM ins sg LEFT JOIN tables/rooms — CTE-wrapped insert
-    // (security-review fix, #301), still anchored as verb='insert'/
-    // table='saved_games' by the sql-mock's CTE support. 4 bound values.
+    // createSavedGameForSession's advisory-lock statement (#334 code-review
+    // fix): SELECT pg_advisory_xact_lock(hashtext($1)) — the first statement
+    // of its `sql.transaction([lock, checkAndInsert])`, coordinating with
+    // cancelActiveSavedGamesForRoomBlock's own lock on the same table.
     sqlMock.addHandler({
-      name: 'INSERT saved game (create)',
+      name: 'SELECT pg_advisory_xact_lock (createSavedGameForSession, #334)',
+      verb: 'select',
+      match: (stmt) => stmt.text.includes('pg_advisory_xact_lock'),
+      respond: () => [{ pg_advisory_xact_lock: null }],
+    })
+
+    // createSavedGameForSession: WITH input AS (SELECT $1,$2,$3,$4), conflict
+    // AS (SELECT 1 FROM event_room_blocks ... CROSS JOIN input WHERE ...),
+    // ins AS (INSERT INTO saved_games (...) SELECT ... FROM input WHERE NOT
+    // EXISTS (SELECT 1 FROM conflict) RETURNING *) SELECT ... FROM ins sg
+    // LEFT JOIN tables/rooms — CTE-wrapped insert (security-review fix,
+    // #301; conflict re-check under the advisory lock added #334
+    // code-review), anchored as verb='insert'/table='saved_games' by the
+    // sql-mock's multi-CTE support (picks the first data-modifying CTE, here
+    // `ins`, over the leading `input`/`conflict` SELECT CTEs). 4 bound
+    // values: table_id, user_id, start_date, end_date — each interpolated
+    // exactly once via the `input` CTE.
+    sqlMock.addHandler({
+      name: 'INSERT saved game (create, with lock-guarded conflict re-check)',
       verb: 'insert',
       match: (stmt) => stmt.table === 'saved_games' && stmt.values.length === 4,
       respond: (stmt) => {
         if (createInsertError) throw createInsertError
         const [tableId, userId, startDate, endDate] = stmt.values.map(String)
+        // Simulates the `WHERE NOT EXISTS (SELECT 1 FROM conflict)` guard:
+        // an event block conflicting with this table/date-range — found
+        // freshly under the advisory lock, independent of whatever
+        // assertTableAndEventAvailability's earlier precheck saw — skips the
+        // insert (0 rows), same as that precheck's own SAVED_GAME_EVENT_CONFLICT.
+        const table = tablesState.get(tableId)
+        const conflict = blocksState.some(
+          (block) =>
+            block.room_id === table?.room_id &&
+            block.date >= startDate &&
+            block.date <= endDate &&
+            (block.table_id == null || block.table_id === tableId),
+        )
+        if (conflict) return []
         const row = makeSavedGame({
           id: `sg-${savedGamesState.length + 1}`,
           table_id: tableId,
@@ -402,6 +433,40 @@ describe('saved games service', () => {
 
   it('rejects date ranges blocked by an event', async () => {
     blocksState.push({ id: 'event-1', room_id: 'room-1', table_id: null, date: '2026-07-01' })
+    const { createSavedGameForSession } = await import('@/lib/server/saved-games-service')
+    await expect(
+      createSavedGameForSession(member, {
+        tableId: 'double',
+        startDate: '2026-06-20',
+        endDate: '2026-07-20',
+      }),
+    ).rejects.toMatchObject({ message: 'SAVED_GAME_EVENT_CONFLICT', statusCode: 409 })
+  })
+
+  it('rejects with SAVED_GAME_EVENT_CONFLICT/409 when an event block appears between the precheck and the lock-guarded insert (#334 code-review — race with cancelActiveSavedGamesForRoomBlock)', async () => {
+    // Simulates cancelActiveSavedGamesForRoomBlock's UPDATE winning the
+    // per-table advisory lock race and committing an event-block-driven
+    // cancellation right after assertTableAndEventAvailability's precheck
+    // ran clean, but before createSavedGameForSession's own insert (which
+    // re-checks the same event_room_blocks condition under the lock, inside
+    // the same statement as the insert) executes. The precheck's SELECT
+    // handler returns a clean room, then pushes the block as a side effect
+    // — visible only to the later re-check embedded in the INSERT's `conflict`
+    // CTE, not to the precheck itself.
+    sqlMock.prependHandler({
+      name: 'SELECT event_room_blocks in range (race: block lands after precheck)',
+      verb: 'select',
+      match: (stmt) => stmt.table === 'event_room_blocks' && stmt.values.length === 3,
+      respond: (stmt) => {
+        const [roomId, startDate, endDate] = stmt.values.map(String)
+        const before = blocksState
+          .filter((block) => block.room_id === roomId && block.date >= startDate && block.date <= endDate)
+          .map((block) => ({ id: block.id, table_id: block.table_id }))
+        blocksState.push({ id: 'block-race', room_id: 'room-1', table_id: null, date: '2026-06-20' })
+        return before
+      },
+    })
+
     const { createSavedGameForSession } = await import('@/lib/server/saved-games-service')
     await expect(
       createSavedGameForSession(member, {

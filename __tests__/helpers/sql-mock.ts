@@ -143,6 +143,44 @@ function escapeRegExp(value: string): string {
 }
 
 /**
+ * Walks every top-level CTE in a `WITH name1 AS (...), name2 AS (...), ...`
+ * prefix (text must already start with `with`) and returns each one's inner
+ * verb, in order. Tracks paren depth while scanning each CTE body so a
+ * nested subquery's own `AS (SELECT ...)` never gets mistaken for the start
+ * of the next top-level CTE. Returns `[]` if `text` doesn't start with `with`
+ * or no CTE could be parsed.
+ */
+function extractLeadingCteVerbs(text: string): SqlVerb[] {
+  if (!/^with\s/i.test(text)) return []
+
+  const verbs: SqlVerb[] = []
+  let pos = 4 // length of "with"
+  for (;;) {
+    const cteHeader = /^\s*[a-z_][a-z0-9_]*\s+as\s*\(/i.exec(text.slice(pos))
+    if (!cteHeader) break
+    const bodyStart = pos + cteHeader[0].length // just after this CTE's '('
+
+    const innerVerb = /^\s*(select|insert|update|delete)\b/i.exec(text.slice(bodyStart))
+    if (innerVerb) verbs.push(innerVerb[1].toLowerCase() as SqlVerb)
+
+    let depth = 1
+    let i = bodyStart
+    while (depth > 0 && i < text.length) {
+      if (text[i] === '(') depth += 1
+      else if (text[i] === ')') depth -= 1
+      i += 1
+    }
+    if (depth !== 0) break // unbalanced parens — malformed input, stop rather than loop forever
+    pos = i // just after this CTE's matching ')'
+
+    const nextComma = /^\s*,/.exec(text.slice(pos))
+    if (!nextComma) break
+    pos += nextComma[0].length
+  }
+  return verbs
+}
+
+/**
  * Rebuilds the query text from a tagged-template call (or a plain string,
  * for callers that invoke `sql` directly instead of as a tagged template)
  * and parses out the verb, table, WHERE clause and RETURNING flag. This is
@@ -199,9 +237,21 @@ export function parseStatement(
   // CTE parens instead treats the statement as that inner verb for handler
   // matching (table/values extraction below already works unmodified against
   // the CTE body since those regexes aren't start-anchored).
+  //
+  // Multi-CTE support (#334 follow-up): a statement can chain several named
+  // CTEs before the data-modifying one — e.g. `WITH input AS (SELECT ...),
+  // conflict AS (SELECT ...), ins AS (INSERT ... RETURNING *) SELECT ... FROM
+  // ins ...` (createSavedGameForSession's advisory-lock-guarded conflict
+  // re-check). The single-CTE regex above only ever looks at the FIRST named
+  // CTE, so it would anchor to `input`'s inner `select` and never find the
+  // real `insert`. `extractLeadingCteVerbs` below walks every top-level CTE
+  // (tracking paren depth so it isn't fooled by nested subqueries) and this
+  // picks the first data-modifying one, falling back to the first CTE's verb
+  // if none of them modify data.
   if (verb === 'unknown') {
-    const cteMatch = /^with\s+\w+\s+as\s*\(\s*(select|insert|update|delete)\b/i.exec(text)
-    if (cteMatch) verb = cteMatch[1] as SqlVerb
+    const cteVerbs = extractLeadingCteVerbs(text)
+    const modifying = cteVerbs.find((v) => v === 'insert' || v === 'update' || v === 'delete')
+    verb = modifying ?? cteVerbs[0] ?? 'unknown'
   }
 
   let table: string | null = null
