@@ -531,32 +531,40 @@ function toAdminClubEvent(
 
 /**
  * #334 — port of the legacy `cancel_saved_games_for_event_block()` trigger
- * function. Exact semantics preserved from the original SQL:
+ * function, with two deliberate departures from the original SQL (both
+ * code-review findings, fixed after the initial port):
  *   - Fires per newly-written `event_room_blocks` row (`NEW`), matched here
- *     to a single inserted block (`roomId`/`date` = that row's room_id/date).
- *   - Cancels `saved_games` rows whose `table_id` belongs to ANY table in
- *     `roomId` — this ignores the block's own `table_id` (single-table
- *     scoping) entirely, because the trigger predates OIR-208's per-table
- *     event_room_blocks scoping and was never updated for it. This is a
- *     deliberate 1:1 port of the original room-wide behavior, not the
- *     table-scoped behavior `applyClubEventBlocksAndMaterials` uses for
- *     reservations.
+ *     to a single inserted block (`tableIds`/`date` = that row's scope and
+ *     date).
+ *   - Cancels `saved_games` rows whose `table_id` is in `tableIds` — the
+ *     caller now passes the SAME scoped table-id list it already computed
+ *     for the reservation cancellation right above this call site
+ *     (table-scoped when the block's own `table_id` is set, room-wide only
+ *     when it's null). The legacy trigger always cancelled room-wide,
+ *     ignoring the block's own `table_id`, because it predates OIR-208's
+ *     per-table `event_room_blocks` scoping; that room-wide-always behavior
+ *     was a bug relative to `assertTableAndEventAvailability` (which only
+ *     rejects new games on the specifically blocked table), not a semantic
+ *     worth preserving, so this port does not carry it forward.
  *   - Only rows with `status = 'active'` are eligible.
  *   - Overlap condition: `date BETWEEN saved.start_date AND saved.end_date`
  *     (inclusive on both ends), where `date` is the block's date — not a
  *     start/end-time overlap, since saved_games are whole-day date ranges.
  * The original function also took an advisory xact lock per table in the
  * room before the UPDATE, guarding concurrent saved-game inserts/renewals
- * inside the same DB transaction. That lock has no equivalent here: this
- * codebase's existing reservation-cancellation step (right above this call
- * site) carries no such lock either, and Neon's HTTP driver does not run
- * these sequential statements inside one shared transaction to begin with.
+ * inside the same DB transaction. This port now has an equivalent (see the
+ * race-condition paragraph below) instead of omitting it.
  *
- * Captures each cancelled row's id (via `UPDATE ... RETURNING`) so a later
- * failure in the same call can restore it exactly, mirroring
- * `cancelOverlappingReservationsForRoomCapturing`. Every cancelled row's
- * pre-cancellation status was always `'active'` (the trigger's own WHERE
- * clause), so — unlike `CancelledReservation` — no status needs capturing.
+ * Captures each cancelled row's id AND its pre-cancellation `updated_at`
+ * (via `UPDATE ... FROM (subquery) ... RETURNING`, same pattern as
+ * `cancelOverlappingReservationsForRoomCapturing`) so a later failure in the
+ * same call can restore it exactly — including the timestamp, not just the
+ * status (code-review finding: the original restore flipped `status` back
+ * but left `updated_at` at the cancellation-time value, so a rolled-back
+ * event mutation still left the saved game's public `updatedAt` changed).
+ * Every cancelled row's pre-cancellation status was always `'active'` (the
+ * trigger's own WHERE clause), so — unlike `CancelledReservation` — no
+ * status needs capturing, only the timestamp.
  *
  * Takes the room's already-resolved table ids (`tableIds`) rather than
  * re-joining `tables` by `room_id` itself (code-review finding, high-effort
@@ -564,24 +572,54 @@ function toAdminClubEvent(
  * `roomTableMap` up front specifically to avoid a redundant per-block
  * `tables` lookup (the #304/#354 code-review optimization); joining inline
  * here would reintroduce exactly that redundant lookup, once per block.
+ *
+ * Race with `createSavedGameForSession` (code-review finding): removing the
+ * legacy trigger's advisory lock left a check-then-insert race — that
+ * function's event-block precheck and its insert are two separate Neon HTTP
+ * round trips, so this UPDATE could run between them and the new saved game
+ * would stay `'active'` even though it should have been blocked. Both sides
+ * now take the same per-table `pg_advisory_xact_lock` (keyed by
+ * `hashtext(table_id)`) as the first statement of a `sql.transaction()`,
+ * before touching `saved_games` — the lock statement blocks until any
+ * concurrent holder commits and releases it, and (per Neon's
+ * `sql.transaction()`, a real non-interactive Postgres transaction) each
+ * statement after it gets its own fresh READ COMMITTED snapshot, so the
+ * second statement here always runs after any concurrent
+ * `createSavedGameForSession` insert has either committed or is blocked
+ * behind this same lock. See `createSavedGameForSession` in
+ * `saved-games-service.ts` for the other side.
  */
-async function cancelActiveSavedGamesForRoomBlock(tableIds: string[], date: string): Promise<string[]> {
+async function cancelActiveSavedGamesForRoomBlock(
+  tableIds: string[],
+  date: string,
+): Promise<Array<{ id: string; updatedAt: string }>> {
   if (tableIds.length === 0) return []
 
-  let cancelledRows: Array<{ id: string }>
+  let cancelledRows: Array<{ id: string; updated_at: string }>
   try {
-    cancelledRows = await sql`
-      UPDATE saved_games AS saved
-      SET status = 'cancelled', updated_at = now()
-      WHERE saved.table_id = ANY(${tableIds})
-        AND saved.status = 'active'
-        AND ${date} BETWEEN saved.start_date AND saved.end_date
-      RETURNING saved.id
-    ` as Array<{ id: string }>
+    const results = await sql.transaction([
+      sql`
+        SELECT pg_advisory_xact_lock(hashtext(t))
+        FROM (SELECT unnest(${tableIds}::text[]) AS t ORDER BY 1) AS ordered_tables
+      `,
+      sql`
+        UPDATE saved_games AS saved
+        SET status = 'cancelled', updated_at = now()
+        FROM (
+          SELECT id, updated_at FROM saved_games
+          WHERE table_id = ANY(${tableIds})
+            AND status = 'active'
+            AND ${date} BETWEEN start_date AND end_date
+        ) AS prior
+        WHERE saved.id = prior.id
+        RETURNING saved.id, prior.updated_at
+      `,
+    ])
+    cancelledRows = results[1] as Array<{ id: string; updated_at: string }>
   } catch {
     serviceError('Internal server error', 500)
   }
-  return cancelledRows.map((row) => row.id)
+  return cancelledRows.map((row) => ({ id: row.id, updatedAt: row.updated_at }))
 }
 
 /**
@@ -589,16 +627,25 @@ async function cancelActiveSavedGamesForRoomBlock(tableIds: string[], date: stri
  * mirrors `restoreCancelledReservations`). Every row cancelled by that
  * function was `'active'` beforehand, so restoration is a plain status flip
  * back — no per-row status needs to be tracked, unlike reservations (which
- * can be 'active' or 'pending'). Best-effort: errors are logged and
- * swallowed, matching every other compensating step in this file.
+ * can be 'active' or 'pending'). Restores each row's own captured
+ * pre-cancellation `updated_at` alongside its status (code-review finding —
+ * see `cancelActiveSavedGamesForRoomBlock`'s doc comment), not just the
+ * status, so a rolled-back event mutation leaves no trace on the saved
+ * game's public `updatedAt`. Best-effort: errors are logged and swallowed,
+ * matching every other compensating step in this file.
  */
-async function restoreCancelledSavedGames(cancelledIds: string[]): Promise<void> {
-  if (cancelledIds.length === 0) return
+async function restoreCancelledSavedGames(cancelled: Array<{ id: string; updatedAt: string }>): Promise<void> {
+  if (cancelled.length === 0) return
   try {
+    const ids = cancelled.map((row) => row.id)
+    const updatedAts = cancelled.map((row) => row.updatedAt)
     await sql`
       UPDATE saved_games
-      SET status = 'active'
-      WHERE id = ANY(${cancelledIds}) AND status = 'cancelled'
+      SET status = 'active', updated_at = restored.updated_at
+      FROM (
+        SELECT * FROM unnest(${ids}::uuid[], ${updatedAts}::timestamptz[]) AS restored(id, updated_at)
+      ) AS restored
+      WHERE saved_games.id = restored.id AND saved_games.status = 'cancelled'
     `
   } catch (rollbackError) {
     console.error('club-events-service: compensating saved-game restore failed (non-fatal):', rollbackError)
@@ -621,13 +668,13 @@ async function rollbackClubEventBlocksWrite(params: {
   eventId: string
   insertedBlockIds: string[]
   cancelledReservations: CancelledReservation[]
-  cancelledSavedGameIds: string[]
+  cancelledSavedGames: Array<{ id: string; updatedAt: string }>
   deletedBlocks: EventRoomBlockRow[]
   deletedMaterials: EventEquipmentRow[]
   insertedMaterialEquipmentIds: string[]
 }): Promise<void> {
   const {
-    eventId, insertedBlockIds, cancelledReservations, cancelledSavedGameIds, deletedBlocks, deletedMaterials,
+    eventId, insertedBlockIds, cancelledReservations, cancelledSavedGames, deletedBlocks, deletedMaterials,
     insertedMaterialEquipmentIds,
   } = params
 
@@ -662,7 +709,7 @@ async function rollbackClubEventBlocksWrite(params: {
     // #334: restore any saved_games this call cancelled via
     // cancelActiveSavedGamesForRoomBlock, same best-effort convention as the
     // reservation restore above.
-    await restoreCancelledSavedGames(cancelledSavedGameIds)
+    await restoreCancelledSavedGames(cancelledSavedGames)
   } catch (rollbackError) {
     console.error('club-events-service: compensating rollback failed (non-fatal) — restoring cancelled saved games:', rollbackError)
   }
@@ -771,7 +818,7 @@ async function applyClubEventBlocksAndMaterials(
       // before surfacing this failure so the event doesn't silently lose its
       // room blocks alongside a 500 for an unrelated materials-delete error.
       await rollbackClubEventBlocksWrite({
-        eventId, insertedBlockIds: [], cancelledReservations: [], cancelledSavedGameIds: [], deletedBlocks, deletedMaterials: [],
+        eventId, insertedBlockIds: [], cancelledReservations: [], cancelledSavedGames: [], deletedBlocks, deletedMaterials: [],
         insertedMaterialEquipmentIds: [],
       })
       serviceError('Internal server error', 500)
@@ -780,7 +827,7 @@ async function applyClubEventBlocksAndMaterials(
 
   const insertedBlockIds: string[] = []
   const cancelledReservations: CancelledReservation[] = []
-  const cancelledSavedGameIds: string[] = []
+  const cancelledSavedGames: Array<{ id: string; updatedAt: string }> = []
   const insertedMaterialEquipmentIds: string[] = []
 
   // Batch the room->table id lookups for every block that needs one (no
@@ -813,7 +860,7 @@ async function applyClubEventBlocksAndMaterials(
         // failure branch in this function, or they stay deleted with nothing
         // to put them back.
         await rollbackClubEventBlocksWrite({
-          eventId, insertedBlockIds: [], cancelledReservations: [], cancelledSavedGameIds: [], deletedBlocks, deletedMaterials,
+          eventId, insertedBlockIds: [], cancelledReservations: [], cancelledSavedGames: [], deletedBlocks, deletedMaterials,
           insertedMaterialEquipmentIds: [],
         })
         serviceError('Internal server error', 500)
@@ -884,20 +931,21 @@ async function applyClubEventBlocksAndMaterials(
         }
 
         // #334: port of the legacy cancel_saved_games_for_event_block()
-        // trigger — cancels active saved_games conflicting with this block,
-        // room-wide (not table-scoped like the `tableIds` used for the
-        // reservation cancellation above; see cancelActiveSavedGamesForRoomBlock's
-        // doc comment for why). Uses the room's full table list from the
-        // already-batched roomTableMap (code-review finding, high-effort
-        // pass) instead of re-joining `tables` per block.
-        const cancelledSavedGames = await cancelActiveSavedGamesForRoomBlock(
-          roomTableMap.get(block.room_id) ?? [],
-          block.date,
-        )
-        cancelledSavedGameIds.push(...cancelledSavedGames)
+        // trigger — cancels active saved_games conflicting with this block.
+        // Code-review finding: this used to always pass the room's FULL
+        // table list (`roomTableMap.get(block.room_id)`), even for a
+        // table-scoped block (`block.table_id` set), cancelling saved games
+        // on unrelated tables the block never actually blocked —
+        // inconsistent with `assertTableAndEventAvailability`, which only
+        // rejects new games on the specifically blocked table. Reuses the
+        // same scoped `tableIds` already computed above for the reservation
+        // cancellation (table-scoped when `block.table_id` is set, room-wide
+        // only when it's null) instead of re-deriving room-wide scope here.
+        const blockCancelledSavedGames = await cancelActiveSavedGamesForRoomBlock(tableIds, block.date)
+        cancelledSavedGames.push(...blockCancelledSavedGames)
       } catch (error) {
         await rollbackClubEventBlocksWrite({
-          eventId, insertedBlockIds, cancelledReservations, cancelledSavedGameIds, deletedBlocks, deletedMaterials,
+          eventId, insertedBlockIds, cancelledReservations, cancelledSavedGames, deletedBlocks, deletedMaterials,
           insertedMaterialEquipmentIds,
         })
         if (error instanceof ServiceError) throw error
@@ -917,7 +965,7 @@ async function applyClubEventBlocksAndMaterials(
         insertedMaterialEquipmentIds.push(material.equipment_id)
       } catch (error) {
         await rollbackClubEventBlocksWrite({
-          eventId, insertedBlockIds, cancelledReservations, cancelledSavedGameIds, deletedBlocks, deletedMaterials,
+          eventId, insertedBlockIds, cancelledReservations, cancelledSavedGames, deletedBlocks, deletedMaterials,
           insertedMaterialEquipmentIds,
         })
         mapEventWriteError(error)

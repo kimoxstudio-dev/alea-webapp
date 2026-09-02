@@ -219,19 +219,51 @@ export async function createSavedGameForSession(
   // Member isolation is enforced by writing `user_id: session.id` explicitly
   // into the insert — the authenticated user can only create rows for
   // themselves.
+  //
+  // #334 code-review finding: `assertTableAndEventAvailability` above and
+  // this insert are two separate Neon HTTP round trips (no shared session or
+  // transaction between them), so an event-block cancellation
+  // (`cancelActiveSavedGamesForRoomBlock` in club-events-service.ts) can run
+  // in between and this insert would still land as 'active' even though the
+  // table is now blocked. Both sides take the same per-table
+  // `pg_advisory_xact_lock` (keyed by `hashtext(table_id)`, matching
+  // `cancelActiveSavedGamesForRoomBlock`) as the first statement of a
+  // `sql.transaction()`, before touching `event_room_blocks`/`saved_games`.
+  // The lock statement blocks until any concurrent holder commits and
+  // releases it; per Neon's `sql.transaction()` (a real non-interactive
+  // Postgres transaction), the second statement then gets its own fresh
+  // READ COMMITTED snapshot, so the event-block re-check below always sees
+  // any concurrent cancellation that won the lock race. The precheck above
+  // stays as a fast-fail for the common non-racing case (clear 409 without
+  // attempting a write); this re-check is the actual concurrency guard.
   let rows: SavedGameJoinedRow[]
   try {
-    rows = await sql`
-      WITH ins AS (
-        INSERT INTO saved_games (table_id, user_id, start_date, end_date)
-        VALUES (${tableId}, ${session.id}, ${startDate}, ${endDate})
-        RETURNING *
-      )
-      SELECT ${sql.unsafe(SAVED_GAME_JOINED_COLUMNS)}
-      FROM ins sg
-      LEFT JOIN tables t ON t.id = sg.table_id
-      LEFT JOIN rooms ON rooms.id = t.room_id
-    ` as SavedGameJoinedRow[]
+    const results = await sql.transaction([
+      sql`SELECT pg_advisory_xact_lock(hashtext(${tableId}))`,
+      sql`
+        WITH conflict AS (
+          SELECT 1
+          FROM event_room_blocks b
+          JOIN tables t ON t.room_id = b.room_id
+          WHERE t.id = ${tableId}
+            AND b.date >= ${startDate}
+            AND b.date <= ${endDate}
+            AND (b.table_id IS NULL OR b.table_id = ${tableId})
+          LIMIT 1
+        ),
+        ins AS (
+          INSERT INTO saved_games (table_id, user_id, start_date, end_date)
+          SELECT ${tableId}, ${session.id}, ${startDate}, ${endDate}
+          WHERE NOT EXISTS (SELECT 1 FROM conflict)
+          RETURNING *
+        )
+        SELECT ${sql.unsafe(SAVED_GAME_JOINED_COLUMNS)}
+        FROM ins sg
+        LEFT JOIN tables t ON t.id = sg.table_id
+        LEFT JOIN rooms ON rooms.id = t.room_id
+      `,
+    ])
+    rows = results[1] as SavedGameJoinedRow[]
   } catch (error) {
     if (isExclusionConflict(error)) serviceError(ERROR_CODES.SAVED_GAME_CONFLICT, 409)
     if (error instanceof NeonDbError && error.code === '23514') {
@@ -248,7 +280,11 @@ export async function createSavedGameForSession(
   }
 
   const data = rows[0]
-  if (!data) serviceError('Internal server error', 500)
+  // `ins`'s WHERE NOT EXISTS guard skips the insert (yielding no row) only
+  // when the re-check under the advisory lock found a conflicting event
+  // block that the precheck above missed due to a race — surface the same
+  // error `assertTableAndEventAvailability` would have thrown.
+  if (!data) serviceError(ERROR_CODES.SAVED_GAME_EVENT_CONFLICT, 409)
   return mapSavedGame(data)
 }
 
