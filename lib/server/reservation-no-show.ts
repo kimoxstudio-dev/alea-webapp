@@ -41,18 +41,7 @@ export function isNoShowExpired(reservation: NoShowCandidateSlot, now: Date): bo
   return now.getTime() > getNoShowDeadline(reservation).getTime()
 }
 
-type NoShowReservationRow = { id: string; date: string | Date; start_time: string; end_time: string }
-
-/**
- * Normalizes a `date` column value to `YYYY-MM-DD`. The SELECT below casts
- * with `date::text` so the Neon driver should already hand back a string,
- * but this is a second line of defense: node-postgres parses the raw `date`
- * OID (1082) as a UTC-midnight `Date` when uncast, and `isNoShowExpired` ->
- * `zonedDateTimeToUtc` throws on that shape (see the try/catch below).
- */
-function normalizeDateOnly(value: string | Date): string {
-  return value instanceof Date ? value.toISOString().slice(0, 10) : value
-}
+type NoShowReservationRow = NoShowCandidateSlot & { id: string }
 
 /**
  * Lazily marks stale pending reservations as 'no_show' at query time.
@@ -72,9 +61,9 @@ export async function markExpiredReservationsAsNoShow(): Promise<number> {
   // The `date::text` cast is load-bearing: without it the Neon driver parses
   // the `date` column (OID 1082) into a JS `Date` object, not a string, and
   // isNoShowExpired -> zonedDateTimeToUtc -> isValidDateOnlyString throws on
-  // that shape. The filter below stays inside this same try/catch as a
-  // second line of defense — a throw there must stay as non-fatal as a
-  // failed SELECT, not escape and break every caller's page-load path.
+  // that shape. The filter below stays inside this same try/catch — a throw
+  // there must stay as non-fatal as a failed SELECT, not escape and break
+  // every caller's page-load path.
   let expiredIds: string[]
   try {
     const rows = await sql`
@@ -84,9 +73,7 @@ export async function markExpiredReservationsAsNoShow(): Promise<number> {
         AND activated_at IS NULL
     ` as NoShowReservationRow[]
 
-    expiredIds = rows
-      .filter((row) => isNoShowExpired({ ...row, date: normalizeDateOnly(row.date) }, nowUtc))
-      .map((row) => row.id)
+    expiredIds = rows.filter((row) => isNoShowExpired(row, nowUtc)).map((row) => row.id)
   } catch (error) {
     console.error('markExpiredReservationsAsNoShow failed (non-fatal):', error)
     return 0

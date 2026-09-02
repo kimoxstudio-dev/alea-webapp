@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createSqlMock, whereColumnHasOperator, whereColumnHasNullCheck } from '../helpers/sql-mock'
+import { whereColumnHasOperator, whereColumnHasNullCheck } from '../helpers/sql-mock'
 import { isNoShowExpired } from '@/lib/server/reservation-no-show'
 
 // vi.hoisted runs before the vi.mock factories below (which themselves run
@@ -28,11 +28,7 @@ async function loadReservationNoShow() {
 
 type ReservationSlotRow = {
   id: string
-  // The real Neon driver returns a plain string here because the SELECT
-  // casts with `date::text`; a bare `Date` object models what the column
-  // would come back as if that cast were ever dropped (node-postgres's
-  // uncast `date` OID 1082 parsing), used by the regression test below.
-  date: string | Date
+  date: string
   start_time: string
   end_time: string
 }
@@ -55,7 +51,15 @@ function registerSelectHandler(rows: ReservationSlotRow[]) {
       stmt.table === 'reservations' &&
       whereColumnHasOperator(stmt, 'status', '=') &&
       whereColumnHasNullCheck(stmt, 'activated_at', 'IS NULL'),
-    respond: () => rows,
+    respond: (stmt) => {
+      // Pins the `date::text` cast as the actual contract (not
+      // defended-against in application code): the Neon driver parses an
+      // uncast `date` column as a JS Date, not a string, and would crash
+      // isNoShowExpired's zonedDateTimeToUtc call. Dropping the cast must
+      // fail a test, not silently keep passing.
+      expect(stmt.selectColumns).toContain('date::text')
+      return rows
+    },
   })
 }
 
@@ -67,7 +71,12 @@ function registerUpdateHandler(respond: (ids: string[]) => Array<{ id: string }>
       stmt.table === 'reservations' &&
       whereColumnHasOperator(stmt, 'status', '=') &&
       whereColumnHasNullCheck(stmt, 'activated_at', 'IS NULL'),
-    respond: (stmt) => respond(stmt.values[0] as string[]),
+    respond: (stmt) => {
+      // Pins the SET clause: the WHERE-based match above alone can't tell
+      // `SET status = 'no_show'` apart from `SET status = 'cancelled'`.
+      expect(stmt.text).toContain(`set status = 'no_show'`)
+      return respond(stmt.values[0] as string[])
+    },
   })
 }
 
@@ -139,23 +148,25 @@ describe('reservation no-show lazy evaluation', () => {
       expect(sqlMock.sql).toHaveBeenCalledTimes(1)
     })
 
-    it('handles a date column returned as a Date object (uncast driver shape) without throwing, and still marks it as no-show', async () => {
-      // Simulates what the Neon driver would hand back if the `date::text`
-      // cast were ever dropped from the SELECT (node-postgres parses the
-      // uncast `date` OID as a UTC-midnight Date). Production must neither
-      // throw nor silently swallow this to 0 — it must normalize the value
-      // and correctly identify the row as expired.
-      const expiredRow = makeRow({ id: 'expired-1', date: new Date('2026-06-19T00:00:00.000Z') })
-      registerSelectHandler([expiredRow])
-      registerUpdateHandler((ids) => {
-        expect(ids).toEqual(['expired-1'])
-        return [{ id: 'expired-1' }]
+    it('stays non-fatal if a row somehow arrives with a non-string date (defense in depth, not the primary contract)', async () => {
+      // The `date::text` cast (pinned by registerSelectHandler above) is the
+      // real contract — production no longer normalizes a Date-shaped `date`
+      // field. This only proves the try/catch around the filter step still
+      // catches a stray isNoShowExpired throw and returns 0, rather than
+      // rejecting and breaking every caller's page-load path.
+      const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      sqlMock.addHandler({
+        name: 'select returns a Date-shaped date column',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'reservations',
+        respond: () => [makeRow({ id: 'bad-shape-1', date: new Date('2026-06-19T00:00:00.000Z') as unknown as string })],
       })
 
       const { markExpiredReservationsAsNoShow } = await loadReservationNoShow()
       const result = await markExpiredReservationsAsNoShow()
 
-      expect(result).toBe(1)
+      expect(result).toBe(0)
+      expect(consoleErrorSpy).toHaveBeenCalled()
     })
 
     it('returns the count of rows actually updated (RETURNING id), not the number of expired candidates', async () => {
