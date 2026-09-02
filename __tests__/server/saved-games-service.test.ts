@@ -262,14 +262,23 @@ describe('saved games service', () => {
         // freshly under the advisory lock, independent of whatever
         // assertTableAndEventAvailability's earlier precheck saw — skips the
         // insert (0 rows), same as that precheck's own SAVED_GAME_EVENT_CONFLICT.
+        //
+        // Code-review finding (MEDIUM 3): only simulate the guard when the
+        // statement actually carries it — otherwise deleting the real
+        // `conflict`/`WHERE NOT EXISTS` CTE from production code would leave
+        // this handler still computing the conflict itself and this test
+        // would stay green despite the guard being gone.
+        const hasConflictGuard = stmt.text.includes('event_room_blocks') && stmt.text.includes('not exists')
         const table = tablesState.get(tableId)
-        const conflict = blocksState.some(
-          (block) =>
-            block.room_id === table?.room_id &&
-            block.date >= startDate &&
-            block.date <= endDate &&
-            (block.table_id == null || block.table_id === tableId),
-        )
+        const conflict =
+          hasConflictGuard &&
+          blocksState.some(
+            (block) =>
+              block.room_id === table?.room_id &&
+              block.date >= startDate &&
+              block.date <= endDate &&
+              (block.table_id == null || block.table_id === tableId),
+          )
         if (conflict) return []
         const row = makeSavedGame({
           id: `sg-${savedGamesState.length + 1}`,
@@ -357,6 +366,17 @@ describe('saved games service', () => {
       roomName: 'Sala',
       tableName: 'Mesa doble',
     })
+
+    // Code-review finding (HIGH): structural proof the lock and the
+    // check+insert actually travel together as one sql.transaction([...])
+    // call — without this, someone could revert createSavedGameForSession
+    // back to two sequential `await sql` calls (fully reopening the #334
+    // race) and this test would stay green, since the handlers above match
+    // on statement shape regardless of how they were dispatched.
+    expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
+    const batched = sqlMock.transaction.mock.calls[0]?.[0]
+    expect(Array.isArray(batched)).toBe(true)
+    expect(batched).toHaveLength(2)
   })
 
   it('rejects create with a 409 when an active bottom reservation overlaps the requested range', async () => {
@@ -475,6 +495,14 @@ describe('saved games service', () => {
         endDate: '2026-07-20',
       }),
     ).rejects.toMatchObject({ message: 'SAVED_GAME_EVENT_CONFLICT', statusCode: 409 })
+
+    // Structural proof (HIGH finding, same as the happy-path test above):
+    // the lock and the re-check+insert still travelled together as one
+    // batched sql.transaction() call even on this rejection path.
+    expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
+    const batched = sqlMock.transaction.mock.calls[0]?.[0]
+    expect(Array.isArray(batched)).toBe(true)
+    expect(batched).toHaveLength(2)
   })
 
   it('deterministically surfaces the availability error on create when both checks would fail (#301 round-3 fix)', async () => {
@@ -573,6 +601,15 @@ describe('saved games service', () => {
       roomName: 'Sala',
       tableName: 'Mesa doble',
     })
+
+    // #334 code-review (MEDIUM 2): renewSavedGameForSession now takes the
+    // same lock-guarded treatment as createSavedGameForSession — structural
+    // proof the lock and the re-check+insert travelled together as one
+    // batched sql.transaction() call.
+    expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
+    const batched = sqlMock.transaction.mock.calls[0]?.[0]
+    expect(Array.isArray(batched)).toBe(true)
+    expect(batched).toHaveLength(2)
   })
 
   it('rejects renewal with a 409 when a bottom reservation overlaps the next period', async () => {

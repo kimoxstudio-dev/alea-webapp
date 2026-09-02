@@ -1901,6 +1901,19 @@ describe('club-events-service', () => {
       // only table-1 is passed to the saved-games cancellation — table-2 is
       // NOT included, unlike the pre-fix room-wide-always behavior.
       expect(savedGamesCancelSpy.mock.calls[0][0]).toEqual(['table-1'])
+
+      // Code-review finding (HIGH): structural proof the lock and the
+      // cancellation UPDATE actually travelled together as one
+      // sql.transaction([...]) call — without this, someone could revert
+      // cancelActiveSavedGamesForRoomBlock back to two sequential `await
+      // sql` calls (fully reopening the #334 race with
+      // createSavedGameForSession) and this test would stay green, since the
+      // lock/cancel handlers above match on statement shape regardless of
+      // how they were dispatched.
+      expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
+      const batched = sqlMock.transaction.mock.calls[0]?.[0]
+      expect(Array.isArray(batched)).toBe(true)
+      expect(batched).toHaveLength(2)
     })
 
     it('cancels active saved games room-wide when the block has no table_id (room-wide block)', async () => {
@@ -1949,6 +1962,13 @@ describe('club-events-service', () => {
 
       expect(savedGamesCancelSpy).toHaveBeenCalledTimes(1)
       expect(savedGamesCancelSpy.mock.calls[0][0]).toEqual(['table-1', 'table-2'])
+
+      // Code-review finding (HIGH): same structural batching proof as the
+      // table-scoped test above.
+      expect(sqlMock.transaction).toHaveBeenCalledTimes(1)
+      const batched = sqlMock.transaction.mock.calls[0]?.[0]
+      expect(Array.isArray(batched)).toBe(true)
+      expect(batched).toHaveLength(2)
     })
 
     it('does not cancel a saved game whose status is not "active" (e.g. already cancelled) — enforced by the mock only matching the active-status query, verified via the real WHERE guard', async () => {
