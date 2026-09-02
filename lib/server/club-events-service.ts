@@ -70,9 +70,12 @@ class ClubEventReadBackError extends ServiceError {
  * room_id, date trigger in `..._trigger.sql`) auto-cancelled active
  * `saved_games` rows conflicting with a newly written `event_room_blocks`
  * row and had no app-layer equivalent — the audit in #309 flagged it as the
- * one real gap. `cancelActiveSavedGamesForRoomBlock` below ports it
- * verbatim (see its own doc comment for the exact semantics preserved),
- * called alongside the existing reservation-cancellation step per inserted
+ * one real gap. `cancelActiveSavedGamesForRoomBlock` below ports it, with
+ * two deliberate departures from the original trigger — table-scoping
+ * (matches the block's own `table_id` instead of always cancelling
+ * room-wide) and advisory-lock coordination with `createSavedGameForSession`
+ * (see its own doc comment for the exact semantics preserved and why they
+ * changed), called alongside the existing reservation-cancellation step per inserted
  * block, since this function only ever inserts new `event_room_blocks` rows
  * (never updates room_id/date on an existing row in place), which is the
  * INSERT half of the original trigger's "AFTER INSERT OR UPDATE OF room_id,
@@ -595,31 +598,54 @@ async function cancelActiveSavedGamesForRoomBlock(
 ): Promise<Array<{ id: string; updatedAt: string }>> {
   if (tableIds.length === 0) return []
 
-  let cancelledRows: Array<{ id: string; updated_at: string }>
+  let cancelledRows: Array<{ id: string; updated_at: string | Date }>
   try {
-    const results = await sql.transaction([
-      sql`
-        SELECT pg_advisory_xact_lock(hashtext(t))
-        FROM (SELECT unnest(${tableIds}::text[]) AS t ORDER BY 1) AS ordered_tables
-      `,
-      sql`
-        UPDATE saved_games AS saved
-        SET status = 'cancelled', updated_at = now()
-        FROM (
-          SELECT id, updated_at FROM saved_games
-          WHERE table_id = ANY(${tableIds})
-            AND status = 'active'
-            AND ${date} BETWEEN start_date AND end_date
-        ) AS prior
-        WHERE saved.id = prior.id
-        RETURNING saved.id, prior.updated_at
-      `,
-    ])
-    cancelledRows = results[1] as Array<{ id: string; updated_at: string }>
+    const results = await sql.transaction(
+      [
+        sql`
+          SELECT pg_advisory_xact_lock(hashtext(t::text))
+          FROM (
+            -- Cast to uuid before hashtext (code-review finding): canonicalizes
+            -- each id's text form so this always hashes to the same lock key
+            -- createSavedGameForSession's own lock derives, regardless of
+            -- spelling — matters there since that id is client-supplied, and
+            -- kept consistent here too so both sides key off the identical
+            -- canonicalization rule. Ordered ascending (ORDER BY 1) so two
+            -- concurrent calls whose tableIds overlap always acquire the
+            -- per-table locks in the same order — without this, call A locking
+            -- [x, y] while call B locks [y, x] concurrently can deadlock.
+            SELECT unnest(${tableIds}::uuid[]) AS t ORDER BY 1
+          ) AS ordered_tables
+        `,
+        sql`
+          UPDATE saved_games AS saved
+          SET status = 'cancelled', updated_at = now()
+          FROM (
+            SELECT id, updated_at FROM saved_games
+            WHERE table_id = ANY(${tableIds})
+              AND status = 'active'
+              AND ${date} BETWEEN start_date AND end_date
+          ) AS prior
+          WHERE saved.id = prior.id
+          RETURNING saved.id, prior.updated_at
+        `,
+      ],
+      { isolationLevel: 'ReadCommitted' },
+    )
+    cancelledRows = results[1] as Array<{ id: string; updated_at: string | Date }>
   } catch {
     serviceError('Internal server error', 500)
   }
-  return cancelledRows.map((row) => ({ id: row.id, updatedAt: row.updated_at }))
+  // @neondatabase/serverless returns `timestamptz` columns as `Date`
+  // instances, not strings (code-review finding) — normalize here so
+  // `restoreCancelledSavedGames`'s "restore it exactly" round-trips through
+  // the same `timestamptz` cast it started from, matching the
+  // `instanceof Date` normalization pattern already used in
+  // equipment-service.ts's `toEquipment`.
+  return cancelledRows.map((row) => ({
+    id: row.id,
+    updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at,
+  }))
 }
 
 /**

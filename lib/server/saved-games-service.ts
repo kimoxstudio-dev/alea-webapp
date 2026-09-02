@@ -226,47 +226,58 @@ export async function createSavedGameForSession(
   // (`cancelActiveSavedGamesForRoomBlock` in club-events-service.ts) can run
   // in between and this insert would still land as 'active' even though the
   // table is now blocked. Both sides take the same per-table
-  // `pg_advisory_xact_lock` (keyed by `hashtext(table_id)`, matching
-  // `cancelActiveSavedGamesForRoomBlock`) as the first statement of a
-  // `sql.transaction()`, before touching `event_room_blocks`/`saved_games`.
-  // The lock statement blocks until any concurrent holder commits and
-  // releases it; per Neon's `sql.transaction()` (a real non-interactive
-  // Postgres transaction), the second statement then gets its own fresh
-  // READ COMMITTED snapshot, so the event-block re-check below always sees
-  // any concurrent cancellation that won the lock race. The precheck above
-  // stays as a fast-fail for the common non-racing case (clear 409 without
-  // attempting a write); this re-check is the actual concurrency guard.
+  // `pg_advisory_xact_lock` (keyed by `hashtext(table_id::uuid::text)`,
+  // matching `cancelActiveSavedGamesForRoomBlock`) as the first statement of
+  // a `sql.transaction()`, before touching `event_room_blocks`/`saved_games`.
+  // The `::uuid::text` cast canonicalizes `tableId` before hashing
+  // (code-review finding) — it's client-supplied here, so a non-canonical
+  // spelling Postgres would still accept (uppercase, brace-wrapped) must
+  // still hash to the same lock key the other side derives from a
+  // DB-read-back (always-canonical) id, or the two sides silently stop
+  // coordinating. The lock statement blocks until any concurrent holder
+  // commits and releases it; per Neon's `sql.transaction()` (a real
+  // non-interactive Postgres transaction, pinned to `ReadCommitted` so this
+  // guarantee can't silently change if the client's default ever does), the
+  // second statement then gets its own fresh READ COMMITTED snapshot, so the
+  // event-block re-check below always sees any concurrent cancellation that
+  // won the lock race. The precheck above stays as a fast-fail for the
+  // common non-racing case (clear 409 without attempting a write); this
+  // re-check is the actual concurrency guard. Same treatment applies to
+  // `renewSavedGameForSession` below — see its own comment.
   let rows: SavedGameJoinedRow[]
   try {
-    const results = await sql.transaction([
-      sql`SELECT pg_advisory_xact_lock(hashtext(${tableId}))`,
-      sql`
-        WITH input AS (
-          SELECT ${tableId}::uuid AS table_id, ${session.id}::uuid AS user_id, ${startDate}::date AS start_date, ${endDate}::date AS end_date
-        ),
-        conflict AS (
-          SELECT 1
-          FROM event_room_blocks b
-          JOIN tables t ON t.room_id = b.room_id
-          CROSS JOIN input
-          WHERE t.id = input.table_id
-            AND b.date >= input.start_date
-            AND b.date <= input.end_date
-            AND (b.table_id IS NULL OR b.table_id = input.table_id)
-          LIMIT 1
-        ),
-        ins AS (
-          INSERT INTO saved_games (table_id, user_id, start_date, end_date)
-          SELECT table_id, user_id, start_date, end_date FROM input
-          WHERE NOT EXISTS (SELECT 1 FROM conflict)
-          RETURNING *
-        )
-        SELECT ${sql.unsafe(SAVED_GAME_JOINED_COLUMNS)}
-        FROM ins sg
-        LEFT JOIN tables t ON t.id = sg.table_id
-        LEFT JOIN rooms ON rooms.id = t.room_id
-      `,
-    ])
+    const results = await sql.transaction(
+      [
+        sql`SELECT pg_advisory_xact_lock(hashtext(${tableId}::uuid::text))`,
+        sql`
+          WITH input AS (
+            SELECT ${tableId}::uuid AS table_id, ${session.id}::uuid AS user_id, ${startDate}::date AS start_date, ${endDate}::date AS end_date
+          ),
+          conflict AS (
+            SELECT 1
+            FROM event_room_blocks b
+            JOIN tables t ON t.room_id = b.room_id
+            CROSS JOIN input
+            WHERE t.id = input.table_id
+              AND b.date >= input.start_date
+              AND b.date <= input.end_date
+              AND (b.table_id IS NULL OR b.table_id = input.table_id)
+            LIMIT 1
+          ),
+          ins AS (
+            INSERT INTO saved_games (table_id, user_id, start_date, end_date)
+            SELECT table_id, user_id, start_date, end_date FROM input
+            WHERE NOT EXISTS (SELECT 1 FROM conflict)
+            RETURNING *
+          )
+          SELECT ${sql.unsafe(SAVED_GAME_JOINED_COLUMNS)}
+          FROM ins sg
+          LEFT JOIN tables t ON t.id = sg.table_id
+          LEFT JOIN rooms ON rooms.id = t.room_id
+        `,
+      ],
+      { isolationLevel: 'ReadCommitted' },
+    )
     rows = results[1] as SavedGameJoinedRow[]
   } catch (error) {
     if (isExclusionConflict(error)) serviceError(ERROR_CODES.SAVED_GAME_CONFLICT, 409)
@@ -322,19 +333,51 @@ export async function renewSavedGameForSession(session: SessionUser, id: string)
   await assertTableAndEventAvailability(current.table_id, startDate, endDate)
   await assertNoBottomReservationConflict(current.table_id, startDate, endDate)
 
+  // #334 code-review finding: this had the identical unlocked
+  // precheck-then-insert race as `createSavedGameForSession` (see its doc
+  // comment above) — an event-block cancellation can land between the
+  // precheck above and this insert, and since renew always inserts a NEW
+  // row, `cancelActiveSavedGamesForRoomBlock`'s already-executed UPDATE
+  // can't retroactively catch it either. Same fix: lock + re-check under the
+  // lock, in the same statement as the insert. `current.table_id` is read
+  // back from the DB just above (always canonical), so no `::uuid::text`
+  // cast is needed before hashing for canonicalization, but the lock key
+  // itself must still match `cancelActiveSavedGamesForRoomBlock`'s.
   let rows: SavedGameJoinedRow[]
   try {
-    rows = await sql`
-      WITH ins AS (
-        INSERT INTO saved_games (table_id, user_id, start_date, end_date, renewed_from_id)
-        VALUES (${current.table_id}, ${current.user_id}, ${startDate}, ${endDate}, ${current.id})
-        RETURNING *
-      )
-      SELECT ${sql.unsafe(SAVED_GAME_JOINED_COLUMNS)}
-      FROM ins sg
-      LEFT JOIN tables t ON t.id = sg.table_id
-      LEFT JOIN rooms ON rooms.id = t.room_id
-    ` as SavedGameJoinedRow[]
+    const results = await sql.transaction(
+      [
+        sql`SELECT pg_advisory_xact_lock(hashtext(${current.table_id}))`,
+        sql`
+          WITH input AS (
+            SELECT ${current.table_id}::uuid AS table_id, ${current.user_id}::uuid AS user_id, ${startDate}::date AS start_date, ${endDate}::date AS end_date, ${current.id}::uuid AS renewed_from_id
+          ),
+          conflict AS (
+            SELECT 1
+            FROM event_room_blocks b
+            JOIN tables t ON t.room_id = b.room_id
+            CROSS JOIN input
+            WHERE t.id = input.table_id
+              AND b.date >= input.start_date
+              AND b.date <= input.end_date
+              AND (b.table_id IS NULL OR b.table_id = input.table_id)
+            LIMIT 1
+          ),
+          ins AS (
+            INSERT INTO saved_games (table_id, user_id, start_date, end_date, renewed_from_id)
+            SELECT table_id, user_id, start_date, end_date, renewed_from_id FROM input
+            WHERE NOT EXISTS (SELECT 1 FROM conflict)
+            RETURNING *
+          )
+          SELECT ${sql.unsafe(SAVED_GAME_JOINED_COLUMNS)}
+          FROM ins sg
+          LEFT JOIN tables t ON t.id = sg.table_id
+          LEFT JOIN rooms ON rooms.id = t.room_id
+        `,
+      ],
+      { isolationLevel: 'ReadCommitted' },
+    )
+    rows = results[1] as SavedGameJoinedRow[]
   } catch (error) {
     if (isRenewedFromConflict(error)) serviceError(ERROR_CODES.SAVED_GAME_ALREADY_RENEWED, 409)
     if (isExclusionConflict(error)) serviceError(ERROR_CODES.SAVED_GAME_CONFLICT, 409)
@@ -342,7 +385,10 @@ export async function renewSavedGameForSession(session: SessionUser, id: string)
   }
 
   const data = rows[0]
-  if (!data) serviceError('Internal server error', 500)
+  // Same lock-guarded conflict re-check as createSavedGameForSession — a
+  // skipped insert (no row) means a concurrent event-block cancellation won
+  // the race after the precheck above.
+  if (!data) serviceError(ERROR_CODES.SAVED_GAME_EVENT_CONFLICT, 409)
   return mapSavedGame(data, today)
 }
 
