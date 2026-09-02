@@ -455,7 +455,7 @@
       "uploadButton": "Elegir archivo",
       "uploading": "Subiendo...",
       "error": "No se pudo subir la imagen. Inténtalo de nuevo.",
-      "hint": "PNG, JPEG, WebP o GIF, hasta 5 MB."
+      "hint": "PNG, JPEG, WebP o GIF, hasta 4 MB."
     }
   },
   "home": {
