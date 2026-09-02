@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { whereColumnHasOperator, whereColumnHasNullCheck } from '../helpers/sql-mock'
+import { whereColumnHasOperator, whereColumnHasNullCheck, type ParsedStatement } from '../helpers/sql-mock'
 import { isNoShowExpired } from '@/lib/server/reservation-no-show'
 
 // vi.hoisted runs before the vi.mock factories below (which themselves run
@@ -43,7 +43,17 @@ function makeRow(overrides?: Partial<ReservationSlotRow>): ReservationSlotRow {
   }
 }
 
-function registerSelectHandler(rows: ReservationSlotRow[]) {
+// Both handlers below record the matched statement instead of asserting on
+// it inline. Production wraps every call to these handlers in its own
+// non-fatal try/catch, so an `expect()` thrown from inside `respond` is
+// swallowed there rather than failing the test — the pin would only bite
+// indirectly (via a confused `result` assertion) or, in tests that already
+// expect a 0 result, not at all. Recording the statement and asserting on it
+// after `markExpiredReservationsAsNoShow()` returns — outside any try/catch —
+// makes a broken pin fail directly and visibly.
+
+function registerSelectHandler(rows: ReservationSlotRow[]): { getStmt: () => ParsedStatement | undefined } {
+  let matchedStmt: ParsedStatement | undefined
   sqlMock.addHandler({
     name: 'select pending never-activated reservations',
     verb: 'select',
@@ -52,18 +62,15 @@ function registerSelectHandler(rows: ReservationSlotRow[]) {
       whereColumnHasOperator(stmt, 'status', '=') &&
       whereColumnHasNullCheck(stmt, 'activated_at', 'IS NULL'),
     respond: (stmt) => {
-      // Pins the `date::text` cast as the actual contract (not
-      // defended-against in application code): the Neon driver parses an
-      // uncast `date` column as a JS Date, not a string, and would crash
-      // isNoShowExpired's zonedDateTimeToUtc call. Dropping the cast must
-      // fail a test, not silently keep passing.
-      expect(stmt.selectColumns).toContain('date::text')
+      matchedStmt = stmt
       return rows
     },
   })
+  return { getStmt: () => matchedStmt }
 }
 
-function registerUpdateHandler(respond: (ids: string[]) => Array<{ id: string }>) {
+function registerUpdateHandler(respond: (ids: string[]) => Array<{ id: string }>): { getStmt: () => ParsedStatement | undefined } {
+  let matchedStmt: ParsedStatement | undefined
   sqlMock.addHandler({
     name: 'update expired reservations to no_show',
     verb: 'update',
@@ -72,12 +79,21 @@ function registerUpdateHandler(respond: (ids: string[]) => Array<{ id: string }>
       whereColumnHasOperator(stmt, 'status', '=') &&
       whereColumnHasNullCheck(stmt, 'activated_at', 'IS NULL'),
     respond: (stmt) => {
-      // Pins the SET clause: the WHERE-based match above alone can't tell
-      // `SET status = 'no_show'` apart from `SET status = 'cancelled'`.
-      expect(stmt.text).toContain(`set status = 'no_show'`)
+      matchedStmt = stmt
       return respond(stmt.values[0] as string[])
     },
   })
+  return { getStmt: () => matchedStmt }
+}
+
+/** Pins the `date::text` cast: an uncast `date` column parses as a JS Date via the Neon driver, not a string, and would crash `isNoShowExpired`'s `zonedDateTimeToUtc` call. Call after `markExpiredReservationsAsNoShow()` returns, never inside a `respond` callback. */
+function expectSelectCastDateToText(select: { getStmt: () => ParsedStatement | undefined }) {
+  expect(select.getStmt()?.selectColumns).toContain('date::text')
+}
+
+/** Pins the SET clause: the WHERE-based match alone can't tell `SET status = 'no_show'` apart from `SET status = 'cancelled'`. Call after `markExpiredReservationsAsNoShow()` returns, never inside a `respond` callback. */
+function expectUpdateSetsNoShowStatus(update: { getStmt: () => ParsedStatement | undefined }) {
+  expect(update.getStmt()?.text).toContain(`set status = 'no_show'`)
 }
 
 describe('reservation no-show lazy evaluation', () => {
@@ -117,8 +133,8 @@ describe('reservation no-show lazy evaluation', () => {
       // getDatabaseNowMock (set in beforeEach) is one millisecond past this
       // slot's 59-minute no-show deadline.
       const expiredRow = makeRow({ id: 'expired-1' })
-      registerSelectHandler([expiredRow])
-      registerUpdateHandler((ids) => {
+      const select = registerSelectHandler([expiredRow])
+      const update = registerUpdateHandler((ids) => {
         expect(ids).toEqual(['expired-1'])
         return [{ id: 'expired-1' }]
       })
@@ -127,6 +143,8 @@ describe('reservation no-show lazy evaluation', () => {
       const result = await markExpiredReservationsAsNoShow()
 
       expect(result).toBe(1)
+      expectSelectCastDateToText(select)
+      expectUpdateSetsNoShowStatus(update)
     })
 
     it('does not touch reservations still within the no-show window', async () => {
@@ -134,7 +152,7 @@ describe('reservation no-show lazy evaluation', () => {
       // still valid (the deadline itself is not yet expired).
       getDatabaseNowMock.mockResolvedValue(new Date('2026-06-19T14:59:00.000Z'))
       const freshRow = makeRow({ id: 'fresh-1' })
-      registerSelectHandler([freshRow])
+      const select = registerSelectHandler([freshRow])
       // No update handler registered: an UPDATE call for a non-expired row
       // would throw via the mock's "no handler matched" guard — but that
       // throw is caught non-fatally by production code (returns 0), so it
@@ -146,6 +164,7 @@ describe('reservation no-show lazy evaluation', () => {
 
       expect(result).toBe(0)
       expect(sqlMock.sql).toHaveBeenCalledTimes(1)
+      expectSelectCastDateToText(select)
     })
 
     it('stays non-fatal if a row somehow arrives with a non-string date (defense in depth, not the primary contract)', async () => {
@@ -175,25 +194,28 @@ describe('reservation no-show lazy evaluation', () => {
       // SELECT and the UPDATE (TOCTOU) is excluded from RETURNING even
       // though it was in expiredIds. The count must reflect that, not the
       // candidate list.
-      registerSelectHandler([makeRow({ id: 'concurrently-activated-1' })])
-      registerUpdateHandler(() => [])
+      const select = registerSelectHandler([makeRow({ id: 'concurrently-activated-1' })])
+      const update = registerUpdateHandler(() => [])
 
       const { markExpiredReservationsAsNoShow } = await loadReservationNoShow()
       const result = await markExpiredReservationsAsNoShow()
 
       expect(result).toBe(0)
+      expectSelectCastDateToText(select)
+      expectUpdateSetsNoShowStatus(update)
     })
 
     it('excludes already-activated or already-non-pending reservations at the query level', async () => {
       // The SELECT is scoped to status='pending' AND activated_at IS NULL, so
       // already-activated/non-pending rows never reach the in-memory filter.
-      registerSelectHandler([])
+      const select = registerSelectHandler([])
 
       const { markExpiredReservationsAsNoShow } = await loadReservationNoShow()
       const result = await markExpiredReservationsAsNoShow()
 
       expect(result).toBe(0)
       expect(sqlMock.sql).toHaveBeenCalledTimes(1)
+      expectSelectCastDateToText(select)
     })
 
     it('swallows a DB failure on the SELECT without throwing', async () => {
