@@ -146,6 +146,7 @@ describe('uploads-service', () => {
       expect(new Uint8Array(body as ArrayBuffer)).toEqual(expectedBytes)
       expect(options.contentType).toBe('image/png')
       expect(options.access).toBe('public')
+      expect(options.addRandomSuffix).toBe(false)
 
       // The returned URL must be exactly what put() resolved, not just any
       // string that happens to contain the expected path segments.

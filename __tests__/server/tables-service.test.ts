@@ -351,7 +351,13 @@ describe('generateTableQrCode', () => {
     expect(putMock).toHaveBeenCalledWith(
       `table-qr-codes/${TABLE_ID}.png`,
       Buffer.from('fake-png-data'),
-      { access: 'public', contentType: 'image/png', addRandomSuffix: false, allowOverwrite: true },
+      {
+        access: 'public',
+        contentType: 'image/png',
+        addRandomSuffix: false,
+        allowOverwrite: true,
+        cacheControlMaxAge: 3600,
+      },
     )
   })
 

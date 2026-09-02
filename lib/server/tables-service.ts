@@ -22,11 +22,16 @@ async function uploadQrCodeToBlob(url: string, blobPath: string): Promise<string
     // allowOverwrite: true — regenerateQrCodes re-uploads the same
     // `{tableId}.png` path on every regeneration (the old Supabase Storage
     // call used upsert: true for the same reason).
+    // cacheControlMaxAge: 3600 — matches supabase-js's default TTL (1 hour),
+    // which the old Supabase Storage call relied on implicitly. Without this,
+    // @vercel/blob's put() defaults to 30 days, so a regenerated QR (same
+    // URL, no cache-busting) would serve the stale PNG far longer than before.
     const blob = await put(`${QR_CODE_PREFIX}/${blobPath}`, buffer, {
       access: 'public',
       contentType: 'image/png',
       addRandomSuffix: false,
       allowOverwrite: true,
+      cacheControlMaxAge: 3600,
     })
     return blob.url
   } catch (error) {
