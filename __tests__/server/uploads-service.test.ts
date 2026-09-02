@@ -16,7 +16,7 @@ import type { ServiceError } from '@/lib/server/service-error'
  *   - missing file
  *   - folder outside allowlist ('../etc', 'avatars', '')
  *   - MIME not allowed (image/svg+xml, application/pdf, text/html)
- *   - size > 5MB
+ *   - size > 4MB
  * - Extension derived from MIME not filename: file named "evil.svg" with type image/png → stored as .png
  * - Blob put() throwing → 500 ServiceError (and console.error called)
  */
@@ -335,10 +335,10 @@ describe('uploads-service', () => {
   })
 
   describe('validation matrix — file size outside bounds', () => {
-    it('file size > 5 MB → 400 before put() call', async () => {
+    it('file size > 4 MB → 400 before put() call', async () => {
       const adminSession = createAdminSession()
-      const fiveMBPlus = 5 * 1024 * 1024 + 1
-      const mockFile = createMockFile(fiveMBPlus, 'image/png')
+      const fourMBPlus = 4 * 1024 * 1024 + 1
+      const mockFile = createMockFile(fourMBPlus, 'image/png')
 
       const { uploadLandingMediaImage } = await loadUploadsService()
 
@@ -368,10 +368,10 @@ describe('uploads-service', () => {
       expect(putMock).not.toHaveBeenCalled()
     })
 
-    it('file size exactly 5 MB (boundary) → allowed', async () => {
+    it('file size exactly 4 MB (boundary) → allowed', async () => {
       const adminSession = createAdminSession()
-      const fiveMB = 5 * 1024 * 1024
-      const mockFile = createMockFile(fiveMB, 'image/png')
+      const fourMB = 4 * 1024 * 1024
+      const mockFile = createMockFile(fourMB, 'image/png')
 
       const { uploadLandingMediaImage } = await loadUploadsService()
 

@@ -14,7 +14,14 @@ import type { SessionUser } from '@/lib/server/auth'
 // ---------------------------------------------------------------------------
 
 const LANDING_MEDIA_PREFIX = 'landing-media'
-const MAX_UPLOAD_SIZE_BYTES = 5 * 1024 * 1024 // 5 MB
+
+// Vercel Functions reject request bodies above 4.5 MB at the platform level,
+// before this route handler's code (and therefore this check) ever runs — a
+// body between 4.5 MB and 5 MB would be rejected upstream with a generic
+// platform error instead of this service's controlled 400. 4 MB stays a safe
+// margin under that 4.5 MB ceiling once multipart/form-data framing overhead
+// is accounted for, so this check is the one that actually fires.
+const MAX_UPLOAD_SIZE_BYTES = 4 * 1024 * 1024 // 4 MB
 
 // Extension is derived from the (validated) MIME type, never from the
 // caller-supplied filename — an attacker-controlled filename must never
@@ -131,11 +138,12 @@ function requireValidFile(file: UploadFileLike | null): { file: UploadFileLike; 
   // NOTE: by the time we get here, request.formData() has already buffered
   // the entire multipart body into memory — this check is a validation gate
   // on the parsed size, not a memory-exhaustion defense. Request size is
-  // bounded upstream by requireAdmin() (auth-gated) and the adminMutation
-  // rate limit; this MAX_UPLOAD_SIZE_BYTES check is what enforces the 5 MB
-  // cap (Vercel Blob has no bucket-level size limit to also enforce it).
+  // bounded upstream by requireAdmin() (auth-gated), the adminMutation rate
+  // limit, and — before any of this code runs — the Vercel Functions 4.5 MB
+  // platform body-size ceiling (see MAX_UPLOAD_SIZE_BYTES comment above).
+  // Vercel Blob itself has no bucket-level size limit to also enforce it.
   if (file.size <= 0 || file.size > MAX_UPLOAD_SIZE_BYTES) {
-    serviceError('file must be between 1 byte and 5 MB', 400)
+    serviceError('file must be between 1 byte and 4 MB', 400)
   }
 
   return { file, extension }
