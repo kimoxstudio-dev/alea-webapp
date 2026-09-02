@@ -28,6 +28,12 @@ type SavedGameJoinedRow = SavedGameRow & {
   table_name: string | null
   room_name: string | null
 }
+// renewSavedGameForSession's lock-guarded insert always returns exactly one
+// row (see its `(SELECT 1) AS one LEFT JOIN ins` shape) — `id`/etc. are null
+// when the `ins` CTE's guard skipped the insert, and `was_inactive` says
+// whether that was because the source row lost 'active' status under the
+// lock rather than an event-block conflict.
+type SavedGameRenewResultRow = Partial<SavedGameJoinedRow> & { was_inactive: boolean }
 
 const SAVED_GAME_COLUMNS = 'id, table_id, user_id, start_date, end_date, status, attendance_count, renewed_from_id, created_at, updated_at'
 // Same shape as SAVED_GAME_COLUMNS plus the table/room join used by
@@ -345,7 +351,16 @@ export async function renewSavedGameForSession(session: SessionUser, id: string)
   // all three lock sites in this file/`club-events-service.ts` stay
   // textually identical rather than relying on the reader noticing which
   // ones can skip it.
-  let rows: SavedGameJoinedRow[]
+  //
+  // Second #334 code-review finding: `current.status` above is read BEFORE
+  // this lock is acquired, and is never rechecked inside the transaction. If
+  // `cancelActiveSavedGamesForRoomBlock` wins the lock race and cancels this
+  // exact row in between, the CTE below still saw `current` as active and
+  // would insert the renewal anyway. `current_check` re-reads the source
+  // row's live status under the lock and the `ins` guard requires it to
+  // still be `'active'`, so a row that got cancelled mid-request blocks its
+  // own renewal.
+  let rows: SavedGameRenewResultRow[]
   try {
     const results = await sql.transaction(
       [
@@ -365,21 +380,29 @@ export async function renewSavedGameForSession(session: SessionUser, id: string)
               AND (b.table_id IS NULL OR b.table_id = input.table_id)
             LIMIT 1
           ),
+          current_check AS (
+            SELECT 1
+            FROM saved_games sg
+            CROSS JOIN input
+            WHERE sg.id = input.renewed_from_id AND sg.status = 'active'
+          ),
           ins AS (
             INSERT INTO saved_games (table_id, user_id, start_date, end_date, renewed_from_id)
             SELECT table_id, user_id, start_date, end_date, renewed_from_id FROM input
-            WHERE NOT EXISTS (SELECT 1 FROM conflict)
+            WHERE NOT EXISTS (SELECT 1 FROM conflict) AND EXISTS (SELECT 1 FROM current_check)
             RETURNING *
           )
-          SELECT ${sql.unsafe(SAVED_GAME_JOINED_COLUMNS)}
-          FROM ins sg
+          SELECT ${sql.unsafe(SAVED_GAME_JOINED_COLUMNS)},
+            (SELECT NOT EXISTS (SELECT 1 FROM current_check)) AS was_inactive
+          FROM (SELECT 1) AS one
+          LEFT JOIN ins sg ON true
           LEFT JOIN tables t ON t.id = sg.table_id
           LEFT JOIN rooms ON rooms.id = t.room_id
         `,
       ],
       { isolationLevel: 'ReadCommitted' },
     )
-    rows = results[1] as SavedGameJoinedRow[]
+    rows = results[1] as SavedGameRenewResultRow[]
   } catch (error) {
     if (isRenewedFromConflict(error)) serviceError(ERROR_CODES.SAVED_GAME_ALREADY_RENEWED, 409)
     if (isExclusionConflict(error)) serviceError(ERROR_CODES.SAVED_GAME_CONFLICT, 409)
@@ -387,11 +410,19 @@ export async function renewSavedGameForSession(session: SessionUser, id: string)
   }
 
   const data = rows[0]
-  // Same lock-guarded conflict re-check as createSavedGameForSession — a
-  // skipped insert (no row) means a concurrent event-block cancellation won
-  // the race after the precheck above.
-  if (!data) serviceError(ERROR_CODES.SAVED_GAME_EVENT_CONFLICT, 409)
-  return mapSavedGame(data, today)
+  // The `one`/`LEFT JOIN ins` shape above always returns exactly one row, so
+  // `data` itself is never undefined — `data.id == null` is what signals the
+  // `ins` guard skipped the insert. `was_inactive` (computed from the same
+  // `current_check` CTE the guard used, under the same lock) distinguishes
+  // *why*: the source row lost its 'active' status to a concurrent
+  // cancellation (`cancelActiveSavedGamesForRoomBlock`), vs. an event block
+  // landing on the new period. No follow-up query needed — both facts come
+  // back from the one locked transaction.
+  if (data?.id == null) {
+    if (data?.was_inactive) serviceError(ERROR_CODES.SAVED_GAME_NOT_ACTIVE, 409)
+    serviceError(ERROR_CODES.SAVED_GAME_EVENT_CONFLICT, 409)
+  }
+  return mapSavedGame(data as SavedGameJoinedRow, today)
 }
 
 export async function recordSavedGameAttendance(playReservation: Tables<'reservations'>): Promise<void> {
