@@ -1,1 +1,0 @@
-CREATE TRIGGER "record_saved_game_attendance_after_activation" AFTER UPDATE OF "status" ON "public"."reservations" FOR EACH ROW WHEN ((OLD."status" IS DISTINCT FROM NEW."status") AND (NEW."status" = 'active'::"public"."reservation_status")) EXECUTE FUNCTION "public"."record_saved_game_attendance_on_activation"();

@@ -18,7 +18,8 @@ Admins can manage users, member imports, rooms, tables, events, and reservations
 |---|---|
 | Framework | Next.js 15 (App Router) |
 | UI | React 19, Tailwind CSS, shadcn/ui |
-| Auth & DB | Supabase (PostgreSQL + Row Level Security) |
+| Database | Neon (PostgreSQL, raw SQL, no RLS) |
+| Auth | Clerk |
 | i18n | next-intl (Spanish + English) |
 | Testing | Vitest + React Testing Library |
 | Language | TypeScript |
@@ -33,12 +34,12 @@ alea-webapp/
 ├── components/             # Reusable UI components
 ├── lib/                    # Application logic
 │   ├── server/             # Server-side service layer (auth, rooms, reservations, users)
-│   └── supabase/           # Supabase client helpers (browser + server)
+│   ├── db/                 # Neon connection (lib/db/client.ts) and versioned SQL schema (lib/db/schema/)
+│   └── supabase/           # types.ts only — generated DB row types, still used as the type source everywhere
 ├── messages/               # i18n translation files (es.json, en.json)
-├── supabase/               # Supabase config and migrations
 ├── __tests__/              # Integration and unit tests
 ├── docs/                   # Architecture and decision documentation
-├── middleware.ts            # i18n routing and CSRF cookie setup
+├── middleware.ts            # Clerk middleware, i18n routing, CSRF cookie setup
 └── scripts/                # Dev utility scripts
 ```
 
@@ -46,11 +47,8 @@ alea-webapp/
 
 - **Node.js** 20+ (see `.nvmrc` or `engines` in `package.json`)
 - **pnpm** 9+ (`npm install -g pnpm`)
-- **Docker Desktop** + **Supabase CLI** *(optional — only required to run `pnpm test:integration` for local schema/migration checks)*
 
 ## Quick Start
-
-### Option A — Fastest path (existing Supabase Cloud project)
 
 1. **Clone the repository**
 
@@ -71,10 +69,10 @@ alea-webapp/
    cp .env.example .env.local
    ```
 
-   The project uses **Supabase Cloud** by default. Open `.env.local` and fill in the following credentials from your Supabase project dashboard:
-   - `NEXT_PUBLIC_SUPABASE_URL`
-   - `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY`
-   - `SUPABASE_SECRET_DEFAULT_KEY`
+   The project uses **Neon** for the database and **Clerk** for auth — there is no local Postgres/Docker setup; development connects to a real Neon branch. Open `.env.local` and fill in:
+   - `DATABASE_URL` — Neon pooled connection string (`?sslmode=require`), from console.neon.tech → your project → Connection Details
+   - `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` / `CLERK_SECRET_KEY` — Clerk test-mode keys, from dashboard.clerk.com → your application → API Keys
+   - `BLOB_READ_WRITE_TOKEN` — Vercel Blob store token, used for admin image uploads and table QR codes
    - `NEXT_PUBLIC_APP_URL` (`http://localhost:3000` locally)
    - `CRON_SECRET` (any long random string for local work)
 
@@ -88,66 +86,15 @@ alea-webapp/
 
    The app is available at [http://localhost:3000](http://localhost:3000).
 
-### Option B — Full local Supabase stack
-
-Use this when you want local DB/auth/state and deterministic QA fixtures.
-
-1. Install Docker Desktop and Supabase CLI.
-
-2. Start Supabase from the repo root:
-
-   ```bash
-   supabase start
-   ```
-
-3. Read local credentials:
-
-   ```bash
-   supabase status
-   ```
-
-4. Copy `.env.example` to `.env.local`, then set:
-
-   - `NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:54321`
-   - `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY=<anon/publishable key from supabase status>`
-   - `SUPABASE_SECRET_DEFAULT_KEY=<service_role/secret key from supabase status>`
-   - `NEXT_PUBLIC_APP_URL=http://localhost:3000`
-   - `CRON_SECRET=<any long random string>`
-
-5. Start the app:
-
-   ```bash
-   pnpm dev
-   ```
-
-Local Supabase ports from `supabase/config.toml`:
-
-| Service | URL |
-|---|---|
-| App | `http://localhost:3000` |
-| Supabase API | `http://127.0.0.1:54321` |
-| Postgres | `postgresql://postgres:postgres@127.0.0.1:54322/postgres` |
-| Supabase Studio | `http://127.0.0.1:54323` |
-
 ### Local seed data
 
-The local Supabase seed is for QA only and is applied by `supabase db reset` / `supabase start`.
-
-- Shared local test password for seeded users: `TestPass123!`
-- Seeded admin email: `admin@alea.test`
-- Seeded profiles/member numbers are defined in `supabase/seed.sql`
-
-Reset local DB + re-apply migrations + seed:
+`scripts/seed-dev.mjs` seeds a development Neon branch with an active admin fixture (its Clerk identity is created directly via the Clerk Backend API) and an inactive member fixture (a `profiles` row only, activated later through the real admin-issued-link flow, same as production). It requires `DATABASE_URL`, `CLERK_SECRET_KEY` (test-mode, `sk_test_...`), and `SEED_ADMIN_PASSWORD` (the admin fixture's initial password — no default). It refuses to run unless `NODE_ENV !== 'production'` **and** `DEV_SEED_CONFIRM` is set to the script's exact confirmation value, and it refuses if `DATABASE_URL` looks like it points at anything containing "prod":
 
 ```bash
-supabase db reset
+DEV_SEED_CONFIRM=YES_SEED_NEON_DEV_DB SEED_ADMIN_PASSWORD=<local-only password> node scripts/seed-dev.mjs
 ```
 
-Stop local Supabase:
-
-```bash
-supabase stop
-```
+Both fixtures are upserted keyed on `member_number`, so re-running the script is safe and will not revert an already-activated member back to pending.
 
 ## Local CI Hook
 
@@ -194,7 +141,6 @@ This repository has no `.github/workflows/` CI pipeline — there is no automate
 | `pnpm build` | Production build |
 | `pnpm test` | Run the full test suite (Vitest) |
 | `pnpm test:watch` | Run Vitest in watch mode |
-| `pnpm test:integration` | Validate migrations/types against a temporary local Supabase stack |
 | `pnpm lint` | ESLint via Next.js |
 | `pnpm typecheck` | TypeScript type-check (no emit) |
 | `pnpm security:deps` | Audit production dependencies |
@@ -207,7 +153,7 @@ For a fresh machine:
 
 1. `pnpm install`
 2. `cp .env.example .env.local`
-3. Fill env values for Cloud or local Supabase
+3. Fill in `DATABASE_URL` (Neon) and the Clerk keys
 4. `pnpm dev`
 5. Optional local guardrail: `pnpm hooks:install`
 
@@ -224,10 +170,7 @@ Session hygiene:
 2. Update `docs/HANDOFF.md` before ending the session.
 3. Keep handoff notes only in `docs/HANDOFF.md`; do not use GitHub PR comments or `CLAUDE.md` for repository handoff state.
 
-If you touched SQL schema or generated DB types:
-
-1. `pnpm test:integration`
-2. confirm `lib/supabase/types.ts` matches generated output
+If you touched SQL schema in `lib/db/schema/`, confirm the change is reflected wherever `lib/supabase/types.ts` types are consumed.
 
 ## Key Business Rules
 
@@ -235,7 +178,7 @@ If you touched SQL schema or generated DB types:
 - **Table types**: `small`, `large`, `removable_top`.
 - **removable_top rule**: A table with a removable top has two bookable surfaces (`top` and `bottom`). Reserving one surface blocks the other surface in the same time slot.
 - **Authentication**: Members currently log in with their member number + password. Passwords require: minimum 12 characters, at least one letter, at least one number, and at least one special character.
-- **Admin**: Admins access the dashboard at `/{locale}/admin` (guarded route). The dashboard features: user management (10/page, paginated list with search, status badge, edit role/status/member number/contact fields, member import from `csv`/`xlsx`/`odt`, delete), room and table management (list/edit rooms, create tables), event management, and reservation management (list all, cancel with confirmation). The member importer accepts source columns such as `USUARIOS` -> `full_name` and `ID` -> `member_number`, normalizes them into the canonical dataset before persistence, returns invalid/skipped rows, and shows a normalized preview for audit. Passwords are never shown or editable. Admin write operations use Supabase admin client (bypasses RLS). Inactive/suspended users cannot log in.
+- **Admin**: Admins access the dashboard at `/{locale}/admin` (guarded route). The dashboard features: user management (10/page, paginated list with search, status badge, edit role/status/member number/contact fields, member import from `csv`/`xlsx`/`odt`, delete), room and table management (list/edit rooms, create tables), event management, and reservation management (list all, cancel with confirmation). The member importer accepts source columns such as `USUARIOS` -> `full_name` and `ID` -> `member_number`, normalizes them into the canonical dataset before persistence, returns invalid/skipped rows, and shows a normalized preview for audit. Passwords are never shown or editable. Admin write operations go through `users-service.ts` using the same Neon `sql` client as every other query (no RLS to bypass — the privilege check is `requireAdmin()` at the route layer). Inactive/suspended users cannot log in.
 - **QR codes**: Each table has a QR code for quick reservation lookup.
 
 ## Accessibility

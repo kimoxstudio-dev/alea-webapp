@@ -87,8 +87,7 @@ export function EventDetailsDialog({ event, locale, variant, onOpenChange }: Eve
               <h3>{t('modal.what')}</h3>
               {/* The remaining when/who/price/organizer/bullets detail from the source
                   design is embedded as formatted text in `description` — the events
-                  schema has no dedicated columns for those fields (see
-                  supabase/migrations/20260703000002_oir202_seed_public_landing_events.sql). */}
+                  schema (lib/db/schema/) has no dedicated columns for those fields. */}
               <p>{description}</p>
             </div>
           </div>

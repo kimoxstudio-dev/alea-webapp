@@ -1,1 +1,0 @@
-CREATE TABLE "public"."saved_game_attendances" ("id" uuid DEFAULT gen_random_uuid() PRIMARY KEY, "saved_game_id" uuid NOT NULL REFERENCES "public"."saved_games"("id") ON DELETE CASCADE, "play_reservation_id" uuid NOT NULL UNIQUE REFERENCES "public"."reservations"("id") ON DELETE CASCADE, "attended_on" date NOT NULL, "scanned_at" timestamptz NOT NULL DEFAULT now());

@@ -1,13 +1,11 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { NextRequest, NextResponse } from 'next/server'
+import { NextRequest } from 'next/server'
 
 const getCurrentUserMock = vi.fn()
 const resolveProfileForClerkUserMock = vi.fn()
 const getClerkSessionMock = vi.fn()
 const getClerkUserMock = vi.fn()
-const routeGetUserMock = vi.fn()
-const routeProfileMaybeSingleMock = vi.fn()
 
 vi.mock('@/lib/server/auth-service', () => ({
   getCurrentUser: getCurrentUserMock,
@@ -22,27 +20,6 @@ vi.mock('@/lib/server/session', () => ({
 vi.mock('@/lib/server/session', () => ({
   getClerkSession: vi.fn(async () => ({ userId: 'clerk-user-1' })),
   getClerkUser: vi.fn(async () => ({ id: 'clerk-user-1', username: 'alea-100001' })),
-}))
-
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseRouteHandlerClient: vi.fn(() => ({
-    supabase: {
-      auth: {
-        getUser: routeGetUserMock,
-      },
-      from: vi.fn(() => ({
-        select: vi.fn(() => ({
-          eq: vi.fn(() => ({
-            maybeSingle: routeProfileMaybeSingleMock,
-          })),
-        })),
-      })),
-    },
-    applyCookies: (response: NextResponse) => {
-      response.cookies.set('sb-access-token', 'test-session')
-      return response
-    },
-  })),
 }))
 
 function createJsonRequest() {
@@ -75,11 +52,6 @@ describe('GET /api/auth/me', () => {
     resolveProfileForClerkUserMock.mockResolvedValue({
       id: 'user-2',
       role: 'member',
-    })
-    routeGetUserMock.mockResolvedValue({ data: { user: { id: 'user-2' } }, error: null })
-    routeProfileMaybeSingleMock.mockResolvedValue({
-      data: { id: 'user-2', role: 'member', is_active: true },
-      error: null,
     })
   })
 

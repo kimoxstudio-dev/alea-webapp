@@ -36,10 +36,6 @@ vi.mock('@/lib/db/client', () => ({
   sql: sqlQueryMock,
 }))
 
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseServerAdminClient: vi.fn(),
-}))
-
 vi.mock('@clerk/backend', () => ({
   clerkClient: {
     users: {

@@ -7,7 +7,8 @@
  * 2. Visibility toggle: visibleOnLanding flag behavior
  * 3. Materials validation: quantity > 0, valid shape
  * 4. RPC payload: tableId inclusion and blocksMatchSchedules comparison
- * 5. Migration sanity: static checks on table_id FK, event_equipment constraints
+ * 5. Migration sanity: static checks on table_id FK and event_equipment CHECK,
+ *    read from lib/db/schema/ (the Neon schema, ported off Supabase migrations)
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
@@ -19,11 +20,6 @@ vi.mock('server-only', () => ({}))
 vi.mock('@/lib/server/database-time', () => ({
   getDatabaseNow: vi.fn(async () => new Date('2026-04-15T12:00:00.000Z')),
 }))
-vi.mock('@/lib/supabase/server', () => ({
-  createSupabaseServerAdminClient: vi.fn(),
-  createSupabaseServerClient: vi.fn(),
-}))
-
 // rooms-service.ts (#302) and tables-service.ts (#333) use the raw-SQL `sql`
 // export. Availability tests below register strict handlers here; unmatched
 // statements fail loudly instead of attempting a real Neon connection.
@@ -376,157 +372,6 @@ function addEventMaterialsSelectHandler(materials: unknown[] = []) {
   })
 }
 
-function buildSupabaseMock() {
-  const state: any = {}
-  return {
-    from: vi.fn(function (table: string) {
-      if (table === 'events') {
-        return {
-          select: vi.fn(() => ({
-            eq: vi.fn(() => ({
-              maybeSingle: vi.fn(async () => ({
-                data: {
-                  id: 'evt-1',
-                  title: 'Test Event',
-                  title_es: 'Evento Prueba',
-                  title_en: 'Test Event',
-                  blurb_es: null,
-                  blurb_en: null,
-                  description_es: null,
-                  description_en: null,
-                  category_es: null,
-                  category_en: null,
-                  date_kind: 'single',
-                  date: '2026-04-20',
-                  end_date: null,
-                  recurrence_label_es: null,
-                  recurrence_label_en: null,
-                  image_url: null,
-                  link_url: null,
-                  created_by: 'user-1',
-                  created_at: '2026-04-01T00:00:00Z',
-                } as EventRow,
-                error: null,
-              })),
-            })),
-          })),
-          insert: vi.fn(() => ({
-            select: vi.fn(() => ({
-              maybeSingle: vi.fn(async () => ({
-                data: { id: 'evt-new-1' } as EventRow,
-                error: null,
-              })),
-            })),
-          })),
-          update: vi.fn(() => ({
-            eq: vi.fn(() => ({
-              select: vi.fn(() => ({
-                maybeSingle: vi.fn(async () => ({
-                  data: state.updateResult || ({} as EventRow),
-                  error: null,
-                })),
-              })),
-            })),
-          })),
-        }
-      }
-
-      if (table === 'event_equipment') {
-        return {
-          select: vi.fn(() => ({
-            eq: vi.fn(() => ({
-              [Symbol.toStringTag]: 'Promise',
-              then: async (cb: any) =>
-                cb?.({
-                  data: state.eventEquipment || [],
-                  error: null,
-                }),
-            })),
-            in: vi.fn(() => ({
-              [Symbol.toStringTag]: 'Promise',
-              then: async (cb: any) =>
-                cb?.({
-                  data: state.eventEquipmentList || [],
-                  error: null,
-                }),
-            })),
-          })),
-        }
-      }
-
-      if (table === 'event_room_blocks') {
-        return {
-          select: vi.fn(() => ({
-            eq: vi.fn(() => ({
-              [Symbol.toStringTag]: 'Promise',
-              then: async (cb: any) =>
-                cb?.({
-                  data: state.eventRoomBlocks || [],
-                  error: null,
-                }),
-            })),
-          })),
-        }
-      }
-
-      if (table === 'rooms' || table === 'tables' || table === 'equipment') {
-        // PR #149 / PR #154 review: updateClubEvent/createClubEvent validate
-        // referenced room/table/equipment ids exist before writing. Default
-        // to "every referenced id exists" so tests in this file that don't
-        // specifically exercise that validation path keep passing unmodified.
-        return {
-          select: vi.fn(() => ({
-            in: vi.fn(async (_col: string, vals: string[]) => ({
-              data: vals.map((id) => ({ id })),
-              error: null,
-            })),
-          })),
-        }
-      }
-
-      return {}
-    }),
-    rpc: vi.fn(async (fn: string, params: any) => {
-      if (fn === 'apply_club_event_room_blocks') {
-        // Simulate RPC call: validate payload includes table_id
-        if (params.p_blocks !== null && Array.isArray(params.p_blocks)) {
-          for (const block of params.p_blocks) {
-            if (!('room_id' in block)) {
-              return { data: null, error: { code: '23502' } }
-            }
-            // OIR-208: table_id is optional (can be null) but must be present in payload
-            if (!('table_id' in block)) {
-              return { data: null, error: { code: '22P02' } }
-            }
-            // OIR-208 regression: the migration's apply_club_event_room_blocks
-            // rejects a block whose table_id does not belong to the given
-            // room_id (mirrors the RAISE EXCEPTION ... USING ERRCODE = '23514'
-            // guard added to the migration).
-            if (block.table_id && TABLE_ROOM_MAP[block.table_id] && TABLE_ROOM_MAP[block.table_id] !== block.room_id) {
-              return { data: null, error: { code: '23514' } }
-            }
-          }
-        }
-        if (params.p_materials !== null && Array.isArray(params.p_materials)) {
-          for (const mat of params.p_materials) {
-            if (!('equipment_id' in mat) || !('quantity' in mat)) {
-              return { data: null, error: { code: '22P02' } }
-            }
-            if (mat.quantity < 1) {
-              return { data: null, error: { code: '23514' } }
-            }
-          }
-        }
-        return {
-          data: state.rpcBlocks || [],
-          error: null,
-        }
-      }
-      return { data: null, error: null }
-    }),
-  }
-}
-
 describe('OIR-208: Unified Events', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -575,10 +420,6 @@ describe('OIR-208: Unified Events', () => {
 
   describe('Materials Validation', () => {
     it('rejects materials with quantity 0', async () => {
-      const mockSupabase = buildSupabaseMock()
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
 
       const { createClubEvent } = await import('@/lib/server/club-events-service')
 
@@ -593,10 +434,6 @@ describe('OIR-208: Unified Events', () => {
     })
 
     it('rejects materials with negative quantity', async () => {
-      const mockSupabase = buildSupabaseMock()
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
 
       const { createClubEvent } = await import('@/lib/server/club-events-service')
 
@@ -611,10 +448,6 @@ describe('OIR-208: Unified Events', () => {
     })
 
     it('rejects non-array materials payload', async () => {
-      const mockSupabase = buildSupabaseMock()
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
 
       const { createClubEvent } = await import('@/lib/server/club-events-service')
 
@@ -629,10 +462,6 @@ describe('OIR-208: Unified Events', () => {
     })
 
     it('rejects materials with missing equipmentId', async () => {
-      const mockSupabase = buildSupabaseMock()
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
 
       const { createClubEvent } = await import('@/lib/server/club-events-service')
 
@@ -671,10 +500,6 @@ describe('OIR-208: Unified Events', () => {
     })
 
     it('rejects duplicate equipment IDs in materials array', async () => {
-      const mockSupabase = buildSupabaseMock()
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        mockSupabase as any,
-      )
 
       const { createClubEvent } = await import('@/lib/server/club-events-service')
 
@@ -800,6 +625,40 @@ describe('OIR-208: Unified Events', () => {
           blocksRooms: true,
         }),
       ).rejects.toMatchObject({ statusCode: 400 })
+    })
+  })
+
+  // Was "Migration Sanity: table_id FK and event_equipment constraints",
+  // reading supabase/migrations/20260704000006_oir208_table_blocks_and_materials.sql
+  // via readFileSync. That directory was deleted (#311, Supabase runtime
+  // removal) once every table/RPC it defined was ported to Neon (#302-#304).
+  // Two of its five assertions still have a live equivalent — the FK and
+  // CHECK constraints below, now defined in lib/db/schema/ — and are kept
+  // here against that file instead. The other three (RLS/GRANT on
+  // service_role, and the apply_club_event_room_blocks RPC's 3-arg
+  // signature) have no live equivalent: Neon has no RLS, and that RPC was
+  // replaced by raw SQL in club-events-service.ts (#304) — so they're
+  // correctly dropped, not just missing.
+  describe('Migration sanity: table_id FK and event_equipment constraints (Neon schema)', () => {
+    const eventRoomBlocksSchema = readFileSync(
+      join(process.cwd(), 'lib/db/schema/009_event_room_blocks.sql'),
+      'utf8',
+    )
+    const eventEquipmentSchema = readFileSync(
+      join(process.cwd(), 'lib/db/schema/010_event_equipment.sql'),
+      'utf8',
+    )
+
+    it('verifies event_room_blocks.table_id has an FK to tables(id) ON DELETE CASCADE', () => {
+      expect(eventRoomBlocksSchema).toContain(
+        'CONSTRAINT "event_room_blocks_table_id_fkey" FOREIGN KEY ("table_id") REFERENCES "tables"("id") ON DELETE CASCADE',
+      )
+    })
+
+    it('verifies event_equipment.quantity has a CHECK (quantity > 0)', () => {
+      expect(eventEquipmentSchema).toContain(
+        'CONSTRAINT "event_equipment_quantity_check" CHECK (("quantity" > 0))',
+      )
     })
   })
 
@@ -943,92 +802,7 @@ describe('OIR-208: Unified Events', () => {
     })
   })
 
-  describe('Migration Sanity: table_id FK and event_equipment constraints', () => {
-    const migrationPath = join(
-      process.cwd(),
-      'supabase/migrations',
-      '20260704000006_oir208_table_blocks_and_materials.sql',
-    )
-    const migrationContent = readFileSync(migrationPath, 'utf8')
-
-    it('verifies event_room_blocks.table_id column exists with FK constraint', () => {
-      expect(migrationContent).toContain(
-        'ADD COLUMN IF NOT EXISTS "table_id" uuid REFERENCES "public"."tables"("id") ON DELETE CASCADE',
-      )
-      // Same migration also guards against a table_id/room_id mismatch at
-      // the RPC level (independent FKs alone can't enforce that pairing).
-      expect(migrationContent).toContain("USING ERRCODE = '23514'")
-      expect(migrationContent).toContain('table_id % does not belong to room_id %')
-    })
-
-    it('verifies event_equipment table has CHECK quantity > 0', () => {
-      expect(migrationContent).toContain('CREATE TABLE IF NOT EXISTS "public"."event_equipment"')
-      expect(migrationContent).toContain('"quantity" integer NOT NULL DEFAULT 1 CHECK ("quantity" > 0)')
-    })
-
-    it('verifies event_equipment RLS is enabled (service_role only)', () => {
-      expect(migrationContent).toContain('ALTER TABLE "public"."event_equipment" ENABLE ROW LEVEL SECURITY')
-      expect(migrationContent).toContain('GRANT ALL ON TABLE "public"."event_equipment" TO "service_role"')
-      // No anon/authenticated policy or grant should exist for this table.
-      expect(migrationContent).not.toMatch(/CREATE POLICY[^;]*"public"\."event_equipment"/)
-      expect(migrationContent).not.toContain('GRANT ALL ON TABLE "public"."event_equipment" TO "anon"')
-      expect(migrationContent).not.toContain('GRANT ALL ON TABLE "public"."event_equipment" TO "authenticated"')
-    })
-
-    it('verifies apply_club_event_room_blocks RPC accepts 3 args', () => {
-      // The 2-arg overload is explicitly dropped so CREATE OR REPLACE defines
-      // a single unambiguous 3-arg function.
-      expect(migrationContent).toContain(
-        'DROP FUNCTION IF EXISTS "public"."apply_club_event_room_blocks"(uuid, jsonb);',
-      )
-      expect(migrationContent).toContain('"p_event_id"  uuid,')
-      expect(migrationContent).toContain('"p_blocks"    jsonb,')
-      expect(migrationContent).toContain('"p_materials" jsonb DEFAULT NULL')
-      // Grants/revokes target the 3-arg signature specifically.
-      expect(migrationContent).toContain(
-        'GRANT EXECUTE ON FUNCTION "public"."apply_club_event_room_blocks"(uuid, jsonb, jsonb) TO "service_role"',
-      )
-    })
-
-    it('verifies RPC uses SECURITY DEFINER with pinned search_path', () => {
-      expect(migrationContent).toContain('SECURITY DEFINER')
-      expect(migrationContent).toContain("SET search_path TO 'public', 'pg_catalog'")
-    })
-  })
-
   describe('Availability table-granularity (highest-risk)', () => {
-    // Shared query-chain stub: every method (eq/in/lt/gt/etc.) returns the
-    // same thenable object so callers can `await` at whatever point their
-    // real query chain happens to end — the different service files under
-    // test (tables-service.ts, rooms-service.ts, reservations-service.ts,
-    // saved-games-service.ts) all build slightly different chains.
-    function chainThen(result: { data: unknown; error: unknown }) {
-      const chain: any = {
-        eq: () => chain,
-        neq: () => chain,
-        in: () => chain,
-        lt: () => chain,
-        gt: () => chain,
-        lte: () => chain,
-        gte: () => chain,
-        is: () => chain,
-        order: () => chain,
-        limit: () => chain,
-        maybeSingle: async () => result,
-        single: async () => result,
-        then: (resolve: any, reject: any) => Promise.resolve(result).then(resolve, reject),
-      }
-      return chain
-    }
-
-    function mockDatabaseNowRpc() {
-      return vi.fn(async (fn: string) => (
-        fn === 'get_database_time'
-          ? { data: '2026-04-20T10:00:00.000Z', error: null }
-          : { data: null, error: null }
-      ))
-    }
-
     type MockTable = { id: string; room_id: string; type: string }
 
     function setupTableAvailabilitySqlMock(
@@ -1208,109 +982,6 @@ describe('OIR-208: Unified Events', () => {
       'res-table-2': { id: 'res-table-2', room_id: RESERVATION_ROOM, type: 'small' },
     }
 
-    function buildReservationSessionClient(config: { insertSpy?: (payload: any) => void; existingReservation?: any }) {
-      return {
-        from: vi.fn((table: string) => {
-          if (table === 'tables') {
-            return {
-              select: vi.fn(() => ({
-                eq: vi.fn((_column: string, value: string) => ({
-                  maybeSingle: vi.fn(async () => ({ data: RESERVATION_TABLES[value] ?? null, error: null })),
-                })),
-              })),
-            }
-          }
-          if (table === 'reservations') {
-            return {
-              select: vi.fn(() => chainThen({ data: [], error: null })), // no user-slot overlap
-              insert: vi.fn((payload: any) => {
-                config.insertSpy?.(payload)
-                return {
-                  select: vi.fn(() => ({
-                    single: vi.fn(async () => ({
-                      data: {
-                        id: 'new-reservation-id',
-                        table_id: payload.table_id,
-                        user_id: payload.user_id,
-                        date: payload.date,
-                        start_time: `${payload.start_time}:00`,
-                        end_time: payload.end_time === '24:00' ? '24:00:00' : `${payload.end_time}:00`,
-                        status: 'active',
-                        surface: payload.surface ?? null,
-                        activated_at: null,
-                        created_at: '2026-04-01T00:00:00.000Z',
-                      },
-                      error: null,
-                    })),
-                  })),
-                }
-              }),
-              update: vi.fn((payload: any) => ({
-                eq: vi.fn(() => ({
-                  select: vi.fn(() => ({
-                    single: vi.fn(async () => ({
-                      data: { ...config.existingReservation, ...payload },
-                      error: null,
-                    })),
-                  })),
-                })),
-              })),
-            }
-          }
-          return {}
-        }),
-        rpc: mockDatabaseNowRpc(),
-      }
-    }
-
-    function buildReservationAdminClient(config: {
-      eventBlocks: Array<{ id: string; table_id: string | null }>
-      existingReservation?: any
-    }) {
-      return {
-        from: vi.fn((table: string) => {
-          if (table === 'event_room_blocks') {
-            return { select: vi.fn(() => chainThen({ data: config.eventBlocks, error: null })) }
-          }
-          if (table === 'saved_games') {
-            return { select: vi.fn(() => chainThen({ data: [], error: null })) }
-          }
-          if (table === 'reservation_equipment') {
-            return {
-              select: vi.fn(() => chainThen({ data: [], error: null })),
-              delete: vi.fn(() => ({ eq: vi.fn(async () => ({ error: null })) })),
-            }
-          }
-          if (table === 'reservations') {
-            return {
-              select: vi.fn(() => {
-                const filters: Record<string, unknown> = {}
-                const chain: any = {
-                  eq: (column: string, value: unknown) => {
-                    filters[column] = value
-                    return chain
-                  },
-                  neq: () => chain,
-                  in: () => chain,
-                  is: () => chain,
-                  order: () => chain,
-                  maybeSingle: async () => ({
-                    data: filters.id && config.existingReservation?.id === filters.id ? config.existingReservation : null,
-                    error: null,
-                  }),
-                  then: (resolve: any, reject: any) =>
-                    Promise.resolve({ data: [], error: null }).then(resolve, reject),
-                }
-                return chain
-              }),
-            }
-          }
-          return {}
-        }),
-        rpc: mockDatabaseNowRpc(),
-      }
-    }
-
     function setupReservationServiceSqlMock(config: {
       eventBlocks: Array<{ id: string; table_id: string | null }>
       existingReservation?: Record<string, unknown>
@@ -1379,12 +1050,6 @@ describe('OIR-208: Unified Events', () => {
     it('hasEventBlockConflict: detects conflict on exact table when table_id set', async () => {
       const eventBlocks = [{ id: 'blk-5', table_id: 'res-table-1' }]
       setupReservationServiceSqlMock({ eventBlocks })
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        buildReservationSessionClient({}) as any,
-      )
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        buildReservationAdminClient({ eventBlocks }) as any,
-      )
 
       const { createReservationForSession } = await import('@/lib/server/reservations-service')
 
@@ -1399,12 +1064,6 @@ describe('OIR-208: Unified Events', () => {
     it('hasEventBlockConflict: no conflict for sibling table when table_id set', async () => {
       const eventBlocks = [{ id: 'blk-6', table_id: 'res-table-1' }]
       setupReservationServiceSqlMock({ eventBlocks })
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        buildReservationSessionClient({}) as any,
-      )
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        buildReservationAdminClient({ eventBlocks }) as any,
-      )
 
       const { createReservationForSession } = await import('@/lib/server/reservations-service')
 
@@ -1420,12 +1079,6 @@ describe('OIR-208: Unified Events', () => {
     it('hasEventBlockConflict: conflict on any table when table_id is null', async () => {
       const eventBlocks = [{ id: 'blk-7', table_id: null }]
       setupReservationServiceSqlMock({ eventBlocks })
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        buildReservationSessionClient({}) as any,
-      )
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        buildReservationAdminClient({ eventBlocks }) as any,
-      )
 
       const { createReservationForSession } = await import('@/lib/server/reservations-service')
 
@@ -1533,12 +1186,6 @@ describe('OIR-208: Unified Events', () => {
       const insertSpy = vi.fn()
       const eventBlocks = [{ id: 'blk-9', table_id: 'res-table-1' }]
       setupReservationServiceSqlMock({ eventBlocks, insertSpy })
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        buildReservationSessionClient({ insertSpy }) as any,
-      )
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        buildReservationAdminClient({ eventBlocks }) as any,
-      )
 
       const { createReservationForSession } = await import('@/lib/server/reservations-service')
 
@@ -1556,12 +1203,6 @@ describe('OIR-208: Unified Events', () => {
       const insertSpy = vi.fn()
       const eventBlocks = [{ id: 'blk-10', table_id: 'res-table-1' }]
       setupReservationServiceSqlMock({ eventBlocks, insertSpy })
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        buildReservationSessionClient({ insertSpy }) as any,
-      )
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        buildReservationAdminClient({ eventBlocks }) as any,
-      )
 
       const { createReservationForSession } = await import('@/lib/server/reservations-service')
 
@@ -1592,12 +1233,6 @@ describe('OIR-208: Unified Events', () => {
       }
       const eventBlocks = [{ id: 'blk-11', table_id: 'res-table-1' }]
       setupReservationServiceSqlMock({ eventBlocks, existingReservation })
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerClient.mockResolvedValue(
-        buildReservationSessionClient({ existingReservation }) as any,
-      )
-      vi.mocked(await import('@/lib/supabase/server')).createSupabaseServerAdminClient.mockReturnValue(
-        buildReservationAdminClient({ eventBlocks, existingReservation }) as any,
-      )
 
       const { updateReservationForSession } = await import('@/lib/server/reservations-service')
 

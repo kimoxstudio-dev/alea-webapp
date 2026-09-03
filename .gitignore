@@ -18,8 +18,6 @@ playwright-report/
 .playwright-mcp/
 
 # Supabase local runtime artifacts (not migrations)
-supabase/.branches/
-supabase/.temp/
 
 # Editor
 .vscode/

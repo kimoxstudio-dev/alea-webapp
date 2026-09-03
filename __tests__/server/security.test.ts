@@ -52,8 +52,8 @@ describe('server security helpers', () => {
     vi.stubEnv('COOKIE_SECURE', 'false')
     const security = await import('@/lib/server/security')
 
-    expect(security.getSupabaseCookieOptions()).toMatchObject({
-      httpOnly: true,
+    expect(security.getCsrfCookieOptions()).toMatchObject({
+      httpOnly: false,
       sameSite: 'lax',
       secure: false,
       path: '/',
@@ -64,8 +64,8 @@ describe('server security helpers', () => {
     vi.stubEnv('COOKIE_SECURE', 'true')
     const security = await import('@/lib/server/security')
 
-    expect(security.getSupabaseCookieOptions()).toMatchObject({
-      httpOnly: true,
+    expect(security.getCsrfCookieOptions()).toMatchObject({
+      httpOnly: false,
       sameSite: 'lax',
       secure: true,
       path: '/',
@@ -77,8 +77,8 @@ describe('server security helpers', () => {
     vi.stubEnv('COOKIE_SECURE', undefined)
     const security = await import('@/lib/server/security')
 
-    expect(security.getSupabaseCookieOptions()).toMatchObject({
-      httpOnly: true,
+    expect(security.getCsrfCookieOptions()).toMatchObject({
+      httpOnly: false,
       sameSite: 'lax',
       secure: true,
       path: '/',
@@ -90,8 +90,8 @@ describe('server security helpers', () => {
     vi.stubEnv('COOKIE_SECURE', undefined)
     const security = await import('@/lib/server/security')
 
-    expect(security.getSupabaseCookieOptions()).toMatchObject({
-      httpOnly: true,
+    expect(security.getCsrfCookieOptions()).toMatchObject({
+      httpOnly: false,
       sameSite: 'lax',
       secure: false,
       path: '/',

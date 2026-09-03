@@ -17,10 +17,6 @@ import { isPendingReservationExpired } from '@/lib/server/pending-reservation-ex
  * `lib/db/client.ts`, matching the established style from `auth-service.ts`
  * (#299) and `database-time.ts` (#308). Neon has no RLS, so the old
  * admin-vs-user-scoped client distinction collapses to a single `sql`.
- *
- * Out of scope (left untouched, still Supabase-based): default-equipment
- * resolution (`lib/server/equipment-service.ts`) and `regenerateQrCodes`
- * (`lib/server/tables-service.ts`).
  */
 
 type RoomRow = {
