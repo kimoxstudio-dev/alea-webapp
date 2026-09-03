@@ -1,5 +1,5 @@
 ---
-description: Analyse a Claude Code conversation from its transcript — this one by default, or an earlier one by id — reporting which skills were available, which fired, whether they were followed, and where the understanding broke down. Use when asked to review, grade or debug how a session went, or why a skill did not fire.
+description: Analyse a Claude Code conversation from its transcript — this one by default, or an earlier one by id — reporting where the session's time went, which skills fired, and which were followed. Use when asked to review, grade or debug how a session went, or why a skill did not fire.
 disable-model-invocation: true
 ---
 
@@ -10,251 +10,110 @@ disable-model-invocation: true
 # Analysing a conversation
 
 What to look at: `$ARGUMENTS` — a session id, a path to a `.jsonl`, or words
-describing the conversation. **Empty means this one**, the conversation you
-are in, which is the usual case: something just went wrong and it is still
-fresh.
+describing the conversation, optionally followed by what to focus on. **Empty
+means this one**, the conversation you are in, which is the usual case:
+something just went wrong and it is still fresh.
 
-This grades **the setup**, not the person and not the model. The output worth
-producing is a change to a `SKILL.md`: a description that did not trigger, a
-rule that was ambiguous, two skills claiming the same ground.
+**You do not read the transcript. `kx-analyst` does.** It is usually larger
+than the conversation it is about, and reading it here would evict the thing
+being analysed. Your job is three steps: pick the target, say what this cannot
+see, and turn what comes back into words.
 
-## Say this before you start
-
-Print it, wait for a go-ahead, then repeat it at the top of the report. A
-caveat that arrives separately from the findings is a caveat nobody read.
-
-> This report is read off a transcript. It sees what was invoked and what was
-> written, not what was understood. Two things it cannot do:
->
-> **It cannot tell a bad skill from a bad session.** If the model driving that
-> conversation was not strong enough for the work, everything looks like a
-> skill failure — a rule ignored, a step skipped, a question misread. Rewriting
-> the skill then fixes nothing. This session ran on `<model>`.
->
-> **It cannot see a skill that was followed without being invoked.** Skills
-> preloaded into a subagent and rules absorbed from a description leave no
-> mark. Absence here is absence of evidence.
-
-Fill in `<model>` from the transcript before printing it. Read, never
-assumed — the whole point of the warning is that it names the actual model,
-and a generic disclaimer is one people learn to scroll past.
-
-**When the session under analysis is this one, add a third:**
-
-> **It is grading its own work.** The same model that made these choices is
-> judging them, so a decision that felt right at the time will read as right
-> here. What survives that is what the transcript contradicts: a rule quoted
-> beside the action that broke it. Take a conclusion with no quote in it as
-> the weakest thing in this report.
->
-> The last turn is missing — the file is written as it goes, so everything up
-> to `<last timestamp>` is readable and this exchange is not in it yet.
-
-A caveat, not a refusal. Analysing the conversation you are in is the main
-use of this: something just went wrong, it is fresh, and the person watching
-it happen is still here to say what they meant. An earlier session is the
-weaker evidence, not the stronger — nobody is left to correct your reading of
-it.
-
-## Finding the transcript
+## 1. Pick the target, and never substitute another
 
 Transcripts live one directory per working directory, with `/` and `.` turned
 into `-`:
 
 ```bash
 DIR=~/.claude/projects/$(pwd | sed 's|[/.]|-|g')
-ls -t "$DIR"/*.jsonl
+ls -t -- "$DIR"/*.jsonl
 ```
 
 **Every one of those paths starts with `-`.** `grep`, `jq` and the rest read
 it as a flag and either fail or print their help — which looks like an empty
-result, not an error. Pass `--` before the filename, or prefix it with `./`.
+result, not an error. Pass `--` before the filename.
 
-**With no argument, the session you are in is the target.** It is the one
-being appended to, so it is the newest by modification time. Confirm it rather
-than assume it: its tail holds the invocation you are answering.
+With no argument, the target is the session you are in: the one being appended
+to, so the newest by modification time. Confirm rather than assume — its tail
+holds the invocation you are answering:
 
 ```bash
-F=$(ls -t "$DIR"/*.jsonl | head -1)
+F=$(ls -t -- "$DIR"/*.jsonl | head -1)
 tail -3 -- "$F" | grep -c 'kx-analyze'
 ```
 
 With an argument, match it against the first human turn of each candidate and
 say which you picked.
 
-**Never analyse a session other than the one asked for.** If the target cannot
-be read, say that and stop. Substituting the next transcript along produces a
-careful report about a conversation nobody asked about, and it is worse than
-no report: it looks like an answer. The same goes for reading the others to
-see what is there — the person named one, and the rest are not yours to open.
+**If you cannot read the target, say so and stop.** Do not move to the next
+transcript along. A careful report about a conversation nobody asked about is
+worse than no report, because it reads as an answer. The others are not yours
+to open either.
 
-## What the file holds
+## 2. Say what this cannot see, then wait
 
-One JSON object per line. The fields that matter:
+Print it, get a go-ahead, and repeat it above the report. A caveat that
+arrives separately from the findings is a caveat nobody read.
 
-| | |
-|---|---|
-| `.type` | `user`, `assistant`, `attachment`, `system` |
-| `.message.model`, `.effort` | on every assistant line |
-| `.isSidechain` | `true` = a subagent's turn, in the same file |
-| `.timestamp`, `.version`, `.gitBranch`, `.cwd` | per line |
+> This report is read off a transcript. It sees what was invoked and what was
+> written, not what was understood. Two things it cannot do:
+>
+> **It cannot tell a bad skill from a bad session.** If the model driving that
+> conversation was not strong enough for the work, everything looks like a
+> skill failure — a rule ignored, a step skipped, a question misread.
+> Rewriting the skill then fixes nothing. This session ran on `<model>` at
+> `<effort>`.
+>
+> **It cannot see a skill that was followed without being invoked.** Skills
+> preloaded into a subagent and rules absorbed from a description leave no
+> mark. Absence here is absence of evidence.
 
-Everything below is one command. Run them, then read the transcript itself
-around anything that stands out — the counts locate the moment, they do not
-explain it.
-
-**Which model, at what effort.** The first thing, because it frames every
-finding after it:
+Read `<model>` and `<effort>` from the file rather than assuming them — a
+disclaimer that names nothing is one people learn to scroll past:
 
 ```bash
 jq -r 'select(.type=="assistant") | [.message.model, .effort] | @tsv' -- "$F" \
   | sort | uniq -c
 ```
 
-More than one model means the session changed mid-way, and findings either
-side of that point are not comparable.
+**When the target is this session, add a third:**
 
-**Which skills were available.**
+> **It is grading its own work.** The same model that made these choices is
+> judging them, so a decision that felt right at the time will read as right
+> here. What survives that is what the transcript contradicts: a rule quoted
+> beside the action that broke it. Take any conclusion with no quote in it as
+> the weakest thing in this report.
+>
+> The last turn is missing. The file is written as it goes, so everything up
+> to `<last timestamp>` is readable and this exchange is not in it yet.
 
-```bash
-jq -r 'select(.attachment.type=="skill_listing") | .attachment.names[]' -- "$F" \
-  | sort -u
-```
+A caveat, not a refusal. Analysing the conversation you are in is the main
+use of this: it is fresh, and the person who watched it happen is still here
+to say what they meant. An earlier session is the weaker evidence — nobody is
+left to correct your reading of it.
 
-**Which fired.**
+## 3. Delegate, then report
 
-```bash
-jq -r 'select(.type=="assistant") | .message.content[]?
-       | select(.type=="tool_use" and .name=="Skill")
-       | "\(.input.skill)\t\(.input.args // "")"' -- "$F"
+One `kx-analyst`, given the path and nothing it would have to guess:
 
-grep -o '<command-name>[^<]*</command-name>' -- "$F" | sort | uniq -c
-```
+- the absolute path to the `.jsonl`
+- whether it is analysing the live session, and if so, that the last turn is
+  absent
+- the focus from `$ARGUMENTS`, if there was one
+- where the skills it will quote actually live: `.claude/skills/kx-<id>/`
 
-Two mechanisms, and they are not the same event. The tool call is the model
-deciding; the command name is the person deciding. A skill that only ever
-appears the second way has a description that does not work.
+It returns the tables and the findings. Print them as they came — they are
+already terse, and a summary of a ranked list is a worse ranked list. Add only
+what it could not know: what the person said this session was about, and
+whether a finding matches something they have already told you.
 
-**What the person actually said.** Filter the noise or you will count the
-harness as a participant:
+**Never fill in a gap it reported.** If it says an episode was indexed and not
+read, that is the state, and answering for it from your own memory of the
+session is the one thing self-analysis makes easy and worthless.
 
-```bash
-jq -r 'select(.type=="user") | .message.content as $c
-       | (if ($c|type)=="string" then $c
-          else ([$c[]? | select(.type=="text") | .text] | join("\n")) end)
-       | select(length > 0)' -- "$F" \
-  | grep -v '^<task-notification>\|^<system-reminder>\|^<local-command'
-```
+## Then
 
-**Where it went wrong.**
-
-```bash
-# failed tool calls
-jq -r 'select(.type=="user") | .message.content[]?
-       | select(.type=="tool_result" and .is_error==true)
-       | (.content | tostring | .[0:300])' -- "$F"
-
-# runs of the same tool, unsorted — a long run is flailing
-jq -r 'select(.type=="assistant") | .message.content[]?
-       | select(.type=="tool_use") | .name' -- "$F" | uniq -c
-```
-
-## The four questions
-
-### 1. Which skill should have fired and did not
-
-The highest-value finding, and the only one the transcript answers cleanly.
-Take the available list, take the work that was done, and name every skill
-whose territory the work was in that never appears.
-
-Then say **why** it did not fire. The description is the only thing loaded
-before invocation, so that is where the answer is. Open it and quote it:
-
-```bash
-sed -n '1,5p' .claude/skills/kx-<id>/SKILL.md
-```
-
-A description saying what the skill *is* does not trigger. One saying when to
-use it does. If the words in the description and the words the person used
-have nothing in common, that is the finding, and the fix is one line.
-
-### 2. Whether an invoked skill was followed
-
-For each one that fired, open its `SKILL.md` and read the turns after the
-invocation against it.
-
-**Quote both sides or do not report it.** The rule as written, and the action
-as taken. "Did not follow `kx-standards`" is unarguable and therefore
-worthless; "`kx-commit` says never a `Co-Authored-By` trailer, and the commit
-at 14:02 has one" is a finding somebody can act on.
-
-Follow the transcript's own order. A rule broken before the skill was invoked
-is not the skill failing.
-
-### 3. Where the understanding broke
-
-Look for the person correcting course. The shapes:
-
-- A turn that repeats the previous one in different words. The first was not
-  understood.
-- "no", "that is not what I asked", a request re-scoped after work started.
-- The assistant reversing itself with nothing new in between.
-- A long run of one tool with small variations — searching for something it
-  had already been told.
-
-For each, count the turns between the misunderstanding and the correction.
-That number is the cost, and it is what decides whether the skill is worth
-changing.
-
-Then ask the question that matters: **was the answer already written down?**
-If a skill said it and was not read, that is a triggering problem. If nothing
-said it, that is a gap. If a skill said it ambiguously, that is the one worth
-fixing — and quote the ambiguous line.
-
-### 4. Whether two skills collided
-
-Two descriptions claiming the same ground is invisible from inside: the model
-invokes whichever it matched first and nothing reports the other. If the
-session invoked one skill where another was the better fit, compare the two
-descriptions and say which words overlap.
-
-## Reporting it
-
-The warning first, with the real model name in it. Then:
-
-| skill | available | invoked | followed | evidence |
-|---|---|---|---|---|
-
-`followed` is `yes` / `no` / **`not visible`** — and `not visible` is the
-common case, not a hedge. A skill preloaded into a subagent, or one whose
-rules were absorbed from its description, leaves nothing to check. Printing
-that as `yes` is the exact failure `kx-reporting` is about: a thing nobody
-looked at reading as a thing that passed.
-
-Then the findings, worst first, each one: what happened, what it cost in
-turns, and the line of the `SKILL.md` to change. A finding with no proposed
-edit is an observation — say so and keep it separate.
-
-**Do not edit any skill.** This reads and reports.
-
-The copy under `.claude/skills/` is generated — an edit there is overwritten
-by the next `kx sync`, and the finding is lost with it. The source lives in
-the kx repository, and a change to it reaches every project on the next sync.
-That is a decision somebody makes, not a fix you apply while reading a
-transcript. Name the file and the line; leave the edit.
-
-## Never
-
-- **Never infer intent from a tool call.** The transcript records what ran,
-  not why. Where the reason matters and is not written down, say it is not
-  written down.
-- **Never grade the human.** "The request was unclear" is not a finding
-  anybody can use. What the setup should have done about an unclear request
-  is.
-- **Never quote a credential.** Transcripts hold whatever was on screen,
-  including output from commands that print tokens. Anything that looks like
-  one is named by its variable, never by its value.
-- **Never report a single session as a pattern.** One conversation is one
-  data point. A description that failed to trigger once may have triggered
-  fine ten times. Say how many sessions the claim rests on, and if it is one,
-  say that.
+The findings name files and lines in the kx repository. Nothing here edits
+them: the copies under `.claude/skills/` are generated and overwritten by the
+next sync, and a change to the source reaches every project. Offer the edit as
+the next step and let somebody decide.

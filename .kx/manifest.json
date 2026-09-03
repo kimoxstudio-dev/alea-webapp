@@ -2,11 +2,12 @@
   "version": 1,
   "project": "alea",
   "files": {
+    ".claude/agents/kx-analyst.md": "6ed7b688a1c63fe8",
     ".claude/agents/kx-developer.md": "93550cb858fc88a9",
     ".claude/agents/kx-documenter.md": "928695648be1409d",
     ".claude/agents/kx-reviewer.md": "c323e2860e8059ff",
     ".claude/agents/kx-tech-debt.md": "8a84af903cd62f53",
-    ".claude/skills/kx-analyze/SKILL.md": "c2d84276d64b2091",
+    ".claude/skills/kx-analyze/SKILL.md": "7c5d3f414c8ffb02",
     ".claude/skills/kx-cli/SKILL.md": "e49896c985df2b8d",
     ".claude/skills/kx-commit/SKILL.md": "21bcfdd19f5d999c",
     ".claude/skills/kx-create-design-from-scratch/SKILL.md": "6c4a5db0f1e2f8a1",
