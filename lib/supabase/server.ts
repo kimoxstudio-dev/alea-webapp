@@ -24,7 +24,8 @@ export async function createSupabaseServerClient() {
           )
         } catch {
           // setAll called from a Server Component — cookies are read-only.
-          // Middleware handles session refresh.
+          // Session refresh cookies set here are silently dropped; the next
+          // Route Handler or Server Action call refreshes them instead.
         }
       },
     },
