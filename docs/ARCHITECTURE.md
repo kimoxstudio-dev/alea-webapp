@@ -85,7 +85,7 @@ alea-webapp/
 │   ├── providers.tsx           # React provider tree (QueryClientProvider, AuthProvider, etc.)
 │   └── utils.ts                # Shared utility functions
 ├── messages/                   # i18n JSON files (es.json, en.json)
-├── middleware.ts               # i18n routing, Supabase token refresh side effect, CSRF cookie setup
+├── middleware.ts               # i18n routing, CSRF cookie setup
 ├── supabase/                   # Supabase project config
 │   ├── config.toml             # Local dev config
 │   └── migrations/             # SQL migration files (versioned)
@@ -99,7 +99,7 @@ alea-webapp/
 `lib/server/` is the application's server-side logic layer. It replaces the former NestJS backend.
 
 All modules in this layer:
-- Are intended to be imported only from Route Handlers (`app/api/`) or Server Components. `lib/server/security.ts` is additionally imported from `middleware.ts` for the `ensureCsrfCookie` and `getSupabaseCookieOptions` helpers.
+- Are intended to be imported only from Route Handlers (`app/api/`) or Server Components. `lib/server/security-edge.ts` is additionally imported from `middleware.ts` for the `ensureCsrfCookie` helper.
 - Never run in the browser.
 - Call Supabase directly using the server-side client factories from `lib/supabase/server.ts`.
 - Throw `ServiceError` instances via the `serviceError()` helper — never raw strings.
@@ -129,7 +129,7 @@ Auth is handled by Supabase Auth with server-side session management via HTTP-on
 2. The Route Handler calls `enforceMutationSecurity()` (CSRF double-submit + same-origin `Origin` + Fetch Metadata check) and `enforceRateLimit()` before any service logic runs. If either check fails, a 403 or 429 response is returned immediately.
 3. Route Handler calls `login()` from `auth-service.ts`. The service resolves the profile by member number using the admin Supabase client (which bypasses RLS), then calls `supabase.auth.signInWithPassword()` with the resolved email address.
 4. Supabase writes session tokens into cookies. The Route Handler captures these via `createSupabaseRouteHandlerClient` and applies them to the `NextResponse` using `applyCookies()`.
-5. On subsequent page requests, `middleware.ts` calls `supabase.auth.getUser()` as a side effect. The return value is discarded. The call exists solely to allow `@supabase/ssr` to silently refresh an expired access token and write updated session cookies into the response. Middleware does not use the auth result for routing decisions.
+5. `middleware.ts` no longer refreshes the Supabase session cookie (removed in #363, dead weight once Clerk owns request auth context) — it only handles locale routing and CSRF cookie setup. Nothing depends on it: session identity comes from Clerk (`lib/server/auth.ts`), and `createSupabaseServerClient()` has no remaining callers.
 6. Protected API routes enforce authentication and authorization per route via `requireAuth()` and `requireAdmin()` from `lib/server/auth.ts`. These helpers read the session from the incoming request cookies and look up the user's role from the `profiles` table.
 7. Logout calls `supabase.auth.signOut()`, which invalidates the session and clears the auth cookie(s).
 
@@ -208,17 +208,17 @@ The admin client bypasses all RLS policies and must never be imported in Client 
 
 ## Middleware (`middleware.ts`)
 
-`middleware.ts` runs on matched page and API requests (Edge Runtime). Its matcher skips Next.js/Vercel internals and static files, while `middleware.ts` returns API requests before locale routing and Supabase refresh. This still lets Clerk initialize request auth context for Route Handlers.
+`middleware.ts` runs on matched page and API requests (Edge Runtime). Its matcher skips Next.js/Vercel internals and static files, while `middleware.ts` returns API requests before locale routing and CSRF cookie setup. This still lets Clerk initialize request auth context for Route Handlers.
 
 What middleware does:
 
 1. **Locale routing**: Delegates to `next-intl/middleware` (`handleI18nRouting`) to inject locale prefixes and resolve the active locale.
-2. **Supabase token refresh (side effect)**: Calls `supabase.auth.getUser()`. The return value is not used. The call exists to allow `@supabase/ssr` to silently refresh an expired access token and write updated session cookies into the response.
-3. **CSRF cookie setup**: Calls `ensureCsrfCookie()` to set a non-`httpOnly` CSRF token cookie if one is not already present or is shorter than 32 characters. The client reads this cookie and sends it as the `x-csrf-token` header on mutations.
+2. **CSRF cookie setup**: Calls `ensureCsrfCookie()` to set a non-`httpOnly` CSRF token cookie if one is not already present or is shorter than 32 characters. The client reads this cookie and sends it as the `x-csrf-token` header on mutations.
 
 What middleware does NOT do:
 - It does not enforce authentication or redirect unauthenticated users. Protected Server Components call `getSessionFromServerCookies()` and Route Handlers call `requireAuth()` / `requireAdmin()` at the resource boundary.
-- It does not run locale routing, Supabase refresh, or CSRF setup for `/api/` routes.
+- It does not refresh the Supabase session cookie (removed in #363). Nothing depends on it — session identity comes from Clerk (`lib/server/auth.ts`), and `createSupabaseServerClient()` has no remaining callers.
+- It does not run locale routing or CSRF setup for `/api/` routes.
 
 ---
 

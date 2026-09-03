@@ -1,10 +1,8 @@
 import createMiddleware from 'next-intl/middleware'
 import { clerkMiddleware } from '@clerk/nextjs/server'
-import { createServerClient, type CookieOptions } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
-import { ensureCsrfCookie, getSupabaseCookieOptions } from './lib/server/security-edge'
+import { ensureCsrfCookie } from './lib/server/security-edge'
 import { locales, defaultLocale } from './lib/i18n/config'
-import { getSupabaseUrl, getSupabasePublishableKey } from './lib/supabase/config.client'
 
 const handleI18nRouting = createMiddleware({
   locales,
@@ -12,32 +10,8 @@ const handleI18nRouting = createMiddleware({
   localePrefix: 'always',
 })
 
-function createMiddlewareSupabaseClient(request: NextRequest, response: NextResponse) {
-  return createServerClient(
-    getSupabaseUrl(),
-    getSupabasePublishableKey(),
-    {
-      cookieOptions: getSupabaseCookieOptions(),
-      cookies: {
-        getAll() {
-          return request.cookies.getAll()
-        },
-        setAll(cookiesToSet: { name: string; value: string; options: CookieOptions }[]) {
-          cookiesToSet.forEach(({ name, value }) => {
-            request.cookies.set(name, value)
-          })
-
-          cookiesToSet.forEach(({ name, value, options }) => {
-            response.cookies.set(name, value, options)
-          })
-        },
-      },
-    },
-  )
-}
-
 /**
- * Clerk + Supabase middleware.
+ * Clerk middleware + CSRF cookie issuance.
  *
  * Clerk is installed and wired here (#297) so `auth()` / `currentUser()`
  * (lib/server/session.ts) are populated. Protected Server Components and
@@ -50,17 +24,16 @@ function createMiddlewareSupabaseClient(request: NextRequest, response: NextResp
  * `currentUser()` (lib/server/session.ts) are populated for any Route
  * Handler that opts into reading a Clerk session.
  *
- * The Supabase auth-cookie refresh (`supabase.auth.getUser()`) that existed
- * before Clerk was introduced is preserved unchanged: several services not
- * yet migrated off Supabase (e.g. `lib/server/rooms-service.ts`,
- * `lib/server/equipment-service.ts`) still read a user-scoped Supabase
- * client that depends on this cookie refresh.
+ * The handler also calls `ensureCsrfCookie()` on page requests, issuing a
+ * non-`httpOnly` CSRF token cookie (or reusing a valid existing one) that
+ * `enforceMutationSecurity()` (lib/server/security.ts) later checks against
+ * the `x-csrf-token` header on unsafe route-handler requests.
  *
- * `/api` requests are intentionally routed around the next-intl rewrite and
- * Supabase cookie refresh (they are not locale-prefixed pages and already
- * resolve their own Clerk/Supabase session per-request via `requireAuth()` /
- * `requireAdmin()` in `lib/server/auth.ts`). They only need
- * `clerkMiddleware()` so Clerk's auth context is populated.
+ * `/api` requests are intentionally routed around the next-intl rewrite
+ * (they are not locale-prefixed pages and already resolve their own
+ * Clerk session per-request via `requireAuth()` / `requireAdmin()` in
+ * `lib/server/auth.ts`). They only need `clerkMiddleware()` so Clerk's
+ * auth context is populated.
  */
 export default clerkMiddleware(async (_auth, request: NextRequest) => {
   if (request.nextUrl.pathname.startsWith('/api')) {
@@ -68,9 +41,6 @@ export default clerkMiddleware(async (_auth, request: NextRequest) => {
   }
 
   const response = handleI18nRouting(request)
-  const supabase = createMiddlewareSupabaseClient(request, response)
-
-  await supabase.auth.getUser()
 
   return ensureCsrfCookie(request, response)
 })
