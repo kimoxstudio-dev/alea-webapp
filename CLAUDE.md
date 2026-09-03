@@ -75,7 +75,7 @@ Before `security-reviewer` opens a PR, it must run `/code-review` (medium effort
 ## Key conventions
 
 - All reads and writes use the tagged-template `sql` export from `lib/db/client.ts` (Neon). Neon has no RLS, so the old admin-vs-user-scoped client distinction collapses to a single `sql` client.
-- All privilege checks (ownership + role) must live in the **service layer**, never in route handlers
+- Admin-only route gating uses `requireAdmin()` at the route boundary; per-resource ownership and role checks live in the **service layer**, never duplicated ad hoc in route handlers
 - i18n keys must maintain full parity between `en.json` and `es.json`
 - Test files must be excluded from `tsconfig.app.json`
 - Test files are owned exclusively by `qa-engineer` — `software-engineer` must never create or modify test files
