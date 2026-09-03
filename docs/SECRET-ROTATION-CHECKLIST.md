@@ -1,7 +1,8 @@
 # Secret Rotation Checklist (Pre-Migration, P0)
 
 This is an investigation + checklist artifact only. **No agent may rotate any secret.**
-Rotation is a manual, user-executed action in the Vercel and Supabase dashboards.
+Rotation is a manual, user-executed action in the Vercel and Clerk dashboards (and the Neon
+console, for `DATABASE_URL`).
 Variable **names** only are referenced below — no actual secret values appear in this
 document or were printed/logged while producing it.
 
@@ -12,72 +13,113 @@ Related issue spec: `docs/issues/migration-pre-04-rotate-p0-secrets.md`
 ## 1. `AUTH_SESSION_SECRET` — dead / legacy config
 
 - **Where it is set:** Not present in `.env.example`. Historically would have been set in
-  `.env.local` for local dev / Vercel project env for deploy, under a pre-M3 (pre-Supabase)
-  session implementation.
+  `.env.local` for local dev / Vercel project env for deploy, under a pre-M3 (pre-Clerk,
+  pre-Supabase) session implementation.
 - **Code consumers:** **None.** A repo-wide grep for the literal string `AUTH_SESSION_SECRET`
-  across all file types (excluding `node_modules` and `.git`) found matches only in
-  `docs/ROLLBACK.md` (lines 122, 127, 141, 151). No `.ts`/`.tsx`/`.js`/`.mjs`/`.cjs` file reads
-  or references `process.env.AUTH_SESSION_SECRET` or the string `AUTH_SESSION_SECRET` in any
-  form.
+  across all file types (excluding `node_modules` and `.git`) found no
+  `.ts`/`.tsx`/`.js`/`.mjs`/`.cjs` file that reads or references
+  `process.env.AUTH_SESSION_SECRET` or the string `AUTH_SESSION_SECRET` in any form — the
+  remaining matches are documentation only: `docs/ROLLBACK.md` (lines 121, 132, 146, 148, 156),
+  `docs/MIGRATION-supabase-to-neon.md:52,93`, and
+  `docs/issues/migration-pre-04-rotate-p0-secrets.md:1,3,4,5`.
 - **`.env.example` status:** Confirmed **not present** — there is nothing to remove there.
-- **What breaks if rotated without updating dependents:** Nothing in the current
-  Supabase-based runtime. `docs/ROLLBACK.md:143` explicitly notes: "For the current
-  Supabase-based runtime, `AUTH_SESSION_SECRET` is not referenced and changing it will not
-  affect active sessions."
+- **What breaks if rotated without updating dependents:** Nothing in the current Clerk-based
+  runtime. `docs/ROLLBACK.md:148` explicitly notes: "For the current Clerk-based runtime,
+  `AUTH_SESSION_SECRET` is not referenced and changing it will not affect active sessions."
 - **Recommendation:** Keep the `docs/ROLLBACK.md` reference as historical rollback
-  documentation (it only matters if the team ever rolls back to a pre-M3, non-Supabase
-  session implementation). Flag for the user to decide whether to drop the `ROLLBACK.md`
-  reference entirely, since there is no live config or code path tied to it today. No action
-  needed for `.env.local`, `.env.example`, or any schema file — there is nothing to rotate.
+  documentation (it only matters if the team ever rolls back to a pre-M3, pre-Clerk session
+  implementation). Flag for the user to decide whether to drop the `ROLLBACK.md` reference
+  entirely, since there is no live config or code path tied to it today. No action needed for
+  `.env.local`, `.env.example`, or any schema file — there is nothing to rotate.
 
 ---
 
-## 2. `CRON_SECRET`
+## 2. `CRON_SECRET` — currently unused by app runtime code (gap, not fixed here)
 
-- **Where it is set:** Present in `.env.example` (`.env.example:79`, comment context at
-  `.env.example:77-78`). Set in `.env.local` for local dev, and in the Vercel project env
+- **Where it is set:** Present in `.env.example` (`.env.example:99`, comment context at
+  `.env.example:95-98`). Set in `.env.local` for local dev, and in the Vercel project env
   (and whatever external cron scheduler calls the endpoint, e.g. cron-job.org) for deploy.
-- **Code consumers:**
-  - `app/api/cron/mark-no-show/route.ts:7` — reads `process.env.CRON_SECRET`.
-  - `app/api/cron/mark-no-show/route.ts:8` — validates the caller's `Authorization: Bearer`
-    header against it via `tokensMatch()` (imported from `lib/server/security` at
-    `app/api/cron/mark-no-show/route.ts:3`); returns 401 if missing/invalid.
-  - Also referenced in QA e2e tooling: `qa/e2e/qa-no-show-expiry.mjs:5,12,106` (used to call
-    the cron endpoint during E2E validation) and in unit tests
-    `__tests__/app/api/cron/mark-no-show.test.ts` (stubbed test value, not a real secret).
-- **What breaks if rotated without updating dependents:** The cron endpoint's own
-  authorization check (`app/api/cron/mark-no-show/route.ts:7-8`). If the env var is rotated
-  in Vercel but the external cron scheduler's `Authorization: Bearer <value>` header is not
-  updated to match, every scheduled call to `/api/cron/mark-no-show` will be rejected with
-  401 and no-show reservations will stop being auto-marked until the scheduler config is
-  updated too.
+- **Code consumers — this section changed since the original P0 audit:** the route this
+  section originally described, `app/api/cron/mark-no-show/route.ts`, **no longer exists**
+  (confirmed via `find` — not present anywhere in the repo, including `__tests__/`). The only
+  cron route now is `app/api/cron/cancel-pending/route.ts`, and its full body is:
+
+  ```ts
+  export async function POST() {
+    return NextResponse.json(
+      { error: 'Endpoint deprecated', message: 'Cron-based auto-cancellation replaced with lazy evaluation at query time (KIM-366)' },
+      { status: 410 },
+    )
+  }
+  ```
+
+  It always returns `410 Gone` and never reads `process.env.CRON_SECRET` or checks an
+  `Authorization` header at all. `.env.example:98` itself is stale too — its comment claims
+  "The route POST /api/cron/cancel-pending will return 401 if this header is missing or
+  wrong," which is false; the route returns 410 unconditionally and never inspects the
+  header. A repo-wide grep for `CRON_SECRET` (excluding `node_modules`) turns up **no
+  remaining app-runtime (`app/`, `lib/`) consumer** — every other hit is a stale reference:
+  `.env.example:98-99`, `README.md:77`, `docs/ARCHITECTURE.md:253`,
+  `docs/MIGRATION-supabase-to-neon.md:52`,
+  `docs/issues/migration-pre-03-register-cron-vercel-json.md:4`, `qa/e2e/README.md:35,94`,
+  and `qa/e2e/qa-no-show-expiry.mjs:5,12,106` (the last still targets the deleted
+  `POST /api/cron/mark-no-show` endpoint and would fail if actually run).
+- **What breaks if rotated without updating dependents:** **Nothing in app runtime code
+  today** — there is no live route checking this value. Rotating it changes nothing except
+  matching (or no longer matching) whatever an external cron scheduler still sends, which
+  currently hits an endpoint that unconditionally returns 410 regardless of the header.
+- **Recommendation (not applied — out of scope for this doc pass):** this is a real drift
+  between `.env.example`/`README.md`/`qa/e2e/*` and the actual route code, independent of the
+  Supabase→Neon/Clerk migration this checklist was written for. It needs its own decision:
+  either restore a CRON_SECRET-checked route if scheduled no-show/cancellation handling is
+  still wanted, or remove `CRON_SECRET` and the stale QA e2e script together. Flagging here
+  rather than silently rewriting the QA tooling or `.env.example`, both of which are outside
+  this document's scope.
 
 ---
 
-## 3. `SUPABASE_SECRET_DEFAULT_KEY`
+## 3. `CLERK_SECRET_KEY`
 
-- **Where it is set:** Present in `.env.example` (`.env.example:18`, comment context at
-  `.env.example:16-17` — sourced from Supabase Project Settings → API Keys → Secret keys →
-  default). Set in `.env.local` for local dev, Vercel project env for deploy.
-- **Code consumers:**
-  - `lib/supabase/config.ts:18-19` — `getSupabaseSecretKey()` reads
-    `process.env.SUPABASE_SECRET_DEFAULT_KEY` via `requiredEnv()`; throws if missing. This
-    file is guarded by `server-only` (`lib/supabase/config.ts:1`) so it cannot be imported
-    into client bundles.
-  - `lib/supabase/server.ts:67-68` — `createSupabaseServerAdminClient()` calls
-    `getSupabaseSecretKey()` to construct the Supabase admin client, which bypasses RLS for
-    all server-side admin write operations.
-  - Also referenced in QA e2e tooling (for privileged fixture writes/deletes against
-    Supabase): `qa/e2e/qa-reservation-cancellation.mjs:15,21`,
-    `qa/e2e/qa-reservation-lifecycle.mjs:13,18`, `qa/e2e/qa-no-show-expiry.mjs:12,17`,
-    `qa/e2e/qa-reservation-equipment.mjs:16,22`.
-- **What breaks if rotated without updating dependents:** Every server-side admin Supabase
-  client created via `createSupabaseServerAdminClient()` (`lib/supabase/server.ts:67`) — i.e.
-  all admin write operations across the app's service layer that bypass RLS. If the env var
-  is rotated in Supabase (key regenerated) without updating it everywhere the app runs
-  (Vercel project env, and any local `.env.local` / `.env.e2e.local` used for QA scripts),
-  those clients will fail to authenticate against Supabase and admin operations will start
-  erroring.
+`lib/supabase/server.ts` and `lib/supabase/config.ts` — the files this section originally
+cited — are **deleted** on this branch (`git log --oneline -- lib/supabase/server.ts` shows
+its removal in the Supabase-cleanup commit; `ls lib/supabase/` now contains only
+`types.ts`). Auth is fully on Clerk (`@clerk/nextjs`); the closest equivalent secret is
+`CLERK_SECRET_KEY`.
+
+- **Where it is set:** Present in `.env.example` (`.env.example:21`, comment context at
+  `.env.example:19-20` — sourced from Clerk Dashboard → Configure → API Keys → Secret keys).
+  Set in `.env.local` for local dev, Vercel project env for deploy.
+- **Code consumers:** unlike the old Supabase secret key, this repo has **no explicit
+  `process.env.CLERK_SECRET_KEY` read** — `@clerk/nextjs` reads it directly from the
+  environment inside its own SDK code. The app-code call sites that depend on it being
+  correctly set are:
+  - `middleware.ts:38` — `clerkMiddleware()` wraps every matched request (see
+    `config.matcher`, `middleware.ts:48-50`), populating `auth()`/`currentUser()` for the
+    rest of the app.
+  - `lib/server/auth-service.ts:6` imports `clerkClient` from `@clerk/nextjs/server`; it is
+    called at `lib/server/auth-service.ts:395` (account activation — `client.users.createUser()`),
+    `:432` (rollback cleanup — `client.users.deleteUser()`), `:518` and `:530` (recovery —
+    `client.users.getUserList()` and `client.users.updateUser()` respectively), and `:666-680`
+    (`logout()`, with `client.sessions.revokeSession()` at `:674`).
+  - `scripts/seed-dev.mjs:214,294` reads `process.env.CLERK_SECRET_KEY` directly (not via the
+    SDK) to create the seeded admin Clerk identity, and refuses to run if the key looks like a
+    live/production key (`scripts/seed-dev.mjs:133` — the `/^sk_live_/i` check; the error
+    message itself is at `:135-139`) — dev-only tooling, not a runtime code path.
+  - Also referenced in tests: `__tests__/scripts/seed-dev.test.ts:22,28` (stubbed test value).
+- **What breaks if rotated without updating dependents:** every Clerk Backend API call the
+  app makes server-side — `clerkMiddleware()`'s session resolution, and every
+  `clerkClient()` call in `lib/server/auth-service.ts` listed above (activation, recovery,
+  logout/session-revocation). If the key is rotated in the Clerk Dashboard without updating
+  the deployment environment (Vercel project env) and any local `.env.local`, those calls
+  will fail to authenticate against Clerk's Backend API and auth/activation/recovery/logout
+  will start erroring.
+- **Known unrelated stale reference (not fixed here, already tracked):** `qa/e2e/qa-reservation-cancellation.mjs`,
+  `qa/e2e/qa-reservation-lifecycle.mjs`, `qa/e2e/qa-no-show-expiry.mjs`,
+  `qa/e2e/qa-reservation-equipment.mjs`, and `qa/e2e/env.mjs` still reference
+  `SUPABASE_SECRET_DEFAULT_KEY`/`NEXT_PUBLIC_SUPABASE_URL` for privileged fixture writes. These
+  are QA e2e tooling code files, out of scope for this docs-only pass — this gap already has an
+  owner, open issue **#312 "[N4] Swap test/E2E auth from Supabase to Clerk"**, so no new issue
+  is needed here. (The `CRON_SECRET` gap above has no matching open issue and is genuinely new.)
 
 ---
 
@@ -105,9 +147,13 @@ fixture writes/deletes.
   `qa/e2e/qa-reservation-cancellation.mjs:13`). Not consumed by any app runtime code (`app/`,
   `lib/`) or by the Vitest unit tests under `__tests__/`.
 - **What breaks if rotated without updating dependents:** the corresponding QA/member account
-  credentials in Supabase must be updated to match, and `.env.e2e.local` on every machine/CI
-  runner that executes the `qa/e2e/*.mjs` scripts must be updated, or those E2E runs will fail
-  to log in / authenticate.
+  credentials (now Clerk identities + Neon `profiles` rows, not Supabase) must be updated to
+  match, and `.env.e2e.local` on every machine/CI runner that executes the `qa/e2e/*.mjs`
+  scripts must be updated, or those E2E runs will fail to log in / authenticate. Note the
+  `qa/e2e/*.mjs` runners themselves still read `NEXT_PUBLIC_SUPABASE_URL`/
+  `SUPABASE_SECRET_DEFAULT_KEY` for privileged fixture writes against Supabase (see the
+  known-stale-reference note in section 3 above) — that gap is already tracked by open issue
+  #312, not something this rotation section is describing as current runtime behavior.
 
 ---
 
@@ -115,18 +161,18 @@ fixture writes/deletes.
 
 Rotation is a **manual, user-only** action. No agent performs any of the following steps:
 
-1. In the Supabase dashboard (Project Settings → API Keys), regenerate the secret key
-   backing `SUPABASE_SECRET_DEFAULT_KEY`.
-2. In the Vercel project settings, update the corresponding env vars
-   (`SUPABASE_SECRET_DEFAULT_KEY`, `CRON_SECRET`) for every environment (Production,
-   Preview, Development) that needs them.
-3. Update the external cron scheduler's `Authorization: Bearer <value>` header to match the
-   new `CRON_SECRET` value.
-4. Update local `.env.local` (and `.env.e2e.local` for QA credentials, if those Supabase
-   accounts are also being rotated) to match.
-5. Decide whether to drop the now-dead `AUTH_SESSION_SECRET` reference from
-   `docs/ROLLBACK.md` (optional — no code or config action required either way).
-6. Verify in the Supabase dashboard and via a smoke test (e.g. an admin write operation and
-   a manual cron endpoint call) that the app authenticates correctly after rotation.
+1. In the Clerk dashboard (Configure → API Keys), regenerate the secret key backing
+   `CLERK_SECRET_KEY`.
+2. In the Vercel project settings, update `CLERK_SECRET_KEY` for every environment
+   (Production, Preview, Development) that needs it. `CRON_SECRET` is currently not checked
+   by any live route (see section 2 above) — rotate it only if/when that gap is separately
+   resolved.
+3. Update local `.env.local` to match.
+4. Decide whether to drop the now-dead `AUTH_SESSION_SECRET` reference from
+   `docs/ROLLBACK.md` (optional — no code or config action required either way), and whether
+   to address the `CRON_SECRET`/QA e2e Supabase-reference gaps noted above (separate from this
+   rotation).
+5. Verify in the Clerk dashboard and via a smoke test (e.g. login, account activation, or
+   logout) that the app authenticates correctly after rotation.
 
 This document intentionally does not, and must never, contain any actual secret value.

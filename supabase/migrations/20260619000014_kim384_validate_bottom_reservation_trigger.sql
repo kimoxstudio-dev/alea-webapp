@@ -1,1 +1,0 @@
-CREATE TRIGGER "reservations_validate_saved_game" BEFORE INSERT OR UPDATE OF "table_id", "date", "surface", "status" ON "public"."reservations" FOR EACH ROW EXECUTE FUNCTION "public"."validate_reservation_against_saved_game"();

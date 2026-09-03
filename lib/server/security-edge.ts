@@ -13,7 +13,14 @@
  * existing route-handler imports from `@/lib/server/security` are unaffected.
  */
 import { NextRequest, NextResponse } from 'next/server'
-import type { CookieOptionsWithName } from '@supabase/ssr'
+
+/** The subset of cookie options this module sets. */
+type CookieOptions = {
+  httpOnly?: boolean
+  path?: string
+  sameSite?: 'lax' | 'strict' | 'none'
+  secure?: boolean
+}
 
 export const CSRF_COOKIE_NAME = 'alea-csrf-token'
 export const CSRF_HEADER_NAME = 'x-csrf-token'
@@ -48,16 +55,7 @@ export function getCsrfCookieOptions() {
     path: '/',
     sameSite: 'lax',
     secure: isSecureContext(),
-  } satisfies CookieOptionsWithName
-}
-
-export function getSupabaseCookieOptions() {
-  return {
-    httpOnly: true,
-    path: '/',
-    sameSite: 'lax',
-    secure: isSecureContext(),
-  } satisfies CookieOptionsWithName
+  } satisfies CookieOptions
 }
 
 export function ensureCsrfCookie(request: NextRequest, response: NextResponse) {

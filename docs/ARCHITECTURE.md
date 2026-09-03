@@ -1,13 +1,13 @@
 # Architecture — Alea WebApp
 
-**Last updated:** 2026-04-05
-**Milestone:** M6 (post-flatten, single Next.js app)
+**Last updated:** 2026-09-03
+**Milestone:** Post-migration (Supabase fully removed — Neon for data, Clerk for auth; issues #299-#310, #360, #363, #311)
 
 ---
 
 ## Overview
 
-Alea is a single Next.js 15 application at the repository root. There is no monorepo, no separate backend process, and no NestJS. All server-side logic runs inside Next.js Route Handlers backed by Supabase.
+Alea is a single Next.js 15 application at the repository root. There is no monorepo, no separate backend process, and no NestJS. All server-side logic runs inside Next.js Route Handlers, backed by Neon (Postgres, raw SQL) for data and Clerk for auth.
 
 ---
 
@@ -17,7 +17,8 @@ Alea is a single Next.js 15 application at the repository root. There is no mono
 |---|---|
 | Framework | Next.js 15, App Router |
 | UI | React 19, Tailwind CSS, shadcn/ui |
-| Auth & DB | Supabase (PostgreSQL + Row Level Security + Supabase Auth) |
+| Database | Neon (PostgreSQL, raw SQL via `lib/db/client.ts`, no RLS) |
+| Auth | Clerk (`@clerk/nextjs`) |
 | i18n | next-intl (ES + EN, locale-prefixed URLs) |
 | Validation | Zod |
 | Data fetching | TanStack Query (client), Route Handlers (server) |
@@ -35,7 +36,7 @@ alea-webapp/
 │   ├── page.tsx                # Root redirect to default locale
 │   ├── globals.css
 │   ├── api/                    # Route Handlers (server-side endpoints)
-│   │   ├── auth/               # login, logout, me, register, callback
+│   │   ├── auth/               # login (410, disabled), logout, me, register (410, disabled), activate, recover
 │   │   ├── rooms/              # room listing, tables, availability
 │   │   ├── reservations/       # reservation CRUD
 │   │   └── users/              # user CRUD (admin)
@@ -51,7 +52,7 @@ alea-webapp/
 ├── lib/
 │   ├── server/                 # Server-side service layer (never imported client-side)
 │   │   ├── auth.ts             # Session guard helpers: requireAuth, requireAdmin, getSessionFromRequest
-│   │   ├── auth-service.ts     # Login (member number only), logout, getCurrentUser
+│   │   ├── auth-service.ts     # Activation/recovery links, Clerk identity resolution, logout, getCurrentUser
 │   │   ├── users-service.ts    # User CRUD operations
 │   │   ├── rooms-service.ts    # Room listing and lookup
 │   │   ├── tables-service.ts   # Table listing, lookup, QR codes
@@ -74,21 +75,18 @@ alea-webapp/
 │   ├── validations/            # Shared Zod schemas (used by both client forms and server route handlers)
 │   │   ├── auth.ts             # loginSchema, registerSchema, passwordSchema
 │   │   └── password.ts         # Password strength validation rules
-│   ├── supabase/               # Supabase client factories and config getters
-│   │   ├── client.ts           # Browser client factory (createSupabaseBrowserClient)
-│   │   ├── server.ts           # Server client factories: createSupabaseServerClient, createSupabaseRouteHandlerClient, createSupabaseServerAdminClient
-│   │   ├── config.ts           # Server-only config getters (secret key); guarded by `server-only`
-│   │   ├── config.client.ts    # Browser-safe config getters (URL, publishable key)
-│   │   └── types.ts            # Generated DB types
+│   ├── db/                     # Neon connection + schema
+│   │   ├── client.ts           # Tagged-template `sql` export (Neon serverless driver)
+│   │   ├── transaction.ts      # Multi-statement transaction helper
+│   │   └── schema/              # Versioned raw SQL schema files (001_extensions.sql, 002_types.sql, ...)
+│   ├── supabase/
+│   │   └── types.ts            # Generated DB row types (`Tables<'x'>`) — only surviving file from the old Supabase client layer, still the type source for every service module
 │   ├── types/
 │   │   └── index.ts            # Shared TypeScript domain types (User, Room, etc.)
 │   ├── providers.tsx           # React provider tree (QueryClientProvider, AuthProvider, etc.)
 │   └── utils.ts                # Shared utility functions
 ├── messages/                   # i18n JSON files (es.json, en.json)
-├── middleware.ts               # i18n routing, CSRF cookie setup
-├── supabase/                   # Supabase project config
-│   ├── config.toml             # Local dev config
-│   └── migrations/             # SQL migration files (versioned)
+├── middleware.ts               # Clerk middleware, i18n routing, CSRF cookie setup
 └── __tests__/                  # Integration and unit tests
 ```
 
@@ -101,7 +99,7 @@ alea-webapp/
 All modules in this layer:
 - Are intended to be imported only from Route Handlers (`app/api/`) or Server Components. `lib/server/security-edge.ts` is additionally imported from `middleware.ts` for the `ensureCsrfCookie` helper.
 - Never run in the browser.
-- Call Supabase directly using the server-side client factories from `lib/supabase/server.ts`.
+- Call the database directly via the tagged-template `sql` export from `lib/db/client.ts` (Neon). There is no separate admin-vs-user-scoped client — Neon has no RLS, so that old distinction collapses to a single `sql` client. Admin-only *routes* are gated by `requireAdmin()` at the route boundary; per-resource ownership and role checks that depend on the specific record (not just "is this user an admin") live in this service layer — see `reservations-service.ts`, `club-events-service.ts`, `partners-service.ts`, `library-games-service.ts`, `saved-games-service.ts`, and `lib/server/data-scoping.ts`.
 - Throw `ServiceError` instances via the `serviceError()` helper — never raw strings.
 
 Each service module maps to a domain:
@@ -109,7 +107,7 @@ Each service module maps to a domain:
 | Module | Responsibility |
 |---|---|
 | `auth.ts` | Session guard helpers: `requireAuth`, `requireAdmin`, `getSessionFromRequest`, `getSessionFromServerCookies` |
-| `auth-service.ts` | Login (member number only), logout, `getCurrentUser` |
+| `auth-service.ts` | Admin-issued activation/recovery links (`activateAccount`, `recoverAccount`), Clerk identity resolution (`resolveProfileForClerkUser`), `logout`, `getCurrentUser`. No password-based `login()` — see Auth Flow below. |
 | `users-service.ts` | User CRUD, role management |
 | `rooms-service.ts` | Room listing and lookup |
 | `tables-service.ts` | Table listing, lookup, QR codes |
@@ -123,21 +121,19 @@ Each service module maps to a domain:
 
 ## Auth Flow
 
-Auth is handled by Supabase Auth with server-side session management via HTTP-only cookies:
+Auth identity is owned entirely by Clerk. There is no password column on `profiles` and no app-level credential store — `lib/server/session.ts` reads the Clerk session directly from Next.js's request context via `auth()`/`currentUser()`, and `clerkMiddleware()` (wired in `middleware.ts`) populates that context on every matched request, including `/api`.
 
-1. Client POSTs credentials to `/api/auth/login`.
-2. The Route Handler calls `enforceMutationSecurity()` (CSRF double-submit + same-origin `Origin` + Fetch Metadata check) and `enforceRateLimit()` before any service logic runs. If either check fails, a 403 or 429 response is returned immediately.
-3. Route Handler calls `login()` from `auth-service.ts`. The service resolves the profile by member number using the admin Supabase client (which bypasses RLS), then calls `supabase.auth.signInWithPassword()` with the resolved email address.
-4. Supabase writes session tokens into cookies. The Route Handler captures these via `createSupabaseRouteHandlerClient` and applies them to the `NextResponse` using `applyCookies()`.
-5. `middleware.ts` no longer refreshes the Supabase session cookie (removed in #363, dead weight once Clerk owns request auth context) — it only handles locale routing and CSRF cookie setup. Nothing depends on it: session identity comes from Clerk (`lib/server/auth.ts`), and `createSupabaseServerClient()` has no remaining callers.
-6. Protected API routes enforce authentication and authorization per route via `requireAuth()` and `requireAdmin()` from `lib/server/auth.ts`. These helpers read the session from the incoming request cookies and look up the user's role from the `profiles` table.
-7. Logout calls `supabase.auth.signOut()`, which invalidates the session and clears the auth cookie(s).
+Members have **no email** and there is **no open self-registration** (closed issues #206/#207). Every member must already exist as an admin-imported `profiles` row (`is_active = false`) before they can ever sign in. The only way a profile becomes active — and the only way its Clerk identity is ever created — is by claiming an admin-issued activation link.
 
-Members can log in with their **member number**.
+1. **Sign-in**: happens on Alea's own form (`app/[locale]/sign-in/[[...sign-in]]/page.tsx` → `components/auth/login-form.tsx`), backed by Clerk's headless `useSignIn()` client SDK — not Clerk's hosted/prebuilt UI. The member types their bare member number; the `alea-` username prefix (see below) is added client-side before calling `signIn.create()`. `POST /api/auth/login` (password-based) and `POST /api/auth/register` (self-registration) are both permanently disabled and return `410 Gone` — they exist only so old clients get a clear, stable response instead of a 404. There is no `/api/auth/callback` route; Clerk owns its own sign-in redirect flow.
+2. **Identity correlation**: the Clerk **username** is `alea-<member_number>` (e.g. `alea-100001`) — the `alea-` prefix exists only because Clerk rejects all-numeric usernames, is never shown to or typed by the member, and carries no email attribute. `resolveProfileForClerkUser()` (`lib/server/auth-service.ts`) strips that prefix and looks up the matching `profiles` row by `member_number`. This is READ-ONLY: a Clerk identity with no matching, already-active `profiles` row never resolves to a session, and no row is ever created as a side effect of a request.
+3. **Session guards**: protected Route Handlers call `requireAuth()` / `requireAdmin()` from `lib/server/auth.ts`. These call `getSessionFromRequest()`, which resolves the Clerk session, reads the Clerk user's username, and calls `resolveProfileForClerkUser()`. `requireAdmin()` additionally checks `session.role === 'admin'`. Protected Server Components call `getSessionFromServerCookies()` directly.
+4. **Activation**: an admin generates a single-use, 24h activation token (`generateActivationLink()`) for a pre-registered, inactive profile. The member claims it via `activateAccount()`, which atomically claims the token, creates the member's Clerk identity (username + password, no email), and flips `profiles.is_active = true`. Every failure path (Clerk create fails, or the DB update fails after Clerk succeeds) compensates: the token claim is restored, and on a DB failure the just-created Clerk user is deleted best-effort — if that delete itself fails, the orphaned Clerk identity is a known, admin-recoverable state rather than blocking retry.
+5. **Recovery**: an admin generates a recovery link the same way; `recoverAccount()` claims the token and calls Clerk's `updateUser()` to set a new password on the member's *existing* Clerk identity (looked up by username, since no Clerk user id is persisted on `profiles`). This is a password reset, not identity creation.
+6. **Logout**: `logout()` (`auth-service.ts`) revokes the current Clerk session server-side via `clerkClient().sessions.revokeSession()`. The client-side Clerk SDK (`useClerk().signOut()`) clears the browser cookie separately.
+7. `middleware.ts` does not refresh any session cookie itself (that role moved entirely to `clerkMiddleware()`) — it only wraps requests with Clerk's auth context, routes locale pages through `next-intl`, and issues the CSRF cookie.
 
-### PKCE Callback
-
-`/api/auth/callback` handles the Supabase PKCE code exchange for OAuth and magic link flows. It exchanges the `code` query parameter for a session via `supabase.auth.exchangeCodeForSession()` and redirects the user. The `next` redirect parameter is sanitized against control characters and validated as a same-origin relative path to prevent open redirect attacks.
+Mutating auth routes (e.g. login) still run `enforceMutationSecurity()` (CSRF double-submit + same-origin `Origin` + Fetch Metadata check) and `enforceRateLimit()` before any handler logic, even where the handler itself just returns `410`.
 
 ---
 
@@ -155,15 +151,15 @@ The admin dashboard is located at `/{locale}/admin`. Access is restricted to aut
 
 The `profiles` table includes an `is_active` column (`BOOLEAN NOT NULL DEFAULT true`). When `is_active` is `false` the user is considered suspended and cannot log in. Status changes are managed through the admin dashboard.
 
-### Supabase Admin Client
+### Admin Writes
 
-All admin write operations (user creation, deletion, status changes, etc.) use the Supabase admin client (`createSupabaseServerAdminClient`). The admin client bypasses all RLS policies, allowing admins to modify user data directly. Read operations on the admin routes may use either the anon client (with RLS) or the admin client depending on the endpoint.
+All admin write operations (user creation, deletion, status changes, member CSV import, etc.) live in `users-service.ts` and go through the same `sql` client from `lib/db/client.ts` as every other read. Neon has no RLS, so there is no separate admin-vs-anon client distinction — the admin-only gate is `requireAdmin()` (`lib/server/auth.ts`) at the route layer, before any service function runs. `users-service.ts` is the only place a `profiles` row is ever created; no self-service path creates one.
 
 ---
 
 ## Data Model (key entities)
 
-- **User** (maps to `profiles` table) — `id`, `memberNumber`, `role` (`admin` | `member`), `isActive` (`boolean`), `createdAt`, `updatedAt`. Suspended users (`isActive = false`) cannot log in. The `email` field is not part of the public user model (issue #39) but is included in admin-facing user data to display and manage members. Supabase Auth continues to own the canonical email in `auth.users`; the `profiles.email` column mirrors it for admin reads.
+- **User** (maps to `profiles` table) — `id`, `memberNumber`, `role` (`admin` | `member`), `isActive` (`boolean`), `createdAt`, `updatedAt`. Suspended users (`isActive = false`) cannot log in. The `email`/`phone` fields are not part of the public user model (issue #39) but are included in admin-facing user data to display and manage members. Neither participates in identity or sign-in — Clerk identity correlation is by username (`alea-<member_number>`), never by email (see Auth Flow above); `profiles.email`/`profiles.auth_email` are plain contact-info columns.
 - **Room** — `id`, `name`, `tableCount`, `description`, `createdAt`
 - **GameTable** (maps to `tables` table) — `id`, `roomId`, `name`, `type` (`small` | `large` | `removable_top`), `qrCode`, `posX`, `posY` (two separate nullable integer columns)
 - **Reservation** — `id`, `tableId`, `userId`, `date`, `startTime`, `endTime`, `status` (`active` | `cancelled` | `completed`), `surface` (`top` | `bottom` | null)
@@ -184,25 +180,24 @@ A `removable_top` table has two bookable surfaces. Reserving one surface blocks 
 
 ---
 
-## Supabase as the Sole Provider
+## Neon as the Data Store
 
-- **Database**: PostgreSQL managed by Supabase. All schema changes are versioned SQL migrations in `supabase/migrations/`.
-- **Auth**: Supabase Auth. No custom JWT implementation.
-- **Row Level Security**: RLS policies enforce access control at the DB level in addition to application-layer checks.
+- **Database**: PostgreSQL, provisioned on Neon. Schema changes are versioned raw SQL files in `lib/db/schema/` (e.g. `003_profiles.sql`, `013_activation_tokens.sql`), applied directly — no ORM, no migration DSL.
+- **Auth**: Clerk. No custom JWT implementation, no password column anywhere in the schema.
+- **Access control**: Neon has no Row Level Security. Every privilege check (ownership + role) is an application-layer check in the service layer (`lib/server/`), enforced before the query runs — never left to the database.
 
-### Supabase Client Variants
+### The `sql` Client
 
-There are three distinct Supabase client factories in `lib/supabase/server.ts`:
+There is a single database client, `sql`, exported from `lib/db/client.ts` (`lib/db/client.ts:1`):
 
-| Factory | Key | Cookie handling | When to use |
-|---|---|---|---|
-| `createSupabaseServerClient()` | Anon key | Reads/writes via `next/headers` cookie store | Server Components, Server Actions |
-| `createSupabaseRouteHandlerClient(request)` | Anon key | Reads from `NextRequest`, buffers writes returned via `applyCookies()` | Route Handlers |
-| `createSupabaseServerAdminClient()` | Secret default key | None (stateless) | Server-only; bypasses all RLS policies |
+```ts
+import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
+export const sql: NeonQueryFunction<false, false> = neon(databaseUrl);
+```
 
-The browser client factory (`createSupabaseBrowserClient` in `lib/supabase/client.ts`) uses the publishable key and creates a new browser client instance per call. It must never be used in server-side code.
+It is a tagged-template function backed by Neon's HTTP driver (no connection pool to manage). Every service module — regular reads and admin writes alike — imports this same `sql` export and calls it as `` sql`SELECT ... WHERE id = ${id}` ``, which auto-parameterizes interpolated values. There is no separate admin/anon/browser client split like the old Supabase setup had: Neon has no RLS to bypass, so that distinction has no equivalent here. `lib/db/transaction.ts` provides a helper for multi-statement transactions where one is needed.
 
-The admin client bypasses all RLS policies and must never be imported in Client Components or exposed to the browser. It is currently used in `auth-service.ts` to look up profiles by member number before sign-in, because the anon client's RLS policies would block unauthenticated profile reads.
+`lib/supabase/types.ts` is the one surviving file from the old Supabase client layer — it still holds the generated `Tables<'x'>` row types every service module imports for typing query results (e.g. `import type { Tables } from '@/lib/supabase/types'`). It is a type-only artifact now; nothing in it makes a network call or reaches an actual Supabase project.
 
 ---
 
@@ -217,7 +212,7 @@ What middleware does:
 
 What middleware does NOT do:
 - It does not enforce authentication or redirect unauthenticated users. Protected Server Components call `getSessionFromServerCookies()` and Route Handlers call `requireAuth()` / `requireAdmin()` at the resource boundary.
-- It does not refresh the Supabase session cookie (removed in #363). Nothing depends on it — session identity comes from Clerk (`lib/server/auth.ts`), and `createSupabaseServerClient()` has no remaining callers.
+- It does not refresh any session cookie itself. Session cookie handling is entirely `clerkMiddleware()`'s job — session identity comes from Clerk (`lib/server/auth.ts`, `lib/server/session.ts`).
 - It does not run locale routing or CSRF setup for `/api/` routes.
 
 ---
@@ -239,7 +234,8 @@ The client-side architecture is organized under `lib/`:
 
 - Node.js 20+
 - pnpm 9+
-- Supabase Cloud project for shared development, or Docker Desktop + Supabase CLI for a full local stack
+- A Neon Postgres branch (dashboard: console.neon.tech) — there is no local Postgres/Docker setup for this project; development connects to a real Neon branch via `DATABASE_URL`.
+- A Clerk application (dashboard: dashboard.clerk.com) in test mode for its keys.
 
 ### Steps
 
@@ -249,10 +245,10 @@ pnpm install
 
 # 2. Copy environment template
 cp .env.example .env.local
-# Edit .env.local with your Supabase credentials:
-# - NEXT_PUBLIC_SUPABASE_URL
-# - NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY
-# - SUPABASE_SECRET_DEFAULT_KEY
+# Edit .env.local with:
+# - DATABASE_URL (Neon pooled connection string, ?sslmode=require)
+# - NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY / CLERK_SECRET_KEY (Clerk test-mode keys)
+# - BLOB_READ_WRITE_TOKEN (Vercel Blob store token)
 # - NEXT_PUBLIC_APP_URL
 # - CRON_SECRET
 
@@ -260,37 +256,23 @@ cp .env.example .env.local
 pnpm dev
 ```
 
-### Local Supabase option
+### Seeding local dev data
 
-If you want a fully local DB/auth stack instead of a shared Supabase Cloud project:
-
-```bash
-supabase start
-supabase status
-```
-
-Then point `.env.local` to:
-
-- `NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:54321`
-- `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY=<publishable key from supabase status>`
-- `SUPABASE_SECRET_DEFAULT_KEY=<secret/service-role key from supabase status>`
-- `NEXT_PUBLIC_APP_URL=http://localhost:3000`
-
-Useful local reset command:
+`scripts/seed-dev.mjs` seeds a development Neon branch with an active admin fixture (Clerk identity created directly via the Clerk Backend API) and an inactive member fixture (a `profiles` row only — no Clerk identity yet, activated later through the real admin-issued-link flow). It requires `DATABASE_URL` and `CLERK_SECRET_KEY` (test-mode, `sk_test_...`) in the environment, plus `SEED_ADMIN_PASSWORD` for the admin fixture's initial password. As a safety gate it refuses to run unless `NODE_ENV !== 'production'` **and** `DEV_SEED_CONFIRM` is set to the script's exact confirmation value, and it refuses if `DATABASE_URL` looks like it points at anything containing "prod":
 
 ```bash
-supabase db reset
+DEV_SEED_CONFIRM=YES_SEED_NEON_DEV_DB SEED_ADMIN_PASSWORD=<local-only password> node scripts/seed-dev.mjs
 ```
 
-This reapplies all migrations and the local QA seed in `supabase/seed.sql`.
+Both fixtures are upserted keyed on `member_number` (`ON CONFLICT ... DO UPDATE`), so re-running the script is safe — it will not revert an already-activated member back to pending.
 
 ### Useful local URLs
 
 | Service | URL |
 |---|---|
 | App | http://localhost:3000 |
-| Supabase API (local) | http://127.0.0.1:54321 |
-| Supabase Studio (local) | http://127.0.0.1:54323 |
+| Neon dashboard | https://console.neon.tech |
+| Clerk dashboard | https://dashboard.clerk.com |
 
 ---
 
@@ -304,17 +286,16 @@ pnpm test:watch    # watch mode
 pnpm typecheck     # TypeScript type-check
 pnpm lint          # ESLint
 pnpm build         # production build check
-pnpm test:integration  # local Supabase migration/type validation
 ```
 
 ---
 
 ## Security Posture
 
-- Passwords never returned from any API endpoint or stored in client state.
-- Admin operations require `role = admin` enforced at the Route Handler level (`requireAdmin()`) and by RLS policies at the database level.
+- Passwords never returned from any API endpoint or stored in client state. There is no password column in the database — Clerk is the sole credential store.
+- Admin operations require `role = admin` enforced at the Route Handler level (`requireAdmin()`). Neon has no RLS, so this application-layer check is the only enforcement — there is no database-level backstop.
 - All input validated with Zod before reaching the service layer.
-- HTTP-only, SameSite cookies for Supabase session token management.
+- Session identity is managed entirely by Clerk (HTTP-only session cookies set by `clerkMiddleware()`); no app code reads or writes a session cookie directly.
 - Mutations are protected by a three-layer check in each Route Handler: Fetch Metadata validation (`sec-fetch-site`), same-origin `Origin` header validation, and double-submit CSRF token validation — all via `enforceMutationSecurity()` from `lib/server/security.ts`. This check runs inside Route Handlers directly; middleware does not cover API routes.
-- The admin Supabase client (secret key) bypasses all RLS policies. It is restricted to server-only code and must never be imported client-side.
+- `CLERK_SECRET_KEY` is restricted to server-only code (`lib/server/**`, `scripts/seed-dev.mjs`) and must never be imported client-side.
 - See `docs/SECURITY_RUNBOOK.md` for the full security checklist.

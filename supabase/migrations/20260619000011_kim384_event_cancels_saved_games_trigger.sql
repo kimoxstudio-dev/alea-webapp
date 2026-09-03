@@ -1,1 +1,0 @@
-CREATE TRIGGER "event_blocks_cancel_saved_games" AFTER INSERT OR UPDATE OF "room_id", "date" ON "public"."event_room_blocks" FOR EACH ROW EXECUTE FUNCTION "public"."cancel_saved_games_for_event_block"();

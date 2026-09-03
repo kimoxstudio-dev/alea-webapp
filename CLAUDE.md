@@ -9,8 +9,8 @@ All process rules (language, agent pipeline, worktrees, git, documentation disci
 
 - **Frontend:** Next.js 15 (App Router), TypeScript, Tailwind CSS, shadcn/ui
 - **Backend:** Next.js Route Handlers (API routes)
-- **Database:** Supabase (Postgres + RLS)
-- **Auth:** Supabase Auth + custom session layer
+- **Database:** Neon (Postgres, raw SQL via `lib/db/client.ts`, no RLS)
+- **Auth:** Clerk (`@clerk/nextjs`)
 - **i18n:** next-intl — locale files in `messages/en.json` and `messages/es.json`
 - **Tests:** Vitest + Testing Library
 - **Package manager:** pnpm
@@ -74,9 +74,8 @@ Before `security-reviewer` opens a PR, it must run `/code-review` (medium effort
 
 ## Key conventions
 
-- Admin write operations use `createSupabaseServerAdminClient()` (bypasses RLS)
-- Regular reads use `createSupabaseServerClient()` (user-scoped, respects RLS)
-- All privilege checks (ownership + role) must live in the **service layer**, never in route handlers
+- All reads and writes use the tagged-template `sql` export from `lib/db/client.ts` (Neon). Neon has no RLS, so the old admin-vs-user-scoped client distinction collapses to a single `sql` client.
+- Admin-only route gating uses `requireAdmin()` at the route boundary; per-resource ownership and role checks live in the **service layer**, never duplicated ad hoc in route handlers
 - i18n keys must maintain full parity between `en.json` and `es.json`
 - Test files must be excluded from `tsconfig.app.json`
 - Test files are owned exclusively by `qa-engineer` — `software-engineer` must never create or modify test files
@@ -91,7 +90,7 @@ When running parallel implementation agents on this repo, use this domain split 
 | Agent | File ownership |
 |-------|----------------|
 | A (frontend) | `app/`, `components/`, `messages/`, `lib/hooks/` |
-| B (backend)  | `lib/server/`, `lib/supabase/`, `supabase/`, `__tests__/` |
+| B (backend)  | `lib/server/`, `lib/supabase/`, `lib/db/`, `__tests__/` |
 
 If a task touches both domains, run agents **sequentially**.
 
@@ -174,15 +173,14 @@ This is the standard workflow — no exceptions.
 
 **CRITICAL RULE:** Claude agents NEVER execute database migrations or modify database state.
 
-- `supabase db push` — forbidden
-- `supabase db pull` — forbidden
-- Direct SQL execution — forbidden
+- Running `scripts/apply-neon-schema.mjs` against staging/production — forbidden
+- Direct SQL execution against staging/production — forbidden
 
 **Correct workflow:**
-1. Agent prepares migration files, commits to branch
-2. User reviews locally (`supabase db reset` to test)
-3. User manually executes `supabase db push`
-4. User verifies in Supabase dashboard
+1. Agent prepares versioned SQL files in `lib/db/schema/`, commits to branch
+2. User reviews locally
+3. User manually executes `node scripts/apply-neon-schema.mjs` against the target database
+4. User verifies at console.neon.tech
 
 Agent prepares + validates. User applies.
 

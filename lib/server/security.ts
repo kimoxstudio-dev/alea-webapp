@@ -12,7 +12,6 @@ export {
   isSecureContext,
   createCsrfToken,
   getCsrfCookieOptions,
-  getSupabaseCookieOptions,
   ensureCsrfCookie,
 } from './security-edge'
 
