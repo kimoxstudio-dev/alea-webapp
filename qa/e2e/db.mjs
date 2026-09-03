@@ -22,10 +22,37 @@ if (!databaseUrl) {
   throw new Error('DATABASE_URL is not set. Add it to .env.e2e.local before running the E2E runners.');
 }
 
-// Heuristic-only defense in depth, mirroring scripts/seed-dev.mjs's own
-// DATABASE_URL "prod" check: the connection string carries no reliable
-// environment marker, but refusing on an obvious "prod" hint costs nothing.
-// These runners do privileged INSERT/DELETE fixture writes, same as seed-dev.
+// Positive allowlist: the operator must declare exactly which host these
+// privileged INSERT/DELETE fixture writes are allowed to hit. A denylist on
+// the string "prod" is not enough — a production Neon branch whose hostname
+// happens not to contain "prod" would sail through it. Neon pooled vs
+// unpooled connection strings have different hostnames (pooled adds
+// "-pooler"), so this must match whichever one DATABASE_URL actually uses.
+const allowedHost = process.env.E2E_DATABASE_HOST;
+if (!allowedHost) {
+  throw new Error('E2E_DATABASE_HOST is not set. Add it to .env.e2e.local before running the E2E runners.');
+}
+
+let actualHost;
+try {
+  actualHost = new URL(databaseUrl).hostname;
+} catch {
+  // Node's ERR_INVALID_URL attaches the full offending string as
+  // error.input, and an uncaught throw dumps that to stderr — never let a
+  // malformed DATABASE_URL (missing scheme colon, stray "psql " prefix,
+  // wrapping quotes) leak the connection string, password included.
+  throw new Error('[qa/e2e] Refusing to run: DATABASE_URL is not a parseable connection-string URL.');
+}
+if (actualHost !== allowedHost) {
+  throw new Error(
+    `[qa/e2e] Refusing to run: DATABASE_URL host "${actualHost}" does not match ` +
+      `E2E_DATABASE_HOST "${allowedHost}"; refusing privileged writes.`
+  );
+}
+
+// Heuristic-only defense in depth on top of the allowlist above, mirroring
+// scripts/seed-dev.mjs's own DATABASE_URL "prod" check: costs nothing and
+// catches an operator who mistakenly points E2E_DATABASE_HOST at prod too.
 if (/prod/i.test(databaseUrl)) {
   throw new Error(
     '[qa/e2e] Refusing to run: DATABASE_URL appears to reference a production database ' +

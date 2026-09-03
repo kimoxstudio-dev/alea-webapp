@@ -31,6 +31,7 @@ Create a dedicated `.env.e2e.local` at the **repo root**. The runners intentiona
 | `PLAYWRIGHT_QA_SECONDARY_USER` | Member number of a regular (non-admin) member |
 | `PLAYWRIGHT_QA_SECONDARY_PASSWORD` | Password for the secondary user |
 | `DATABASE_URL` | Dev Neon connection string |
+| `E2E_DATABASE_HOST` | Positive allowlist for `DATABASE_URL`'s host — the runners refuse to run if `DATABASE_URL`'s hostname doesn't match this exactly. Copy the exact hostname from the same Neon connection string used for `DATABASE_URL` (pooled connections use a `-pooler` suffix; unpooled does not — match whichever one you're actually using) |
 | `E2E_ALLOW_DESTRUCTIVE` | Must be exactly `1` to acknowledge privileged fixture writes/deletes |
 
 ### 3. Override variables (optional)
