@@ -14,7 +14,6 @@ export function requireE2EEnv(required) {
   if (env.E2E_ALLOW_DESTRUCTIVE !== '1') {
     throw new Error('Refusing privileged E2E writes. Set E2E_ALLOW_DESTRUCTIVE=1 in .env.e2e.local.');
   }
-  new URL(env.NEXT_PUBLIC_SUPABASE_URL);
 }
 
 export function chromiumLaunchOptions() {

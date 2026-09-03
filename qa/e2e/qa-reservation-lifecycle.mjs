@@ -9,16 +9,12 @@
  */
 import { chromium } from 'playwright';
 import { chromiumLaunchOptions, env, requireE2EEnv } from './env.mjs';
+import { sql, tryDelete } from './db.mjs';
 
-const required = ['PLAYWRIGHT_QA_USER', 'PLAYWRIGHT_QA_PASSWORD', 'NEXT_PUBLIC_SUPABASE_URL', 'SUPABASE_SECRET_DEFAULT_KEY'];
+const required = ['PLAYWRIGHT_QA_USER', 'PLAYWRIGHT_QA_PASSWORD', 'DATABASE_URL'];
 requireE2EEnv(required);
 
 const appUrl = process.env.E2E_BASE_URL || 'http://localhost:3001';
-const supabaseUrl = env.NEXT_PUBLIC_SUPABASE_URL;
-const serviceKey = env.SUPABASE_SECRET_DEFAULT_KEY;
-const adminHeaders = { apikey: serviceKey, Authorization: `Bearer ${serviceKey}`, 'Content-Type': 'application/json' };
-const rest = (path, options = {}) =>
-  fetch(`${supabaseUrl}/rest/v1/${path}`, { ...options, headers: { ...adminHeaders, ...options.headers } });
 const json = (response) => response.json().catch(() => null);
 
 const checks = [];
@@ -33,14 +29,13 @@ const browser = await chromium.launch(chromiumLaunchOptions());
 
 try {
   // ── Fixture: pick a regular (non-removable-top) table ─────────────────────
-  const tableResp = await rest('tables?select=id,room_id,type,name&type=eq.small&limit=1');
-  const [table] = await json(tableResp);
-  check('fixture table found', tableResp.status === 200 && Boolean(table?.id), { status: tableResp.status, table });
+  const [table] = await sql`SELECT id, room_id, type, name FROM tables WHERE type = 'small' LIMIT 1`;
+  check('fixture table found', Boolean(table?.id), { table });
   created.tableId = table.id;
 
   // ── Compute a slot: tomorrow, 10:00–11:00 ─────────────────────────────────
-  const timeResp = await rest('rpc/get_database_time', { method: 'POST', body: '{}' });
-  const dbNow = new Date(await json(timeResp));
+  const [{ now: nowValue }] = await sql`SELECT now() AS now`;
+  const dbNow = new Date(nowValue);
   const tomorrow = new Date(Date.UTC(dbNow.getUTCFullYear(), dbNow.getUTCMonth(), dbNow.getUTCDate() + 1));
   const date = tomorrow.toISOString().slice(0, 10);
   const startTime = '10:00';
@@ -59,7 +54,7 @@ try {
     }
   });
 
-  await page.goto(`${appUrl}/es/login`, { waitUntil: 'networkidle' });
+  await page.goto(`${appUrl}/es/sign-in`, { waitUntil: 'networkidle' });
   await page.getByLabel('Número de socio').fill(env.PLAYWRIGHT_QA_USER);
   await page.getByLabel('Contraseña', { exact: true }).fill(env.PLAYWRIGHT_QA_PASSWORD);
   await Promise.all([
@@ -108,11 +103,8 @@ try {
 
   // ── 3. Inject pending reservation backdated to right now for check-in ──────
   // The reservation was created for tomorrow; we can't check-in to it.
-  // Instead, create a separate fixture for today via admin REST.
-  const profileResp = await rest(
-    `profiles?select=id&member_number=eq.${encodeURIComponent(env.PLAYWRIGHT_QA_USER)}&limit=1`
-  );
-  const [profile] = await json(profileResp);
+  // Instead, create a separate fixture for today via a direct DB insert.
+  const [profile] = await sql`SELECT id FROM profiles WHERE member_number = ${env.PLAYWRIGHT_QA_USER} LIMIT 1`;
 
   const dbParts = Object.fromEntries(
     new Intl.DateTimeFormat('en-CA', {
@@ -133,19 +125,11 @@ try {
     const slotStart = fmt(nowMins - 1);
     const slotEnd = fmt(nowMins + 30);
 
-    const insertResp = await rest('reservations', {
-      method: 'POST',
-      headers: { Prefer: 'return=representation' },
-      body: JSON.stringify({
-        table_id: table.id,
-        user_id: profile.id,
-        date: today,
-        start_time: slotStart,
-        end_time: slotEnd,
-        status: 'pending',
-      }),
-    });
-    const [inserted] = await json(insertResp);
+    const [inserted] = await sql`
+      INSERT INTO reservations (table_id, user_id, date, start_time, end_time, status)
+      VALUES (${table.id}, ${profile.id}, ${today}, ${slotStart}, ${slotEnd}, 'pending')
+      RETURNING id
+    `;
     checkinReservationId = inserted?.id;
     created.checkinReservationId = checkinReservationId;
 
@@ -188,10 +172,10 @@ try {
 } finally {
   await browser.close();
   if (created.reservationId) {
-    await rest(`reservations?id=eq.${created.reservationId}`, { method: 'DELETE' });
+    await tryDelete`DELETE FROM reservations WHERE id = ${created.reservationId}`;
   }
   if (created.checkinReservationId) {
-    await rest(`reservations?id=eq.${created.checkinReservationId}`, { method: 'DELETE' });
+    await tryDelete`DELETE FROM reservations WHERE id = ${created.checkinReservationId}`;
   }
   console.log(JSON.stringify({ cleanup: 'done' }));
 }

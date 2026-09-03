@@ -8,15 +8,15 @@ Standalone Node.js/Playwright scripts that validate the reservation system end-t
 
 ### 1. Install dependencies
 
-The runners need `playwright` and `dotenv`. Install them locally in this directory or use the repo devDependencies:
+The runners need `playwright`, `dotenv`, and `@neondatabase/serverless`. Install them locally in this directory or use the repo devDependencies:
 
 ```bash
-# From repo root (if playwright/dotenv are already devDeps):
+# From repo root (if these are already devDeps):
 pnpm install
 
 # Or install locally inside qa/e2e/:
 cd qa/e2e
-npm install playwright dotenv
+npm install playwright dotenv @neondatabase/serverless
 npx playwright install chromium
 ```
 
@@ -30,9 +30,7 @@ Create a dedicated `.env.e2e.local` at the **repo root**. The runners intentiona
 | `PLAYWRIGHT_QA_PASSWORD` | Password for the admin QA user |
 | `PLAYWRIGHT_QA_SECONDARY_USER` | Member number of a regular (non-admin) member |
 | `PLAYWRIGHT_QA_SECONDARY_PASSWORD` | Password for the secondary user |
-| `NEXT_PUBLIC_SUPABASE_URL` | Supabase project URL |
-| `SUPABASE_SECRET_DEFAULT_KEY` | Supabase service-role key (bypasses RLS for fixtures) |
-| `CRON_SECRET` | Secret used to authenticate the no-show cron endpoint |
+| `DATABASE_URL` | Dev Neon connection string |
 | `E2E_ALLOW_DESTRUCTIVE` | Must be exactly `1` to acknowledge privileged fixture writes/deletes |
 
 ### 3. Override variables (optional)
@@ -76,7 +74,7 @@ Each runner prints a JSON summary: `{ summary: { passed, total }, checks: [...] 
 Full pending → active reservation lifecycle for a regular (non-removable-top) table:
 - Create reservation via API → assert 201 + `status: pending`
 - Assert table slot is blocked in the availability endpoint
-- Inject a backdated pending reservation (admin REST) → activate via `POST /api/tables/:id/activate`
+- Inject a backdated pending reservation (direct DB insert) → activate via `POST /api/tables/:id/activate`
 - Assert `status: active` after check-in
 - Assert second check-in attempt returns 409 `CHECK_IN_ALREADY_ACTIVE`
 
@@ -84,19 +82,18 @@ Full pending → active reservation lifecycle for a regular (non-removable-top) 
 Cancellation cutoff enforcement (must run as a non-admin member):
 - Create reservation for tomorrow → cancel within cutoff window → assert 200 + `status: cancelled`
 - Assert slot is re-available in the availability endpoint after cancellation
-- Inject a reservation starting within 60 minutes (admin REST) → attempt member cancel → assert 403 `CANCELLATION_CUTOFF`
+- Inject a reservation starting within 60 minutes (direct DB insert) → attempt member cancel → assert 403 `CANCELLATION_CUTOFF`
 
 ### `qa-no-show-expiry.mjs`
-No-show cron endpoint (`POST /api/cron/mark-no-show`):
-- Assert unauthenticated call → 401
-- Assert call with wrong secret → 401
-- Insert a backdated pending reservation (slot ended 60+ minutes ago)
-- Call cron with correct `CRON_SECRET` → assert 200 + `marked >= 1`
+Lazy no-show expiry (`markExpiredReservationsAsNoShow`, `lib/server/reservation-no-show.ts`) — no more cron endpoint; this now runs inline on every `GET /api/reservations` call, for any authenticated session:
+- Assert unauthenticated `GET /api/reservations` → 401
+- Insert a backdated pending reservation (direct DB insert; slot ended 60 min ago — the deadline is `min(start + 59min, end)`, and with the slot's start 90 min ago, `end` is the binding term, giving 60 min of margin past it)
+- Call `GET /api/reservations` as an authenticated admin user → assert 200
 - Assert reservation transitioned to `no_show` in DB
 
 ### `qa-reservation-equipment.mjs`
 Equipment conflict and validation:
-- Create equipment item via admin REST
+- Create equipment item via direct DB insert
 - Admin books table with that equipment → assert 201 + equipment appears in response
 - Assert equipment shows as unavailable in `GET /api/rooms/:id/available-equipment`
 - Assert booking with unknown equipment UUID returns 400 `INVALID_ROOM_EQUIPMENT`

@@ -1,7 +1,7 @@
 /**
  * qa-reservation-equipment.mjs
  * Tests equipment reservation lifecycle:
- *  1. Create an equipment item via admin REST
+ *  1. Create an equipment item via a direct DB insert
  *  2. Admin creates reservation with that equipmentId → assert equipment in response
  *  3. Secondary user books a DIFFERENT table in same room same slot with same equipment
  *     → should get 409 EQUIPMENT_ALREADY_RESERVED
@@ -9,20 +9,16 @@
  */
 import { chromium } from 'playwright';
 import { chromiumLaunchOptions, env, requireE2EEnv } from './env.mjs';
+import { sql, tryDelete } from './db.mjs';
 
 const required = [
   'PLAYWRIGHT_QA_USER', 'PLAYWRIGHT_QA_PASSWORD',
   'PLAYWRIGHT_QA_SECONDARY_USER', 'PLAYWRIGHT_QA_SECONDARY_PASSWORD',
-  'NEXT_PUBLIC_SUPABASE_URL', 'SUPABASE_SECRET_DEFAULT_KEY',
+  'DATABASE_URL',
 ];
 requireE2EEnv(required);
 
 const appUrl = process.env.E2E_BASE_URL || 'http://localhost:3001';
-const supabaseUrl = env.NEXT_PUBLIC_SUPABASE_URL;
-const serviceKey = env.SUPABASE_SECRET_DEFAULT_KEY;
-const adminHeaders = { apikey: serviceKey, Authorization: `Bearer ${serviceKey}`, 'Content-Type': 'application/json' };
-const rest = (path, options = {}) =>
-  fetch(`${supabaseUrl}/rest/v1/${path}`, { ...options, headers: { ...adminHeaders, ...options.headers } });
 const json = (r) => r.json().catch(() => null);
 
 const checks = [];
@@ -36,57 +32,53 @@ const created = { equipmentId: null, reservation1Id: null, reservation2Id: null,
 const browser = await chromium.launch(chromiumLaunchOptions());
 
 try {
-  // ── 1. Create a fresh equipment item via admin REST ───────────────────────
-  const eqInsertResp = await rest('equipment', {
-    method: 'POST',
-    headers: { Prefer: 'return=representation' },
-    body: JSON.stringify({ name: `QA Equipment ${Date.now()}`, description: 'E2E test fixture' }),
-  });
-  const [eq] = await json(eqInsertResp);
+  // ── 1. Create a fresh equipment item via a direct DB insert ───────────────
+  const [eq] = await sql`
+    INSERT INTO equipment (name, description)
+    VALUES (${`QA Equipment ${Date.now()}`}, 'E2E test fixture')
+    RETURNING id
+  `;
   created.equipmentId = eq?.id;
-  check('equipment item created', eqInsertResp.status === 201 && Boolean(created.equipmentId), {
-    status: eqInsertResp.status, eq,
-  });
+  check('equipment item created', Boolean(created.equipmentId), { eq });
 
   // ── 2. Pick a regular table (primary booking table) ──────────────────────
-  const tableResp = await rest('tables?select=id,room_id,type,name&type=eq.small&limit=1');
-  const [table] = await json(tableResp);
-  check('fixture table 1', tableResp.status === 200 && Boolean(table?.id), { status: tableResp.status });
+  const [table] = await sql`SELECT id, room_id, type, name FROM tables WHERE type = 'small' LIMIT 1`;
+  check('fixture table 1', Boolean(table?.id), { table });
 
   // ── 3. Pick a second regular table in the SAME room ─────────────────────
   // (needed so secondary user's booking doesn't hit SLOT_TAKEN on the same table)
-  const table2Resp = await rest(
-    `tables?select=id,room_id,type,name&type=eq.small&room_id=eq.${table.room_id}&id=neq.${table.id}&limit=1`
-  );
-  let [table2] = await json(table2Resp);
+  const [table2Found] = await sql`
+    SELECT id, room_id FROM tables
+    WHERE type = 'small' AND room_id = ${table.room_id} AND id != ${table.id}
+    LIMIT 1
+  `;
+  let table2 = table2Found;
 
   // If there's no second table in the same room, create a temporary one
   if (!table2?.id) {
-    const createTable2 = await rest('tables', {
-      method: 'POST',
-      headers: { Prefer: 'return=representation' },
-      body: JSON.stringify({ room_id: table.room_id, name: `QA Extra ${Date.now()}`, type: 'small' }),
-    });
-    const [t2] = await json(createTable2);
+    const [t2] = await sql`
+      INSERT INTO tables (room_id, name, type)
+      VALUES (${table.room_id}, ${`QA Extra ${Date.now()}`}, 'small')
+      RETURNING id
+    `;
     created.extraTableId = t2?.id;
-    check('created extra table for conflict test', createTable2.status === 201 && Boolean(t2?.id), {
-      status: createTable2.status,
-    });
+    check('created extra table for conflict test', Boolean(t2?.id), { t2 });
     table2 = { id: t2.id, room_id: table.room_id };
   } else {
     check('fixture table 2 (same room)', Boolean(table2.id), { table2 });
   }
 
-  const roomDefaultResp = await rest('room_default_equipment', {
-    method: 'POST',
-    body: JSON.stringify({ room_id: table.room_id, equipment_id: created.equipmentId }),
-  });
-  created.roomDefaultSeeded = roomDefaultResp.status === 201;
-  check('equipment assigned to fixture room', created.roomDefaultSeeded, { status: roomDefaultResp.status });
+  const [roomDefault] = await sql`
+    INSERT INTO room_default_equipment (room_id, equipment_id)
+    VALUES (${table.room_id}, ${created.equipmentId})
+    RETURNING room_id
+  `;
+  created.roomDefaultSeeded = Boolean(roomDefault);
+  check('equipment assigned to fixture room', created.roomDefaultSeeded, { roomDefault });
 
   // ── 4. Compute date: tomorrow ─────────────────────────────────────────────
-  const timeResp = await rest('rpc/get_database_time', { method: 'POST', body: '{}' });
-  const dbNow = new Date(await json(timeResp));
+  const [{ now: nowValue }] = await sql`SELECT now() AS now`;
+  const dbNow = new Date(nowValue);
   const tomorrow = new Date(Date.UTC(dbNow.getUTCFullYear(), dbNow.getUTCMonth(), dbNow.getUTCDate() + 1));
   const date = tomorrow.toISOString().slice(0, 10);
   const startTime = '15:00';
@@ -95,7 +87,7 @@ try {
   // ── 5. Login as admin user ────────────────────────────────────────────────
   const ctx1 = await browser.newContext();
   const page1 = await ctx1.newPage();
-  await page1.goto(`${appUrl}/es/login`, { waitUntil: 'networkidle' });
+  await page1.goto(`${appUrl}/es/sign-in`, { waitUntil: 'networkidle' });
   await page1.getByLabel('Número de socio').fill(env.PLAYWRIGHT_QA_USER);
   await page1.getByLabel('Contraseña', { exact: true }).fill(env.PLAYWRIGHT_QA_PASSWORD);
   await Promise.all([
@@ -158,7 +150,7 @@ try {
   // ── 9. Secondary user books table2 (same room, same slot) with same equipment ─
   const ctx2 = await browser.newContext();
   const page2 = await ctx2.newPage();
-  await page2.goto(`${appUrl}/es/login`, { waitUntil: 'networkidle' });
+  await page2.goto(`${appUrl}/es/sign-in`, { waitUntil: 'networkidle' });
   await page2.getByLabel('Número de socio').fill(env.PLAYWRIGHT_QA_SECONDARY_USER);
   await page2.getByLabel('Contraseña', { exact: true }).fill(env.PLAYWRIGHT_QA_SECONDARY_PASSWORD);
   await Promise.all([
@@ -198,21 +190,21 @@ try {
 } finally {
   await browser.close();
   if (created.reservation1Id) {
-    await rest(`reservation_equipment?reservation_id=eq.${created.reservation1Id}`, { method: 'DELETE' });
-    await rest(`reservations?id=eq.${created.reservation1Id}`, { method: 'DELETE' });
+    await tryDelete`DELETE FROM reservation_equipment WHERE reservation_id = ${created.reservation1Id}`;
+    await tryDelete`DELETE FROM reservations WHERE id = ${created.reservation1Id}`;
   }
   if (created.reservation2Id) {
-    await rest(`reservation_equipment?reservation_id=eq.${created.reservation2Id}`, { method: 'DELETE' });
-    await rest(`reservations?id=eq.${created.reservation2Id}`, { method: 'DELETE' });
+    await tryDelete`DELETE FROM reservation_equipment WHERE reservation_id = ${created.reservation2Id}`;
+    await tryDelete`DELETE FROM reservations WHERE id = ${created.reservation2Id}`;
   }
   if (created.roomDefaultSeeded && created.equipmentId) {
-    await rest(`room_default_equipment?equipment_id=eq.${created.equipmentId}`, { method: 'DELETE' });
+    await tryDelete`DELETE FROM room_default_equipment WHERE equipment_id = ${created.equipmentId}`;
   }
   if (created.equipmentId) {
-    await rest(`equipment?id=eq.${created.equipmentId}`, { method: 'DELETE' });
+    await tryDelete`DELETE FROM equipment WHERE id = ${created.equipmentId}`;
   }
   if (created.extraTableId) {
-    await rest(`tables?id=eq.${created.extraTableId}`, { method: 'DELETE' });
+    await tryDelete`DELETE FROM tables WHERE id = ${created.extraTableId}`;
   }
   console.log(JSON.stringify({ cleanup: 'done' }));
 }
