@@ -37,11 +37,13 @@ describe('qa/e2e/db.mjs — DATABASE_URL host allowlist', () => {
     NEON_MOCK.mockClear()
     delete process.env.DATABASE_URL
     delete process.env.E2E_DATABASE_HOST
+    process.exitCode = undefined
   })
 
   afterEach(() => {
     delete process.env.DATABASE_URL
     delete process.env.E2E_DATABASE_HOST
+    process.exitCode = undefined
   })
 
   it('rejects on a host mismatch and never calls neon()', async () => {
@@ -95,5 +97,50 @@ describe('qa/e2e/db.mjs — DATABASE_URL host allowlist', () => {
     expect(String(caught)).not.toContain('npg_SUPERSECRET')
     expect(String(caught)).not.toContain(badUrl)
     expect(NEON_MOCK).not.toHaveBeenCalled()
+  })
+})
+
+describe('qa/e2e/db.mjs — tryDelete', () => {
+  const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+  beforeEach(() => {
+    vi.resetModules()
+    NEON_MOCK.mockClear()
+    consoleErrorSpy.mockClear()
+    process.env.DATABASE_URL = DEV_URL
+    process.env.E2E_DATABASE_HOST = DEV_HOST
+    process.exitCode = undefined
+  })
+
+  afterEach(() => {
+    delete process.env.DATABASE_URL
+    delete process.env.E2E_DATABASE_HOST
+    process.exitCode = undefined
+  })
+
+  it('swallows a failing DELETE, logs it, and sets process.exitCode to 1', async () => {
+    const rejectingSql = vi.fn(() => Promise.reject(new Error('ON DELETE RESTRICT violation')))
+    NEON_MOCK.mockImplementationOnce(() => rejectingSql)
+
+    const { tryDelete } = await import('../../qa/e2e/db.mjs')
+
+    await expect(tryDelete`DELETE FROM equipment WHERE id = ${'some-id'}`).resolves.toBeUndefined()
+
+    expect(rejectingSql).toHaveBeenCalledTimes(1)
+    expect(consoleErrorSpy).toHaveBeenCalledTimes(1)
+    expect(consoleErrorSpy.mock.calls[0][0]).toContain('ON DELETE RESTRICT violation')
+    expect(process.exitCode).toBe(1)
+  })
+
+  it('leaves process.exitCode untouched when the DELETE succeeds', async () => {
+    const succeedingSql = vi.fn(() => Promise.resolve([]))
+    NEON_MOCK.mockImplementationOnce(() => succeedingSql)
+
+    const { tryDelete } = await import('../../qa/e2e/db.mjs')
+
+    await tryDelete`DELETE FROM equipment WHERE id = ${'some-id'}`
+
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    expect(process.exitCode).toBeUndefined()
   })
 })

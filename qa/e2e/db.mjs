@@ -68,11 +68,17 @@ export const sql = neon(databaseUrl);
  * calls, which always resolved with a status code) — an unwrapped DELETE
  * that fails (e.g. an ON DELETE RESTRICT FK) would abort the rest of
  * cleanup and hide the real test failure behind a cleanup error instead.
+ *
+ * The failure is still surfaced: logged, and `process.exitCode` is set to
+ * `1` so the runner exits non-zero even if every `check()` in the script
+ * passed — otherwise a failed cleanup leaves privileged fixtures behind in
+ * the dev DB with a silent exit 0, invisible to CI or an operator.
  */
 export async function tryDelete(strings, ...values) {
   try {
     await sql(strings, ...values);
   } catch (error) {
     console.error(JSON.stringify({ cleanupError: String(error) }));
+    process.exitCode = 1;
   }
 }
