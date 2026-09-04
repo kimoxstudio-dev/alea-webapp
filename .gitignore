@@ -67,3 +67,6 @@ docs/AUDIT-*.md
 # kx — managed, do not edit between these markers
 .vercel
 # kx — end
+
+# Supabase CLI local state (Supabase removed in #311; the CLI still writes these if run)
+supabase/
