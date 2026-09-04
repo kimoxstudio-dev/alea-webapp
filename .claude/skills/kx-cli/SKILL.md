@@ -69,6 +69,14 @@ kx exec --env production pnpm build
 `op run --env-file` resolves the references as it reads the file, so the
 environment is chosen by which file is read, never as the command runs.
 
+**`kx exec` is also the form to write down.** The raw `op run` fails three ways
+that never mention `.env.op` — wrong directory, before the first sync, `op` not
+installed — and `kx exec` refuses with the reason instead, and names a variable
+the model has grown since the last sync. A file in the project spelling the raw
+form out is not a second convention: a `Fastfile` and the rest are scaffolded
+once and never rewritten, so their comments are as old as whatever generated
+them.
+
 Declare one without editing the file by hand:
 
 ```bash
