@@ -16,10 +16,17 @@ export default defineConfig({
     setupFiles: ['./vitest.setup.ts'],
     env: {
       // Pin tests to a known IANA timezone so service code and test helpers agree.
-      // The service (lib/club-time.ts) defaults to a hardcoded 'Atlantic/Canary'
-      // when this is unset, not the server's system timezone; test helpers fall
-      // back to 'Europe/Madrid' — pinning here keeps them in sync.
+      // lib/club-time.ts reads NEXT_PUBLIC_CLUB_TIMEZONE first, then CLUB_TIMEZONE,
+      // then falls back to a hardcoded 'Atlantic/Canary' — both must be pinned here
+      // (a `??` fallback chain does not skip an empty string, only null/undefined,
+      // so this can't be pinned by setting NEXT_PUBLIC_CLUB_TIMEZONE to ''). Vitest
+      // never loads .env.local, so a value set there has no effect on the suite —
+      // this `env` block is the only source of truth for the test run. Test helpers
+      // fall back to 'Europe/Madrid' independently (e.g.
+      // __tests__/server/reservations-activation.test.ts:298,345) — pinning both
+      // vars here keeps service code and those helpers in sync.
       CLUB_TIMEZONE: 'Europe/Madrid',
+      NEXT_PUBLIC_CLUB_TIMEZONE: 'Europe/Madrid',
     },
     include: ['__tests__/**/*.{test,spec}.{ts,tsx}'],
     exclude: ['node_modules', '.next'],

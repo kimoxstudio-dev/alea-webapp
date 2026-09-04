@@ -36,8 +36,8 @@ Related issue spec: `docs/issues/migration-pre-04-rotate-p0-secrets.md`
 
 ## 2. `CRON_SECRET` — currently unused by app runtime code (gap, not fixed here)
 
-- **Where it is set:** Present in `.env.example` (`.env.example:125`, comment context at
-  `.env.example:120-124`). Set in `.env.local` for local dev, and in the Vercel project env
+- **Where it is set:** Present in `.env.example` (`.env.example:131`, comment context at
+  `.env.example:128-130`). Set in `.env.local` for local dev, and in the Vercel project env
   (and whatever external cron scheduler calls the endpoint, e.g. cron-job.org) for deploy.
 - **Code consumers — this section changed since the original P0 audit:** the route this
   section originally described, `app/api/cron/mark-no-show/route.ts`, **no longer exists**
@@ -54,15 +54,26 @@ Related issue spec: `docs/issues/migration-pre-04-rotate-p0-secrets.md`
   ```
 
   It always returns `410 Gone` and never reads `process.env.CRON_SECRET` or checks an
-  `Authorization` header at all. `.env.example:120-124`'s comment is accurate as of this
+  `Authorization` header at all. `.env.example:128-130`'s comment is accurate as of this
   writing — it already states the route "never reads this header." A repo-wide grep for
-  `CRON_SECRET` (excluding `node_modules`) turns up **no remaining app-runtime (`app/`,
-  `lib/`) consumer** — every other hit is a stale reference: `.env.example:120-125`,
-  `docs/MIGRATION-supabase-to-neon.md:52`,
-  `docs/issues/migration-pre-03-register-cron-vercel-json.md:4`, and
-  `qa/e2e/qa-no-show-expiry.mjs:4` (a comment noting that this runner now
-  exercises the lazy no-show expiry path instead of the deleted, `CRON_SECRET`-gated
-  `POST /api/cron/mark-no-show` route).
+  `CRON_SECRET` (`git grep -n CRON_SECRET -- ':!node_modules'`, re-run against the final
+  tree of this branch) turns up **no remaining app-runtime (`app/`, `lib/`) consumer**.
+  The rest of the hits split into two groups:
+  - **Accurate, not stale:** `.env.example:128-131` (this section's own template entry
+    and comment), `docs/ENVIRONMENT.md:39,184`, `docs/ROLLBACK.md:130` (all three added
+    or verified in the same pass as this checklist update, and correctly describe the
+    variable as present-but-unused), and this document's own section 2.
+  - **Stale** (predate the discovery that the route is dead, and read as if the variable
+    were still live): `docs/MIGRATION-supabase-to-neon.md:52` (lists it among secrets to
+    rotate before cutover, with no note that it's currently unused),
+    `docs/issues/migration-pre-03-register-cron-vercel-json.md:4` (describes reviving the
+    now-deleted `mark-no-show` route and verifying its `CRON_SECRET` check), and
+    `docs/issues/migration-pre-04-rotate-p0-secrets.md:3` (same "needs rotation" framing,
+    no unused-variable note). All three are historical migration-issue specs, not live
+    documentation — left as-is; not rewritten in this docs-only pass.
+  - `qa/e2e/qa-no-show-expiry.mjs:4` is neither: a code comment, not documentation,
+    correctly noting the deleted `CRON_SECRET`-gated `POST /api/cron/mark-no-show` route
+    as the reason this runner now exercises the lazy no-show expiry path instead.
 - **What breaks if rotated without updating dependents:** **Nothing in app runtime code
   today** — there is no live route checking this value. Rotating it changes nothing except
   matching (or no longer matching) whatever an external cron scheduler still sends, which
