@@ -36,8 +36,8 @@ Related issue spec: `docs/issues/migration-pre-04-rotate-p0-secrets.md`
 
 ## 2. `CRON_SECRET` — currently unused by app runtime code (gap, not fixed here)
 
-- **Where it is set:** Present in `.env.example` (`.env.example:99`, comment context at
-  `.env.example:95-98`). Set in `.env.local` for local dev, and in the Vercel project env
+- **Where it is set:** Present in `.env.example` (`.env.example:125`, comment context at
+  `.env.example:120-124`). Set in `.env.local` for local dev, and in the Vercel project env
   (and whatever external cron scheduler calls the endpoint, e.g. cron-job.org) for deploy.
 - **Code consumers — this section changed since the original P0 audit:** the route this
   section originally described, `app/api/cron/mark-no-show/route.ts`, **no longer exists**
@@ -54,16 +54,15 @@ Related issue spec: `docs/issues/migration-pre-04-rotate-p0-secrets.md`
   ```
 
   It always returns `410 Gone` and never reads `process.env.CRON_SECRET` or checks an
-  `Authorization` header at all. `.env.example:98` itself is stale too — its comment claims
-  "The route POST /api/cron/cancel-pending will return 401 if this header is missing or
-  wrong," which is false; the route returns 410 unconditionally and never inspects the
-  header. A repo-wide grep for `CRON_SECRET` (excluding `node_modules`) turns up **no
-  remaining app-runtime (`app/`, `lib/`) consumer** — every other hit is a stale reference:
-  `.env.example:98-99`, `README.md:77`, `docs/ARCHITECTURE.md:253`,
+  `Authorization` header at all. `.env.example:120-124`'s comment is accurate as of this
+  writing — it already states the route "never reads this header." A repo-wide grep for
+  `CRON_SECRET` (excluding `node_modules`) turns up **no remaining app-runtime (`app/`,
+  `lib/`) consumer** — every other hit is a stale reference: `.env.example:120-125`,
   `docs/MIGRATION-supabase-to-neon.md:52`,
-  `docs/issues/migration-pre-03-register-cron-vercel-json.md:4`, `qa/e2e/README.md:35,94`,
-  and `qa/e2e/qa-no-show-expiry.mjs:5,12,106` (the last still targets the deleted
-  `POST /api/cron/mark-no-show` endpoint and would fail if actually run).
+  `docs/issues/migration-pre-03-register-cron-vercel-json.md:4`, and
+  `qa/e2e/qa-no-show-expiry.mjs:4` (a comment noting that this runner now
+  exercises the lazy no-show expiry path instead of the deleted, `CRON_SECRET`-gated
+  `POST /api/cron/mark-no-show` route).
 - **What breaks if rotated without updating dependents:** **Nothing in app runtime code
   today** — there is no live route checking this value. Rotating it changes nothing except
   matching (or no longer matching) whatever an external cron scheduler still sends, which
@@ -86,8 +85,8 @@ its removal in the Supabase-cleanup commit; `ls lib/supabase/` now contains only
 `types.ts`). Auth is fully on Clerk (`@clerk/nextjs`); the closest equivalent secret is
 `CLERK_SECRET_KEY`.
 
-- **Where it is set:** Present in `.env.example` (`.env.example:21`, comment context at
-  `.env.example:19-20` — sourced from Clerk Dashboard → Configure → API Keys → Secret keys).
+- **Where it is set:** Present in `.env.example` (`.env.example:28`, comment context at
+  `.env.example:24-27` — sourced from Clerk Dashboard → Configure → API Keys → Secret keys).
   Set in `.env.local` for local dev, Vercel project env for deploy.
 - **Code consumers:** unlike the old Supabase secret key, this repo has **no explicit
   `process.env.CLERK_SECRET_KEY` read** — `@clerk/nextjs` reads it directly from the
@@ -101,6 +100,8 @@ its removal in the Supabase-cleanup commit; `ls lib/supabase/` now contains only
     `:432` (rollback cleanup — `client.users.deleteUser()`), `:518` and `:530` (recovery —
     `client.users.getUserList()` and `client.users.updateUser()` respectively), and `:666-680`
     (`logout()`, with `client.sessions.revokeSession()` at `:674`).
+  - `lib/server/users-service.ts:408,457,492,589` also calls `clerkClient()` — the same
+    Backend API dependency, separate call sites from `auth-service.ts`.
   - `scripts/seed-dev.mjs:214,294` reads `process.env.CLERK_SECRET_KEY` directly (not via the
     SDK) to create the seeded admin Clerk identity, and refuses to run if the key looks like a
     live/production key (`scripts/seed-dev.mjs:133` — the `/^sk_live_/i` check; the error
@@ -126,11 +127,11 @@ its removal in the Supabase-cleanup commit; `ls lib/supabase/` now contains only
 
 ## 4. QA credentials
 
-Grepped `.env.example` for `QA_`, `TEST_`, `E2E_`, `PLAYWRIGHT`, and `qa` patterns: **none of
-these appear in `.env.example`.** They are documented separately in `qa/e2e/README.md`
-(lines 27-36) as belonging to a dedicated `.env.e2e.local` file at the repo root — the E2E
-runners intentionally do not load the app's `.env.local` because they perform privileged
-fixture writes/deletes.
+`.env.example` carries only a one-line pointer naming these prefixes (`E2E_*`,
+`PLAYWRIGHT_QA_*`) — it does not declare or default any of them. They are documented in full
+in `qa/e2e/README.md` (lines 27-36) as belonging to a dedicated `.env.e2e.local` file at the
+repo root — the E2E runners intentionally do not load the app's `.env.local` because they
+perform privileged fixture writes/deletes.
 
 - **Variables (names only):**
   - `PLAYWRIGHT_QA_USER` — member number of the admin QA user.
@@ -142,11 +143,11 @@ fixture writes/deletes.
 - **Where set:** `.env.e2e.local` at the repo root (local dev / CI runner only — not part of
   the deployed app's runtime env).
 - **Code consumers:** the standalone Playwright/Node E2E runners under `qa/e2e/*.mjs`
-  (e.g. `qa/e2e/qa-reservation-lifecycle.mjs:13,63-64,113`,
-  `qa/e2e/qa-reservation-equipment.mjs:14,99-100`,
-  `qa/e2e/qa-no-show-expiry.mjs:12,44`,
-  `qa/e2e/qa-reservation-cancellation.mjs:13`). Not consumed by any app runtime code (`app/`,
-  `lib/`) or by the Vitest unit tests under `__tests__/`.
+  (`qa/e2e/qa-reservation-lifecycle.mjs:14,58-59,107`,
+  `qa/e2e/qa-reservation-equipment.mjs:15-16,91-92,154-155`,
+  `qa/e2e/qa-no-show-expiry.mjs:19,88-89,97`,
+  `qa/e2e/qa-reservation-cancellation.mjs:14-15,49-50,106`). Not consumed by any app runtime
+  code (`app/`, `lib/`) or by the Vitest unit tests under `__tests__/`.
 - **What breaks if rotated without updating dependents:** the corresponding QA/member account
   credentials (Clerk identities + Neon `profiles` rows) must be updated to match, and
   `.env.e2e.local` on every machine/CI runner that executes the `qa/e2e/*.mjs` scripts must be
@@ -169,8 +170,7 @@ Rotation is a **manual, user-only** action. No agent performs any of the followi
 3. Update local `.env.local` to match.
 4. Decide whether to drop the now-dead `AUTH_SESSION_SECRET` reference from
    `docs/ROLLBACK.md` (optional — no code or config action required either way), and whether
-   to address the `CRON_SECRET`/QA e2e Supabase-reference gaps noted above (separate from this
-   rotation).
+   to address the `CRON_SECRET` gap noted above (separate from this rotation).
 5. Verify in the Clerk dashboard and via a smoke test (e.g. login, account activation, or
    logout) that the app authenticates correctly after rotation.
 

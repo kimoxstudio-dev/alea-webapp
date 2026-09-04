@@ -5,7 +5,8 @@ where its value comes from. Variable **names** and setting names only — no
 actual values appear in this document.
 
 See `.env.example` for the local-dev template (app runtime + scripts).
-`qa/e2e/README.md` covers the E2E runner variables in more detail.
+`qa/e2e/README.md` covers the E2E runner variables in more detail; they are
+intentionally not part of `.env.example` (see that file's pointer comment).
 
 ---
 
@@ -16,44 +17,53 @@ Scope:
 - **browser** — `NEXT_PUBLIC_*`, inlined into the client bundle at build time
 - **script** — read only by a one-off script under `scripts/`
 - **e2e** — read only by the standalone runners under `qa/e2e/*.mjs`, from a dedicated `.env.e2e.local`
-- **test** — read/stubbed only inside `__tests__/` or `vitest.setup.ts`
 
 | Variable | Scope | Required? | Purpose | Obtain from |
 |---|---|---|---|---|
-| `DATABASE_URL` | server | Required | Neon pooled connection string; every query in `lib/db/client.ts` | Neon console → project → Connection Details |
+| `DATABASE_URL` | server, script | Required | Neon pooled connection string; every query in `lib/db/client.ts`. Also read directly by `scripts/seed-dev.mjs:287` and `scripts/apply-neon-schema.mjs:375`. `vitest.setup.ts:6` supplies a dummy value for the test suite when it's otherwise unset | Neon console → project → Connection Details |
 | `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | browser | Required | Clerk publishable key. Read implicitly by `@clerk/nextjs` — no explicit `process.env` reference in this repo | Clerk dashboard → application → API Keys |
-| `CLERK_SECRET_KEY` | server | Required | Clerk secret key. Read implicitly by `@clerk/nextjs` (`middleware.ts`, `clerkClient` in `lib/server/auth-service.ts`) and explicitly by `scripts/seed-dev.mjs` | Clerk dashboard → application → API Keys |
-| `NEXT_PUBLIC_CLERK_SIGN_IN_URL` | browser | Optional, unset by default | Overrides Clerk's default sign-in route. Read implicitly by `@clerk/nextjs`; unset because sign-in is a locale-prefixed page resolved at request time | Not applicable — set manually if a fixed path is ever needed |
-| `NEXT_PUBLIC_CLERK_SIGN_UP_URL` | browser | Optional, unset by default | Same, for sign-up | Same |
+| `CLERK_SECRET_KEY` | server | Required | Clerk secret key. Read implicitly by `@clerk/nextjs` (`middleware.ts`, and `clerkClient` calls in `lib/server/auth-service.ts` and `lib/server/users-service.ts`) and explicitly by `scripts/seed-dev.mjs` | Clerk dashboard → application → API Keys |
+| `NEXT_PUBLIC_CLERK_SIGN_IN_URL` | browser | Optional, unset by default | Currently inert in this repo: nothing calls `auth.protect()`, `redirectToSignIn()`, `<SignIn>`/`<SignUp>`, or passes `signInUrl`/`signUpUrl` — `app/layout.tsx` renders a bare `<ClerkProvider>`, and `components/auth/login-form.tsx` authenticates through the headless `useSignIn()` + `router.push()`, which never consults this. Setting it has no observable effect today | Not applicable |
+| `NEXT_PUBLIC_CLERK_SIGN_UP_URL` | browser | Optional, unset by default | Same — also inert | Same |
 | `BLOB_READ_WRITE_TOKEN` | server | Required | Vercel Blob store token. Read implicitly by the `@vercel/blob` SDK's `put()` in `lib/server/uploads-service.ts` (admin image uploads) and `lib/server/tables-service.ts` (table QR codes) | Vercel dashboard → project → Storage → Blob store → `.env.local` tab |
-| `NEXT_PUBLIC_APP_URL` | server (see note) | Required for table QR generation | Base URL used to build the QR-code check-in link (`lib/server/tables-service.ts`, `lib/server/rooms-service.ts`). Despite the `NEXT_PUBLIC_` prefix it is only read server-side in this repo — it does **not** drive auth callbacks or cookie flags | Set to the deployment's public URL |
-| `COOKIE_SECURE` | server | Optional | Forces the `Secure` flag on auth/CSRF cookies (`lib/server/security-edge.ts`). Evaluated at runtime, not build time. Default: `true` when `NODE_ENV=production`, else `false` | Set explicitly only for local HTTP dev (`false`) |
-| `TRUST_PROXY_HEADERS` | server | Optional | Whether to trust `x-forwarded-for`/`x-real-ip` from a reverse proxy for rate limiting (`lib/server/security.ts`). Default: `false` | Set `true` only when the ingress strips and rewrites those headers |
-| `TRUSTED_PROXY_CIDRS` | server | Optional | CIDR allowlist for proxies permitted to supply `x-forwarded-for`, used only when `TRUST_PROXY_HEADERS=true` | Set to the ingress's source IP ranges |
+| `NEXT_PUBLIC_APP_URL` | server (see note) | Required for table QR generation | Base URL used to build the QR-code check-in link. Despite the `NEXT_PUBLIC_` prefix it is only read server-side in this repo, and does **not** drive auth callbacks or cookie flags. Two call sites behave differently when unset: `lib/server/rooms-service.ts` (table creation) only fires QR generation if this is set, so an unset value means the table is created successfully with no QR code and no error; `lib/server/tables-service.ts`'s `regenerateQrCodes()` (called from `POST /api/tables/[id]/qr`) throws a 500 if unset. `generateTableQrCode()` itself has no production caller — only its own test calls it | Set to the deployment's public URL |
+| `COOKIE_SECURE` | server | Optional | Forces the `Secure` flag on auth/CSRF cookies (`lib/server/security-edge.ts:36-39`). Evaluated at runtime, not build time. String comparison against the exact value `'true'` — `1`, `TRUE`, `yes`, or any other value all evaluate as `false`. Default when unset: `true` when `NODE_ENV=production`, else `false` | Set explicitly only for local HTTP dev (`false`) |
+| `TRUST_PROXY_HEADERS` | server | Optional | Gates whether `x-forwarded-for` is preferred over `x-real-ip` for the rate-limit key, and only when the request's source IP is also in `TRUSTED_PROXY_CIDRS` (`lib/server/security.ts:278-291`). `x-real-ip` is read unconditionally either way — an ingress that doesn't strip and overwrite both `x-real-ip` and `x-forwarded-for` before the request reaches the app lets a client set its own rate-limit key via either header, regardless of this flag. String comparison against the exact value `'true'`, same as `COOKIE_SECURE` above. Default: `false` | Set `true` only when the ingress strips and rewrites both headers |
+| `TRUSTED_PROXY_CIDRS` | server | Optional | CIDR allowlist for proxies permitted to supply `x-forwarded-for`, used only when `TRUST_PROXY_HEADERS=true`. Default when unset: `['127.0.0.1/32', '::1/128']` (`DEFAULT_TRUSTED_PROXY_CIDRS`, `lib/server/security.ts:50`) — `.env.example` ships the same value | Set to the ingress's source IP ranges |
 | `NEXT_PUBLIC_API_URL` | browser | Optional | API base URL override for the frontend (`lib/api/client.ts`). Default: `/api` | Set only when the browser must call a different API base URL |
-| `NEXT_PUBLIC_ASSOCIATION_URL` | browser | Optional | External association link shown in the footer (`components/layout/footer.tsx`). Default: hidden if unset | The club's association URL |
-| `CLUB_TIMEZONE` | server | Optional | IANA timezone override (`lib/club-time.ts`). Default: `'Atlantic/Canary'` — a hardcoded fallback, not the server's system timezone | Set to the club's IANA timezone name |
+| `NEXT_PUBLIC_ASSOCIATION_URL` | browser | Optional | External association link shown in the footer (`components/layout/footer.tsx:17,81-86`). The link always renders — `href={associationUrl ?? '#'}` — unset only means it points at `#` instead of a real URL; `target="_blank"`/`rel`/the external-link icon are what's conditional on it being set | The club's association URL |
+| `CLUB_TIMEZONE` | server | Optional | IANA timezone override (`lib/club-time.ts:8-11`). Default: `'Atlantic/Canary'` — a hardcoded fallback, not the server's system timezone. `vitest.config.mts:17-22` pins this to `'Europe/Madrid'` for the entire test suite, overriding whatever `.env.local` sets | Set to the club's IANA timezone name |
 | `NEXT_PUBLIC_CLUB_TIMEZONE` | browser + server | Optional | Same override, exposed to the browser — `lib/club-time.ts` is imported by client components (e.g. `components/rooms/rooms-view.tsx`), so a server-only `CLUB_TIMEZONE` is invisible to them. Takes precedence over `CLUB_TIMEZONE` when both are set | Same |
 | `UPSTASH_REDIS_REST_URL` | server | Optional | Rate limiter backing store (`lib/server/security.ts`). When set together with the token below, rate limiting is shared across serverless instances via Upstash Redis; otherwise it falls back to an in-memory `Map` (per-instance only, bypassable in production by rotating instances) | Upstash console → Redis database → REST API |
 | `UPSTASH_REDIS_REST_TOKEN` | server | Optional | Paired with `UPSTASH_REDIS_REST_URL` | Same |
 | `CRON_SECRET` | server | Present but unused | `POST /api/cron/cancel-pending` unconditionally returns `410` and never reads this. Kept defined pending a decision on whether the route is revived or removed — see `docs/SECRET-ROTATION-CHECKLIST.md` | Not applicable while unused |
 | `ALLOW_NON_EMPTY_DB` | script | Optional | `scripts/apply-neon-schema.mjs`: skips the empty-database guard, applying schema files even when tables already exist. Default: guard fails closed | Set `1` only when intentionally re-applying schema to a non-empty dev database |
 | `SEED_ADMIN_PASSWORD` | script | Required to run the script | `scripts/seed-dev.mjs`: initial password for the seeded admin Clerk identity | Choose a local-only password |
-| `DEV_SEED_CONFIRM` | script | Required to run the script | `scripts/seed-dev.mjs`: exact confirmation string, a safety gate against running against the wrong database. Script also refuses if `DATABASE_URL` looks like it points at anything containing `"prod"` | See the exact expected value in `scripts/seed-dev.mjs` |
+| `DEV_SEED_CONFIRM` | script | Required to run the script | `scripts/seed-dev.mjs`: safety gate against running against the wrong environment — the script refuses unless this exactly equals `YES_SEED_NEON_DEV_DB` (`DEV_SEED_CONFIRM_VALUE`, `scripts/seed-dev.mjs:90,101`). Not a secret — the expected value is printed in the script's own usage comment and in `README.md`'s seeding section | Set literally to `YES_SEED_NEON_DEV_DB` |
 | `E2E_BASE_URL` | e2e | Optional | Base URL of the running app the E2E runners hit | Default: `http://localhost:3001` |
-| `E2E_DATABASE_HOST` | e2e | Required | Positive hostname allowlist for `DATABASE_URL` — runners refuse to start if the hostname doesn't match exactly (`qa/e2e/db.mjs`) | Copy from the same Neon connection string used for `DATABASE_URL` |
+| `E2E_DATABASE_HOST` | e2e | Required | Positive hostname allowlist for `DATABASE_URL` — runners refuse to start if the hostname doesn't match exactly (`qa/e2e/db.mjs:26-49`). A second, heuristic-only defense also refuses if `DATABASE_URL` matches `/prod/i` regardless of this allowlist (`qa/e2e/db.mjs:56-59`) | Copy from the same Neon connection string used for `DATABASE_URL` |
 | `E2E_ALLOW_DESTRUCTIVE` | e2e | Required | Must be exactly `1` to acknowledge the runners perform privileged fixture writes/deletes | — |
 | `CHROME_PATH` | e2e | Optional | Custom Chrome/Chromium executable path (`qa/e2e/env.mjs`) | Default: Playwright's bundled Chromium |
-| `PLAYWRIGHT_QA_USER` | e2e | Required (most runners) | Member number of the admin QA user | A seeded/activated Clerk identity in the dev database |
-| `PLAYWRIGHT_QA_PASSWORD` | e2e | Required (most runners) | Password for the admin QA user | Same |
-| `PLAYWRIGHT_QA_SECONDARY_USER` | e2e | Required (cancellation/equipment runners) | Member number of a regular, non-admin QA member | Same |
-| `PLAYWRIGHT_QA_SECONDARY_PASSWORD` | e2e | Required (cancellation/equipment runners) | Password for the secondary user | Same |
+| `PLAYWRIGHT_QA_USER` | e2e | Required (all four runners) | Member number of the admin QA user (`qa-reservation-lifecycle.mjs:14`, `qa-reservation-cancellation.mjs:14`, `qa-reservation-equipment.mjs:15`, `qa-no-show-expiry.mjs:19`) | A seeded/activated Clerk identity in the dev database |
+| `PLAYWRIGHT_QA_PASSWORD` | e2e | Required (all four runners) | Password for the admin QA user | Same |
+| `PLAYWRIGHT_QA_SECONDARY_USER` | e2e | Required (cancellation, equipment runners) | Member number of a regular, non-admin QA member | Same |
+| `PLAYWRIGHT_QA_SECONDARY_PASSWORD` | e2e | Required (cancellation, equipment runners) | Password for the secondary user | Same |
 | `DATABASE_URL` (e2e context) | e2e | Required | Same variable as above — the E2E runners connect directly for fixture setup/teardown | Same as the app's `DATABASE_URL` |
-| `NODE_ENV` | server, framework-managed | N/A | Standard Next.js/Node variable. Gates `scripts/seed-dev.mjs` (refuses in production) and the `COOKIE_SECURE` default | Set by the runtime, not by a developer |
+| `NODE_ENV` | server, framework-managed | N/A | Standard Next.js/Node variable. Gates `scripts/seed-dev.mjs` (refuses in production), the `COOKIE_SECURE` default, and a one-time console warning in `lib/server/security.ts:441` when the in-memory rate limiter is used in production | Set by the runtime, not by a developer |
+
+### Read by SDKs, optional, not set
+
+A few more variables `@clerk/nextjs` and `@vercel/blob` recognize but this
+repo does not currently set. Not an exhaustive SDK variable list — only the
+ones with an actual runtime effect if someone did set them:
+
+- `NEXT_PUBLIC_CLERK_TELEMETRY_DISABLED` — Clerk's anonymous telemetry is **on** by default; setting this to `1` disables it. Not set anywhere in this repo.
+- `CLERK_ENCRYPTION_KEY` — only needed if Clerk's data encryption at rest is enabled for this instance; not currently configured.
+- `VERCEL_OIDC_TOKEN` / `BLOB_STORE_ID` — an alternative to `BLOB_READ_WRITE_TOKEN` for authenticating `@vercel/blob` on Vercel's own infrastructure via OIDC. Not used here; `BLOB_READ_WRITE_TOKEN` is the auth path this repo relies on.
 
 ### Not environment variables (found during this audit, excluded)
 
-The issue's starting grep included a few names that turned out to be
+The initial audit grep included a few names that turned out to be
 hardcoded constants, not `process.env` reads — listed here so they aren't
 re-added by mistake:
 
@@ -63,29 +73,28 @@ re-added by mistake:
 - `BLOB_BASE_URL` — a test-fixture constant in `__tests__/server/tables-service.test.ts`, not read from the environment.
 - `VERCEL_TOKEN` — not read anywhere in this repo; it authenticates the Vercel CLI itself and is supplied by the `vercel` connector in this studio's tooling, not declared by the app.
 
-### Removed: the old Supabase project-URL variable and `SUPABASE_SECRET_DEFAULT_KEY`
+### Removed: `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY` / `SUPABASE_SECRET_DEFAULT_KEY`
 
-Neither is read anywhere in the current codebase — Supabase was fully
-removed (#311/#366), and the E2E runners were swapped from Supabase to
-Clerk in #312 (merged, PR #367). The only remaining mentions were two
+None of the three are read anywhere in the current codebase — Supabase was
+fully removed (#311/#366), and the E2E runners were swapped from Supabase to
+Clerk in #312 (merged, PR #367). The only remaining mentions were three
 stale references in `docs/SECRET-ROTATION-CHECKLIST.md` describing this as
-an open gap; that doc has been updated to reflect the fix. Both variables
-are still set on Vercel (see the gap list below) — that's leftover
-configuration, not a code dependency.
+an open gap; that doc has been updated to reflect the fix. All three
+variables are still set on Vercel (see the gap list below) — that's
+leftover configuration, not a code dependency.
 
 ---
 
 ## Vercel environments
 
 Checked via `vercel env ls` (names and environment columns only — no
-values) against a project this repo is linked to. Deployment env config is
-authoritative on Vercel's side; the code-side "what does the app actually
-read" comes from the table above.
+values) against the project this repo is linked to, on 2026-09-04. Deployment
+env config is authoritative on Vercel's side; the code-side "what does the
+app actually read" comes from the table above.
 
 ### What must differ between Preview and Production
 
-- `DATABASE_URL` (and any Neon-injected siblings actually in use — see the
-  stale-injected-vars note below) — each points at a different Neon branch.
+- `DATABASE_URL` — each should point at a different Neon branch.
 - `CLERK_SECRET_KEY` / `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` — Preview should
   use a Clerk **test** instance's keys, Production a separate **live**
   Clerk instance's keys. See "Clerk instance configuration" below for why
@@ -105,29 +114,58 @@ read" comes from the table above.
   shared Redis database, or be split per environment; either is fine
   since rate-limit state doesn't need to be shared across environments.
 
-### What Vercel injects itself
+### Gap: shared between Preview and Production but must differ
 
-`VERCEL`, `VERCEL_ENV`, `VERCEL_URL`, `VERCEL_REGION`, and similar
-`VERCEL_*` variables are set automatically by the platform at build/runtime
-and are not declared anywhere in this repo.
+Every variable in "What must differ" above appears in `vercel env ls` as a
+**single row** whose environments column lists more than one target,
+meaning one value is currently assigned to all of them — not split per
+environment:
+
+- `DATABASE_URL` — one row, target `Preview, Production`. Preview and
+  Production currently run against the same Neon database.
+- `NEXT_PUBLIC_APP_URL` — one row, target `Preview, Production`. Preview
+  builds QR-code check-in links pointing at Production's URL (or vice
+  versa, depending on which was set last).
+- `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` — one row, target `Development,
+  Preview, Production`.
+- `CLERK_SECRET_KEY` — one row, target `Development, Preview, Production`.
+  Combined with the row above: Development, Preview, and Production all
+  currently authenticate against the same Clerk instance.
+- `BLOB_READ_WRITE_TOKEN` — not present in `vercel env ls` at all for any
+  environment (see the next gap section) — Preview and Production don't
+  even share a value here, neither has one.
 
 ### Gap: read by code, not set on Vercel
 
 - **`BLOB_READ_WRITE_TOKEN`** — not present in `vercel env ls` output for
   Preview or Production. Both `lib/server/uploads-service.ts` (admin image
   uploads) and `lib/server/tables-service.ts` (table QR codes) need it;
-  without it those code paths fail. This looks like a real gap, not an
-  intentional omission — flagging for the user to confirm and set.
-- `NEXT_PUBLIC_CLERK_SIGN_IN_URL` / `NEXT_PUBLIC_CLERK_SIGN_UP_URL`,
-  `COOKIE_SECURE`, `NEXT_PUBLIC_CLERK_SIGN_UP_URL` — not set on Vercel
-  either, but these are genuinely optional with working defaults, so this
+  without it those code paths fail.
+
+### Not set on Vercel, optional
+
+- `NEXT_PUBLIC_CLERK_SIGN_IN_URL` / `NEXT_PUBLIC_CLERK_SIGN_UP_URL` —
+  inert in this repo (see the variable table above); absence has no effect.
+- `COOKIE_SECURE` — has a working default (`true` in production); absence
   is expected, not a gap.
+- `NEXT_PUBLIC_CLUB_TIMEZONE` — absent, while `CLUB_TIMEZONE` **is** set
+  on Vercel (one row, target `Preview, Production`). If that value is ever
+  anything other than the default `'Atlantic/Canary'`,
+  server code (which reads `CLUB_TIMEZONE`) and client components (which
+  read `NEXT_PUBLIC_CLUB_TIMEZONE`, not set, so they fall through to the
+  hardcoded default) will compute day boundaries in two different
+  timezones. Not harmless if `CLUB_TIMEZONE`'s actual value is non-default.
+- `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` — absent. Without
+  both, the rate limiter falls back to the in-memory `Map`, which this
+  document's own variable table calls "bypassable in production by
+  rotating instances." Not harmless — this is the difference between a
+  real production rate limit and one an attacker can reset by triggering
+  new serverless instances.
 
 ### Gap: set on Vercel, nothing reads it
 
-- The old Supabase project-URL variable, its browser publishable-key
-  sibling, and `SUPABASE_SECRET_DEFAULT_KEY` — dead, Supabase fully removed
-  (see above).
+- `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY`,
+  `SUPABASE_SECRET_DEFAULT_KEY` — dead, Supabase fully removed (see above).
 - `AUTH_SESSION_SECRET`, `AUTH_SECRET` — dead, pre-Clerk session
   implementation; `docs/SECRET-ROTATION-CHECKLIST.md` already documents
   `AUTH_SESSION_SECRET` as unreferenced by any code.
@@ -142,44 +180,43 @@ and are not declared anywhere in this repo.
   read by the standalone `qa/e2e/*.mjs` runners, which load them from a
   dedicated `.env.e2e.local` and are normally run locally against a dev
   server, not as part of a Vercel deployment. Set on Preview/Production
-  regardless — worth confirming with the user whether some CI job runs
-  these against a Preview deployment, or whether this is leftover.
+  regardless.
 - `CRON_SECRET` — set, but unused by any route (see the variable table
   above and `docs/SECRET-ROTATION-CHECKLIST.md` section 2).
 
-None of the above were changed, promoted, or deleted — reporting only, per
-this repo's DDL/secrets rules (user-only execution).
+Nothing was changed, promoted, or deleted on Vercel while producing this
+document — read-only, per this repo's DDL/secrets rules.
 
 ---
 
 ## Clerk instance configuration
 
-### Development instance — verified live, 2026-09-04
+### Development instance — verified against the live instance on 2026-09-04
 
-Queried directly against the Clerk Frontend API (`GET
+Verified directly against the Clerk Frontend API (`GET
 https://<frontend-api-host>/v1/environment`, host decoded from the
-publishable key in the worktree's `.env.local`) rather than trusted from
-the issue text.
+publishable key), rather than assumed from the issue text. All paths below
+are relative to the response's `user_settings` object.
 
 | Setting | Live value | Issue #335's claim | Match? |
 |---|---|---|---|
 | `sign_up.mode` | `restricted` | `restricted` | Yes |
-| `attributes.username.enabled` | `false` | "username enabled" | **No** — live instance has username *disabled* as a sign-up attribute (though `used_for_first_factor: true` is still set, and app accounts are provisioned via the Backend API rather than public sign-up, so this may not currently block anything — flagging the mismatch rather than interpreting it) |
+| `attributes.username.enabled` | `false` | "username enabled" | **No** — the live instance has the username *attribute* disabled for sign-up collection. `attributes.username.used_for_first_factor` is `true` — see "Target production instance configuration" below for why this, not `enabled`, is the setting that matters here |
 | `attributes.email_address.enabled` | `false` | "email_address disabled" | Yes |
 | `attributes.password.enabled` | `true` | "password enabled" | Yes |
 | `social.oauth_google.enabled` | `true` | Not mentioned in the issue | **New finding** — Google OAuth sign-in is enabled on the dev instance. Not mentioned by #335 and not consistent with the club's no-public-signup identity model (see below) |
 
-Other observed settings, for completeness: `captcha_enabled: true`,
+Other observed settings, for completeness: `sign_up.captcha_enabled: true`,
 `sign_up.progressive: true`, `sign_up.legal_consent_enabled: false`,
-`restrictions.allowlist/blocklist: disabled`,
-`username_settings.min_length: 4`, `actions.create_organization: true`.
-None of these were claimed by the issue either way.
+`sign_up.mfa.required: false`, `sign_in.second_factor.required: false`,
+`restrictions.allowlist.enabled: false`, `restrictions.blocklist.enabled:
+false`, `username_settings.min_length: 4`, `actions.create_organization:
+true`. None of these were claimed by the issue either way.
 
-**Not independently verified:** allowed origins / redirect URLs, MFA
-policy beyond the `required: false` flag above, and anything requiring the
-Backend API (`api.clerk.com`) rather than the public Frontend API — the
-Frontend API's `/v1/environment` endpoint was sufficient for everything in
-the table above and needed no secret key.
+**Not independently verified:** allowed origins / redirect URLs, and
+anything requiring the Backend API (`api.clerk.com`) rather than the public
+Frontend API — the Frontend API's `/v1/environment` endpoint was sufficient
+for everything in the table above and needed no secret key.
 
 ### Target production instance configuration
 
@@ -190,11 +227,18 @@ channel. Zero outgoing email (identity model from #299).
 | Setting | Target | Rationale |
 |---|---|---|
 | `sign_up.mode` | `restricted` (no public self-signup) | Members are provisioned by an admin via the activation-link flow, never by visiting a public sign-up page |
-| `attributes.username.enabled` | `true`, required | The member number is the sign-in identifier (`alea-<memberNumber>`, see `CLERK_USERNAME_PREFIX` in `lib/server/auth-service.ts`) |
+| `attributes.username.used_for_first_factor` | `true` | The member number is the sign-in identifier: `components/auth/login-form.tsx:84-85` calls `signIn.create({ identifier: 'alea-<memberNumber>', password })`, and `lib/server/auth-service.ts:395-398` provisions accounts via the Backend API's `client.users.createUser({ username, password })` — never through the public sign-up form. `attributes.username.enabled`/`.required` govern sign-up-form attribute *collection*, which is moot here: sign-up is `restricted` and accounts are always created server-side. The live dev instance already has `used_for_first_factor: true` with `enabled: false` (see above) — that combination is what production should match, not `enabled: true` |
 | `attributes.email_address.enabled` | `false` | Members have no email addresses in this system |
 | `attributes.password.enabled` | `true` | Password is the only credential members authenticate with |
 | Email/SMS verification flows | Disabled | There is no outgoing email or SMS channel to verify through |
 | `social.*` (OAuth providers) | All disabled | No provider is part of the identity model; the live dev instance's `oauth_google: true` should not carry into production |
+
+The verified dev instance already matches this target on every row except
+`social.oauth_google`. Production should be provisioned to match the dev
+instance's verified settings above, not the settings that were assumed
+before this audit. Any deviation from this table — including keeping
+`oauth_google` enabled — must be smoke-tested under issue #313 before
+cutover, not assumed safe.
 
 ### Development vs. production instance, generally
 

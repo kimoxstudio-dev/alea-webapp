@@ -100,7 +100,7 @@ Neon does not support automatic down migrations any more than Supabase did. To r
 
 ### Taking a database backup (Neon)
 
-Neon retains automatic point-in-time recovery per branch (retention window depends on the Neon plan) — Neon Console → Branches → the branch → Restore. For a portable, explicit backup file, use `pg_dump`. Only the pooled connection string is configured in this repo (`DATABASE_URL`, `.env.example:8`) — there is no unpooled variable defined anywhere. For a `pg_dump` (a long-running operation that can be unreliable over the pooled/PgBouncer endpoint), copy the unpooled connection string manually from Neon Console → your project → Connection Details → toggle "Pooled connection" off, then run:
+Neon retains automatic point-in-time recovery per branch (retention window depends on the Neon plan) — Neon Console → Branches → the branch → Restore. For a portable, explicit backup file, use `pg_dump`. Only the pooled connection string is configured in this repo (`DATABASE_URL`, `.env.example:12`) — there is no unpooled variable defined anywhere. For a `pg_dump` (a long-running operation that can be unreliable over the pooled/PgBouncer endpoint), copy the unpooled connection string manually from Neon Console → your project → Connection Details → toggle "Pooled connection" off, then run:
 
 ```bash
 pg_dump "<unpooled-connection-string-from-neon-console>" > backup-$(date +%Y%m%d).sql
@@ -110,7 +110,7 @@ pg_dump "<unpooled-connection-string-from-neon-console>" > backup-$(date +%Y%m%d
 
 ## Environment Variable Checklist
 
-Ensure these variables are correctly set in the target environment before deploying or rolling back:
+Ensure these variables are correctly set in the target environment before deploying or rolling back. See `docs/ENVIRONMENT.md` for the full reference (scope, defaults, and where each value is obtained) — this table only covers what's relevant to a rollback decision.
 
 | Variable | Required | Description |
 |---|---|---|
@@ -118,8 +118,8 @@ Ensure these variables are correctly set in the target environment before deploy
 | `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | Yes | Clerk publishable key (format: `pk_test_*`/`pk_live_*`); safe to expose in the browser. |
 | `CLERK_SECRET_KEY` | Yes | Clerk secret key (format: `sk_test_*`/`sk_live_*`); server only. |
 | `BLOB_READ_WRITE_TOKEN` | Yes | Vercel Blob read/write token used by `lib/server/uploads-service.ts` and `lib/server/tables-service.ts`. |
-| `AUTH_SESSION_SECRET` | No | Auth session secret (min 32 chars); only required if rolling back to pre-M3 implementations |
-| `NEXT_PUBLIC_APP_URL` | No | Public app base URL (e.g. `https://app.alea.club`). Used for auth callbacks/redirects. |
+| `AUTH_SESSION_SECRET` | No | Dead — no code consumer in the current Clerk-based runtime (see `docs/SECRET-ROTATION-CHECKLIST.md` section 1). Listed here only because a rollback to a pre-M3, pre-Clerk implementation would need it. |
+| `NEXT_PUBLIC_APP_URL` | No | Public app base URL (e.g. `https://app.alea.club`). Despite the name, only read server-side, to build table QR-code check-in links — it does not drive auth callbacks or redirects. See `docs/ENVIRONMENT.md` for the exact unset-value behavior. |
 | `COOKIE_SECURE` | No | Controls the `Secure` flag on the CSRF cookie (`lib/server/security-edge.ts:52-58`); defaults to `true` when `NODE_ENV=production`, `false` otherwise. The Clerk session cookie's `Secure` flag is set by Clerk, not by this variable. Leave unset in production. |
 | `TRUST_PROXY_HEADERS` | No | Set to `true` only when the ingress strips and rewrites both `x-real-ip` and `x-forwarded-for` before requests reach the app. |
 | `TRUSTED_PROXY_CIDRS` | No | Comma-separated CIDR allowlist for reverse proxies that are allowed to supply `x-forwarded-for` when `TRUST_PROXY_HEADERS=true`. Requests outside these source-IP ranges fall back to `x-real-ip` for rate limiting; the ingress must also strip and overwrite inbound `x-real-ip` and `x-forwarded-for`. |
@@ -127,7 +127,7 @@ Ensure these variables are correctly set in the target environment before deploy
 | `NEXT_PUBLIC_ASSOCIATION_URL` | No | External URL for the association link in the footer. |
 | `CLUB_TIMEZONE` | No | IANA timezone override; defaults to `'Atlantic/Canary'` (`lib/club-time.ts:1`). `NEXT_PUBLIC_CLUB_TIMEZONE` takes precedence over this value. |
 | `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | No | When both are set, rate limiting uses shared Upstash Redis instead of an in-memory Map. |
-| `CRON_SECRET` | No | Bearer token the external cron scheduler must send. Note: `POST /api/cron/cancel-pending` (`app/api/cron/cancel-pending/route.ts`) currently returns `410 Gone` unconditionally and does not check this value — it is effectively unused by app runtime code as of this writing; see `docs/SECRET-ROTATION-CHECKLIST.md` for the fuller note on this gap. |
+| `CRON_SECRET` | No | Not currently a bearer token anything checks: `POST /api/cron/cancel-pending` (`app/api/cron/cancel-pending/route.ts`) returns `410 Gone` unconditionally and never reads this value — it is effectively unused by app runtime code as of this writing; see `docs/SECRET-ROTATION-CHECKLIST.md` for the fuller note on this gap. |
 
 > **Security:** `CLERK_SECRET_KEY`, `AUTH_SESSION_SECRET`, and `DATABASE_URL` must never be exposed to the browser or committed to git. Unlike a Supabase project URL, Neon's `DATABASE_URL` embeds a password — treat a leaked connection string as a credential exposure, not just a config leak.
 

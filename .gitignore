@@ -17,7 +17,11 @@ test-results/
 playwright-report/
 .playwright-mcp/
 
-# Supabase local runtime artifacts (not migrations)
+# Supabase local runtime artifacts (not migrations). Supabase itself was
+# removed in #311; this only catches a stray Supabase CLI run re-creating
+# its scratch directory. Anchored to the repo root — lib/supabase/ (still
+# tracked, holds the generated DB row types) must not match.
+/supabase/
 
 # Editor
 .vscode/
@@ -67,6 +71,3 @@ docs/AUDIT-*.md
 # kx — managed, do not edit between these markers
 .vercel
 # kx — end
-
-# Supabase CLI local state (Supabase removed in #311; the CLI still writes these if run)
-supabase/

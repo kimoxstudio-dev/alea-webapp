@@ -16,8 +16,9 @@ export default defineConfig({
     setupFiles: ['./vitest.setup.ts'],
     env: {
       // Pin tests to a known IANA timezone so service code and test helpers agree.
-      // The service defaults to the server's system timezone when this is unset;
-      // test helpers fall back to 'Europe/Madrid' — pinning here keeps them in sync.
+      // The service (lib/club-time.ts) defaults to a hardcoded 'Atlantic/Canary'
+      // when this is unset, not the server's system timezone; test helpers fall
+      // back to 'Europe/Madrid' — pinning here keeps them in sync.
       CLUB_TIMEZONE: 'Europe/Madrid',
     },
     include: ['__tests__/**/*.{test,spec}.{ts,tsx}'],
