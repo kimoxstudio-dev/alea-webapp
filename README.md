@@ -69,14 +69,9 @@ alea-webapp/
    cp .env.example .env.local
    ```
 
-   The project uses **Neon** for the database and **Clerk** for auth — there is no local Postgres/Docker setup; development connects to a real Neon branch. Open `.env.local` and fill in:
-   - `DATABASE_URL` — Neon pooled connection string (`?sslmode=require`), from console.neon.tech → your project → Connection Details
-   - `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` / `CLERK_SECRET_KEY` — Clerk test-mode keys, from dashboard.clerk.com → your application → API Keys
-   - `BLOB_READ_WRITE_TOKEN` — Vercel Blob store token, used for admin image uploads and table QR codes
-   - `NEXT_PUBLIC_APP_URL` (`http://localhost:3000` locally)
-   - `CRON_SECRET` (any long random string for local work)
+   The project uses **Neon** for the database and **Clerk** for auth — there is no local Postgres/Docker setup; development connects to a real Neon branch. Open `.env.local` and fill in at minimum `DATABASE_URL`, `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` / `CLERK_SECRET_KEY`, `BLOB_READ_WRITE_TOKEN`, and `NEXT_PUBLIC_APP_URL`.
 
-   If the app runs behind a reverse proxy or CDN in deployment, set `TRUST_PROXY_HEADERS=true` and configure `TRUSTED_PROXY_CIDRS` with the proxy source-IP ranges that are allowed to provide `x-forwarded-for`; otherwise rate limiting falls back to `x-real-ip`. Your ingress must also strip and overwrite inbound `x-real-ip` and `x-forwarded-for` headers before the request reaches the app.
+   See **[docs/ENVIRONMENT.md](docs/ENVIRONMENT.md)** for the full variable reference (every variable, its scope, required/optional status, and where to obtain it), the Preview/Production split, and the Clerk instance configuration.
 
 4. **Start the development server**
 

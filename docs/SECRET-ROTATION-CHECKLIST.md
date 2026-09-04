@@ -113,13 +113,14 @@ its removal in the Supabase-cleanup commit; `ls lib/supabase/` now contains only
   the deployment environment (Vercel project env) and any local `.env.local`, those calls
   will fail to authenticate against Clerk's Backend API and auth/activation/recovery/logout
   will start erroring.
-- **Known unrelated stale reference (not fixed here, already tracked):** `qa/e2e/qa-reservation-cancellation.mjs`,
+- **Resolved (was a known stale reference, tracked by #312):** `qa/e2e/qa-reservation-cancellation.mjs`,
   `qa/e2e/qa-reservation-lifecycle.mjs`, `qa/e2e/qa-no-show-expiry.mjs`,
-  `qa/e2e/qa-reservation-equipment.mjs`, and `qa/e2e/env.mjs` still reference
-  `SUPABASE_SECRET_DEFAULT_KEY`/`NEXT_PUBLIC_SUPABASE_URL` for privileged fixture writes. These
-  are QA e2e tooling code files, out of scope for this docs-only pass — this gap already has an
-  owner, open issue **#312 "[N4] Swap test/E2E auth from Supabase to Clerk"**, so no new issue
-  is needed here. (The `CRON_SECRET` gap above has no matching open issue and is genuinely new.)
+  `qa/e2e/qa-reservation-equipment.mjs`, and `qa/e2e/env.mjs` used to reference
+  `SUPABASE_SECRET_DEFAULT_KEY` and the old Supabase project-URL variable for privileged fixture writes. Issue
+  **#312 "[N4] Swap test/E2E auth from Supabase to Clerk"** (PR #367) has since merged — the
+  runners now authenticate as Clerk identities via `PLAYWRIGHT_QA_USER`/`PLAYWRIGHT_QA_PASSWORD`
+  (see `docs/ENVIRONMENT.md`), and neither Supabase variable is read anywhere in the repo
+  anymore. (The `CRON_SECRET` gap above has no matching open issue and is still open.)
 
 ---
 
@@ -147,13 +148,11 @@ fixture writes/deletes.
   `qa/e2e/qa-reservation-cancellation.mjs:13`). Not consumed by any app runtime code (`app/`,
   `lib/`) or by the Vitest unit tests under `__tests__/`.
 - **What breaks if rotated without updating dependents:** the corresponding QA/member account
-  credentials (now Clerk identities + Neon `profiles` rows, not Supabase) must be updated to
-  match, and `.env.e2e.local` on every machine/CI runner that executes the `qa/e2e/*.mjs`
-  scripts must be updated, or those E2E runs will fail to log in / authenticate. Note the
-  `qa/e2e/*.mjs` runners themselves still read `NEXT_PUBLIC_SUPABASE_URL`/
-  `SUPABASE_SECRET_DEFAULT_KEY` for privileged fixture writes against Supabase (see the
-  known-stale-reference note in section 3 above) — that gap is already tracked by open issue
-  #312, not something this rotation section is describing as current runtime behavior.
+  credentials (Clerk identities + Neon `profiles` rows) must be updated to match, and
+  `.env.e2e.local` on every machine/CI runner that executes the `qa/e2e/*.mjs` scripts must be
+  updated, or those E2E runs will fail to log in / authenticate. The Supabase-based fixture
+  writes noted in an earlier version of this section were resolved by #312 (see section 3
+  above) — the runners no longer touch Supabase at all.
 
 ---
 
