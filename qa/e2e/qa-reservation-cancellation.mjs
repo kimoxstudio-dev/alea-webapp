@@ -8,20 +8,16 @@
  */
 import { chromium } from 'playwright';
 import { chromiumLaunchOptions, env, requireE2EEnv } from './env.mjs';
+import { sql, tryDelete } from './db.mjs';
 
 const required = [
   'PLAYWRIGHT_QA_USER', 'PLAYWRIGHT_QA_PASSWORD',
   'PLAYWRIGHT_QA_SECONDARY_USER', 'PLAYWRIGHT_QA_SECONDARY_PASSWORD',
-  'NEXT_PUBLIC_SUPABASE_URL', 'SUPABASE_SECRET_DEFAULT_KEY',
+  'DATABASE_URL',
 ];
 requireE2EEnv(required);
 
 const appUrl = process.env.E2E_BASE_URL || 'http://localhost:3001';
-const supabaseUrl = env.NEXT_PUBLIC_SUPABASE_URL;
-const serviceKey = env.SUPABASE_SECRET_DEFAULT_KEY;
-const adminHeaders = { apikey: serviceKey, Authorization: `Bearer ${serviceKey}`, 'Content-Type': 'application/json' };
-const rest = (path, options = {}) =>
-  fetch(`${supabaseUrl}/rest/v1/${path}`, { ...options, headers: { ...adminHeaders, ...options.headers } });
 const json = (r) => r.json().catch(() => null);
 
 const checks = [];
@@ -36,21 +32,20 @@ const browser = await chromium.launch(chromiumLaunchOptions());
 
 try {
   // ── Fixture: regular table ─────────────────────────────────────────────────
-  const tableResp = await rest('tables?select=id,room_id,type,name&type=eq.small&limit=1');
-  const [table] = await json(tableResp);
-  check('fixture table', tableResp.status === 200 && Boolean(table?.id), { status: tableResp.status });
+  const [table] = await sql`SELECT id, room_id, type, name FROM tables WHERE type = 'small' LIMIT 1`;
+  check('fixture table', Boolean(table?.id), { table });
   created.tableId = table.id;
 
   // ── DB time ───────────────────────────────────────────────────────────────
-  const timeResp = await rest('rpc/get_database_time', { method: 'POST', body: '{}' });
-  const dbNow = new Date(await json(timeResp));
+  const [{ now: nowValue }] = await sql`SELECT now() AS now`;
+  const dbNow = new Date(nowValue);
   const tomorrow = new Date(Date.UTC(dbNow.getUTCFullYear(), dbNow.getUTCMonth(), dbNow.getUTCDate() + 1));
   const tomorrowStr = tomorrow.toISOString().slice(0, 10);
 
   // ── Login as MEMBER (secondary user) ─────────────────────────────────────
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
-  await page.goto(`${appUrl}/es/login`, { waitUntil: 'networkidle' });
+  await page.goto(`${appUrl}/es/sign-in`, { waitUntil: 'networkidle' });
   await page.getByLabel('Número de socio').fill(env.PLAYWRIGHT_QA_SECONDARY_USER);
   await page.getByLabel('Contraseña', { exact: true }).fill(env.PLAYWRIGHT_QA_SECONDARY_PASSWORD);
   await Promise.all([
@@ -106,12 +101,9 @@ try {
     sample: slotsAfter.slice(0, 4),
   });
 
-  // ── Test 2: Cancel AFTER cutoff — inject via admin REST ──────────────────
+  // ── Test 2: Cancel AFTER cutoff — inject via direct DB insert ────────────
   // Resolve secondary profile id
-  const profileResp = await rest(
-    `profiles?select=id&member_number=eq.${encodeURIComponent(env.PLAYWRIGHT_QA_SECONDARY_USER)}&limit=1`
-  );
-  const [profile] = await json(profileResp);
+  const [profile] = await sql`SELECT id FROM profiles WHERE member_number = ${env.PLAYWRIGHT_QA_SECONDARY_USER} LIMIT 1`;
 
   // Get club-local time
   const dbParts = Object.fromEntries(
@@ -133,23 +125,13 @@ try {
     const nearStart = fmt(nowMins + 30);
     const nearEnd   = fmt(nowMins + 60);
 
-    const lateInsert = await rest('reservations', {
-      method: 'POST',
-      headers: { Prefer: 'return=representation' },
-      body: JSON.stringify({
-        table_id: table.id,
-        user_id: profile.id,
-        date: today,
-        start_time: nearStart,
-        end_time: nearEnd,
-        status: 'pending',
-      }),
-    });
-    const [lateRes] = await json(lateInsert);
+    const [lateRes] = await sql`
+      INSERT INTO reservations (table_id, user_id, date, start_time, end_time, status)
+      VALUES (${table.id}, ${profile.id}, ${today}, ${nearStart}, ${nearEnd}, 'pending')
+      RETURNING id
+    `;
     created.lateReservationId = lateRes?.id;
-    check('late-fixture inserted', lateInsert.status === 201 && Boolean(created.lateReservationId), {
-      status: lateInsert.status, body: lateRes,
-    });
+    check('late-fixture inserted', Boolean(created.lateReservationId), { lateRes });
 
     // Member tries to cancel — must be rejected (< 60 min to start)
     const lateCancelResp = await put(`/reservations/${created.lateReservationId}`, { status: 'cancelled' });
@@ -172,7 +154,7 @@ try {
   if (passed < total) throw new Error(`${total - passed} check(s) failed`);
 } finally {
   await browser.close();
-  if (created.earlyReservationId) await rest(`reservations?id=eq.${created.earlyReservationId}`, { method: 'DELETE' });
-  if (created.lateReservationId)  await rest(`reservations?id=eq.${created.lateReservationId}`,  { method: 'DELETE' });
+  if (created.earlyReservationId) await tryDelete`DELETE FROM reservations WHERE id = ${created.earlyReservationId}`;
+  if (created.lateReservationId)  await tryDelete`DELETE FROM reservations WHERE id = ${created.lateReservationId}`;
   console.log(JSON.stringify({ cleanup: 'done' }));
 }

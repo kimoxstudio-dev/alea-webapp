@@ -5,12 +5,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check env.mjs && node --check qa-no-show-expiry.mjs && node --check qa-reservation-cancellation.mjs && node --check qa-reservation-equipment.mjs && node --check qa-reservation-lifecycle.mjs"
+    "check": "node --check db.mjs && node --check env.mjs && node --check qa-no-show-expiry.mjs && node --check qa-reservation-cancellation.mjs && node --check qa-reservation-equipment.mjs && node --check qa-reservation-lifecycle.mjs"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "devDependencies": {
+    "@neondatabase/serverless": "^1.1.0",
     "dotenv": "^17.4.2",
     "playwright": "^1.61.0"
   }
