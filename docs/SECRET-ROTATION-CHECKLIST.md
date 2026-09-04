@@ -36,8 +36,8 @@ Related issue spec: `docs/issues/migration-pre-04-rotate-p0-secrets.md`
 
 ## 2. `CRON_SECRET` — currently unused by app runtime code (gap, not fixed here)
 
-- **Where it is set:** Present in `.env.example` (`.env.example:131`, comment context at
-  `.env.example:128-130`). Set in `.env.local` for local dev, and in the Vercel project env
+- **Where it is set:** Present in `.env.example` (`.env.example:132`, comment context at
+  `.env.example:129-131`). Set in `.env.local` for local dev, and in the Vercel project env
   (and whatever external cron scheduler calls the endpoint, e.g. cron-job.org) for deploy.
 - **Code consumers — this section changed since the original P0 audit:** the route this
   section originally described, `app/api/cron/mark-no-show/route.ts`, **no longer exists**
@@ -54,13 +54,13 @@ Related issue spec: `docs/issues/migration-pre-04-rotate-p0-secrets.md`
   ```
 
   It always returns `410 Gone` and never reads `process.env.CRON_SECRET` or checks an
-  `Authorization` header at all. `.env.example:128-130`'s comment is accurate as of this
+  `Authorization` header at all. `.env.example:129-131`'s comment is accurate as of this
   writing — it already states the route "never reads this header." A repo-wide grep for
   `CRON_SECRET` (`git grep -n CRON_SECRET -- ':!node_modules'`, re-run against the final
   tree of this branch) turns up **no remaining app-runtime (`app/`, `lib/`) consumer**.
   The rest of the hits split into two groups:
-  - **Accurate, not stale:** `.env.example:128-131` (this section's own template entry
-    and comment), `docs/ENVIRONMENT.md:39,184`, `docs/ROLLBACK.md:130` (all three added
+  - **Accurate, not stale:** `.env.example:129-132` (this section's own template entry
+    and comment), `docs/ENVIRONMENT.md:45,200`, `docs/ROLLBACK.md:130` (all three added
     or verified in the same pass as this checklist update, and correctly describe the
     variable as present-but-unused), and this document's own section 2.
   - **Stale** (predate the discovery that the route is dead, and read as if the variable
@@ -96,8 +96,8 @@ its removal in the Supabase-cleanup commit; `ls lib/supabase/` now contains only
 `types.ts`). Auth is fully on Clerk (`@clerk/nextjs`); the closest equivalent secret is
 `CLERK_SECRET_KEY`.
 
-- **Where it is set:** Present in `.env.example` (`.env.example:28`, comment context at
-  `.env.example:24-27` — sourced from Clerk Dashboard → Configure → API Keys → Secret keys).
+- **Where it is set:** Present in `.env.example` (`.env.example:32`, comment context at
+  `.env.example:24-31` — sourced from Clerk Dashboard → Configure → API Keys → Secret keys).
   Set in `.env.local` for local dev, Vercel project env for deploy.
 - **Code consumers:** unlike the old Supabase secret key, this repo has **no explicit
   `process.env.CLERK_SECRET_KEY` read** — `@clerk/nextjs` reads it directly from the

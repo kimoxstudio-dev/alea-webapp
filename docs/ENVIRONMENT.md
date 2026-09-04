@@ -1,8 +1,11 @@
 # Environment Variables
 
-Every environment variable read anywhere in this repo, where it's read, and
-where its value comes from. Variable **names** and setting names only — no
-actual values appear in this document.
+The environment contract owned by this repo: variables read directly by app,
+script, and E2E code; variables already declared by its templates; and the
+required Clerk and Blob credential paths read implicitly by installed SDKs.
+Optional SDK customization variables are outside this document's contract;
+use the vendors' references for those. Variable **names** and setting names
+only — no credential values appear here.
 
 See `.env.example` for the local-dev template (app runtime + scripts).
 `qa/e2e/README.md` covers the E2E runner variables in more detail; they are
@@ -17,15 +20,18 @@ Scope:
 - **browser** — `NEXT_PUBLIC_*`, inlined into the client bundle at build time
 - **script** — read only by a one-off script under `scripts/`
 - **e2e** — read only by the standalone runners under `qa/e2e/*.mjs`, from a dedicated `.env.e2e.local`
+- **framework-managed** / **platform-managed** — supplied by Node/Next.js or Vercel rather than configured as an application value
 
 | Variable | Scope | Required? | Purpose | Obtain from |
 |---|---|---|---|---|
 | `DATABASE_URL` | server, script | Required | Neon pooled connection string; every query in `lib/db/client.ts`. Also read directly by `scripts/seed-dev.mjs:287` and `scripts/apply-neon-schema.mjs:375`. `vitest.setup.ts:6` supplies a dummy value for the test suite when it's otherwise unset | Neon console → project → Connection Details |
 | `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | browser + server | Required | Clerk publishable key. Read implicitly by `@clerk/nextjs` — no explicit `process.env` reference in this repo. Despite the `NEXT_PUBLIC_` prefix it's also read server-side: `@clerk/nextjs`'s `server/constants.js` uses it to derive the Backend API URL for every `clerkClient()` call, and `clerkMiddleware()` (`middleware.ts:38`) throws at startup if it's missing | Clerk dashboard → application → API Keys |
-| `CLERK_SECRET_KEY` | server | Required | Clerk secret key. Read implicitly by `@clerk/nextjs`. The hottest dependency is `lib/server/session.ts`'s `currentUser()` (Backend API `users.getUser`), called on every authenticated request via `requireAuth()`/`requireAdmin()` (`lib/server/auth.ts`, ~38 call sites) — not just the `clerkClient()` calls in `lib/server/auth-service.ts` and `lib/server/users-service.ts` (activation/recovery/logout). Also read explicitly by `scripts/seed-dev.mjs` | Clerk dashboard → application → API Keys |
+| `CLERK_SECRET_KEY` | server, script | Required | Clerk secret key. Read implicitly by `@clerk/nextjs`. The hottest dependency is `lib/server/session.ts`'s `currentUser()` (Backend API `users.getUser`), called on every authenticated request via `requireAuth()`/`requireAdmin()` (`lib/server/auth.ts`, ~38 call sites) — not just the `clerkClient()` calls in `lib/server/auth-service.ts` and `lib/server/users-service.ts` (activation/recovery/logout). Also read explicitly by `scripts/seed-dev.mjs` | Clerk dashboard → application → API Keys |
 | `NEXT_PUBLIC_CLERK_SIGN_IN_URL` | browser | Optional, unset by default | Currently inert in this repo: nothing calls `auth.protect()`, `redirectToSignIn()`, `<SignIn>`/`<SignUp>`, or passes `signInUrl`/`signUpUrl` — `app/layout.tsx` renders a bare `<ClerkProvider>`, and `components/auth/login-form.tsx` authenticates through the headless `useSignIn()` + `router.push()`, which never consults this. Setting it has no observable effect today | Not applicable |
 | `NEXT_PUBLIC_CLERK_SIGN_UP_URL` | browser | Optional, unset by default | Same — also inert | Same |
-| `BLOB_READ_WRITE_TOKEN` | server | Required | Vercel Blob store token. Read implicitly by the `@vercel/blob` SDK's `put()` in `lib/server/uploads-service.ts` (admin image uploads) and `lib/server/tables-service.ts` (table QR codes) | Vercel dashboard → project → Storage → Blob store → `.env.local` tab |
+| `BLOB_READ_WRITE_TOKEN` | server | Required locally; optional on Vercel with OIDC | Long-lived Vercel Blob credential. The installed `@vercel/blob` SDK's `put()` uses this when OIDC is unavailable. Local development needs this path; a Vercel deployment can instead use the short-lived OIDC path below | Vercel dashboard → project → Storage → Blob store → `.env.local` tab |
+| `VERCEL_OIDC_TOKEN` | server, platform-managed | Required with `BLOB_STORE_ID` when using Blob OIDC | Short-lived Vercel-issued token. `@vercel/blob` tries this path before `BLOB_READ_WRITE_TOKEN`; Vercel injects and rotates it after the Blob store is upgraded to OIDC | Vercel runtime; do not set manually |
+| `BLOB_STORE_ID` | server, platform-managed | Required with `VERCEL_OIDC_TOKEN` | Identifies the Blob store for OIDC authentication. Without it, the SDK falls back to `BLOB_READ_WRITE_TOKEN` | Vercel Blob project connection |
 | `NEXT_PUBLIC_APP_URL` | server (see note) | Required for table QR generation | Base URL used to build the QR-code check-in link. Despite the `NEXT_PUBLIC_` prefix it is only read server-side in this repo, and does **not** drive auth callbacks or cookie flags. Two call sites behave differently when unset: `lib/server/rooms-service.ts` (table creation) only fires QR generation if this is set, so an unset value means the table is created successfully with no QR code and no error; `lib/server/tables-service.ts`'s `regenerateQrCodes()` (called from `POST /api/tables/[id]/qr`) throws a 500 if unset. `generateTableQrCode()` itself has no production caller — only its own test calls it | Set to the deployment's public URL |
 | `COOKIE_SECURE` | server | Optional | Forces the `Secure` flag on the CSRF cookie only (`lib/server/security-edge.ts:35-40` `isSecureContext()`, its one consumer being `getCsrfCookieOptions()` at `:52-58`). The Clerk session cookie's `Secure` flag is set by Clerk itself, not by this variable. Evaluated at runtime, not build time. String comparison against the exact value `'true'` — `1`, `TRUE`, `yes`, or any other value all evaluate as `false`. Default when unset: `true` when `NODE_ENV=production`, else `false` | Set explicitly only for local HTTP dev (`false`) |
 | `TRUST_PROXY_HEADERS` | server | Optional | When `false` (the default), only the `x-real-ip` header value is used as the rate-limit key — `x-forwarded-for` is never consulted. When `true`, `x-forwarded-for` is used instead, but only if `x-real-ip`'s value is itself inside `TRUSTED_PROXY_CIDRS` (`getClientAddress()`, `lib/server/security.ts:280-290`; the exact-`'true'` check is `trustProxyHeaders()` at `:271-273`). The CIDR allowlist is checked against the `x-real-ip` **header value**, not the actual socket peer — an ingress that doesn't strip and overwrite both `x-real-ip` and `x-forwarded-for` before the request reaches the app lets a client forge either header. String comparison against the exact value `'true'`, same as `COOKIE_SECURE` above. Default: `false` | Set `true` only when the ingress strips and rewrites both headers |
@@ -49,17 +55,24 @@ Scope:
 | `PLAYWRIGHT_QA_SECONDARY_USER` | e2e | Required (cancellation, equipment runners) | Member number of a regular, non-admin QA member | Same |
 | `PLAYWRIGHT_QA_SECONDARY_PASSWORD` | e2e | Required (cancellation, equipment runners) | Password for the secondary user | Same |
 | `DATABASE_URL` (e2e context) | e2e | Required | Same variable as above — the E2E runners connect directly for fixture setup/teardown | Same as the app's `DATABASE_URL` |
-| `NODE_ENV` | server, framework-managed | N/A | Standard Next.js/Node variable. Gates `scripts/seed-dev.mjs` (refuses in production), the `COOKIE_SECURE` default, and a one-time console warning in `lib/server/security.ts:441` when the in-memory rate limiter is used in production | Set by the runtime, not by a developer |
+| `NODE_ENV` | server, script, framework-managed | N/A | Standard Next.js/Node variable. Gates `scripts/seed-dev.mjs` (refuses in production), the `COOKIE_SECURE` default, and a one-time console warning in `lib/server/security.ts:441` when the in-memory rate limiter is used in production | Set by the runtime, not by a developer |
 
-### Read by SDKs, optional, not set
+### Optional SDK customization, not part of this inventory
 
-A few more variables `@clerk/nextjs` and `@vercel/blob` recognize but this
-repo does not currently set. Not an exhaustive SDK variable list — only the
-ones with an actual runtime effect if someone did set them:
+The installed SDKs recognize many optional overrides that this application
+does not own or set, including Clerk API/proxy/domain, redirect, JS/UI, and
+telemetry controls. They are intentionally not enumerated here: documenting a
+partial SDK API as an application inventory would become inaccurate whenever a
+dependency adds another override. Consult Clerk's
+[environment-variable reference](https://clerk.com/docs/guides/development/clerk-environment-variables)
+and `@vercel/blob`'s installed type declarations for the exhaustive SDK
+contracts.
+
+Three previously investigated examples remain useful context:
 
 - `NEXT_PUBLIC_CLERK_TELEMETRY_DISABLED` (browser) / `CLERK_TELEMETRY_DISABLED` (server) — Clerk's anonymous telemetry collector (`@clerk/shared`) hard-disables itself for any instance whose publishable key isn't a `pk_test_`/development key (`instanceType !== "development"`), so on a `pk_live_` production instance neither variable has any effect. Only relevant to the dev instance. Not set anywhere in this repo.
 - `CLERK_ENCRYPTION_KEY` — the AES key `@clerk/nextjs` needs to propagate a dynamic `secretKey` from `clerkMiddleware()` to server-side helpers; unrelated to data encryption at rest. This repo doesn't pass `secretKey` to `clerkMiddleware()` (`middleware.ts:38`), so it's unused.
-- `VERCEL_OIDC_TOKEN` / `BLOB_STORE_ID` — an alternative to `BLOB_READ_WRITE_TOKEN` for authenticating `@vercel/blob` on Vercel's own infrastructure via OIDC. Not used here; `BLOB_READ_WRITE_TOKEN` is the auth path this repo relies on.
+- `VERCEL_OIDC_TOKEN` / `BLOB_STORE_ID` — documented in the main table because they form the deployment credential path for the Blob calls this repo makes.
 
 ### Not environment variables (found during this audit, excluded)
 
@@ -100,8 +113,9 @@ app actually read" comes from the table above.
   Clerk instance's keys. See "Clerk instance configuration" below for why
   these must be two separate instances, not one instance's two key pairs.
 - `NEXT_PUBLIC_APP_URL` — each environment's own public URL.
-- `BLOB_READ_WRITE_TOKEN` — each environment's own Blob store token, if
-  Preview and Production use separate stores.
+- Blob credential/store selection — if Preview and Production use separate
+  stores, split `BLOB_READ_WRITE_TOKEN`; with OIDC, connect each deployment
+  target to its intended store so `BLOB_STORE_ID` resolves accordingly.
 
 ### What can be shared
 
@@ -131,16 +145,18 @@ environment:
 - `CLERK_SECRET_KEY` — one row, target `Development, Preview, Production`.
   Combined with the row above: Development, Preview, and Production all
   currently authenticate against the same Clerk instance.
-- `BLOB_READ_WRITE_TOKEN` — not present in `vercel env ls` at all for any
-  environment (see the next gap section) — Preview and Production don't
-  even share a value here, neither has one.
+- No Blob credential or store identifier appears in `vercel env ls`; see the
+  owner-verification item below.
 
-### Gap: read by code, not set on Vercel
+### Needs owner verification: Blob authentication
 
-- **`BLOB_READ_WRITE_TOKEN`** — not present in `vercel env ls` output for
-  Preview or Production. Both `lib/server/uploads-service.ts` (admin image
-  uploads) and `lib/server/tables-service.ts` (table QR codes) need it;
-  without it those code paths fail.
+- Neither `BLOB_READ_WRITE_TOKEN` nor `BLOB_STORE_ID` appears in `vercel env
+  ls`. That listing does not prove the deployment lacks Blob access: after a
+  store is upgraded and connected for OIDC, Vercel can inject the short-lived
+  `VERCEL_OIDC_TOKEN` and store identifier at runtime. Confirm the project-store
+  connection in the Blob dashboard or exercise one upload and one table-QR
+  write in Preview. Those paths fail only if neither OIDC (`VERCEL_OIDC_TOKEN`
+  plus `BLOB_STORE_ID`) nor `BLOB_READ_WRITE_TOKEN` is available.
 
 ### Not set on Vercel, optional
 
@@ -233,18 +249,28 @@ channel. Zero outgoing email (identity model from #299).
 | Setting | Target | Rationale |
 |---|---|---|
 | `sign_up.mode` | `restricted` (no public self-signup) | Members are provisioned by an admin via the activation-link flow, never by visiting a public sign-up page |
+| `sign_up.captcha_enabled` | `true` | Preserve the verified dev posture as defense in depth if a sign-up surface is exposed accidentally |
+| `sign_up.progressive` | `true` | Preserve the verified dev setting; it is inert while sign-up remains restricted |
+| `sign_up.legal_consent_enabled` | `false` | The app has no Clerk-hosted public sign-up flow on which to collect this consent |
+| `sign_up.mfa.required` | `false` | Members have no configured email, SMS, authenticator, or backup-code enrollment flow |
+| `sign_in.second_factor.required` | `false` | Username plus password is the complete supported member authentication flow |
+| `attributes.username.enabled` | `false` | Username is not collected through a sign-up form; accounts are provisioned through the Backend API |
 | `attributes.username.used_for_first_factor` | `true` | The member number is the sign-in identifier: `components/auth/login-form.tsx:84-85` calls `signIn.create({ identifier: 'alea-<memberNumber>', password })`, and `lib/server/auth-service.ts:395-398` provisions accounts via the Backend API's `client.users.createUser({ username, password })` — never through the public sign-up form. `attributes.username.enabled`/`.required` govern sign-up-form attribute *collection*, which is moot here: sign-up is `restricted` and accounts are always created server-side. The evidence for recommending `used_for_first_factor: true` with `enabled: false` specifically (rather than assuming `enabled: true` is needed) is that this is the verified dev instance's live configuration (see the table above), and username+password login against it is known to work — the standalone E2E runners under `qa/e2e/` sign in this same way (`PLAYWRIGHT_QA_USER` filled into the member-number field, then submitted through this same `login-form.tsx` flow) against that instance |
+| `username_settings.min_length` | `4` | Preserve the verified dev constraint; provisioned usernames use the `alea-` prefix and already exceed it |
 | `attributes.email_address.enabled` | `false` | Members have no email addresses in this system |
 | `attributes.password.enabled` | `true` | Password is the only credential members authenticate with |
 | Email/SMS verification flows | Disabled | There is no outgoing email or SMS channel to verify through. Verified on the dev instance: `attributes.email_address.verifications: []`/`verify_at_sign_up: false`, `attributes.phone_number.enabled: false`/`verifications: []` (see "Other observed settings" above) |
 | `social.*` (OAuth providers) | All disabled | No provider is part of the identity model; the live dev instance's `oauth_google: true` should not carry into production |
+| `restrictions.allowlist.enabled` | `false` | Admin provisioning and the database profile mapping are the membership gate; no separate Clerk allowlist is maintained |
+| `restrictions.blocklist.enabled` | `false` | The app's admin-managed user status is the account-control mechanism; no separate Clerk blocklist is maintained |
+| `actions.create_organization` | `false` | Alea does not use Clerk Organizations; production should not expose an unrelated organization-creation capability |
 
-The verified dev instance already matches this target on every row except
-`social.oauth_google`. Production should be provisioned to match the dev
-instance's verified settings above, not the settings that were assumed
-before this audit. Any deviation from this table — including keeping
-`oauth_google` enabled — must be smoke-tested under issue #313 before
-cutover, not assumed safe.
+The verified dev instance differs from this target on
+`social.oauth_google.enabled` and `actions.create_organization`; both are
+enabled in dev but must be disabled in production because Alea uses neither
+capability. Production should preserve the verified dev values for the other
+rows. Any deviation from this table must be smoke-tested under issue #313
+before cutover, not assumed safe.
 
 ### Development vs. production instance, generally
 

@@ -69,7 +69,7 @@ alea-webapp/
    cp .env.example .env.local
    ```
 
-   The project uses **Neon** for the database and **Clerk** for auth — there is no local Postgres/Docker setup; development connects to a real Neon branch. Open `.env.local` and fill in at minimum `DATABASE_URL`, `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` / `CLERK_SECRET_KEY`, `BLOB_READ_WRITE_TOKEN`, and `NEXT_PUBLIC_APP_URL`.
+   The project uses **Neon** for the database and **Clerk** for auth — there is no local Postgres/Docker setup; development connects to a real Neon branch. Open `.env.local` and fill in at minimum `DATABASE_URL`, `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` / `CLERK_SECRET_KEY`, `BLOB_READ_WRITE_TOKEN` (local Blob access), and `NEXT_PUBLIC_APP_URL`.
 
    See **[docs/ENVIRONMENT.md](docs/ENVIRONMENT.md)** for the full variable reference (every variable, its scope, required/optional status, and where to obtain it), the Preview/Production split, and the Clerk instance configuration.
 

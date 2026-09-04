@@ -246,7 +246,7 @@ pnpm install
 # 2. Copy environment template
 cp .env.example .env.local
 # Edit .env.local — at minimum DATABASE_URL, the Clerk keys,
-# BLOB_READ_WRITE_TOKEN, and NEXT_PUBLIC_APP_URL. See docs/ENVIRONMENT.md
+# BLOB_READ_WRITE_TOKEN (local Blob access), and NEXT_PUBLIC_APP_URL. See docs/ENVIRONMENT.md
 # for the full variable reference (scope, required/optional, where each
 # value comes from) and the Preview/Production split.
 
