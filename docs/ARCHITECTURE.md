@@ -245,12 +245,10 @@ pnpm install
 
 # 2. Copy environment template
 cp .env.example .env.local
-# Edit .env.local with:
-# - DATABASE_URL (Neon pooled connection string, ?sslmode=require)
-# - NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY / CLERK_SECRET_KEY (Clerk test-mode keys)
-# - BLOB_READ_WRITE_TOKEN (Vercel Blob store token)
-# - NEXT_PUBLIC_APP_URL
-# - CRON_SECRET
+# Edit .env.local — at minimum DATABASE_URL, the Clerk keys,
+# BLOB_READ_WRITE_TOKEN (local Blob access), and NEXT_PUBLIC_APP_URL. See docs/ENVIRONMENT.md
+# for the full variable reference (scope, required/optional, where each
+# value comes from) and the Preview/Production split.
 
 # 3. Start dev server
 pnpm dev

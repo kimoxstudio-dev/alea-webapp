@@ -52,6 +52,8 @@ This repo is owned by `KimoxStudio` and deploys to Vercel (`kimox-studio` team, 
 
 ## Mandatory exhaustive /code-review before opening any PR
 
+**Scope note (2026-09-04):** this section applies only to the `security-reviewer` pipeline, i.e. when `kx-session` is NOT present in this repo. Under `kx-session` (currently installed — see "Team Coordination" below) the pre-PR review is `kx-reviewer` only, capped at 2 developer↔reviewer rounds, then escalate to the user; `/code-review` is not launched unless the user asks for it in that turn. Decided by the user during #335 after the `high`+`medium` loop cost ~170k tokens per pass over 3 rounds. The global rule lives in `~/.claude/CLAUDE.md` ("Under `kx-session`, review is `kx-reviewer` only").
+
 Before `security-reviewer` opens a PR, it must run `/code-review` (medium effort — the user's standing default as of 2026-08-22; high/max are the user's own manual call, not something agents launch) against the branch's own diff and apply/route any real findings first. This runs **in addition to**, not instead of, the manual security review the agent already does.
 
 **Why:** PR #337 (#332, 2026-08-17) opened after `security-reviewer` approved, and a manual `/code-review` run by the user immediately after found 5 real defects the reviewer missed, then Codex's independent review on the open PR found 3 more (1 overlapping) — 7 unique post-open findings total. All were genuine (verified against production SQL, not false positives) and all were fixable before merge if caught pre-open. Catching them after the PR is open means a second round of push/re-review/inline-reply-to-external-bot churn that an exhaustive review before opening would have avoided.
