@@ -111,7 +111,7 @@ const ADMIN_LIST_COLUMNS =
 const PUBLIC_RETURNING_COLUMNS =
   'id, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date::text as date, end_date::text as end_date, recurrence_label_es, recurrence_label_en, image_url, link_url'
 
-const ROOM_BLOCK_COLUMNS = 'id, event_id, room_id, table_id, date, start_time, end_time, all_day'
+const ROOM_BLOCK_COLUMNS = 'id, event_id, room_id, table_id, date::text as date, start_time, end_time, all_day'
 
 // ---------------------------------------------------------------------------
 // Shared row fixtures

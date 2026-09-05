@@ -833,7 +833,7 @@ async function applyClubEventBlocksAndMaterials(
       deletedBlocks = await sql`
         DELETE FROM event_room_blocks
         WHERE event_id = ${eventId}
-        RETURNING id, event_id, room_id, table_id, date, start_time, end_time, all_day
+        RETURNING id, event_id, room_id, table_id, date::text AS date, start_time, end_time, all_day
       ` as EventRoomBlockRow[]
     } catch {
       serviceError('Internal server error', 500)
@@ -926,7 +926,7 @@ async function applyClubEventBlocksAndMaterials(
         const blockRows = await sql`
           INSERT INTO event_room_blocks (event_id, room_id, table_id, date, start_time, end_time, all_day)
           VALUES (${eventId}, ${block.room_id}, ${block.table_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day})
-          RETURNING id, event_id, room_id, table_id, date, start_time, end_time, all_day
+          RETURNING id, event_id, room_id, table_id, date::text AS date, start_time, end_time, all_day
         ` as EventRoomBlockRow[]
 
         const blockRow = blockRows[0]
@@ -1011,7 +1011,7 @@ async function applyClubEventBlocksAndMaterials(
   let resultBlocks: EventRoomBlockRow[]
   try {
     resultBlocks = await sql`
-      SELECT id, event_id, room_id, table_id, date, start_time, end_time, all_day
+      SELECT id, event_id, room_id, table_id, date::text AS date, start_time, end_time, all_day
       FROM event_room_blocks
       WHERE event_id = ${eventId}
       ORDER BY date ASC, start_time ASC
@@ -1225,7 +1225,7 @@ async function fetchEventRoomBlocks(eventId: string): Promise<EventRoomBlockRow[
   let rows: EventRoomBlockRow[]
   try {
     rows = await sql`
-      SELECT id, event_id, room_id, table_id, date, start_time, end_time, all_day
+      SELECT id, event_id, room_id, table_id, date::text AS date, start_time, end_time, all_day
       FROM event_room_blocks
       WHERE event_id = ${eventId}
     ` as EventRoomBlockRow[]
@@ -1271,7 +1271,7 @@ export async function listAdminClubEvents(session: SessionUser): Promise<AdminLi
   let blocks: EventRoomBlockRow[]
   try {
     blocks = await sql`
-      SELECT id, event_id, room_id, table_id, date, start_time, end_time, all_day
+      SELECT id, event_id, room_id, table_id, date::text AS date, start_time, end_time, all_day
       FROM event_room_blocks
       WHERE event_id = ANY(${eventIds})
     ` as EventRoomBlockRow[]
