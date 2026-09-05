@@ -26,7 +26,8 @@
     "results": "results",
     "noResults": "No results found",
     "loadingPage": "Loading page...",
-    "requiredField": "This field is required."
+    "requiredField": "This field is required.",
+    "invalidUrl": "Enter a valid http(s) URL."
   },
   "nav": {
     "rooms": "Rooms",

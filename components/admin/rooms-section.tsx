@@ -200,10 +200,16 @@ function RoomTablesPanel({ room }: { room: Room }) {
               value={tableName}
               onChange={(e) => setTableName(e.target.value)}
               placeholder={t('tableName')}
+              required
               aria-invalid={!!formError}
+              aria-describedby={formError ? `table-name-error-${room.id}` : undefined}
               className="h-8 text-sm bg-background-secondary border-border focus:border-primary/50"
             />
-            {formError && <p role="alert" className="text-xs text-destructive">{formError}</p>}
+            {formError && (
+              <p id={`table-name-error-${room.id}`} role="alert" className="text-xs text-destructive">
+                {formError}
+              </p>
+            )}
           </div>
           <div className="space-y-1.5">
             <Label htmlFor={`table-type-${room.id}`} className="text-xs text-muted-foreground">
@@ -371,7 +377,7 @@ function RoomRow({ room }: { room: Room }) {
       )}
 
       {/* Edit dialog */}
-      <Dialog open={editing} onOpenChange={setEditing}>
+      <Dialog open={editing} onOpenChange={(open) => { setEditing(open); if (!open) setEditError(null) }}>
         <DialogContent className="bg-card border-border max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle className="font-cinzel text-gradient-gold">{t('editRoom')}</DialogTitle>
@@ -385,10 +391,16 @@ function RoomRow({ room }: { room: Room }) {
                 id={`room-name-edit-${room.id}`}
                 value={editName}
                 onChange={(e) => setEditName(e.target.value)}
+                required
                 aria-invalid={!!editError}
+                aria-describedby={editError ? `room-name-edit-error-${room.id}` : undefined}
                 className="bg-background-secondary border-border focus:border-primary/50"
               />
-              {editError && <p role="alert" className="text-xs text-destructive">{editError}</p>}
+              {editError && (
+                <p id={`room-name-edit-error-${room.id}`} role="alert" className="text-xs text-destructive">
+                  {editError}
+                </p>
+              )}
             </div>
             <div className="space-y-2">
               <Label htmlFor={`room-desc-edit-${room.id}`} className="text-sm text-muted-foreground font-medium">
@@ -559,7 +571,7 @@ export function RoomsSection() {
       )}
 
       {/* Create Room Dialog */}
-      <Dialog open={showCreate} onOpenChange={setShowCreate}>
+      <Dialog open={showCreate} onOpenChange={(open) => { setShowCreate(open); if (!open) setCreateError(null) }}>
         <DialogContent className="bg-card border-border max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <div className="flex items-center gap-3 mb-1">
@@ -578,10 +590,16 @@ export function RoomsSection() {
                 id="new-room-name"
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
+                required
                 aria-invalid={!!createError}
+                aria-describedby={createError ? 'new-room-name-error' : undefined}
                 className="bg-background-secondary border-border focus:border-primary/50"
               />
-              {createError && <p role="alert" className="text-xs text-destructive">{createError}</p>}
+              {createError && (
+                <p id="new-room-name-error" role="alert" className="text-xs text-destructive">
+                  {createError}
+                </p>
+              )}
             </div>
             <div className="space-y-2">
               <Label htmlFor="new-room-desc" className="text-sm text-muted-foreground font-medium">

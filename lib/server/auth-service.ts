@@ -65,18 +65,27 @@ function memberNumberFromClerkUsername(username: string): string | null {
   return memberNumber.length > 0 ? memberNumber : null
 }
 
+/** Clerk error codes that are specifically about password *length*, matching
+ * what `errors.servicePasswordRejected` (messages/en.json, messages/es.json)
+ * actually advertises: "at least 15 characters". Other `form_password_*`
+ * codes (`form_password_pwned`, `form_password_not_strong_enough`) are real
+ * Clerk rejections too, but for a different reason — surfacing this file's
+ * specific length-focused copy for those would be wrong advice, so they fall
+ * through to the generic `AUTH_ACCOUNT_CREDENTIALS_*_FAILED` path instead. */
+const CLERK_PASSWORD_LENGTH_CODES = new Set([
+  'form_password_length_too_short',
+  'form_password_length_too_long',
+  'form_password_size_in_bytes_exceeded',
+])
+
 /**
- * Detects a Clerk password-policy rejection without importing any Clerk
+ * Detects a Clerk password-length rejection without importing any Clerk
  * error class (#313 smoke QA fix): both `createUser()` and `updateUser()`
  * throw an error shaped `{ errors: [{ code: string, ... }] }` on a 4xx
  * response — this is the same shape Clerk's own `ClerkAPIResponseError`
  * carries, checked structurally instead of via `instanceof`/type-guard
  * imports so this file doesn't need `@clerk/backend` as a direct dependency
- * (only `@clerk/nextjs` is). Clerk's password-policy codes are all prefixed
- * `form_password_` (e.g. `form_password_length_too_short`,
- * `form_password_pwned`) — matching the prefix, rather than one exact code,
- * covers every password-policy rejection Clerk can return, not just the
- * length one this was found from.
+ * (only `@clerk/nextjs` is).
  *
  * Repro (#313): the club's real Clerk instance requires a 15+ character
  * password, but this app's own client-side checklist (`lib/validations/auth.ts`)
@@ -89,7 +98,7 @@ function isClerkPasswordRejection(error: unknown): boolean {
   const errors = (error as { errors?: unknown })?.errors
   if (!Array.isArray(errors)) return false
   return errors.some((entry) => typeof (entry as { code?: unknown })?.code === 'string'
-    && (entry as { code: string }).code.startsWith('form_password_'))
+    && CLERK_PASSWORD_LENGTH_CODES.has((entry as { code: string }).code))
 }
 
 function hashActivationToken(token: string) {

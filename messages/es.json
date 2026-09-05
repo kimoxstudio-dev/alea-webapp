@@ -26,7 +26,8 @@
     "results": "resultados",
     "noResults": "No se encontraron resultados",
     "loadingPage": "Cargando página...",
-    "requiredField": "Este campo es obligatorio."
+    "requiredField": "Este campo es obligatorio.",
+    "invalidUrl": "Introduce una URL http(s) válida."
   },
   "nav": {
     "rooms": "Salas",

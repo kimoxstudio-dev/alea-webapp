@@ -7,7 +7,23 @@ import { serviceError } from '@/lib/server/service-error'
 // go through THIS validator. Only absolute http(s) URLs are accepted (or
 // empty/omitted) — javascript:, data:, relative paths, and any other scheme
 // are rejected before they can ever be persisted.
-const ALLOWED_URL_PROTOCOLS = new Set(['http:', 'https:'])
+export const ALLOWED_URL_PROTOCOLS = new Set(['http:', 'https:'])
+
+/**
+ * Client-safe shape check for an optional absolute http(s) URL — same accept
+ * rule as `validateOptionalUrl` below, without the server-only throw, so
+ * client components can surface a field-level error before submit instead of
+ * round-tripping to the API for a 400.
+ */
+export function isValidOptionalUrl(value: string): boolean {
+  const str = value.trim()
+  if (str === '') return true
+  try {
+    return ALLOWED_URL_PROTOCOLS.has(new URL(str).protocol)
+  } catch {
+    return false
+  }
+}
 
 /**
  * Validate an optional, user-supplied absolute http(s) URL.

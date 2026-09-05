@@ -102,10 +102,16 @@ function EquipmentRow({ item }: { item: Equipment }) {
                 id={`equip-name-edit-${item.id}`}
                 value={editName}
                 onChange={(e) => setEditName(e.target.value)}
+                required
                 aria-invalid={!!editError}
+                aria-describedby={editError ? `equip-name-edit-error-${item.id}` : undefined}
                 className="bg-background-secondary border-border focus:border-primary/50"
               />
-              {editError && <p role="alert" className="text-xs text-destructive">{editError}</p>}
+              {editError && (
+                <p id={`equip-name-edit-error-${item.id}`} role="alert" className="text-xs text-destructive">
+                  {editError}
+                </p>
+              )}
             </div>
             <div className="space-y-2">
               <Label htmlFor={`equip-desc-edit-${item.id}`} className="text-sm text-muted-foreground font-medium">
@@ -271,10 +277,16 @@ export function EquipmentSection() {
                 id="new-equipment-name"
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
+                required
                 aria-invalid={!!createError}
+                aria-describedby={createError ? 'new-equipment-name-error' : undefined}
                 className="bg-background-secondary border-border focus:border-primary/50"
               />
-              {createError && <p role="alert" className="text-xs text-destructive">{createError}</p>}
+              {createError && (
+                <p id="new-equipment-name-error" role="alert" className="text-xs text-destructive">
+                  {createError}
+                </p>
+              )}
             </div>
             <div className="space-y-2">
               <Label htmlFor="new-equipment-desc" className="text-sm text-muted-foreground font-medium">

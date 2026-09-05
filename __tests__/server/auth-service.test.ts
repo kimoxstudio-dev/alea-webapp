@@ -942,6 +942,39 @@ describe('auth service (alea- username model)', () => {
       expect(updatedToken?.used_at).toBeNull()
     })
 
+    it('does not misclassify a non-length Clerk error as a password rejection (#313 review)', async () => {
+      // A widened/broken predicate (e.g. `code.startsWith('form_')`, or no
+      // code check at all) would misroute an unrelated Clerk rejection —
+      // like a username collision — into AUTH_PASSWORD_REJECTED/400. This
+      // must still fall through to the generic
+      // AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED/500 path.
+      const { activateAccount } = (await loadService()) as any
+      const plainToken = createActivationToken()
+      const tokenHash = hashActivationToken(plainToken)
+
+      const token = createTestToken({
+        token_hash: tokenHash,
+        profile_id: 'user-test',
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+        used_at: null,
+      })
+      tokensStore.set(tokenHash, token)
+
+      clerkCreateUserMock.mockRejectedValueOnce({
+        errors: [{ code: 'form_identifier_exists', message: 'That username is taken' }],
+      })
+
+      await expect(
+        activateAccount({
+          token: plainToken,
+          password: 'Password123',
+        }),
+      ).rejects.toMatchObject({
+        message: 'AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED',
+        statusCode: 500,
+      })
+    })
+
     it('restores the claimed token when Clerk createUser fails, and the same link succeeds on retry (#299 Codex review finding 1)', async () => {
       const { activateAccount } = (await loadService()) as any
       const plainToken = createActivationToken()
@@ -1198,6 +1231,38 @@ describe('auth service (alea- username model)', () => {
 
       const updatedToken2 = tokensStore.get(tokenHash)
       expect(updatedToken2?.used_at).toBeNull()
+    })
+
+    it('does not misclassify a non-length Clerk error as a password rejection (#313 review)', async () => {
+      // Same guard as activateAccount's equivalent test: a widened predicate
+      // must not misroute an unrelated Clerk rejection into
+      // AUTH_PASSWORD_REJECTED/400 — it must fall through to the generic
+      // AUTH_ACCOUNT_CREDENTIALS_UPDATE_FAILED/500 path.
+      const { recoverAccount } = (await loadService()) as any
+      const plainToken = createActivationToken()
+      const tokenHash = hashActivationToken(plainToken)
+
+      const token = createTestToken({
+        token_hash: tokenHash,
+        profile_id: 'user-active',
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+        used_at: null,
+      })
+      tokensStore.set(tokenHash, token)
+
+      clerkUpdateUserMock.mockRejectedValueOnce({
+        errors: [{ code: 'form_identifier_exists', message: 'That username is taken' }],
+      })
+
+      await expect(
+        recoverAccount({
+          token: plainToken,
+          password: 'NewPassword123',
+        }),
+      ).rejects.toMatchObject({
+        message: 'AUTH_ACCOUNT_CREDENTIALS_UPDATE_FAILED',
+        statusCode: 500,
+      })
     })
 
     it('restores the claimed token when Clerk updateUser fails, and the same link succeeds on retry (#299 Codex review finding 1)', async () => {

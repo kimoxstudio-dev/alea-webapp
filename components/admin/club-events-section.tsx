@@ -204,19 +204,35 @@ function buildPayload(form: ClubEventFormState): ClubEventPayload {
   }
 }
 
+/** Which required field is blank, anchoring a field-level error message to
+ * the actual input instead of one generic message at the bottom of the form.
+ * A schedule row error also carries its index, since `blocksRooms` allows
+ * multiple room-block rows. */
+type ClubEventFieldError =
+  | { kind: 'titleEs' | 'date' | 'endDate' }
+  | { kind: 'schedule'; index: number; field: 'date' | 'startTime' | 'endTime' }
+
 /** Every field the form marks `required` — checked client-side on submit
  * (#313: a blank one used to fall through to the browser's native,
  * English-only validation bubble instead of this app's Spanish-capable error
  * display). The form itself sets `noValidate`, so this is the only gate left
- * against submitting a blank required field. */
-function hasBlankRequiredField(form: ClubEventFormState): boolean {
-  if (!form.titleEs.trim() || !form.date.trim()) return true
-  if (form.dateKind === 'range' && !form.endDate.trim()) return true
+ * against submitting a blank required field. Returns the first blank field
+ * found, or `null` when the form is valid. */
+function getBlankRequiredField(form: ClubEventFormState): ClubEventFieldError | null {
+  if (!form.titleEs.trim()) return { kind: 'titleEs' }
+  if (!form.date.trim()) return { kind: 'date' }
+  if (form.dateKind === 'range' && !form.endDate.trim()) return { kind: 'endDate' }
   if (form.blocksRooms) {
-    return form.schedules.some((s) => !s.date.trim()
-      || (!s.allDay && (!s.startTime.trim() || !s.endTime.trim())))
+    for (let i = 0; i < form.schedules.length; i += 1) {
+      const s = form.schedules[i]
+      if (!s.date.trim()) return { kind: 'schedule', index: i, field: 'date' }
+      if (!s.allDay) {
+        if (!s.startTime.trim()) return { kind: 'schedule', index: i, field: 'startTime' }
+        if (!s.endTime.trim()) return { kind: 'schedule', index: i, field: 'endTime' }
+      }
+    }
   }
-  return false
+  return null
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +245,7 @@ function ScheduleRow({
   onChange,
   onRemove,
   dialogId,
+  errorField,
 }: {
   index: number
   entry: ScheduleEntry
@@ -236,6 +253,7 @@ function ScheduleRow({
   onChange: (updated: ScheduleEntry) => void
   onRemove: () => void
   dialogId: string
+  errorField: 'date' | 'startTime' | 'endTime' | null
 }) {
   const t = useTranslations('admin')
   const tc = useTranslations('common')
@@ -338,8 +356,13 @@ function ScheduleRow({
             value={entry.date}
             onChange={field('date')}
             required
+            aria-invalid={errorField === 'date'}
+            aria-describedby={errorField === 'date' ? id('date-error') : undefined}
             className="bg-background-secondary border-border focus:border-primary/50 h-8 text-sm"
           />
+          {errorField === 'date' && (
+            <p id={id('date-error')} role="alert" className="text-xs text-destructive">{tc('requiredField')}</p>
+          )}
         </div>
         {!entry.allDay && (
           <>
@@ -354,8 +377,13 @@ function ScheduleRow({
                 value={entry.startTime}
                 onChange={field('startTime')}
                 required={!entry.allDay}
+                aria-invalid={errorField === 'startTime'}
+                aria-describedby={errorField === 'startTime' ? id('start-error') : undefined}
                 className="bg-background-secondary border-border focus:border-primary/50 h-8 text-sm"
               />
+              {errorField === 'startTime' && (
+                <p id={id('start-error')} role="alert" className="text-xs text-destructive">{tc('requiredField')}</p>
+              )}
             </div>
             <div className="space-y-1">
               <Label htmlFor={id('end')} className="text-xs text-muted-foreground font-medium">
@@ -368,8 +396,13 @@ function ScheduleRow({
                 value={entry.endTime}
                 onChange={field('endTime')}
                 required={!entry.allDay}
+                aria-invalid={errorField === 'endTime'}
+                aria-describedby={errorField === 'endTime' ? id('end-error') : undefined}
                 className="bg-background-secondary border-border focus:border-primary/50 h-8 text-sm"
               />
+              {errorField === 'endTime' && (
+                <p id={id('end-error')} role="alert" className="text-xs text-destructive">{tc('requiredField')}</p>
+              )}
             </div>
           </>
         )}
@@ -486,6 +519,7 @@ function ClubEventFormDialog({
   onSubmit,
   isPending,
   error,
+  fieldError,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -496,6 +530,7 @@ function ClubEventFormDialog({
   onSubmit: (e: React.FormEvent) => void
   isPending: boolean
   error?: string | null
+  fieldError: ClubEventFieldError | null
 }) {
   const t = useTranslations('admin')
   const tc = useTranslations('common')
@@ -541,8 +576,15 @@ function ClubEventFormDialog({
               value={form.titleEs}
               onChange={(e) => setForm({ ...form, titleEs: e.target.value })}
               required
+              aria-invalid={fieldError?.kind === 'titleEs'}
+              aria-describedby={fieldError?.kind === 'titleEs' ? `${dialogId}-title-es-error` : undefined}
               className="bg-background-secondary border-border focus:border-primary/50"
             />
+            {fieldError?.kind === 'titleEs' && (
+              <p id={`${dialogId}-title-es-error`} role="alert" className="text-xs text-destructive">
+                {tc('requiredField')}
+              </p>
+            )}
           </div>
 
           {/* Visible on landing toggle (OIR-208) */}
@@ -634,8 +676,15 @@ function ClubEventFormDialog({
                 value={form.date}
                 onChange={(e) => setForm({ ...form, date: e.target.value })}
                 required
+                aria-invalid={fieldError?.kind === 'date'}
+                aria-describedby={fieldError?.kind === 'date' ? `${dialogId}-date-error` : undefined}
                 className="bg-background-secondary border-border focus:border-primary/50"
               />
+              {fieldError?.kind === 'date' && (
+                <p id={`${dialogId}-date-error`} role="alert" className="text-xs text-destructive">
+                  {tc('requiredField')}
+                </p>
+              )}
             </div>
             {form.dateKind === 'range' && (
               <div className="space-y-2">
@@ -648,8 +697,15 @@ function ClubEventFormDialog({
                   value={form.endDate}
                   onChange={(e) => setForm({ ...form, endDate: e.target.value })}
                   required
+                  aria-invalid={fieldError?.kind === 'endDate'}
+                  aria-describedby={fieldError?.kind === 'endDate' ? `${dialogId}-end-date-error` : undefined}
                   className="bg-background-secondary border-border focus:border-primary/50"
                 />
+                {fieldError?.kind === 'endDate' && (
+                  <p id={`${dialogId}-end-date-error`} role="alert" className="text-xs text-destructive">
+                    {tc('requiredField')}
+                  </p>
+                )}
               </div>
             )}
           </div>
@@ -820,6 +876,9 @@ function ClubEventFormDialog({
                       onChange={(updated) => updateSchedule(i, updated)}
                       onRemove={() => removeSchedule(i)}
                       dialogId={dialogId}
+                      errorField={
+                        fieldError?.kind === 'schedule' && fieldError.index === i ? fieldError.field : null
+                      }
                     />
                   ))}
                 </div>
@@ -1037,7 +1096,6 @@ function ClubEventList({
 // ---------------------------------------------------------------------------
 export function ClubEventsSection() {
   const t = useTranslations('admin')
-  const tc = useTranslations('common')
 
   const { data, isLoading } = useAdminClubEvents()
   const createClubEvent = useAdminCreateClubEvent()
@@ -1054,10 +1112,13 @@ export function ClubEventsSection() {
   const [deleteError, setDeleteError] = useState<string | null>(null)
   const [createError, setCreateError] = useState<string | null>(null)
   const [updateError, setUpdateError] = useState<string | null>(null)
+  const [createFieldError, setCreateFieldError] = useState<ClubEventFieldError | null>(null)
+  const [updateFieldError, setUpdateFieldError] = useState<ClubEventFieldError | null>(null)
 
   function openEdit(event: AdminClubEvent) {
     setEditingEvent(event)
     setEditForm(formFromEvent(event))
+    setUpdateFieldError(null)
   }
 
   function openDelete(event: AdminClubEvent) {
@@ -1073,10 +1134,12 @@ export function ClubEventsSection() {
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault()
-    if (hasBlankRequiredField(createForm)) {
-      setCreateError(tc('requiredField'))
+    const blankField = getBlankRequiredField(createForm)
+    if (blankField) {
+      setCreateFieldError(blankField)
       return
     }
+    setCreateFieldError(null)
     setCreateError(null)
     try {
       await createClubEvent.mutateAsync(buildPayload(createForm))
@@ -1090,10 +1153,12 @@ export function ClubEventsSection() {
   async function handleUpdate(e: React.FormEvent) {
     e.preventDefault()
     if (!editingEvent) return
-    if (hasBlankRequiredField(editForm)) {
-      setUpdateError(tc('requiredField'))
+    const blankField = getBlankRequiredField(editForm)
+    if (blankField) {
+      setUpdateFieldError(blankField)
       return
     }
+    setUpdateFieldError(null)
     setUpdateError(null)
     try {
       await updateClubEvent.mutateAsync({ id: editingEvent.id, data: buildPayload(editForm) })
@@ -1134,7 +1199,7 @@ export function ClubEventsSection() {
         <Button
           variant="outline"
           size="sm"
-          onClick={() => { setCreateForm(emptyForm()); setShowCreate(true) }}
+          onClick={() => { setCreateForm(emptyForm()); setCreateFieldError(null); setShowCreate(true) }}
           className="gap-1.5 border-primary/30 text-primary/80 hover:bg-primary/10 hover:border-primary/50 hover:text-primary transition-colors"
         >
           <Plus className="h-4 w-4" aria-hidden="true" />
@@ -1181,7 +1246,13 @@ export function ClubEventsSection() {
 
       <ClubEventFormDialog
         open={showCreate}
-        onOpenChange={(open) => { setShowCreate(open); if (!open) setCreateError(null) }}
+        onOpenChange={(open) => {
+          setShowCreate(open)
+          if (!open) {
+            setCreateError(null)
+            setCreateFieldError(null)
+          }
+        }}
         dialogId="create-club-event"
         title={t('clubEvents.createEvent')}
         form={createForm}
@@ -1189,11 +1260,18 @@ export function ClubEventsSection() {
         onSubmit={handleCreate}
         isPending={createClubEvent.isPending}
         error={createError}
+        fieldError={createFieldError}
       />
 
       <ClubEventFormDialog
         open={!!editingEvent}
-        onOpenChange={(open) => { if (!open) { setEditingEvent(null); setUpdateError(null) } }}
+        onOpenChange={(open) => {
+          if (!open) {
+            setEditingEvent(null)
+            setUpdateError(null)
+            setUpdateFieldError(null)
+          }
+        }}
         dialogId="edit-club-event"
         title={t('clubEvents.editEvent')}
         form={editForm}
@@ -1201,6 +1279,7 @@ export function ClubEventsSection() {
         onSubmit={handleUpdate}
         isPending={updateClubEvent.isPending}
         error={updateError}
+        fieldError={updateFieldError}
       />
 
       <DeleteClubEventDialog
