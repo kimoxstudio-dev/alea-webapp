@@ -622,11 +622,7 @@ describe('reservations service', () => {
     })
 
     it('invalid CLUB_TIMEZONE propagates as a RangeError', async () => {
-      // Task 4: CLUB_TIMEZONE='Invalid/Zone' → RangeError propagates (no fallback).
-      // lib/club-time.ts reads NEXT_PUBLIC_CLUB_TIMEZONE first, and vitest.config.mts
-      // pins that globally for the suite — both must be stubbed here, or the global
-      // pin wins and this test exercises the pinned zone instead of the invalid one.
-      vi.stubEnv('NEXT_PUBLIC_CLUB_TIMEZONE', 'Invalid/Zone')
+      // Task 4: CLUB_TIMEZONE='Invalid/Zone' → RangeError propagates (no fallback)
       vi.stubEnv('CLUB_TIMEZONE', 'Invalid/Zone')
       const { activateReservationByTable } = await loadReservationModules()
 

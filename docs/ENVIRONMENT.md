@@ -26,7 +26,7 @@ Scope:
 |---|---|---|---|---|
 | `DATABASE_URL` | server, script | Required | Neon pooled connection string; every query in `lib/db/client.ts`. Also read directly by `scripts/seed-dev.mjs:287` and `scripts/apply-neon-schema.mjs:375`. `vitest.setup.ts:6` supplies a dummy value for the test suite when it's otherwise unset | Neon console → project → Connection Details |
 | `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | browser + server | Required | Clerk publishable key. Read implicitly by `@clerk/nextjs` — no explicit `process.env` reference in this repo. Despite the `NEXT_PUBLIC_` prefix it's also read server-side: `@clerk/nextjs`'s `server/constants.js` uses it to derive the Backend API URL for every `clerkClient()` call, and `clerkMiddleware()` (`middleware.ts:38`) throws at startup if it's missing | Clerk dashboard → application → API Keys |
-| `CLERK_SECRET_KEY` | server, script | Required | Clerk secret key. Read implicitly by `@clerk/nextjs`. The hottest dependency is `lib/server/session.ts`'s `currentUser()` (Backend API `users.getUser`), called on every authenticated request via `requireAuth()`/`requireAdmin()` (`lib/server/auth.ts`, ~38 call sites) — not just the `clerkClient()` calls in `lib/server/auth-service.ts` and `lib/server/users-service.ts` (activation/recovery/logout). Also read explicitly by `scripts/seed-dev.mjs` | Clerk dashboard → application → API Keys |
+| `CLERK_SECRET_KEY` | server, script | Required | Clerk secret key. Read implicitly by `@clerk/nextjs`. The hottest dependency is `lib/server/session.ts`'s `currentUser()` (Backend API `users.getUser`), called on every authenticated request via `requireAuth()`/`requireAdmin()` (`lib/server/auth.ts`, ~33 files) — not just the `clerkClient()` calls in `lib/server/auth-service.ts` and `lib/server/users-service.ts` (activation/recovery/logout). Also read explicitly by `scripts/seed-dev.mjs` | Clerk dashboard → application → API Keys |
 | `NEXT_PUBLIC_CLERK_SIGN_IN_URL` | browser | Optional, unset by default | Currently inert in this repo: nothing calls `auth.protect()`, `redirectToSignIn()`, `<SignIn>`/`<SignUp>`, or passes `signInUrl`/`signUpUrl` — `app/layout.tsx` renders a bare `<ClerkProvider>`, and `components/auth/login-form.tsx` authenticates through the headless `useSignIn()` + `router.push()`, which never consults this. Setting it has no observable effect today | Not applicable |
 | `NEXT_PUBLIC_CLERK_SIGN_UP_URL` | browser | Optional, unset by default | Same — also inert | Same |
 | `BLOB_READ_WRITE_TOKEN` | server | Required locally; optional on Vercel with OIDC | Long-lived Vercel Blob credential. The installed `@vercel/blob` SDK's `put()` uses this when OIDC is unavailable. Local development needs this path; a Vercel deployment can instead use the short-lived OIDC path below | Vercel dashboard → project → Storage → Blob store → `.env.local` tab |
@@ -148,6 +148,10 @@ environment:
 - No Blob credential or store identifier appears in `vercel env ls`; see the
   owner-verification item below.
 
+These per-environment splits are tracked for action under issue #336 Phase 4
+item 6 (production cutover, user-only) — not actioned here, since this
+document is read-only per this repo's DDL/secrets rules.
+
 ### Needs owner verification: Blob authentication
 
 - Neither `BLOB_READ_WRITE_TOKEN` nor `BLOB_STORE_ID` appears in `vercel env
@@ -156,7 +160,8 @@ environment:
   `VERCEL_OIDC_TOKEN` and store identifier at runtime. Confirm the project-store
   connection in the Blob dashboard or exercise one upload and one table-QR
   write in Preview. Those paths fail only if neither OIDC (`VERCEL_OIDC_TOKEN`
-  plus `BLOB_STORE_ID`) nor `BLOB_READ_WRITE_TOKEN` is available.
+  plus `BLOB_STORE_ID`) nor `BLOB_READ_WRITE_TOKEN` is available. Tracked for
+  action under issue #336 Phase 4 item 6 (production cutover, user-only).
 
 ### Not set on Vercel, optional
 
@@ -176,7 +181,8 @@ environment:
   document's own variable table calls "bypassable in production by
   rotating instances." Not harmless — this is the difference between a
   real production rate limit and one an attacker can reset by triggering
-  new serverless instances.
+  new serverless instances. Tracked for action under issue #336 Phase 4
+  item 6 (production cutover, user-only).
 
 ### Gap: set on Vercel, nothing reads it
 
