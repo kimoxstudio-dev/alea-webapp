@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import Image from 'next/image'
 import { useTranslations } from 'next-intl'
 import { Pencil, Plus, ChevronDown, ChevronRight, DoorOpen, Table2, QrCode, Download, RefreshCw } from 'lucide-react'
@@ -150,11 +150,13 @@ function RoomTablesPanel({ room }: { room: Room }) {
   const [tableName, setTableName] = useState('')
   const [tableType, setTableType] = useState<'small' | 'large' | 'removable_top'>('small')
   const [formError, setFormError] = useState<string | null>(null)
+  const tableNameRef = useRef<HTMLInputElement>(null)
 
   async function handleCreateTable(e: React.FormEvent) {
     e.preventDefault()
     if (!tableName.trim()) {
       setFormError(tc('requiredField'))
+      tableNameRef.current?.focus()
       return
     }
     setFormError(null)
@@ -197,6 +199,7 @@ function RoomTablesPanel({ room }: { room: Room }) {
             </Label>
             <Input
               id={`table-name-${room.id}`}
+              ref={tableNameRef}
               value={tableName}
               onChange={(e) => setTableName(e.target.value)}
               placeholder={t('tableName')}
@@ -270,6 +273,7 @@ function RoomRow({ room }: { room: Room }) {
   const [editTableCount, setEditTableCount] = useState(String(room.tableCount))
   const [selectedEquipmentIds, setSelectedEquipmentIds] = useState<string[]>([])
   const [editError, setEditError] = useState<string | null>(null)
+  const editNameRef = useRef<HTMLInputElement>(null)
 
   const updateRoom = useAdminUpdateRoom()
   const setRoomDefaultEquipment = useAdminSetRoomDefaultEquipment()
@@ -305,6 +309,7 @@ function RoomRow({ room }: { room: Room }) {
     e.preventDefault()
     if (!editName.trim()) {
       setEditError(tc('requiredField'))
+      editNameRef.current?.focus()
       return
     }
     setEditError(null)
@@ -389,6 +394,7 @@ function RoomRow({ room }: { room: Room }) {
               </Label>
               <Input
                 id={`room-name-edit-${room.id}`}
+                ref={editNameRef}
                 value={editName}
                 onChange={(e) => setEditName(e.target.value)}
                 required
@@ -480,6 +486,7 @@ export function RoomsSection() {
   const [newTableCount, setNewTableCount] = useState('0')
   const [newEquipmentIds, setNewEquipmentIds] = useState<string[]>([])
   const [createError, setCreateError] = useState<string | null>(null)
+  const newNameRef = useRef<HTMLInputElement>(null)
 
   function toggleNewEquipment(id: string) {
     setNewEquipmentIds((prev) =>
@@ -491,6 +498,7 @@ export function RoomsSection() {
     e.preventDefault()
     if (!newName.trim()) {
       setCreateError(tc('requiredField'))
+      newNameRef.current?.focus()
       return
     }
     setCreateError(null)
@@ -588,6 +596,7 @@ export function RoomsSection() {
               </Label>
               <Input
                 id="new-room-name"
+                ref={newNameRef}
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
                 required

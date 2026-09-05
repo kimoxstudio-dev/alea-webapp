@@ -67,16 +67,31 @@ function memberNumberFromClerkUsername(username: string): string | null {
 
 /** Clerk error codes that are specifically about password *length*, matching
  * what `errors.servicePasswordRejected` (messages/en.json, messages/es.json)
- * actually advertises: "at least 15 characters". Other `form_password_*`
- * codes (`form_password_pwned`, `form_password_not_strong_enough`) are real
- * Clerk rejections too, but for a different reason — surfacing this file's
- * specific length-focused copy for those would be wrong advice, so they fall
- * through to the generic `AUTH_ACCOUNT_CREDENTIALS_*_FAILED` path instead. */
+ * actually advertises: "at least 15 characters". */
 const CLERK_PASSWORD_LENGTH_CODES = new Set([
   'form_password_length_too_short',
   'form_password_length_too_long',
   'form_password_size_in_bytes_exceeded',
 ])
+
+/** Other `form_password_*` Clerk codes: real password rejections, but not
+ * about length — a breached (`form_password_pwned`) or weak
+ * (`form_password_not_strong_enough`) password. Surfacing this file's
+ * length-focused copy for these would be wrong advice (retrying the same
+ * password fails identically), so they get their own generic-but-accurate
+ * "try a different password" message instead (issue #371). */
+const CLERK_PASSWORD_OTHER_CODES = new Set([
+  'form_password_pwned',
+  'form_password_not_strong_enough',
+])
+
+function clerkErrorCodes(error: unknown): string[] {
+  const errors = (error as { errors?: unknown })?.errors
+  if (!Array.isArray(errors)) return []
+  return errors
+    .map((entry) => (entry as { code?: unknown })?.code)
+    .filter((code): code is string => typeof code === 'string')
+}
 
 /**
  * Detects a Clerk password-length rejection without importing any Clerk
@@ -95,10 +110,20 @@ const CLERK_PASSWORD_LENGTH_CODES = new Set([
  * constraint instead of a generic "failed" message.
  */
 function isClerkPasswordRejection(error: unknown): boolean {
-  const errors = (error as { errors?: unknown })?.errors
-  if (!Array.isArray(errors)) return false
-  return errors.some((entry) => typeof (entry as { code?: unknown })?.code === 'string'
-    && CLERK_PASSWORD_LENGTH_CODES.has((entry as { code: string }).code))
+  return clerkErrorCodes(error).some((code) => CLERK_PASSWORD_LENGTH_CODES.has(code))
+}
+
+/**
+ * Detects a Clerk password rejection for a reason OTHER than length —
+ * breached or insufficiently strong (issue #371). Distinct from
+ * `isClerkPasswordRejection()` so the caller can map each to its own,
+ * accurate error code instead of both falling through to the generic
+ * `AUTH_ACCOUNT_CREDENTIALS_*_FAILED` message, which gives advice ("try
+ * again or ask an administrator for a new link") that fails identically on
+ * retry with the same rejected password.
+ */
+function isClerkPasswordRejectionGeneric(error: unknown): boolean {
+  return clerkErrorCodes(error).some((code) => CLERK_PASSWORD_OTHER_CODES.has(code))
 }
 
 function hashActivationToken(token: string) {
@@ -441,6 +466,9 @@ export async function activateAccount(input: { token: unknown; password: unknown
     if (isClerkPasswordRejection(error)) {
       serviceError(ERROR_CODES.AUTH_PASSWORD_REJECTED, 400)
     }
+    if (isClerkPasswordRejectionGeneric(error)) {
+      serviceError(ERROR_CODES.AUTH_PASSWORD_REJECTED_GENERIC, 400)
+    }
     serviceError(ERROR_CODES.AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED, 500)
   }
 
@@ -575,6 +603,9 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
     await safeRestoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: recoveredAt })
     if (isClerkPasswordRejection(error)) {
       serviceError(ERROR_CODES.AUTH_PASSWORD_REJECTED, 400)
+    }
+    if (isClerkPasswordRejectionGeneric(error)) {
+      serviceError(ERROR_CODES.AUTH_PASSWORD_REJECTED_GENERIC, 400)
     }
     serviceError(ERROR_CODES.AUTH_ACCOUNT_CREDENTIALS_UPDATE_FAILED, 500)
   }

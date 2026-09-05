@@ -124,6 +124,7 @@
       "serviceActivationLinkUsed": "This activation link has already been used.",
       "serviceAccountCredentialsCreateFailed": "We could not create your account credentials. Please try again or ask an administrator for a new link.",
       "servicePasswordRejected": "Your password does not meet our security requirements: it must be at least 15 characters long.",
+      "servicePasswordRejectedGeneric": "This password doesn't meet the security requirements — try a different, less common password.",
       "serviceActivationFailed": "We could not activate your account. Please try again or ask an administrator for a new link.",
       "serviceInvalidRecoveryLink": "This recovery link is invalid.",
       "serviceRecoveryLinkExpired": "This recovery link is invalid or has expired.",

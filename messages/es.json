@@ -124,6 +124,7 @@
       "serviceActivationLinkUsed": "Este enlace de activación ya ha sido utilizado.",
       "serviceAccountCredentialsCreateFailed": "No hemos podido crear las credenciales de tu cuenta. Inténtalo de nuevo o pide a un administrador un nuevo enlace.",
       "servicePasswordRejected": "Tu contraseña no cumple los requisitos de seguridad: debe tener al menos 15 caracteres.",
+      "servicePasswordRejectedGeneric": "Esta contraseña no cumple los requisitos de seguridad: prueba con otra menos habitual.",
       "serviceActivationFailed": "No hemos podido activar tu cuenta. Inténtalo de nuevo o pide a un administrador un nuevo enlace.",
       "serviceInvalidRecoveryLink": "Este enlace de recuperación no es válido.",
       "serviceRecoveryLinkExpired": "Este enlace de recuperación no es válido o ha caducado.",

@@ -975,15 +975,14 @@ describe('auth service (alea- username model)', () => {
       })
     })
 
-    it('does not misclassify a non-length password rejection as a password-length rejection (#313 round 3)', async () => {
-      // Regression guard for narrowing `isClerkPasswordRejection` from
-      // `code.startsWith('form_password_')` to a fixed set of length-related
-      // codes: `form_password_pwned` is a real Clerk code (still a password
-      // rejection, but not a length problem) that matched the old broad
-      // predicate. It must now fall through to the generic
-      // AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED/500 path instead of
-      // AUTH_PASSWORD_REJECTED/400 — reverting the narrowing back to a
-      // prefix match would make this test fail.
+    it('maps a non-length password rejection to AUTH_PASSWORD_REJECTED_GENERIC/400, not the length-specific or generic-failure codes (issue #371)', async () => {
+      // `form_password_pwned` is a real Clerk password rejection, but not a
+      // length problem — the length-specific `errors.servicePasswordRejected`
+      // copy ("must be at least 15 characters") would be wrong advice here,
+      // and it must not fall through to the generic
+      // AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED/500 either, since that gives
+      // advice ("try again or ask an administrator for a new link") that
+      // fails identically on retry with the same breached password.
       const { activateAccount } = (await loadService()) as any
       const plainToken = createActivationToken()
       const tokenHash = hashActivationToken(plainToken)
@@ -1006,9 +1005,14 @@ describe('auth service (alea- username model)', () => {
           password: 'Password123',
         }),
       ).rejects.toMatchObject({
-        message: 'AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED',
-        statusCode: 500,
+        message: 'AUTH_PASSWORD_REJECTED_GENERIC',
+        statusCode: 400,
       })
+
+      // Same retry guarantee as any other Clerk failure: the token is
+      // restored, not permanently burned.
+      const updatedToken = tokensStore.get(tokenHash)
+      expect(updatedToken?.used_at).toBeNull()
     })
 
     it('restores the claimed token when Clerk createUser fails, and the same link succeeds on retry (#299 Codex review finding 1)', async () => {
@@ -1301,12 +1305,13 @@ describe('auth service (alea- username model)', () => {
       })
     })
 
-    it('does not misclassify a non-length password rejection as a password-length rejection (#313 round 3)', async () => {
-      // Same regression guard as activateAccount's equivalent test:
-      // `form_password_pwned` is a real Clerk code that matched the old
-      // broad `code.startsWith('form_password_')` predicate but must not
-      // match the narrowed length-only set — it must fall through to the
-      // generic AUTH_ACCOUNT_CREDENTIALS_UPDATE_FAILED/500 path.
+    it('maps a non-length password rejection to AUTH_PASSWORD_REJECTED_GENERIC/400, not the length-specific or generic-failure codes (issue #371)', async () => {
+      // Same case as activateAccount's equivalent test: `form_password_pwned`
+      // is a real Clerk password rejection, but not a length problem, and
+      // must not fall through to the generic
+      // AUTH_ACCOUNT_CREDENTIALS_UPDATE_FAILED/500 path either — that advice
+      // ("try again") fails identically on retry with the same breached
+      // password.
       const { recoverAccount } = (await loadService()) as any
       const plainToken = createActivationToken()
       const tokenHash = hashActivationToken(plainToken)
@@ -1329,9 +1334,12 @@ describe('auth service (alea- username model)', () => {
           password: 'NewPassword123',
         }),
       ).rejects.toMatchObject({
-        message: 'AUTH_ACCOUNT_CREDENTIALS_UPDATE_FAILED',
-        statusCode: 500,
+        message: 'AUTH_PASSWORD_REJECTED_GENERIC',
+        statusCode: 400,
       })
+
+      const updatedToken2 = tokensStore.get(tokenHash)
+      expect(updatedToken2?.used_at).toBeNull()
     })
 
     it('restores the claimed token when Clerk updateUser fails, and the same link succeeds on retry (#299 Codex review finding 1)', async () => {

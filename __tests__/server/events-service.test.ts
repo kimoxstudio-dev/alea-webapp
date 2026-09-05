@@ -90,14 +90,14 @@ function addReservationsCancelHandler(respond: () => unknown) {
   })
 }
 
-/** SELECT title, description, date, start_time, end_time, title_es, title_en FROM events WHERE id=$1 LIMIT 1 (updateEvent's currentRows fetch) */
+/** SELECT title, description, date::text AS date, start_time, end_time, title_es, title_en FROM events WHERE id=$1 LIMIT 1 (updateEvent's currentRows fetch; #313 fix folded in — date is cast to text, see events-service.ts) */
 function addCurrentEventHandler(respond: () => unknown) {
   sqlMock.addHandler({
     name: 'SELECT current event row for update',
     verb: 'select',
     match: (stmt) =>
       stmt.table === 'events' &&
-      hasExactSelectColumns(stmt, 'title, description, date, start_time, end_time, title_es, title_en'),
+      hasExactSelectColumns(stmt, 'title, description, date::text as date, start_time, end_time, title_es, title_en'),
     respond,
   })
 }
@@ -156,14 +156,14 @@ function addEventsDeleteHandler(respond: () => unknown) {
   })
 }
 
-/** SELECT room_id, date, start_time, end_time FROM event_room_blocks WHERE event_id=$1 (deleteEventCascade's blocks fetch) */
+/** SELECT room_id, date::text AS date, start_time, end_time FROM event_room_blocks WHERE event_id=$1 (deleteEventCascade's blocks fetch; #313 fix folded in — date is cast to text, see events-service.ts) */
 function addCascadeBlocksFetchHandler(respond: () => unknown) {
   sqlMock.addHandler({
     name: 'SELECT room_id, date, start_time, end_time FROM event_room_blocks (cascade)',
     verb: 'select',
     match: (stmt) =>
       stmt.table === 'event_room_blocks' &&
-      hasExactSelectColumns(stmt, 'room_id, date, start_time, end_time'),
+      hasExactSelectColumns(stmt, 'room_id, date::text as date, start_time, end_time'),
     respond,
   })
 }

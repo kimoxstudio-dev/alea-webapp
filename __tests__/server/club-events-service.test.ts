@@ -436,12 +436,12 @@ function addEventRoomBlocksSelectHandler(blocks: unknown[] = []) {
   })
 }
 
-/** SELECT room_id, date, start_time, end_time FROM event_room_blocks WHERE event_id=$1 — deleteEventCascade's blocks fetch */
+/** SELECT room_id, date::text AS date, start_time, end_time FROM event_room_blocks WHERE event_id=$1 — deleteEventCascade's blocks fetch (#313 fix folded in — date is cast to text, see events-service.ts) */
 function addCascadeBlocksFetchHandler(blocks: unknown[] = []) {
   sqlMock.addHandler({
     name: 'SELECT room_id, date, start_time, end_time FROM event_room_blocks (cascade)',
     verb: 'select',
-    match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, 'room_id, date, start_time, end_time'),
+    match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, 'room_id, date::text as date, start_time, end_time'),
     respond: () => blocks,
   })
 }
@@ -1495,7 +1495,7 @@ describe('club-events-service', () => {
         verb: 'select',
         match: (stmt) =>
           stmt.table === 'events' &&
-          hasExactSelectColumns(stmt, 'id, title, description, date, start_time, end_time, created_by, created_at') &&
+          hasExactSelectColumns(stmt, 'id, title, description, date::text as date, start_time, end_time, created_by, created_at') &&
           Boolean(stmt.whereClause?.includes('title_es')) &&
           Boolean(stmt.whereClause?.includes('title_en')),
         respond: eventsSelectSpy,

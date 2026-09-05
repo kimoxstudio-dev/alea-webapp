@@ -24,6 +24,7 @@ const AUTH_ERROR_MESSAGE_KEYS: Partial<Record<string, string>> = {
   [ERROR_CODES.AUTH_ACTIVATION_LINK_USED]: 'errors.serviceActivationLinkUsed',
   [ERROR_CODES.AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED]: 'errors.serviceAccountCredentialsCreateFailed',
   [ERROR_CODES.AUTH_PASSWORD_REJECTED]: 'errors.servicePasswordRejected',
+  [ERROR_CODES.AUTH_PASSWORD_REJECTED_GENERIC]: 'errors.servicePasswordRejectedGeneric',
   [ERROR_CODES.AUTH_ACTIVATION_FAILED]: 'errors.serviceActivationFailed',
   [ERROR_CODES.AUTH_INVALID_RECOVERY_LINK]: 'errors.serviceInvalidRecoveryLink',
   [ERROR_CODES.AUTH_RECOVERY_LINK_EXPIRED]: 'errors.serviceRecoveryLinkExpired',

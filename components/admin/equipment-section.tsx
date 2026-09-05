@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useTranslations } from 'next-intl'
 import { Pencil, Plus, Trash2, Package } from 'lucide-react'
 import { DiceLoader } from '@/components/ui/dice-loader'
@@ -28,6 +28,7 @@ function EquipmentRow({ item }: { item: Equipment }) {
   const [editName, setEditName] = useState(item.name)
   const [editDesc, setEditDesc] = useState(item.description ?? '')
   const [editError, setEditError] = useState<string | null>(null)
+  const editNameRef = useRef<HTMLInputElement>(null)
 
   const updateEquipment = useAdminUpdateEquipment()
   const deleteEquipment = useAdminDeleteEquipment()
@@ -36,6 +37,7 @@ function EquipmentRow({ item }: { item: Equipment }) {
     e.preventDefault()
     if (!editName.trim()) {
       setEditError(tc('requiredField'))
+      editNameRef.current?.focus()
       return
     }
     setEditError(null)
@@ -100,6 +102,7 @@ function EquipmentRow({ item }: { item: Equipment }) {
               </Label>
               <Input
                 id={`equip-name-edit-${item.id}`}
+                ref={editNameRef}
                 value={editName}
                 onChange={(e) => setEditName(e.target.value)}
                 required
@@ -180,11 +183,13 @@ export function EquipmentSection() {
   const [newName, setNewName] = useState('')
   const [newDesc, setNewDesc] = useState('')
   const [createError, setCreateError] = useState<string | null>(null)
+  const newNameRef = useRef<HTMLInputElement>(null)
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault()
     if (!newName.trim()) {
       setCreateError(tc('requiredField'))
+      newNameRef.current?.focus()
       return
     }
     setCreateError(null)
@@ -275,6 +280,7 @@ export function EquipmentSection() {
               </Label>
               <Input
                 id="new-equipment-name"
+                ref={newNameRef}
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
                 required
