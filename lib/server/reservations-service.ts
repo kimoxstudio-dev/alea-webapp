@@ -33,7 +33,13 @@ export { CHECK_IN_LATE_MINUTES }
 export const BOOKING_WINDOW_DAYS = 7
 const CANCELLATION_CUTOFF_MS = 60 * 60 * 1000 // 60 minutes
 
-const RESERVATION_COLUMNS = 'id, table_id, user_id, date, start_time, end_time, status, surface, activated_at, created_at'
+// `date::text AS date` is load-bearing: without it the Neon driver parses
+// the `date` column (OID 1082) into a JS `Date` object, not a string, and
+// isPendingReservationExpired -> zonedDateTimeToUtc -> isValidDateOnlyString
+// throws on that shape (same failure mode documented in
+// reservation-no-show.ts's markExpiredReservationsAsNoShow).
+const RESERVATION_COLUMNS =
+  'id, table_id, user_id, date::text AS date, start_time, end_time, status, surface, activated_at, created_at'
 
 function parseDate(value: string): string {
   if (!isValidDateOnlyString(value)) {
@@ -567,7 +573,7 @@ export async function listVisibleReservations(input: {
   let rows: ReservationListRow[]
   try {
     rows = await sql`
-      SELECT r.id, r.table_id, r.user_id, r.date, r.start_time, r.end_time, r.status, r.surface, r.activated_at, r.created_at,
+      SELECT r.id, r.table_id, r.user_id, r.date::text AS date, r.start_time, r.end_time, r.status, r.surface, r.activated_at, r.created_at,
         p.member_number, t.name AS table_name, rooms.name AS room_name
       FROM reservations r
       LEFT JOIN profiles p ON p.id = r.user_id

@@ -114,9 +114,14 @@ export async function getTableAvailability(tableId: string, date?: string | null
   let savedGameRows: Array<{ id: string }>
   let nowUtc: Date
   try {
+    // `date::text` cast is load-bearing: without it the Neon driver parses
+    // the `date` column (OID 1082) into a JS `Date` object, not a string,
+    // and isPendingReservationExpired -> zonedDateTimeToUtc ->
+    // isValidDateOnlyString throws on that shape (same failure mode
+    // documented in reservation-no-show.ts's markExpiredReservationsAsNoShow).
     ;[allReservations, allEventBlocks, savedGameRows, nowUtc] = await Promise.all([
       sql`
-        SELECT id, table_id, date, start_time, end_time, status, surface, user_id, activated_at, created_at
+        SELECT id, table_id, date::text AS date, start_time, end_time, status, surface, user_id, activated_at, created_at
         FROM reservations
         WHERE table_id = ${tableId}
           AND date = ${effectiveDate}
