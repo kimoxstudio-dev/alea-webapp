@@ -1,4 +1,4 @@
-import { ERROR_CODES } from '@/lib/types/error-codes'
+import { ERROR_CODES, type AuthErrorCode } from '@/lib/types/error-codes'
 
 /**
  * Maps an `auth-service.ts` `ERROR_CODES.AUTH_*` code (the raw
@@ -12,8 +12,12 @@ import { ERROR_CODES } from '@/lib/types/error-codes'
  * this fixes. Returns `null` for a code with no mapping (e.g. a network
  * error's message, which is never one of these codes); callers fall back to
  * their own generic, already-translated message in that case.
+ *
+ * Typed `Record<AuthErrorCode, string>` (not `Partial<Record<string, string>>`)
+ * so a new `ERROR_CODES.AUTH_*` value with no entry here is a compile error
+ * (#313 code-review finding 8).
  */
-const AUTH_ERROR_MESSAGE_KEYS: Partial<Record<string, string>> = {
+const AUTH_ERROR_MESSAGE_KEYS: Record<AuthErrorCode, string> = {
   [ERROR_CODES.AUTH_USER_NOT_FOUND]: 'errors.serviceUserNotFound',
   [ERROR_CODES.AUTH_ONLY_MEMBER_CAN_ACTIVATE]: 'errors.serviceOnlyMemberCanActivate',
   [ERROR_CODES.AUTH_MEMBER_ALREADY_ACTIVE]: 'errors.serviceMemberAlreadyActive',
@@ -37,5 +41,5 @@ const AUTH_ERROR_MESSAGE_KEYS: Partial<Record<string, string>> = {
 
 export function getAuthServiceErrorMessageKey(code: string | undefined | null): string | null {
   if (!code) return null
-  return AUTH_ERROR_MESSAGE_KEYS[code] ?? null
+  return AUTH_ERROR_MESSAGE_KEYS[code as AuthErrorCode] ?? null
 }

@@ -1015,6 +1015,42 @@ describe('auth service (alea- username model)', () => {
       expect(updatedToken?.used_at).toBeNull()
     })
 
+    it('maps an unrecognized form_password_* code to AUTH_PASSWORD_REJECTED_GENERIC instead of falling through to the unrelated create-failed code (#313 code-review finding 7)', async () => {
+      // Neither CLERK_PASSWORD_LENGTH_CODES nor CLERK_PASSWORD_OTHER_CODES
+      // knows this hypothetical future Clerk code. Without the
+      // startsWith('form_password_') fallback this would silently land on
+      // AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED/500 — reproducing the
+      // original bug this file exists to fix.
+      const { activateAccount } = (await loadService()) as any
+      const plainToken = createActivationToken()
+      const tokenHash = hashActivationToken(plainToken)
+
+      const token = createTestToken({
+        token_hash: tokenHash,
+        profile_id: 'user-test',
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+        used_at: null,
+      })
+      tokensStore.set(tokenHash, token)
+
+      clerkCreateUserMock.mockRejectedValueOnce({
+        errors: [{ code: 'form_password_some_future_code', message: 'Some future Clerk password rejection' }],
+      })
+
+      await expect(
+        activateAccount({
+          token: plainToken,
+          password: 'Password123',
+        }),
+      ).rejects.toMatchObject({
+        message: 'AUTH_PASSWORD_REJECTED_GENERIC',
+        statusCode: 400,
+      })
+
+      const updatedToken2 = tokensStore.get(tokenHash)
+      expect(updatedToken2?.used_at).toBeNull()
+    })
+
     it('restores the claimed token when Clerk createUser fails, and the same link succeeds on retry (#299 Codex review finding 1)', async () => {
       const { activateAccount } = (await loadService()) as any
       const plainToken = createActivationToken()
@@ -1340,6 +1376,40 @@ describe('auth service (alea- username model)', () => {
 
       const updatedToken2 = tokensStore.get(tokenHash)
       expect(updatedToken2?.used_at).toBeNull()
+    })
+
+    it('maps an unrecognized form_password_* code to AUTH_PASSWORD_REJECTED_GENERIC instead of falling through to the unrelated update-failed code (#313 code-review finding 7)', async () => {
+      // Same case as activateAccount's equivalent test: a hypothetical
+      // future Clerk code neither known set covers must still route to the
+      // generic password-rejection path, not AUTH_ACCOUNT_CREDENTIALS_UPDATE_FAILED/500.
+      const { recoverAccount } = (await loadService()) as any
+      const plainToken = createActivationToken()
+      const tokenHash = hashActivationToken(plainToken)
+
+      const token = createTestToken({
+        token_hash: tokenHash,
+        profile_id: 'user-active',
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+        used_at: null,
+      })
+      tokensStore.set(tokenHash, token)
+
+      clerkUpdateUserMock.mockRejectedValueOnce({
+        errors: [{ code: 'form_password_some_future_code', message: 'Some future Clerk password rejection' }],
+      })
+
+      await expect(
+        recoverAccount({
+          token: plainToken,
+          password: 'NewPassword123',
+        }),
+      ).rejects.toMatchObject({
+        message: 'AUTH_PASSWORD_REJECTED_GENERIC',
+        statusCode: 400,
+      })
+
+      const updatedToken3 = tokensStore.get(tokenHash)
+      expect(updatedToken3?.used_at).toBeNull()
     })
 
     it('restores the claimed token when Clerk updateUser fails, and the same link succeeds on retry (#299 Codex review finding 1)', async () => {

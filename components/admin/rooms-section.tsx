@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import Image from 'next/image'
 import { useTranslations } from 'next-intl'
 import { Pencil, Plus, ChevronDown, ChevronRight, DoorOpen, Table2, QrCode, Download, RefreshCw } from 'lucide-react'
@@ -27,6 +27,7 @@ import {
   useAdminRoomDefaultEquipment,
   useAdminSetRoomDefaultEquipment,
 } from '@/lib/hooks/use-admin'
+import { useRequiredFieldFocus } from '@/lib/hooks/use-required-field-focus'
 import type { Room, GameTable } from '@/lib/types'
 
 // Table type badge styling
@@ -150,13 +151,13 @@ function RoomTablesPanel({ room }: { room: Room }) {
   const [tableName, setTableName] = useState('')
   const [tableType, setTableType] = useState<'small' | 'large' | 'removable_top'>('small')
   const [formError, setFormError] = useState<string | null>(null)
-  const tableNameRef = useRef<HTMLInputElement>(null)
+  const { getRef: getTableRef, focus: focusTableField } = useRequiredFieldFocus<'name'>()
 
   async function handleCreateTable(e: React.FormEvent) {
     e.preventDefault()
     if (!tableName.trim()) {
       setFormError(tc('requiredField'))
-      tableNameRef.current?.focus()
+      focusTableField('name')
       return
     }
     setFormError(null)
@@ -199,7 +200,7 @@ function RoomTablesPanel({ room }: { room: Room }) {
             </Label>
             <Input
               id={`table-name-${room.id}`}
-              ref={tableNameRef}
+              ref={getTableRef('name')}
               value={tableName}
               onChange={(e) => setTableName(e.target.value)}
               placeholder={t('tableName')}
@@ -273,7 +274,7 @@ function RoomRow({ room }: { room: Room }) {
   const [editTableCount, setEditTableCount] = useState(String(room.tableCount))
   const [selectedEquipmentIds, setSelectedEquipmentIds] = useState<string[]>([])
   const [editError, setEditError] = useState<string | null>(null)
-  const editNameRef = useRef<HTMLInputElement>(null)
+  const { getRef: getEditRef, focus: focusEditField } = useRequiredFieldFocus<'name'>()
 
   const updateRoom = useAdminUpdateRoom()
   const setRoomDefaultEquipment = useAdminSetRoomDefaultEquipment()
@@ -309,7 +310,7 @@ function RoomRow({ room }: { room: Room }) {
     e.preventDefault()
     if (!editName.trim()) {
       setEditError(tc('requiredField'))
-      editNameRef.current?.focus()
+      focusEditField('name')
       return
     }
     setEditError(null)
@@ -394,7 +395,7 @@ function RoomRow({ room }: { room: Room }) {
               </Label>
               <Input
                 id={`room-name-edit-${room.id}`}
-                ref={editNameRef}
+                ref={getEditRef('name')}
                 value={editName}
                 onChange={(e) => setEditName(e.target.value)}
                 required
@@ -486,7 +487,7 @@ export function RoomsSection() {
   const [newTableCount, setNewTableCount] = useState('0')
   const [newEquipmentIds, setNewEquipmentIds] = useState<string[]>([])
   const [createError, setCreateError] = useState<string | null>(null)
-  const newNameRef = useRef<HTMLInputElement>(null)
+  const { getRef: getCreateRef, focus: focusCreateField } = useRequiredFieldFocus<'name'>()
 
   function toggleNewEquipment(id: string) {
     setNewEquipmentIds((prev) =>
@@ -498,7 +499,7 @@ export function RoomsSection() {
     e.preventDefault()
     if (!newName.trim()) {
       setCreateError(tc('requiredField'))
-      newNameRef.current?.focus()
+      focusCreateField('name')
       return
     }
     setCreateError(null)
@@ -596,7 +597,7 @@ export function RoomsSection() {
               </Label>
               <Input
                 id="new-room-name"
-                ref={newNameRef}
+                ref={getCreateRef('name')}
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
                 required

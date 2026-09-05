@@ -7,7 +7,7 @@ import { serviceError } from '@/lib/server/service-error'
 // go through THIS validator. Only absolute http(s) URLs are accepted (or
 // empty/omitted) — javascript:, data:, relative paths, and any other scheme
 // are rejected before they can ever be persisted.
-export const ALLOWED_URL_PROTOCOLS = new Set(['http:', 'https:'])
+const ALLOWED_URL_PROTOCOLS = new Set(['http:', 'https:'])
 
 /**
  * Client-safe shape check for an optional absolute http(s) URL — same accept

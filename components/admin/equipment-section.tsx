@@ -1,6 +1,6 @@
 'use client'
 
-import { useRef, useState } from 'react'
+import { useState } from 'react'
 import { useTranslations } from 'next-intl'
 import { Pencil, Plus, Trash2, Package } from 'lucide-react'
 import { DiceLoader } from '@/components/ui/dice-loader'
@@ -17,6 +17,7 @@ import {
   useAdminUpdateEquipment,
   useAdminDeleteEquipment,
 } from '@/lib/hooks/use-admin'
+import { useRequiredFieldFocus } from '@/lib/hooks/use-required-field-focus'
 import type { Equipment } from '@/lib/types'
 
 function EquipmentRow({ item }: { item: Equipment }) {
@@ -28,7 +29,7 @@ function EquipmentRow({ item }: { item: Equipment }) {
   const [editName, setEditName] = useState(item.name)
   const [editDesc, setEditDesc] = useState(item.description ?? '')
   const [editError, setEditError] = useState<string | null>(null)
-  const editNameRef = useRef<HTMLInputElement>(null)
+  const { getRef: getEditRef, focus: focusEditField } = useRequiredFieldFocus<'name'>()
 
   const updateEquipment = useAdminUpdateEquipment()
   const deleteEquipment = useAdminDeleteEquipment()
@@ -37,7 +38,7 @@ function EquipmentRow({ item }: { item: Equipment }) {
     e.preventDefault()
     if (!editName.trim()) {
       setEditError(tc('requiredField'))
-      editNameRef.current?.focus()
+      focusEditField('name')
       return
     }
     setEditError(null)
@@ -102,7 +103,7 @@ function EquipmentRow({ item }: { item: Equipment }) {
               </Label>
               <Input
                 id={`equip-name-edit-${item.id}`}
-                ref={editNameRef}
+                ref={getEditRef('name')}
                 value={editName}
                 onChange={(e) => setEditName(e.target.value)}
                 required
@@ -183,13 +184,13 @@ export function EquipmentSection() {
   const [newName, setNewName] = useState('')
   const [newDesc, setNewDesc] = useState('')
   const [createError, setCreateError] = useState<string | null>(null)
-  const newNameRef = useRef<HTMLInputElement>(null)
+  const { getRef: getCreateRef, focus: focusCreateField } = useRequiredFieldFocus<'name'>()
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault()
     if (!newName.trim()) {
       setCreateError(tc('requiredField'))
-      newNameRef.current?.focus()
+      focusCreateField('name')
       return
     }
     setCreateError(null)
@@ -280,7 +281,7 @@ export function EquipmentSection() {
               </Label>
               <Input
                 id="new-equipment-name"
-                ref={newNameRef}
+                ref={getCreateRef('name')}
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
                 required

@@ -128,7 +128,7 @@ export async function getTableAvailability(tableId: string, date?: string | null
           AND status IN ('active', 'pending')
       ` as unknown as Promise<ReservationRow[]>,
       sql`
-        SELECT id, event_id, room_id, table_id, date, start_time, end_time, all_day
+        SELECT id, event_id, room_id, table_id, date::text AS date, start_time, end_time, all_day
         FROM event_room_blocks
         WHERE room_id = ${table.room_id}
           AND date = ${effectiveDate}

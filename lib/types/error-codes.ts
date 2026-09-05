@@ -64,3 +64,13 @@ export const ERROR_CODES = {
 } as const
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES]
+
+/**
+ * Union of just the `AUTH_*` error codes. Lets `service-error-messages.ts`
+ * type its message map as `Record<AuthErrorCode, string>` instead of
+ * `Partial<Record<string, string>>`, so adding a new `AUTH_*` code with no
+ * matching translation-key entry is a compile error, not a silent gap only
+ * the dedicated test file happens to catch (#313 code-review finding 8).
+ */
+type AuthErrorCodeKey = Extract<keyof typeof ERROR_CODES, `AUTH_${string}`>
+export type AuthErrorCode = (typeof ERROR_CODES)[AuthErrorCodeKey]

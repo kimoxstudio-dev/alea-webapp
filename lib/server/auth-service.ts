@@ -109,21 +109,31 @@ function clerkErrorCodes(error: unknown): string[] {
  * other Clerk failure lets the caller return a message that states the real
  * constraint instead of a generic "failed" message.
  */
-function isClerkPasswordRejection(error: unknown): boolean {
-  return clerkErrorCodes(error).some((code) => CLERK_PASSWORD_LENGTH_CODES.has(code))
+function isClerkPasswordRejection(codes: string[]): boolean {
+  return codes.some((code) => CLERK_PASSWORD_LENGTH_CODES.has(code))
 }
 
 /**
  * Detects a Clerk password rejection for a reason OTHER than length —
- * breached or insufficiently strong (issue #371). Distinct from
- * `isClerkPasswordRejection()` so the caller can map each to its own,
- * accurate error code instead of both falling through to the generic
- * `AUTH_ACCOUNT_CREDENTIALS_*_FAILED` message, which gives advice ("try
- * again or ask an administrator for a new link") that fails identically on
- * retry with the same rejected password.
+ * breached or insufficiently strong (issue #371), or an unrecognized
+ * `form_password_*` code (#313 code-review finding 7): Clerk can add a new
+ * password-rejection code neither set above has been updated for, and
+ * silently falling through to the unrelated "try again or ask an
+ * administrator for a new link" message would reproduce the original bug
+ * this file fixes. Any code shaped like a password rejection that isn't a
+ * known length code is treated as a generic password rejection rather than
+ * an unrelated failure. Distinct from `isClerkPasswordRejection()` so the
+ * caller can map each to its own, accurate error code instead of both
+ * falling through to the generic `AUTH_ACCOUNT_CREDENTIALS_*_FAILED`
+ * message, which gives advice that fails identically on retry with the same
+ * rejected password.
  */
-function isClerkPasswordRejectionGeneric(error: unknown): boolean {
-  return clerkErrorCodes(error).some((code) => CLERK_PASSWORD_OTHER_CODES.has(code))
+function isClerkPasswordRejectionGeneric(codes: string[]): boolean {
+  return codes.some(
+    (code) =>
+      CLERK_PASSWORD_OTHER_CODES.has(code) ||
+      (code.startsWith('form_password_') && !CLERK_PASSWORD_LENGTH_CODES.has(code)),
+  )
 }
 
 function hashActivationToken(token: string) {
@@ -463,13 +473,14 @@ export async function activateAccount(input: { token: unknown; password: unknown
     // member was never actually activated, so the token must not stay
     // burned — restore it so the same admin-issued link can be retried.
     await safeRestoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: activatedAt })
-    if (isClerkPasswordRejection(error)) {
+    const codes = clerkErrorCodes(error)
+    if (isClerkPasswordRejection(codes)) {
       serviceError(ERROR_CODES.AUTH_PASSWORD_REJECTED, 400)
-    }
-    if (isClerkPasswordRejectionGeneric(error)) {
+    } else if (isClerkPasswordRejectionGeneric(codes)) {
       serviceError(ERROR_CODES.AUTH_PASSWORD_REJECTED_GENERIC, 400)
+    } else {
+      serviceError(ERROR_CODES.AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED, 500)
     }
-    serviceError(ERROR_CODES.AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED, 500)
   }
 
   // Clerk succeeded, but the DB profile update itself can still fail — a
@@ -601,13 +612,14 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
     })
   } catch (error) {
     await safeRestoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: recoveredAt })
-    if (isClerkPasswordRejection(error)) {
+    const codes = clerkErrorCodes(error)
+    if (isClerkPasswordRejection(codes)) {
       serviceError(ERROR_CODES.AUTH_PASSWORD_REJECTED, 400)
-    }
-    if (isClerkPasswordRejectionGeneric(error)) {
+    } else if (isClerkPasswordRejectionGeneric(codes)) {
       serviceError(ERROR_CODES.AUTH_PASSWORD_REJECTED_GENERIC, 400)
+    } else {
+      serviceError(ERROR_CODES.AUTH_ACCOUNT_CREDENTIALS_UPDATE_FAILED, 500)
     }
-    serviceError(ERROR_CODES.AUTH_ACCOUNT_CREDENTIALS_UPDATE_FAILED, 500)
   }
 
   // Clerk succeeded, but the DB profile update itself can still fail — a
