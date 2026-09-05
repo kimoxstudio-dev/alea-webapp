@@ -439,7 +439,7 @@ function addEventRoomBlocksSelectHandler(blocks: unknown[] = []) {
 /** SELECT room_id, date::text AS date, start_time, end_time FROM event_room_blocks WHERE event_id=$1 — deleteEventCascade's blocks fetch (#313 fix folded in — date is cast to text, see events-service.ts) */
 function addCascadeBlocksFetchHandler(blocks: unknown[] = []) {
   sqlMock.addHandler({
-    name: 'SELECT room_id, date, start_time, end_time FROM event_room_blocks (cascade)',
+    name: 'SELECT room_id, date::text AS date, start_time, end_time FROM event_room_blocks (cascade)',
     verb: 'select',
     match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, 'room_id, date::text as date, start_time, end_time'),
     respond: () => blocks,

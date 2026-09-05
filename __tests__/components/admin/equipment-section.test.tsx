@@ -39,6 +39,10 @@ describe('EquipmentSection — required-field validation (#313)', () => {
     // "Please fill out this field" bubble competing with the message above).
     const nameInput = screen.getByLabelText('equipment.equipmentName')
     expect(nameInput.closest('form')).toHaveAttribute('novalidate')
+
+    // Focus must move to the offending field so a keyboard/screen-reader
+    // user lands on it without having to hunt for the error.
+    expect(nameInput).toHaveFocus()
   })
 
   it('submits once the required name is filled in', async () => {

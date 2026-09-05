@@ -75,23 +75,27 @@ function makeBlockRow(overrides: Record<string, unknown> = {}) {
 // Shared handler factories
 // ---------------------------------------------------------------------------
 
-/** INSERT INTO events (title, description, date, start_time, end_time, created_by) — multi-block create (6 bound values). */
+/** INSERT INTO events (title, description, date, start_time, end_time, created_by) — multi-block create (6 bound values). RETURNING casts `date` back to text (#313), pinned via stmt.text. */
 function addMultiBlockEventInsertHandler(respond: (values: unknown[]) => unknown) {
   sqlMock.addHandler({
     name: 'INSERT events (multi-block, 6 values incl. created_by)',
     verb: 'insert',
-    match: (stmt) => stmt.table === 'events' && stmt.returning && stmt.values.length === 6,
+    match: (stmt) =>
+      stmt.table === 'events' &&
+      stmt.returning &&
+      stmt.values.length === 6 &&
+      stmt.text.includes('date::text as date'),
     respond: (stmt) => respond(stmt.values),
   })
 }
 
-/** INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day) RETURNING ... */
+/** INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day) RETURNING ... — RETURNING casts `date` back to text (#313), pinned via stmt.text. */
 function addRoomBlockInsertHandler(respond: (values: unknown[]) => unknown) {
   let callIndex = -1
   sqlMock.addHandler({
     name: 'INSERT event_room_blocks',
     verb: 'insert',
-    match: (stmt) => stmt.table === 'event_room_blocks' && stmt.returning,
+    match: (stmt) => stmt.table === 'event_room_blocks' && stmt.returning && stmt.text.includes('date::text as date'),
     respond: (stmt) => {
       callIndex += 1
       return respond(stmt.values)
@@ -135,7 +139,7 @@ function addCurrentEventHandler(respond: () => unknown) {
   })
 }
 
-/** UPDATE events SET title=,description=,date=,start_time=,end_time= WHERE id=... RETURNING ... (multi-block update) */
+/** UPDATE events SET title=,description=,date=,start_time=,end_time= WHERE id=... RETURNING ... (multi-block update). RETURNING casts `date` back to text (#313), pinned via stmt.text. */
 function addMultiBlockEventUpdateHandler(respond: (values: unknown[]) => unknown) {
   sqlMock.addHandler({
     name: 'UPDATE events (multi-block)',
@@ -144,17 +148,18 @@ function addMultiBlockEventUpdateHandler(respond: (values: unknown[]) => unknown
       stmt.table === 'events' &&
       stmt.returning &&
       whereColumnHasOperator(stmt, 'id', '=') &&
-      whereConditionCount(stmt) === 1,
+      whereConditionCount(stmt) === 1 &&
+      stmt.text.includes('date::text as date'),
     respond: (stmt) => respond(stmt.values),
   })
 }
 
-/** DELETE FROM event_room_blocks WHERE event_id=$1 */
+/** DELETE FROM event_room_blocks WHERE event_id=$1 RETURNING ... — RETURNING casts `date` back to text (#313), pinned via stmt.text. */
 function addBlocksDeleteHandler(respond: () => unknown) {
   sqlMock.addHandler({
     name: 'DELETE event_room_blocks WHERE event_id',
     verb: 'delete',
-    match: (stmt) => stmt.table === 'event_room_blocks',
+    match: (stmt) => stmt.table === 'event_room_blocks' && stmt.returning && stmt.text.includes('date::text as date'),
     respond,
   })
 }
@@ -172,7 +177,7 @@ function addDeleteGuardHandler(respond: () => unknown) {
 /** SELECT room_id, date::text AS date, start_time, end_time FROM event_room_blocks WHERE event_id=$1 (deleteEventCascade's blocks fetch; #313 fix folded in — date is cast to text, see events-service.ts) */
 function addCascadeBlocksFetchHandler(respond: () => unknown) {
   sqlMock.addHandler({
-    name: 'SELECT room_id, date, start_time, end_time FROM event_room_blocks (cascade)',
+    name: 'SELECT room_id, date::text AS date, start_time, end_time FROM event_room_blocks (cascade)',
     verb: 'select',
     match: (stmt) =>
       stmt.table === 'event_room_blocks' &&

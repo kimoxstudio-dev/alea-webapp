@@ -47,7 +47,12 @@ describe('PartnersSection — URL field validation (#313)', () => {
     // The translated, app-controlled field-level message must appear...
     expect(await screen.findByRole('alert')).toHaveTextContent('invalidUrl')
     // ...anchored to the linkUrl input specifically.
-    expect(screen.getByLabelText('partners.linkUrl')).toHaveAttribute('aria-invalid', 'true')
+    const linkUrlInput = screen.getByLabelText('partners.linkUrl')
+    expect(linkUrlInput).toHaveAttribute('aria-invalid', 'true')
+    // Focus must move to linkUrl specifically — not just "the only input",
+    // since this form has three fields, proving the ref-keying targets the
+    // actual offending field rather than always focusing the first one.
+    expect(linkUrlInput).toHaveFocus()
     // ...and the mutation (which would persist an invalid URL) must never fire.
     expect(mockCreateMutateAsync).not.toHaveBeenCalled()
   })
