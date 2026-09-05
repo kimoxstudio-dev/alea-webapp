@@ -25,7 +25,8 @@
     "showing": "Showing",
     "results": "results",
     "noResults": "No results found",
-    "loadingPage": "Loading page..."
+    "loadingPage": "Loading page...",
+    "requiredField": "This field is required."
   },
   "nav": {
     "rooms": "Rooms",
@@ -111,7 +112,25 @@
       "memberNumberRequired": "Member number is required",
       "memberNumberTooLong": "Member number must not exceed 10 digits",
       "memberNumberNumeric": "Member number must contain only digits",
-      "invalidRegistrationDetails": "Invalid registration details"
+      "invalidRegistrationDetails": "Invalid registration details",
+      "serviceUserNotFound": "User not found.",
+      "serviceOnlyMemberCanActivate": "Only member accounts can be activated.",
+      "serviceMemberAlreadyActive": "This member is already active.",
+      "serviceOnlyMemberCanReceiveRecovery": "Only member accounts can receive recovery links.",
+      "serviceMemberMustActivateBeforeRecovery": "This member must activate the account before using recovery.",
+      "serviceInvalidActivationLink": "This activation link is invalid.",
+      "serviceActivationLinkExpired": "This activation link is invalid or has expired.",
+      "serviceActivationLinkUsed": "This activation link has already been used.",
+      "serviceAccountCredentialsCreateFailed": "We could not create your account credentials. Please try again or ask an administrator for a new link.",
+      "servicePasswordRejected": "Your password does not meet our security requirements: it must be at least 15 characters long.",
+      "serviceActivationFailed": "We could not activate your account. Please try again or ask an administrator for a new link.",
+      "serviceInvalidRecoveryLink": "This recovery link is invalid.",
+      "serviceRecoveryLinkExpired": "This recovery link is invalid or has expired.",
+      "serviceRecoveryLinkUsed": "This recovery link has already been used.",
+      "serviceInternalError": "Something went wrong on our end. Please try again.",
+      "serviceAccountCredentialsUpdateFailed": "We could not update your account credentials. Please try again or ask an administrator for a new link.",
+      "serviceRecoveryFailed": "We could not recover your account. Please try again or ask an administrator for a new link.",
+      "serviceUnauthorized": "You must sign in to continue."
     }
   },
   "rooms": {

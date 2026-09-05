@@ -25,7 +25,8 @@
     "showing": "Mostrando",
     "results": "resultados",
     "noResults": "No se encontraron resultados",
-    "loadingPage": "Cargando página..."
+    "loadingPage": "Cargando página...",
+    "requiredField": "Este campo es obligatorio."
   },
   "nav": {
     "rooms": "Salas",
@@ -111,7 +112,25 @@
       "memberNumberRequired": "El número de socio es obligatorio",
       "memberNumberTooLong": "El número de socio no puede superar los 10 dígitos",
       "memberNumberNumeric": "El número de socio solo puede contener dígitos",
-      "invalidRegistrationDetails": "Datos de registro inválidos"
+      "invalidRegistrationDetails": "Datos de registro inválidos",
+      "serviceUserNotFound": "Usuario no encontrado.",
+      "serviceOnlyMemberCanActivate": "Solo las cuentas de socio pueden activarse.",
+      "serviceMemberAlreadyActive": "Este socio ya está activo.",
+      "serviceOnlyMemberCanReceiveRecovery": "Solo las cuentas de socio pueden recibir enlaces de recuperación.",
+      "serviceMemberMustActivateBeforeRecovery": "Este socio debe activar la cuenta antes de usar la recuperación.",
+      "serviceInvalidActivationLink": "Este enlace de activación no es válido.",
+      "serviceActivationLinkExpired": "Este enlace de activación no es válido o ha caducado.",
+      "serviceActivationLinkUsed": "Este enlace de activación ya ha sido utilizado.",
+      "serviceAccountCredentialsCreateFailed": "No hemos podido crear las credenciales de tu cuenta. Inténtalo de nuevo o pide a un administrador un nuevo enlace.",
+      "servicePasswordRejected": "Tu contraseña no cumple los requisitos de seguridad: debe tener al menos 15 caracteres.",
+      "serviceActivationFailed": "No hemos podido activar tu cuenta. Inténtalo de nuevo o pide a un administrador un nuevo enlace.",
+      "serviceInvalidRecoveryLink": "Este enlace de recuperación no es válido.",
+      "serviceRecoveryLinkExpired": "Este enlace de recuperación no es válido o ha caducado.",
+      "serviceRecoveryLinkUsed": "Este enlace de recuperación ya ha sido utilizado.",
+      "serviceInternalError": "Algo ha ido mal por nuestra parte. Inténtalo de nuevo.",
+      "serviceAccountCredentialsUpdateFailed": "No hemos podido actualizar las credenciales de tu cuenta. Inténtalo de nuevo o pide a un administrador un nuevo enlace.",
+      "serviceRecoveryFailed": "No hemos podido recuperar tu cuenta. Inténtalo de nuevo o pide a un administrador un nuevo enlace.",
+      "serviceUnauthorized": "Debes iniciar sesión para continuar."
     }
   },
   "rooms": {

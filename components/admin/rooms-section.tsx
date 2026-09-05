@@ -149,10 +149,15 @@ function RoomTablesPanel({ room }: { room: Room }) {
   const [showCreateTable, setShowCreateTable] = useState(false)
   const [tableName, setTableName] = useState('')
   const [tableType, setTableType] = useState<'small' | 'large' | 'removable_top'>('small')
+  const [formError, setFormError] = useState<string | null>(null)
 
   async function handleCreateTable(e: React.FormEvent) {
     e.preventDefault()
-    if (!tableName.trim()) return
+    if (!tableName.trim()) {
+      setFormError(tc('requiredField'))
+      return
+    }
+    setFormError(null)
     await createTable.mutateAsync({ roomId: room.id, data: { name: tableName.trim(), type: tableType } })
     setTableName('')
     setTableType('small')
@@ -182,7 +187,7 @@ function RoomTablesPanel({ room }: { room: Room }) {
 
       {/* Create table form */}
       {showCreateTable ? (
-        <form onSubmit={handleCreateTable} className="space-y-3 rounded-md border border-primary/20 bg-primary/5 p-4">
+        <form onSubmit={handleCreateTable} noValidate className="space-y-3 rounded-md border border-primary/20 bg-primary/5 p-4">
           <p className="text-xs font-cinzel font-semibold text-primary/80 uppercase tracking-wider mb-2">
             {t('createTable')}
           </p>
@@ -195,9 +200,10 @@ function RoomTablesPanel({ room }: { room: Room }) {
               value={tableName}
               onChange={(e) => setTableName(e.target.value)}
               placeholder={t('tableName')}
-              required
+              aria-invalid={!!formError}
               className="h-8 text-sm bg-background-secondary border-border focus:border-primary/50"
             />
+            {formError && <p role="alert" className="text-xs text-destructive">{formError}</p>}
           </div>
           <div className="space-y-1.5">
             <Label htmlFor={`table-type-${room.id}`} className="text-xs text-muted-foreground">
@@ -224,7 +230,7 @@ function RoomTablesPanel({ room }: { room: Room }) {
               type="button"
               variant="outline"
               size="sm"
-              onClick={() => setShowCreateTable(false)}
+              onClick={() => { setShowCreateTable(false); setFormError(null) }}
               className="h-8 border-border"
             >
               {tc('cancel')}
@@ -257,6 +263,7 @@ function RoomRow({ room }: { room: Room }) {
   const [editDesc, setEditDesc] = useState(room.description ?? '')
   const [editTableCount, setEditTableCount] = useState(String(room.tableCount))
   const [selectedEquipmentIds, setSelectedEquipmentIds] = useState<string[]>([])
+  const [editError, setEditError] = useState<string | null>(null)
 
   const updateRoom = useAdminUpdateRoom()
   const setRoomDefaultEquipment = useAdminSetRoomDefaultEquipment()
@@ -268,6 +275,7 @@ function RoomRow({ room }: { room: Room }) {
     setEditName(room.name)
     setEditDesc(room.description ?? '')
     setEditTableCount(String(room.tableCount))
+    setEditError(null)
     setEditing(true)
   }
 
@@ -289,6 +297,11 @@ function RoomRow({ room }: { room: Room }) {
 
   async function handleSave(e: React.FormEvent) {
     e.preventDefault()
+    if (!editName.trim()) {
+      setEditError(tc('requiredField'))
+      return
+    }
+    setEditError(null)
     const tableCount = Math.max(0, parseInt(editTableCount, 10) || 0)
     await Promise.all([
       updateRoom.mutateAsync({
@@ -363,7 +376,7 @@ function RoomRow({ room }: { room: Room }) {
           <DialogHeader>
             <DialogTitle className="font-cinzel text-gradient-gold">{t('editRoom')}</DialogTitle>
           </DialogHeader>
-          <form onSubmit={handleSave} className="space-y-4 py-2">
+          <form onSubmit={handleSave} noValidate className="space-y-4 py-2">
             <div className="space-y-2">
               <Label htmlFor={`room-name-edit-${room.id}`} className="text-sm text-muted-foreground font-medium">
                 {t('roomName')}
@@ -372,9 +385,10 @@ function RoomRow({ room }: { room: Room }) {
                 id={`room-name-edit-${room.id}`}
                 value={editName}
                 onChange={(e) => setEditName(e.target.value)}
-                required
+                aria-invalid={!!editError}
                 className="bg-background-secondary border-border focus:border-primary/50"
               />
+              {editError && <p role="alert" className="text-xs text-destructive">{editError}</p>}
             </div>
             <div className="space-y-2">
               <Label htmlFor={`room-desc-edit-${room.id}`} className="text-sm text-muted-foreground font-medium">
@@ -453,6 +467,7 @@ export function RoomsSection() {
   const [newDesc, setNewDesc] = useState('')
   const [newTableCount, setNewTableCount] = useState('0')
   const [newEquipmentIds, setNewEquipmentIds] = useState<string[]>([])
+  const [createError, setCreateError] = useState<string | null>(null)
 
   function toggleNewEquipment(id: string) {
     setNewEquipmentIds((prev) =>
@@ -462,6 +477,11 @@ export function RoomsSection() {
 
   async function handleCreateRoom(e: React.FormEvent) {
     e.preventDefault()
+    if (!newName.trim()) {
+      setCreateError(tc('requiredField'))
+      return
+    }
+    setCreateError(null)
     const parsed = Number(newTableCount)
     const tableCount = Number.isInteger(parsed) && parsed >= 0 ? parsed : 0
     const created = await createRoom.mutateAsync({ name: newName.trim(), description: newDesc.trim() || undefined, tableCount })
@@ -549,7 +569,7 @@ export function RoomsSection() {
               <DialogTitle className="font-cinzel text-gradient-gold">{t('createRoom')}</DialogTitle>
             </div>
           </DialogHeader>
-          <form onSubmit={handleCreateRoom} className="space-y-4 py-2">
+          <form onSubmit={handleCreateRoom} noValidate className="space-y-4 py-2">
             <div className="space-y-2">
               <Label htmlFor="new-room-name" className="text-sm text-muted-foreground font-medium">
                 {t('roomName')}
@@ -558,9 +578,10 @@ export function RoomsSection() {
                 id="new-room-name"
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
-                required
+                aria-invalid={!!createError}
                 className="bg-background-secondary border-border focus:border-primary/50"
               />
+              {createError && <p role="alert" className="text-xs text-destructive">{createError}</p>}
             </div>
             <div className="space-y-2">
               <Label htmlFor="new-room-desc" className="text-sm text-muted-foreground font-medium">
@@ -611,7 +632,7 @@ export function RoomsSection() {
               </div>
             )}
             <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setShowCreate(false)} className="border-border">
+              <Button type="button" variant="outline" onClick={() => { setShowCreate(false); setCreateError(null) }} className="border-border">
                 {tc('cancel')}
               </Button>
               <Button type="submit" disabled={createRoom.isPending || setRoomDefaultEquipment.isPending} className="min-w-[80px]">

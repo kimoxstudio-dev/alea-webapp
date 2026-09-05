@@ -568,7 +568,7 @@ describe('auth service (alea- username model)', () => {
           baseUrl: 'http://localhost:3000',
           createdBy: 'admin-test',
         }),
-      ).rejects.toMatchObject({ message: 'User not found', statusCode: 404 })
+      ).rejects.toMatchObject({ message: 'AUTH_USER_NOT_FOUND', statusCode: 404 })
     })
 
     it('rejects when user is not a member role', async () => {
@@ -581,7 +581,7 @@ describe('auth service (alea- username model)', () => {
           createdBy: 'admin-test',
         }),
       ).rejects.toMatchObject({
-        message: 'Only member accounts can be activated',
+        message: 'AUTH_ONLY_MEMBER_CAN_ACTIVATE',
         statusCode: 400,
       })
     })
@@ -596,7 +596,7 @@ describe('auth service (alea- username model)', () => {
           createdBy: 'admin-test',
         }),
       ).rejects.toMatchObject({
-        message: 'This member is already active',
+        message: 'AUTH_MEMBER_ALREADY_ACTIVE',
         statusCode: 400,
       })
     })
@@ -690,7 +690,7 @@ describe('auth service (alea- username model)', () => {
           createdBy: 'admin-test',
         }),
       ).rejects.toMatchObject({
-        message: 'This member must activate the account before using recovery',
+        message: 'AUTH_MEMBER_MUST_ACTIVATE_BEFORE_RECOVERY',
         statusCode: 400,
       })
     })
@@ -705,7 +705,7 @@ describe('auth service (alea- username model)', () => {
           createdBy: 'admin-test',
         }),
       ).rejects.toMatchObject({
-        message: 'Only member accounts can receive recovery links',
+        message: 'AUTH_ONLY_MEMBER_CAN_RECEIVE_RECOVERY',
         statusCode: 400,
       })
     })
@@ -757,7 +757,7 @@ describe('auth service (alea- username model)', () => {
           password: 'Password123',
         }),
       ).rejects.toMatchObject({
-        message: 'Activation link is invalid or has expired',
+        message: 'AUTH_ACTIVATION_LINK_EXPIRED',
         statusCode: 400,
       })
     })
@@ -780,7 +780,7 @@ describe('auth service (alea- username model)', () => {
           password: 'Password123',
         }),
       ).rejects.toMatchObject({
-        message: 'Activation link is invalid or has expired',
+        message: 'AUTH_ACTIVATION_LINK_EXPIRED',
         statusCode: 400,
       })
     })
@@ -803,7 +803,7 @@ describe('auth service (alea- username model)', () => {
           password: 'Password123',
         }),
       ).rejects.toMatchObject({
-        message: 'Activation link has already been used',
+        message: 'AUTH_ACTIVATION_LINK_USED',
         statusCode: 400,
       })
 
@@ -836,7 +836,7 @@ describe('auth service (alea- username model)', () => {
           password: 'Password123',
         }),
       ).rejects.toMatchObject({
-        message: 'Activation link has already been used',
+        message: 'AUTH_ACTIVATION_LINK_USED',
         statusCode: 400,
       })
     })
@@ -861,7 +861,7 @@ describe('auth service (alea- username model)', () => {
           password: 'Short1', // Missing uppercase or length
         }),
       ).rejects.toMatchObject({
-        message: 'Invalid activation link',
+        message: 'AUTH_INVALID_ACTIVATION_LINK',
         statusCode: 400,
       })
 
@@ -891,13 +891,53 @@ describe('auth service (alea- username model)', () => {
           password: 'Password123',
         }),
       ).rejects.toMatchObject({
-        message: 'Failed to create account credentials',
+        message: 'AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED',
         statusCode: 500,
       })
 
       // Token must be restored (used_at cleared) on Clerk failure — #299
       // Codex review finding 1 compensation. The member was never actually
       // activated, so the admin-issued link must remain usable for retry.
+      const updatedToken = tokensStore.get(tokenHash)
+      expect(updatedToken?.used_at).toBeNull()
+    })
+
+    it('distinguishes a Clerk password-policy rejection with its own code and a 400 (#313)', async () => {
+      // #313 smoke QA: the club's real Clerk instance enforces a 15+ character
+      // password, stricter than this app's own 8-character client checklist.
+      // A rejection shaped like Clerk's ClerkAPIResponseError — an `errors`
+      // array with a `form_password_*` code — must surface as
+      // AUTH_PASSWORD_REJECTED/400, not the generic
+      // AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED/500, so the client can show a
+      // message that states the real constraint.
+      const { activateAccount } = (await loadService()) as any
+      const plainToken = createActivationToken()
+      const tokenHash = hashActivationToken(plainToken)
+
+      const token = createTestToken({
+        token_hash: tokenHash,
+        profile_id: 'user-test',
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+        used_at: null,
+      })
+      tokensStore.set(tokenHash, token)
+
+      clerkCreateUserMock.mockRejectedValueOnce({
+        errors: [{ code: 'form_password_length_too_short', message: 'Password is too short' }],
+      })
+
+      await expect(
+        activateAccount({
+          token: plainToken,
+          password: 'ShortPassword1',
+        }),
+      ).rejects.toMatchObject({
+        message: 'AUTH_PASSWORD_REJECTED',
+        statusCode: 400,
+      })
+
+      // Same retry guarantee as any other Clerk failure: the token is
+      // restored, not permanently burned.
       const updatedToken = tokensStore.get(tokenHash)
       expect(updatedToken?.used_at).toBeNull()
     })
@@ -923,7 +963,7 @@ describe('auth service (alea- username model)', () => {
           password: 'Password123',
         }),
       ).rejects.toMatchObject({
-        message: 'Failed to create account credentials',
+        message: 'AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED',
         statusCode: 500,
       })
 
@@ -1004,7 +1044,7 @@ describe('auth service (alea- username model)', () => {
           password: 'NewPassword123',
         }),
       ).rejects.toMatchObject({
-        message: 'Recovery link is invalid or has expired',
+        message: 'AUTH_RECOVERY_LINK_EXPIRED',
         statusCode: 400,
       })
     })
@@ -1028,7 +1068,7 @@ describe('auth service (alea- username model)', () => {
           password: 'NewPassword123',
         }),
       ).rejects.toMatchObject({
-        message: 'Recovery link is invalid or has expired',
+        message: 'AUTH_RECOVERY_LINK_EXPIRED',
         statusCode: 400,
       })
     })
@@ -1052,7 +1092,7 @@ describe('auth service (alea- username model)', () => {
           password: 'NewPassword123',
         }),
       ).rejects.toMatchObject({
-        message: 'Recovery link has already been used',
+        message: 'AUTH_RECOVERY_LINK_USED',
         statusCode: 400,
       })
 
@@ -1084,7 +1124,7 @@ describe('auth service (alea- username model)', () => {
           password: 'NewPassword123',
         }),
       ).rejects.toMatchObject({
-        message: 'Internal server error',
+        message: 'AUTH_INTERNAL_ERROR',
         statusCode: 500,
       })
     })
@@ -1111,7 +1151,7 @@ describe('auth service (alea- username model)', () => {
           password: 'NewPassword123',
         }),
       ).rejects.toMatchObject({
-        message: 'Failed to update account credentials',
+        message: 'AUTH_ACCOUNT_CREDENTIALS_UPDATE_FAILED',
         statusCode: 500,
       })
 
@@ -1121,6 +1161,43 @@ describe('auth service (alea- username model)', () => {
       // usable for retry.
       const updatedToken = tokensStore.get(tokenHash)
       expect(updatedToken?.used_at).toBeNull()
+    })
+
+    it('distinguishes a Clerk password-policy rejection with its own code and a 400 (#313 repro)', async () => {
+      // #313 smoke QA repro: on /es/recover, a password that passes the
+      // client-side checklist (8+ chars) but fails Clerk's real 15+ character
+      // policy produced a raw English "Failed to update account credentials"
+      // on an all-Spanish page. Root cause was a generic 500 with no way for
+      // the client to distinguish "password rejected" from any other Clerk
+      // failure. AUTH_PASSWORD_REJECTED/400 fixes that.
+      const { recoverAccount } = (await loadService()) as any
+      const plainToken = createActivationToken()
+      const tokenHash = hashActivationToken(plainToken)
+
+      const token = createTestToken({
+        token_hash: tokenHash,
+        profile_id: 'user-active',
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+        used_at: null,
+      })
+      tokensStore.set(tokenHash, token)
+
+      clerkUpdateUserMock.mockRejectedValueOnce({
+        errors: [{ code: 'form_password_length_too_short', message: 'Password is too short' }],
+      })
+
+      await expect(
+        recoverAccount({
+          token: plainToken,
+          password: 'ShortPassword1',
+        }),
+      ).rejects.toMatchObject({
+        message: 'AUTH_PASSWORD_REJECTED',
+        statusCode: 400,
+      })
+
+      const updatedToken2 = tokensStore.get(tokenHash)
+      expect(updatedToken2?.used_at).toBeNull()
     })
 
     it('restores the claimed token when Clerk updateUser fails, and the same link succeeds on retry (#299 Codex review finding 1)', async () => {
@@ -1144,7 +1221,7 @@ describe('auth service (alea- username model)', () => {
           password: 'NewPassword123',
         }),
       ).rejects.toMatchObject({
-        message: 'Failed to update account credentials',
+        message: 'AUTH_ACCOUNT_CREDENTIALS_UPDATE_FAILED',
         statusCode: 500,
       })
 
@@ -1251,7 +1328,7 @@ describe('auth service (alea- username model)', () => {
     it('rejects when no session is provided', async () => {
       const { getCurrentUser } = (await loadService()) as any
       await expect(getCurrentUser(null)).rejects.toMatchObject({
-        message: 'Unauthorized',
+        message: 'AUTH_UNAUTHORIZED',
         statusCode: 401,
       })
     })
@@ -1261,7 +1338,7 @@ describe('auth service (alea- username model)', () => {
       await expect(
         getCurrentUser({ id: 'nonexistent-user', role: 'member' }),
       ).rejects.toMatchObject({
-        message: 'Unauthorized',
+        message: 'AUTH_UNAUTHORIZED',
         statusCode: 401,
       })
     })
@@ -1298,7 +1375,7 @@ describe('auth service (alea- username model)', () => {
       clerkRevokeSessionMock.mockRejectedValueOnce(new Error('Clerk API error'))
 
       await expect(logout()).rejects.toMatchObject({
-        message: 'Internal server error',
+        message: 'AUTH_INTERNAL_ERROR',
         statusCode: 500,
       })
     })
@@ -1722,14 +1799,14 @@ describe('auth service (alea- username model)', () => {
         })
         throw new Error('Should have thrown')
       } catch (e) {
-        // With guard working: get the INTENDED "Failed to activate account" error
+        // With guard working: get the INTENDED "AUTH_ACTIVATION_FAILED" error
         // Without guard: would get the restore's "Database error during token restoration"
         expect(e).toMatchObject({
-          message: expect.stringContaining('Failed'),
+          message: 'AUTH_ACTIVATION_FAILED',
           statusCode: 500,
         })
         // Verify it's the RIGHT error, not the compensation's
-        expect((e as any).message).toContain('activate')
+        expect((e as any).message).toContain('ACTIVATION')
       }
     })
 
@@ -1763,14 +1840,14 @@ describe('auth service (alea- username model)', () => {
         })
         throw new Error('Should have thrown')
       } catch (e) {
-        // With guard: get the intended "Failed to recover account" error
+        // With guard: get the intended "AUTH_RECOVERY_FAILED" error
         // Without guard: would get the restore's "Database error..."
         expect(e).toMatchObject({
-          message: expect.stringContaining('Failed'),
+          message: 'AUTH_RECOVERY_FAILED',
           statusCode: 500,
         })
         // Verify it's the RIGHT error
-        expect((e as any).message).toContain('recover')
+        expect((e as any).message).toContain('RECOVERY')
       }
     })
 

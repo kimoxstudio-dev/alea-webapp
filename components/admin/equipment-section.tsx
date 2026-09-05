@@ -27,12 +27,18 @@ function EquipmentRow({ item }: { item: Equipment }) {
   const [deleting, setDeleting] = useState(false)
   const [editName, setEditName] = useState(item.name)
   const [editDesc, setEditDesc] = useState(item.description ?? '')
+  const [editError, setEditError] = useState<string | null>(null)
 
   const updateEquipment = useAdminUpdateEquipment()
   const deleteEquipment = useAdminDeleteEquipment()
 
   async function handleSave(e: React.FormEvent) {
     e.preventDefault()
+    if (!editName.trim()) {
+      setEditError(tc('requiredField'))
+      return
+    }
+    setEditError(null)
     await updateEquipment.mutateAsync({
       id: item.id,
       data: { name: editName.trim() || item.name, description: editDesc.trim() || null },
@@ -62,6 +68,7 @@ function EquipmentRow({ item }: { item: Equipment }) {
             onClick={() => {
               setEditName(item.name)
               setEditDesc(item.description ?? '')
+              setEditError(null)
               setEditing(true)
             }}
             className="h-8 w-8 text-muted-foreground hover:text-primary hover:bg-primary/10 transition-colors"
@@ -81,12 +88,12 @@ function EquipmentRow({ item }: { item: Equipment }) {
       </div>
 
       {/* Edit dialog */}
-      <Dialog open={editing} onOpenChange={setEditing}>
+      <Dialog open={editing} onOpenChange={(open) => { setEditing(open); if (!open) setEditError(null) }}>
         <DialogContent className="bg-card border-border">
           <DialogHeader>
             <DialogTitle className="font-cinzel text-gradient-gold">{t('equipment.editEquipment')}</DialogTitle>
           </DialogHeader>
-          <form onSubmit={handleSave} className="space-y-4 py-2">
+          <form onSubmit={handleSave} noValidate className="space-y-4 py-2">
             <div className="space-y-2">
               <Label htmlFor={`equip-name-edit-${item.id}`} className="text-sm text-muted-foreground font-medium">
                 {t('equipment.equipmentName')}
@@ -95,9 +102,10 @@ function EquipmentRow({ item }: { item: Equipment }) {
                 id={`equip-name-edit-${item.id}`}
                 value={editName}
                 onChange={(e) => setEditName(e.target.value)}
-                required
+                aria-invalid={!!editError}
                 className="bg-background-secondary border-border focus:border-primary/50"
               />
+              {editError && <p role="alert" className="text-xs text-destructive">{editError}</p>}
             </div>
             <div className="space-y-2">
               <Label htmlFor={`equip-desc-edit-${item.id}`} className="text-sm text-muted-foreground font-medium">
@@ -165,9 +173,15 @@ export function EquipmentSection() {
   const [showCreate, setShowCreate] = useState(false)
   const [newName, setNewName] = useState('')
   const [newDesc, setNewDesc] = useState('')
+  const [createError, setCreateError] = useState<string | null>(null)
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault()
+    if (!newName.trim()) {
+      setCreateError(tc('requiredField'))
+      return
+    }
+    setCreateError(null)
     await createEquipment.mutateAsync({ name: newName.trim(), description: newDesc.trim() || undefined })
     setNewName('')
     setNewDesc('')
@@ -238,7 +252,7 @@ export function EquipmentSection() {
       )}
 
       {/* Create Equipment Dialog */}
-      <Dialog open={showCreate} onOpenChange={setShowCreate}>
+      <Dialog open={showCreate} onOpenChange={(open) => { setShowCreate(open); if (!open) setCreateError(null) }}>
         <DialogContent className="bg-card border-border">
           <DialogHeader>
             <div className="flex items-center gap-3 mb-1">
@@ -248,7 +262,7 @@ export function EquipmentSection() {
               <DialogTitle className="font-cinzel text-gradient-gold">{t('equipment.createEquipment')}</DialogTitle>
             </div>
           </DialogHeader>
-          <form onSubmit={handleCreate} className="space-y-4 py-2">
+          <form onSubmit={handleCreate} noValidate className="space-y-4 py-2">
             <div className="space-y-2">
               <Label htmlFor="new-equipment-name" className="text-sm text-muted-foreground font-medium">
                 {t('equipment.equipmentName')}
@@ -257,9 +271,10 @@ export function EquipmentSection() {
                 id="new-equipment-name"
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
-                required
+                aria-invalid={!!createError}
                 className="bg-background-secondary border-border focus:border-primary/50"
               />
+              {createError && <p role="alert" className="text-xs text-destructive">{createError}</p>}
             </div>
             <div className="space-y-2">
               <Label htmlFor="new-equipment-desc" className="text-sm text-muted-foreground font-medium">
@@ -273,7 +288,7 @@ export function EquipmentSection() {
               />
             </div>
             <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setShowCreate(false)} className="border-border">
+              <Button type="button" variant="outline" onClick={() => { setShowCreate(false); setCreateError(null) }} className="border-border">
                 {tc('cancel')}
               </Button>
               <Button type="submit" disabled={createEquipment.isPending} className="min-w-[80px]">

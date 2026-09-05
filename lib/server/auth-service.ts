@@ -8,6 +8,7 @@ import { type PublicProfileRow, toPublicUser } from '@/lib/server/profile-mapper
 import { sql } from '@/lib/db/client'
 import { getDatabaseNow } from '@/lib/server/database-time'
 import { activationServerSchema, recoveryServerSchema } from '@/lib/validations/auth'
+import { ERROR_CODES } from '@/lib/types/error-codes'
 
 /**
  * Raw-SQL, Clerk-backed auth service (#299, pass 3).
@@ -62,6 +63,33 @@ function memberNumberFromClerkUsername(username: string): string | null {
   }
   const memberNumber = username.slice(CLERK_USERNAME_PREFIX.length)
   return memberNumber.length > 0 ? memberNumber : null
+}
+
+/**
+ * Detects a Clerk password-policy rejection without importing any Clerk
+ * error class (#313 smoke QA fix): both `createUser()` and `updateUser()`
+ * throw an error shaped `{ errors: [{ code: string, ... }] }` on a 4xx
+ * response — this is the same shape Clerk's own `ClerkAPIResponseError`
+ * carries, checked structurally instead of via `instanceof`/type-guard
+ * imports so this file doesn't need `@clerk/backend` as a direct dependency
+ * (only `@clerk/nextjs` is). Clerk's password-policy codes are all prefixed
+ * `form_password_` (e.g. `form_password_length_too_short`,
+ * `form_password_pwned`) — matching the prefix, rather than one exact code,
+ * covers every password-policy rejection Clerk can return, not just the
+ * length one this was found from.
+ *
+ * Repro (#313): the club's real Clerk instance requires a 15+ character
+ * password, but this app's own client-side checklist (`lib/validations/auth.ts`)
+ * only advertises an 8-character minimum — so a password that satisfies the
+ * visible checklist can still be rejected here. Distinguishing this from any
+ * other Clerk failure lets the caller return a message that states the real
+ * constraint instead of a generic "failed" message.
+ */
+function isClerkPasswordRejection(error: unknown): boolean {
+  const errors = (error as { errors?: unknown })?.errors
+  if (!Array.isArray(errors)) return false
+  return errors.some((entry) => typeof (entry as { code?: unknown })?.code === 'string'
+    && (entry as { code: string }).code.startsWith('form_password_'))
 }
 
 function hashActivationToken(token: string) {
@@ -212,13 +240,13 @@ export async function generateActivationLink(input: {
   const profile = await getProfileById(input.userId)
 
   if (!profile) {
-    serviceError('User not found', 404)
+    serviceError(ERROR_CODES.AUTH_USER_NOT_FOUND, 404)
   }
   if (profile.role !== 'member') {
-    serviceError('Only member accounts can be activated', 400)
+    serviceError(ERROR_CODES.AUTH_ONLY_MEMBER_CAN_ACTIVATE, 400)
   }
   if (profile.is_active) {
-    serviceError('This member is already active', 400)
+    serviceError(ERROR_CODES.AUTH_MEMBER_ALREADY_ACTIVE, 400)
   }
 
   const token = createActivationToken()
@@ -282,13 +310,13 @@ export async function generateRecoveryLink(input: {
   const profile = await getProfileById(input.userId)
 
   if (!profile) {
-    serviceError('User not found', 404)
+    serviceError(ERROR_CODES.AUTH_USER_NOT_FOUND, 404)
   }
   if (profile.role !== 'member') {
-    serviceError('Only member accounts can receive recovery links', 400)
+    serviceError(ERROR_CODES.AUTH_ONLY_MEMBER_CAN_RECEIVE_RECOVERY, 400)
   }
   if (!profile.is_active) {
-    serviceError('This member must activate the account before using recovery', 400)
+    serviceError(ERROR_CODES.AUTH_MEMBER_MUST_ACTIVATE_BEFORE_RECOVERY, 400)
   }
 
   const token = createActivationToken()
@@ -346,7 +374,7 @@ export async function generateRecoveryLink(input: {
 export async function activateAccount(input: { token: unknown; password: unknown }) {
   const parsed = activationServerSchema.safeParse(input)
   if (!parsed.success) {
-    serviceError('Invalid activation link', 400)
+    serviceError(ERROR_CODES.AUTH_INVALID_ACTIVATION_LINK, 400)
   }
 
   const tokenHash = hashActivationToken(parsed.data.token)
@@ -354,18 +382,18 @@ export async function activateAccount(input: { token: unknown; password: unknown
 
   const databaseNow = existingToken ? await getDatabaseNow() : null
   if (!existingToken || !databaseNow || isActivationExpired(existingToken.expires_at, databaseNow)) {
-    serviceError('Activation link is invalid or has expired', 400)
+    serviceError(ERROR_CODES.AUTH_ACTIVATION_LINK_EXPIRED, 400)
   }
   if (existingToken.used_at) {
-    serviceError('Activation link has already been used', 400)
+    serviceError(ERROR_CODES.AUTH_ACTIVATION_LINK_USED, 400)
   }
 
   const profile = await getProfileById(existingToken.profile_id)
   if (!profile) {
-    serviceError('Activation link is invalid or has expired', 400)
+    serviceError(ERROR_CODES.AUTH_ACTIVATION_LINK_EXPIRED, 400)
   }
   if (profile.is_active) {
-    serviceError('Activation link has already been used', 400)
+    serviceError(ERROR_CODES.AUTH_ACTIVATION_LINK_USED, 400)
   }
 
   const activatedAt = (await getDatabaseNow()).toISOString()
@@ -382,9 +410,9 @@ export async function activateAccount(input: { token: unknown; password: unknown
   if (!claimedToken) {
     const latestToken = await getActivationTokenByHash(tokenHash)
     if (latestToken?.used_at) {
-      serviceError('Activation link has already been used', 400)
+      serviceError(ERROR_CODES.AUTH_ACTIVATION_LINK_USED, 400)
     }
-    serviceError('Activation link is invalid or has expired', 400)
+    serviceError(ERROR_CODES.AUTH_ACTIVATION_LINK_EXPIRED, 400)
   }
 
   // Token is now spent (single-use, claimed above) — create the Clerk
@@ -396,12 +424,15 @@ export async function activateAccount(input: { token: unknown; password: unknown
       username: toClerkUsername(profile.member_number),
       password: parsed.data.password,
     })
-  } catch {
+  } catch (error) {
     // Clerk failure after the claim above (#299 Codex review finding 1): the
     // member was never actually activated, so the token must not stay
     // burned — restore it so the same admin-issued link can be retried.
     await safeRestoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: activatedAt })
-    serviceError('Failed to create account credentials', 500)
+    if (isClerkPasswordRejection(error)) {
+      serviceError(ERROR_CODES.AUTH_PASSWORD_REJECTED, 400)
+    }
+    serviceError(ERROR_CODES.AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED, 500)
   }
 
   // Clerk succeeded, but the DB profile update itself can still fail — a
@@ -436,7 +467,7 @@ export async function activateAccount(input: { token: unknown; password: unknown
       // known, admin-recoverable state; a silently-un-restored token is not.
     }
     await safeRestoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: activatedAt })
-    serviceError('Failed to activate account', 500)
+    serviceError(ERROR_CODES.AUTH_ACTIVATION_FAILED, 500)
   }
 
   return { user: toPublicUser(updatedProfile) }
@@ -467,7 +498,7 @@ export async function activateAccount(input: { token: unknown; password: unknown
 export async function recoverAccount(input: { token: unknown; password: unknown }) {
   const parsed = recoveryServerSchema.safeParse(input)
   if (!parsed.success) {
-    serviceError('Invalid recovery link', 400)
+    serviceError(ERROR_CODES.AUTH_INVALID_RECOVERY_LINK, 400)
   }
 
   const tokenHash = hashActivationToken(parsed.data.token)
@@ -475,15 +506,15 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
 
   const databaseNow = existingToken ? await getDatabaseNow() : null
   if (!existingToken || !databaseNow || isActivationExpired(existingToken.expires_at, databaseNow)) {
-    serviceError('Recovery link is invalid or has expired', 400)
+    serviceError(ERROR_CODES.AUTH_RECOVERY_LINK_EXPIRED, 400)
   }
   if (existingToken.used_at) {
-    serviceError('Recovery link has already been used', 400)
+    serviceError(ERROR_CODES.AUTH_RECOVERY_LINK_USED, 400)
   }
 
   const profile = await getProfileById(existingToken.profile_id)
   if (!profile || !profile.is_active) {
-    serviceError('Recovery link is invalid or has expired', 400)
+    serviceError(ERROR_CODES.AUTH_RECOVERY_LINK_EXPIRED, 400)
   }
 
   const recoveredAt = (await getDatabaseNow()).toISOString()
@@ -500,9 +531,9 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
   if (!claimedToken) {
     const latestToken = await getActivationTokenByHash(tokenHash)
     if (latestToken?.used_at) {
-      serviceError('Recovery link has already been used', 400)
+      serviceError(ERROR_CODES.AUTH_RECOVERY_LINK_USED, 400)
     }
-    serviceError('Recovery link is invalid or has expired', 400)
+    serviceError(ERROR_CODES.AUTH_RECOVERY_LINK_EXPIRED, 400)
   }
 
   // Token is now spent — find the existing Clerk identity by username (no
@@ -519,11 +550,11 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
     clerkUser = data[0]
   } catch {
     await safeRestoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: recoveredAt })
-    serviceError('Internal server error', 500)
+    serviceError(ERROR_CODES.AUTH_INTERNAL_ERROR, 500)
   }
   if (!clerkUser) {
     await safeRestoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: recoveredAt })
-    serviceError('Internal server error', 500)
+    serviceError(ERROR_CODES.AUTH_INTERNAL_ERROR, 500)
   }
 
   try {
@@ -531,9 +562,12 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
       password: parsed.data.password,
       signOutOfOtherSessions: true,
     })
-  } catch {
+  } catch (error) {
     await safeRestoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: recoveredAt })
-    serviceError('Failed to update account credentials', 500)
+    if (isClerkPasswordRejection(error)) {
+      serviceError(ERROR_CODES.AUTH_PASSWORD_REJECTED, 400)
+    }
+    serviceError(ERROR_CODES.AUTH_ACCOUNT_CREDENTIALS_UPDATE_FAILED, 500)
   }
 
   // Clerk succeeded, but the DB profile update itself can still fail — a
@@ -568,7 +602,7 @@ export async function recoverAccount(input: { token: unknown; password: unknown 
 
   if (!updatedProfile) {
     await safeRestoreClaimedToken({ id: claimedToken.id, tokenHash, usedAt: recoveredAt })
-    serviceError('Failed to recover account', 500)
+    serviceError(ERROR_CODES.AUTH_RECOVERY_FAILED, 500)
   }
 
   return { user: toPublicUser(updatedProfile) }
@@ -634,12 +668,12 @@ export async function resolveProfileForClerkUser(input: {
  */
 export async function getCurrentUser(session: SessionUser | null): Promise<User> {
   if (!session) {
-    serviceError('Unauthorized', 401)
+    serviceError(ERROR_CODES.AUTH_UNAUTHORIZED, 401)
   }
 
   const profile = await getProfileById(session.id)
   if (!profile) {
-    serviceError('Unauthorized', 401)
+    serviceError(ERROR_CODES.AUTH_UNAUTHORIZED, 401)
   }
 
   return toPublicUser(profile)
@@ -673,7 +707,7 @@ export async function logout() {
     const client = await clerkClient()
     await client.sessions.revokeSession(clerkSession.sessionId)
   } catch {
-    serviceError('Internal server error', 500)
+    serviceError(ERROR_CODES.AUTH_INTERNAL_ERROR, 500)
   }
 
   return { success: true }

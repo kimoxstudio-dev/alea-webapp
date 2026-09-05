@@ -68,6 +68,13 @@ function formToPayload(form: LibraryGameFormState): LibraryGamePayload {
   }
 }
 
+/** Fields the form marks `required` — checked client-side on submit (#313: a
+ * blank one used to fall through to the browser's native, English-only
+ * validation bubble instead of this app's Spanish-capable error display). */
+function hasBlankRequiredField(form: LibraryGameFormState): boolean {
+  return !form.title.trim() || !form.categoryEs.trim() || !form.players.trim() || !form.playTime.trim()
+}
+
 function LibraryGameFormFields({ form, onChange, idPrefix }: {
   form: LibraryGameFormState
   onChange: (form: LibraryGameFormState) => void
@@ -223,6 +230,10 @@ function LibraryGameRow({ game }: { game: AdminLibraryGame }) {
 
   async function handleSave(e: React.FormEvent) {
     e.preventDefault()
+    if (hasBlankRequiredField(form)) {
+      setSaveError(tc('requiredField'))
+      return
+    }
     setSaveError(null)
     try {
       await updateGame.mutateAsync({ id: game.id, data: formToPayload(form) })
@@ -317,7 +328,7 @@ function LibraryGameRow({ game }: { game: AdminLibraryGame }) {
           <DialogHeader>
             <DialogTitle className="font-cinzel text-gradient-gold">{t('libraryGames.editLibraryGame')}</DialogTitle>
           </DialogHeader>
-          <form onSubmit={handleSave} className="space-y-4 py-2">
+          <form onSubmit={handleSave} noValidate className="space-y-4 py-2">
             <LibraryGameFormFields form={form} onChange={setForm} idPrefix={`library-game-edit-${game.id}`} />
             {saveError && (
               <div role="alert" className="rounded-md bg-destructive/15 border border-destructive/30 px-3 py-2 text-sm text-destructive">
@@ -395,6 +406,10 @@ export function LibraryGamesSection() {
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault()
+    if (hasBlankRequiredField(form)) {
+      setCreateError(tc('requiredField'))
+      return
+    }
     setCreateError(null)
     try {
       await createGame.mutateAsync(formToPayload(form))
@@ -498,7 +513,7 @@ export function LibraryGamesSection() {
               <DialogTitle className="font-cinzel text-gradient-gold">{t('libraryGames.createLibraryGame')}</DialogTitle>
             </div>
           </DialogHeader>
-          <form onSubmit={handleCreate} className="space-y-4 py-2">
+          <form onSubmit={handleCreate} noValidate className="space-y-4 py-2">
             <LibraryGameFormFields form={form} onChange={setForm} idPrefix="library-game-new" />
             {createError && (
               <div role="alert" className="rounded-md bg-destructive/15 border border-destructive/30 px-3 py-2 text-sm text-destructive">

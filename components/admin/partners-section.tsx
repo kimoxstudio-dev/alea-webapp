@@ -187,6 +187,10 @@ function PartnerRow({ partner }: { partner: AdminPartner }) {
 
   async function handleSave(e: React.FormEvent) {
     e.preventDefault()
+    if (!form.name.trim() || !form.imageUrl.trim()) {
+      setSaveError(tc('requiredField'))
+      return
+    }
     setSaveError(null)
     try {
       await updatePartner.mutateAsync({ id: partner.id, data: formToPayload(form) })
@@ -283,7 +287,7 @@ function PartnerRow({ partner }: { partner: AdminPartner }) {
           <DialogHeader>
             <DialogTitle className="font-cinzel text-gradient-gold">{t('partners.editPartner')}</DialogTitle>
           </DialogHeader>
-          <form onSubmit={handleSave} className="space-y-4 py-2">
+          <form onSubmit={handleSave} noValidate className="space-y-4 py-2">
             <PartnerFormFields form={form} onChange={setForm} idPrefix={`partner-edit-${partner.id}`} />
             {saveError && (
               <div role="alert" className="rounded-md bg-destructive/15 border border-destructive/30 px-3 py-2 text-sm text-destructive">
@@ -361,6 +365,10 @@ export function PartnersSection() {
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault()
+    if (!form.name.trim() || !form.imageUrl.trim()) {
+      setCreateError(tc('requiredField'))
+      return
+    }
     setCreateError(null)
     try {
       await createPartner.mutateAsync(formToPayload(form))
@@ -464,7 +472,7 @@ export function PartnersSection() {
               <DialogTitle className="font-cinzel text-gradient-gold">{t('partners.createPartner')}</DialogTitle>
             </div>
           </DialogHeader>
-          <form onSubmit={handleCreate} className="space-y-4 py-2">
+          <form onSubmit={handleCreate} noValidate className="space-y-4 py-2">
             <PartnerFormFields form={form} onChange={setForm} idPrefix="partner-new" />
             {createError && (
               <div role="alert" className="rounded-md bg-destructive/15 border border-destructive/30 px-3 py-2 text-sm text-destructive">

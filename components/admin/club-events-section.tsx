@@ -204,6 +204,21 @@ function buildPayload(form: ClubEventFormState): ClubEventPayload {
   }
 }
 
+/** Every field the form marks `required` — checked client-side on submit
+ * (#313: a blank one used to fall through to the browser's native,
+ * English-only validation bubble instead of this app's Spanish-capable error
+ * display). The form itself sets `noValidate`, so this is the only gate left
+ * against submitting a blank required field. */
+function hasBlankRequiredField(form: ClubEventFormState): boolean {
+  if (!form.titleEs.trim() || !form.date.trim()) return true
+  if (form.dateKind === 'range' && !form.endDate.trim()) return true
+  if (form.blocksRooms) {
+    return form.schedules.some((s) => !s.date.trim()
+      || (!s.allDay && (!s.startTime.trim() || !s.endTime.trim())))
+  }
+  return false
+}
+
 // ---------------------------------------------------------------------------
 // ScheduleRow — one room-block entry in the "blocks rooms" sub-flow
 // ---------------------------------------------------------------------------
@@ -515,7 +530,7 @@ function ClubEventFormDialog({
             <DialogTitle className="font-cinzel text-gradient-gold">{title}</DialogTitle>
           </div>
         </DialogHeader>
-        <form onSubmit={onSubmit} className="space-y-4 py-2">
+        <form onSubmit={onSubmit} noValidate className="space-y-4 py-2">
           {/* Title */}
           <div className="space-y-2">
             <Label htmlFor={`${dialogId}-title-es`} className="text-sm text-muted-foreground font-medium">
@@ -1022,6 +1037,7 @@ function ClubEventList({
 // ---------------------------------------------------------------------------
 export function ClubEventsSection() {
   const t = useTranslations('admin')
+  const tc = useTranslations('common')
 
   const { data, isLoading } = useAdminClubEvents()
   const createClubEvent = useAdminCreateClubEvent()
@@ -1057,6 +1073,10 @@ export function ClubEventsSection() {
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault()
+    if (hasBlankRequiredField(createForm)) {
+      setCreateError(tc('requiredField'))
+      return
+    }
     setCreateError(null)
     try {
       await createClubEvent.mutateAsync(buildPayload(createForm))
@@ -1070,6 +1090,10 @@ export function ClubEventsSection() {
   async function handleUpdate(e: React.FormEvent) {
     e.preventDefault()
     if (!editingEvent) return
+    if (hasBlankRequiredField(editForm)) {
+      setUpdateError(tc('requiredField'))
+      return
+    }
     setUpdateError(null)
     try {
       await updateClubEvent.mutateAsync({ id: editingEvent.id, data: buildPayload(editForm) })
