@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useLocale, useTranslations } from 'next-intl'
 import { CalendarHeart, Plus, Pencil, Trash2, PlusCircle, MinusCircle } from 'lucide-react'
 import { DiceLoader } from '@/components/ui/dice-loader'
@@ -235,6 +235,30 @@ function getBlankRequiredField(form: ClubEventFormState): ClubEventFieldError | 
   return null
 }
 
+/** Refs to the input for each field `getBlankRequiredField` can report, so a
+ * failed submit can move focus to the offending field (#313 round 3: this
+ * dialog is long and scrollable — an inline error can mount off-screen with
+ * no visible or focus change). Schedule rows are dynamic, so their refs are
+ * keyed by `${index}-${field}` instead of a fixed property. */
+interface ClubEventFieldRefs {
+  titleEs: HTMLInputElement | null
+  date: HTMLInputElement | null
+  endDate: HTMLInputElement | null
+  schedule: Record<string, HTMLInputElement | null>
+}
+
+function createClubEventFieldRefs(): ClubEventFieldRefs {
+  return { titleEs: null, date: null, endDate: null, schedule: {} }
+}
+
+function focusClubEventField(fieldRefs: ClubEventFieldRefs, error: ClubEventFieldError) {
+  if (error.kind === 'schedule') {
+    fieldRefs.schedule[`${error.index}-${error.field}`]?.focus()
+    return
+  }
+  fieldRefs[error.kind]?.focus()
+}
+
 // ---------------------------------------------------------------------------
 // ScheduleRow — one room-block entry in the "blocks rooms" sub-flow
 // ---------------------------------------------------------------------------
@@ -246,6 +270,7 @@ function ScheduleRow({
   onRemove,
   dialogId,
   errorField,
+  fieldRefs,
 }: {
   index: number
   entry: ScheduleEntry
@@ -254,6 +279,7 @@ function ScheduleRow({
   onRemove: () => void
   dialogId: string
   errorField: 'date' | 'startTime' | 'endTime' | null
+  fieldRefs: ClubEventFieldRefs
 }) {
   const t = useTranslations('admin')
   const tc = useTranslations('common')
@@ -352,6 +378,7 @@ function ScheduleRow({
           </Label>
           <Input
             id={id('date')}
+            ref={(el) => { fieldRefs.schedule[`${index}-date`] = el }}
             type="date"
             value={entry.date}
             onChange={field('date')}
@@ -372,6 +399,7 @@ function ScheduleRow({
               </Label>
               <Input
                 id={id('start')}
+                ref={(el) => { fieldRefs.schedule[`${index}-startTime`] = el }}
                 type="time"
                 step={3600}
                 value={entry.startTime}
@@ -391,6 +419,7 @@ function ScheduleRow({
               </Label>
               <Input
                 id={id('end')}
+                ref={(el) => { fieldRefs.schedule[`${index}-endTime`] = el }}
                 type="time"
                 step={3600}
                 value={entry.endTime}
@@ -520,6 +549,7 @@ function ClubEventFormDialog({
   isPending,
   error,
   fieldError,
+  fieldRefs,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -531,6 +561,7 @@ function ClubEventFormDialog({
   isPending: boolean
   error?: string | null
   fieldError: ClubEventFieldError | null
+  fieldRefs: ClubEventFieldRefs
 }) {
   const t = useTranslations('admin')
   const tc = useTranslations('common')
@@ -573,6 +604,7 @@ function ClubEventFormDialog({
             </Label>
             <Input
               id={`${dialogId}-title-es`}
+              ref={(el) => { fieldRefs.titleEs = el }}
               value={form.titleEs}
               onChange={(e) => setForm({ ...form, titleEs: e.target.value })}
               required
@@ -672,6 +704,7 @@ function ClubEventFormDialog({
               </Label>
               <Input
                 id={`${dialogId}-date`}
+                ref={(el) => { fieldRefs.date = el }}
                 type="date"
                 value={form.date}
                 onChange={(e) => setForm({ ...form, date: e.target.value })}
@@ -693,6 +726,7 @@ function ClubEventFormDialog({
                 </Label>
                 <Input
                   id={`${dialogId}-end-date`}
+                  ref={(el) => { fieldRefs.endDate = el }}
                   type="date"
                   value={form.endDate}
                   onChange={(e) => setForm({ ...form, endDate: e.target.value })}
@@ -879,6 +913,7 @@ function ClubEventFormDialog({
                       errorField={
                         fieldError?.kind === 'schedule' && fieldError.index === i ? fieldError.field : null
                       }
+                      fieldRefs={fieldRefs}
                     />
                   ))}
                 </div>
@@ -1114,6 +1149,8 @@ export function ClubEventsSection() {
   const [updateError, setUpdateError] = useState<string | null>(null)
   const [createFieldError, setCreateFieldError] = useState<ClubEventFieldError | null>(null)
   const [updateFieldError, setUpdateFieldError] = useState<ClubEventFieldError | null>(null)
+  const createFieldRefs = useRef<ClubEventFieldRefs>(createClubEventFieldRefs())
+  const updateFieldRefs = useRef<ClubEventFieldRefs>(createClubEventFieldRefs())
 
   function openEdit(event: AdminClubEvent) {
     setEditingEvent(event)
@@ -1137,6 +1174,7 @@ export function ClubEventsSection() {
     const blankField = getBlankRequiredField(createForm)
     if (blankField) {
       setCreateFieldError(blankField)
+      focusClubEventField(createFieldRefs.current, blankField)
       return
     }
     setCreateFieldError(null)
@@ -1156,6 +1194,7 @@ export function ClubEventsSection() {
     const blankField = getBlankRequiredField(editForm)
     if (blankField) {
       setUpdateFieldError(blankField)
+      focusClubEventField(updateFieldRefs.current, blankField)
       return
     }
     setUpdateFieldError(null)
@@ -1261,6 +1300,7 @@ export function ClubEventsSection() {
         isPending={createClubEvent.isPending}
         error={createError}
         fieldError={createFieldError}
+        fieldRefs={createFieldRefs.current}
       />
 
       <ClubEventFormDialog
@@ -1280,6 +1320,7 @@ export function ClubEventsSection() {
         isPending={updateClubEvent.isPending}
         error={updateError}
         fieldError={updateFieldError}
+        fieldRefs={updateFieldRefs.current}
       />
 
       <DeleteClubEventDialog

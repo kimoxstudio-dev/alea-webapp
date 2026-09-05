@@ -906,8 +906,8 @@ describe('auth service (alea- username model)', () => {
       // #313 smoke QA: the club's real Clerk instance enforces a 15+ character
       // password, stricter than this app's own 8-character client checklist.
       // A rejection shaped like Clerk's ClerkAPIResponseError — an `errors`
-      // array with a `form_password_*` code — must surface as
-      // AUTH_PASSWORD_REJECTED/400, not the generic
+      // array with a length-specific `form_password_length_*` code — must
+      // surface as AUTH_PASSWORD_REJECTED/400, not the generic
       // AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED/500, so the client can show a
       // message that states the real constraint.
       const { activateAccount } = (await loadService()) as any
@@ -962,6 +962,42 @@ describe('auth service (alea- username model)', () => {
 
       clerkCreateUserMock.mockRejectedValueOnce({
         errors: [{ code: 'form_identifier_exists', message: 'That username is taken' }],
+      })
+
+      await expect(
+        activateAccount({
+          token: plainToken,
+          password: 'Password123',
+        }),
+      ).rejects.toMatchObject({
+        message: 'AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED',
+        statusCode: 500,
+      })
+    })
+
+    it('does not misclassify a non-length password rejection as a password-length rejection (#313 round 3)', async () => {
+      // Regression guard for narrowing `isClerkPasswordRejection` from
+      // `code.startsWith('form_password_')` to a fixed set of length-related
+      // codes: `form_password_pwned` is a real Clerk code (still a password
+      // rejection, but not a length problem) that matched the old broad
+      // predicate. It must now fall through to the generic
+      // AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED/500 path instead of
+      // AUTH_PASSWORD_REJECTED/400 — reverting the narrowing back to a
+      // prefix match would make this test fail.
+      const { activateAccount } = (await loadService()) as any
+      const plainToken = createActivationToken()
+      const tokenHash = hashActivationToken(plainToken)
+
+      const token = createTestToken({
+        token_hash: tokenHash,
+        profile_id: 'user-test',
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+        used_at: null,
+      })
+      tokensStore.set(tokenHash, token)
+
+      clerkCreateUserMock.mockRejectedValueOnce({
+        errors: [{ code: 'form_password_pwned', message: 'Password has been found in an online data breach' }],
       })
 
       await expect(
@@ -1252,6 +1288,39 @@ describe('auth service (alea- username model)', () => {
 
       clerkUpdateUserMock.mockRejectedValueOnce({
         errors: [{ code: 'form_identifier_exists', message: 'That username is taken' }],
+      })
+
+      await expect(
+        recoverAccount({
+          token: plainToken,
+          password: 'NewPassword123',
+        }),
+      ).rejects.toMatchObject({
+        message: 'AUTH_ACCOUNT_CREDENTIALS_UPDATE_FAILED',
+        statusCode: 500,
+      })
+    })
+
+    it('does not misclassify a non-length password rejection as a password-length rejection (#313 round 3)', async () => {
+      // Same regression guard as activateAccount's equivalent test:
+      // `form_password_pwned` is a real Clerk code that matched the old
+      // broad `code.startsWith('form_password_')` predicate but must not
+      // match the narrowed length-only set — it must fall through to the
+      // generic AUTH_ACCOUNT_CREDENTIALS_UPDATE_FAILED/500 path.
+      const { recoverAccount } = (await loadService()) as any
+      const plainToken = createActivationToken()
+      const tokenHash = hashActivationToken(plainToken)
+
+      const token = createTestToken({
+        token_hash: tokenHash,
+        profile_id: 'user-active',
+        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+        used_at: null,
+      })
+      tokensStore.set(tokenHash, token)
+
+      clerkUpdateUserMock.mockRejectedValueOnce({
+        errors: [{ code: 'form_password_pwned', message: 'Password has been found in an online data breach' }],
       })
 
       await expect(

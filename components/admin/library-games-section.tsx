@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useTranslations } from 'next-intl'
 import { Dices, Plus, Pencil, Trash2 } from 'lucide-react'
 import { DiceLoader } from '@/components/ui/dice-loader'
@@ -83,11 +83,18 @@ function getBlankRequiredField(form: LibraryGameFormState): LibraryGameRequiredF
   return null
 }
 
-function LibraryGameFormFields({ form, onChange, idPrefix, errorField }: {
+/** Refs to the input for each required field, keyed the same way
+ * `getBlankRequiredField` reports them, so a failed submit can move focus to
+ * the offending field (#313 round 3: this dialog is long and scrollable — an
+ * inline error can mount off-screen with no visible or focus change). */
+type LibraryGameFieldRefs = Partial<Record<LibraryGameRequiredField, HTMLInputElement | null>>
+
+function LibraryGameFormFields({ form, onChange, idPrefix, errorField, fieldRefs }: {
   form: LibraryGameFormState
   onChange: (form: LibraryGameFormState) => void
   idPrefix: string
   errorField: LibraryGameRequiredField | null
+  fieldRefs: React.MutableRefObject<LibraryGameFieldRefs>
 }) {
   const t = useTranslations('admin')
   const tc = useTranslations('common')
@@ -105,6 +112,7 @@ function LibraryGameFormFields({ form, onChange, idPrefix, errorField }: {
         </Label>
         <Input
           id={`${idPrefix}-title`}
+          ref={(el) => { fieldRefs.current.title = el }}
           value={form.title}
           onChange={(e) => onChange({ ...form, title: e.target.value })}
           required
@@ -122,6 +130,7 @@ function LibraryGameFormFields({ form, onChange, idPrefix, errorField }: {
         </Label>
         <Input
           id={`${idPrefix}-category-es`}
+          ref={(el) => { fieldRefs.current.categoryEs = el }}
           value={form.categoryEs}
           onChange={(e) => onChange({ ...form, categoryEs: e.target.value })}
           required
@@ -158,6 +167,7 @@ function LibraryGameFormFields({ form, onChange, idPrefix, errorField }: {
           </Label>
           <Input
             id={`${idPrefix}-players`}
+            ref={(el) => { fieldRefs.current.players = el }}
             value={form.players}
             onChange={(e) => onChange({ ...form, players: e.target.value })}
             required
@@ -175,6 +185,7 @@ function LibraryGameFormFields({ form, onChange, idPrefix, errorField }: {
           </Label>
           <Input
             id={`${idPrefix}-play-time`}
+            ref={(el) => { fieldRefs.current.playTime = el }}
             value={form.playTime}
             onChange={(e) => onChange({ ...form, playTime: e.target.value })}
             required
@@ -260,6 +271,7 @@ function LibraryGameRow({ game }: { game: AdminLibraryGame }) {
   const [errorField, setErrorField] = useState<LibraryGameRequiredField | null>(null)
   const [deleteError, setDeleteError] = useState<string | null>(null)
   const [toggleError, setToggleError] = useState<string | null>(null)
+  const fieldRefs = useRef<LibraryGameFieldRefs>({})
 
   const updateGame = useAdminUpdateLibraryGame()
   const deleteGame = useAdminDeleteLibraryGame()
@@ -269,6 +281,7 @@ function LibraryGameRow({ game }: { game: AdminLibraryGame }) {
     const blankField = getBlankRequiredField(form)
     if (blankField) {
       setErrorField(blankField)
+      fieldRefs.current[blankField]?.focus()
       return
     }
     setErrorField(null)
@@ -371,7 +384,13 @@ function LibraryGameRow({ game }: { game: AdminLibraryGame }) {
             <DialogTitle className="font-cinzel text-gradient-gold">{t('libraryGames.editLibraryGame')}</DialogTitle>
           </DialogHeader>
           <form onSubmit={handleSave} noValidate className="space-y-4 py-2">
-            <LibraryGameFormFields form={form} onChange={setForm} idPrefix={`library-game-edit-${game.id}`} errorField={errorField} />
+            <LibraryGameFormFields
+              form={form}
+              onChange={setForm}
+              idPrefix={`library-game-edit-${game.id}`}
+              errorField={errorField}
+              fieldRefs={fieldRefs}
+            />
             {saveError && (
               <div role="alert" className="rounded-md bg-destructive/15 border border-destructive/30 px-3 py-2 text-sm text-destructive">
                 {saveError}
@@ -446,12 +465,14 @@ export function LibraryGamesSection() {
   const [form, setForm] = useState<LibraryGameFormState>(emptyForm())
   const [createError, setCreateError] = useState<string | null>(null)
   const [errorField, setErrorField] = useState<LibraryGameRequiredField | null>(null)
+  const fieldRefs = useRef<LibraryGameFieldRefs>({})
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault()
     const blankField = getBlankRequiredField(form)
     if (blankField) {
       setErrorField(blankField)
+      fieldRefs.current[blankField]?.focus()
       return
     }
     setErrorField(null)
@@ -563,7 +584,13 @@ export function LibraryGamesSection() {
             </div>
           </DialogHeader>
           <form onSubmit={handleCreate} noValidate className="space-y-4 py-2">
-            <LibraryGameFormFields form={form} onChange={setForm} idPrefix="library-game-new" errorField={errorField} />
+            <LibraryGameFormFields
+              form={form}
+              onChange={setForm}
+              idPrefix="library-game-new"
+              errorField={errorField}
+              fieldRefs={fieldRefs}
+            />
             {createError && (
               <div role="alert" className="rounded-md bg-destructive/15 border border-destructive/30 px-3 py-2 text-sm text-destructive">
                 {createError}
