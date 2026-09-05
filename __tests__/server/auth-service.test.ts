@@ -1016,11 +1016,10 @@ describe('auth service (alea- username model)', () => {
     })
 
     it('maps an unrecognized form_password_* code to AUTH_PASSWORD_REJECTED_GENERIC instead of falling through to the unrelated create-failed code (#313 code-review finding 7)', async () => {
-      // Neither CLERK_PASSWORD_LENGTH_CODES nor CLERK_PASSWORD_OTHER_CODES
-      // knows this hypothetical future Clerk code. Without the
-      // startsWith('form_password_') fallback this would silently land on
-      // AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED/500 — reproducing the
-      // original bug this file exists to fix.
+      // CLERK_PASSWORD_LENGTH_CODES doesn't know this hypothetical future
+      // Clerk code. Without the startsWith('form_password_') fallback this
+      // would silently land on AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED/500 —
+      // reproducing the original bug this file exists to fix.
       const { activateAccount } = (await loadService()) as any
       const plainToken = createActivationToken()
       const tokenHash = hashActivationToken(plainToken)

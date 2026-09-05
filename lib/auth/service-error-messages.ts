@@ -43,3 +43,21 @@ export function getAuthServiceErrorMessageKey(code: string | undefined | null): 
   if (!code) return null
   return AUTH_ERROR_MESSAGE_KEYS[code as AuthErrorCode] ?? null
 }
+
+/**
+ * Extracts the machine-readable error code from a caught `unknown` error,
+ * regardless of which failure path produced it: `apiClient` (`lib/api/client.ts`)
+ * throws a plain `Error` whose `message` is the server's `ERROR_CODES.AUTH_*`
+ * code, while a `fetch`-level failure (e.g. network error) throws a `TypeError`
+ * — both are real `Error` instances, but some call sites also see a plain
+ * object with a string `message` property, so both shapes are handled here.
+ * Returns `null` when neither shape matches (#313 code-review round 2, finding 1:
+ * this extraction was duplicated identically in 4 call sites).
+ */
+export function extractErrorCode(error: unknown): string | null {
+  if (error instanceof Error) return error.message
+  if (typeof error === 'object' && error !== null && 'message' in error && typeof error.message === 'string') {
+    return error.message
+  }
+  return null
+}

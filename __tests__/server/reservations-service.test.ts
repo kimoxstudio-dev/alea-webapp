@@ -1,7 +1,7 @@
 // @vitest-environment node
 import type { SessionUser } from '@/lib/server/auth'
 import { beforeEach, describe, expect, it, vi, afterEach } from 'vitest'
-import { createSqlMock, parseStatement, whereColumnHasOperator, whereConditionCount, whereHasColumn } from '../helpers/sql-mock'
+import { createSqlMock, hasExactSelectColumns, parseStatement, whereColumnHasOperator, whereConditionCount, whereHasColumn } from '../helpers/sql-mock'
 import { NeonDbError } from '@neondatabase/serverless'
 
 /**
@@ -16,6 +16,14 @@ function makeNeonDbError(code: string): NeonDbError {
   error.code = code
   return error
 }
+
+// Mirrors `RESERVATION_COLUMNS` in `lib/server/reservations-service.ts` — the
+// `date::text AS date` cast is load-bearing (an uncast `date` column parses
+// as a JS `Date` via the Neon driver, crashing `isPendingReservationExpired`
+// -> `zonedDateTimeToUtc` -> `isValidDateOnlyString`). Pinned by exact
+// column-list match below so dropping the cast fails a test instead of
+// silently matching (#313 code-review round 2, finding 3).
+const RESERVATION_COLUMNS = 'id, table_id, user_id, date::text AS date, start_time, end_time, status, surface, activated_at, created_at'
 
 const sqlMock = createSqlMock()
 
@@ -428,7 +436,14 @@ describe('reservations service', () => {
     sqlMock.addHandler({
       name: 'SELECT visible reservations with metadata',
       verb: 'select',
-      match: (stmt) => stmt.table === 'reservations' && stmt.values.length === 6 && stmt.orderBy === 'r.date asc, r.start_time asc, r.id asc',
+      match: (stmt) =>
+        stmt.table === 'reservations' &&
+        stmt.values.length === 6 &&
+        stmt.orderBy === 'r.date asc, r.start_time asc, r.id asc' &&
+        hasExactSelectColumns(
+          stmt,
+          'r.id, r.table_id, r.user_id, r.date::text AS date, r.start_time, r.end_time, r.status, r.surface, r.activated_at, r.created_at, p.member_number, t.name AS table_name, rooms.name AS room_name',
+        ),
       respond: (stmt) => {
         const [userId, , tableId, , date] = stmt.values
         return reservationsState.filter((row) =>
@@ -463,7 +478,10 @@ describe('reservations service', () => {
     sqlMock.addHandler({
       name: 'SELECT reservation by id for access',
       verb: 'select',
-      match: (stmt) => stmt.table === 'reservations' && whereConditionCount(stmt) === 1,
+      match: (stmt) =>
+        stmt.table === 'reservations' &&
+        whereConditionCount(stmt) === 1 &&
+        hasExactSelectColumns(stmt, RESERVATION_COLUMNS),
       respond: (stmt) => {
         const reservation = reservationsState.find((row) => row.id === String(stmt.values[0]))
         return reservation ? [cloneReservation(reservation)] : []

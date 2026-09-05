@@ -74,17 +74,6 @@ const CLERK_PASSWORD_LENGTH_CODES = new Set([
   'form_password_size_in_bytes_exceeded',
 ])
 
-/** Other `form_password_*` Clerk codes: real password rejections, but not
- * about length — a breached (`form_password_pwned`) or weak
- * (`form_password_not_strong_enough`) password. Surfacing this file's
- * length-focused copy for these would be wrong advice (retrying the same
- * password fails identically), so they get their own generic-but-accurate
- * "try a different password" message instead (issue #371). */
-const CLERK_PASSWORD_OTHER_CODES = new Set([
-  'form_password_pwned',
-  'form_password_not_strong_enough',
-])
-
 function clerkErrorCodes(error: unknown): string[] {
   const errors = (error as { errors?: unknown })?.errors
   if (!Array.isArray(errors)) return []
@@ -115,10 +104,11 @@ function isClerkPasswordRejection(codes: string[]): boolean {
 
 /**
  * Detects a Clerk password rejection for a reason OTHER than length —
- * breached or insufficiently strong (issue #371), or an unrecognized
- * `form_password_*` code (#313 code-review finding 7): Clerk can add a new
- * password-rejection code neither set above has been updated for, and
- * silently falling through to the unrelated "try again or ask an
+ * breached (`form_password_pwned`) or insufficiently strong
+ * (`form_password_not_strong_enough`) (issue #371), or any other
+ * unrecognized `form_password_*` code (#313 code-review finding 7): Clerk
+ * can add a new password-rejection code this file hasn't been updated for,
+ * and silently falling through to the unrelated "try again or ask an
  * administrator for a new link" message would reproduce the original bug
  * this file fixes. Any code shaped like a password rejection that isn't a
  * known length code is treated as a generic password rejection rather than
@@ -130,9 +120,7 @@ function isClerkPasswordRejection(codes: string[]): boolean {
  */
 function isClerkPasswordRejectionGeneric(codes: string[]): boolean {
   return codes.some(
-    (code) =>
-      CLERK_PASSWORD_OTHER_CODES.has(code) ||
-      (code.startsWith('form_password_') && !CLERK_PASSWORD_LENGTH_CODES.has(code)),
+    (code) => code.startsWith('form_password_') && !CLERK_PASSWORD_LENGTH_CODES.has(code),
   )
 }
 

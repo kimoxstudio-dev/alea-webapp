@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest'
-import { isValidOptionalUrl } from '@/lib/validations/url'
+import { isValidOptionalUrl } from '@/lib/validations/url-client'
 
 describe('isValidOptionalUrl (#313)', () => {
   it('accepts an empty or whitespace-only value — the URL is optional', () => {

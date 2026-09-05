@@ -539,6 +539,7 @@ function ClubEventFormDialog({
   isPending,
   error,
   fieldError,
+  onClearFieldError,
   getFieldRef,
 }: {
   open: boolean
@@ -551,6 +552,7 @@ function ClubEventFormDialog({
   isPending: boolean
   error?: string | null
   fieldError: ClubEventFieldError | null
+  onClearFieldError: () => void
   getFieldRef: ReturnType<typeof useRequiredFieldFocus<ClubEventFieldKey>>['getRef']
 }) {
   const t = useTranslations('admin')
@@ -568,6 +570,12 @@ function ClubEventFormDialog({
   function removeSchedule(index: number) {
     const schedules = form.schedules.filter((_, i) => i !== index)
     setForm({ ...form, schedules })
+    // A field error anchored to a schedule row's index (e.g. `{kind:
+    // 'schedule', index: 1, field: 'date'}`) becomes stale once a row above
+    // it is removed and every later row shifts up — the error (and its
+    // aria-invalid) would otherwise land on a different, now-valid input
+    // (#313 code-review round 2, finding 5).
+    onClearFieldError()
   }
 
   const textareaClass = 'flex w-full rounded-md border border-input bg-background-surface px-3 py-2 text-sm '
@@ -1290,6 +1298,7 @@ export function ClubEventsSection() {
         isPending={createClubEvent.isPending}
         error={createError}
         fieldError={createFieldError}
+        onClearFieldError={() => setCreateFieldError(null)}
         getFieldRef={getCreateFieldRef}
       />
 
@@ -1310,6 +1319,7 @@ export function ClubEventsSection() {
         isPending={updateClubEvent.isPending}
         error={updateError}
         fieldError={updateFieldError}
+        onClearFieldError={() => setUpdateFieldError(null)}
         getFieldRef={getUpdateFieldRef}
       />
 

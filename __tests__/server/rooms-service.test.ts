@@ -4,6 +4,7 @@ import { NeonDbError } from '@neondatabase/serverless'
 import type { ServiceError } from '@/lib/server/service-error'
 import {
   createSqlMock,
+  hasExactSelectColumns,
   whereColumnHasOperator,
   whereConditionCount,
   whereHasColumn,
@@ -414,7 +415,13 @@ describe('rooms-service (Neon raw SQL)', () => {
         match: (stmt) =>
           stmt.table === 'reservations' &&
           whereColumnHasOperator(stmt, 'date', '=') &&
-          whereHasColumn(stmt, 'table_id'),
+          whereHasColumn(stmt, 'table_id') &&
+          // `date::text` cast is load-bearing (uncast `date` parses as a JS
+          // `Date` via the Neon driver, crashing `isPendingReservationExpired`
+          // -> `zonedDateTimeToUtc` -> `isValidDateOnlyString`). Pinned by
+          // exact column-list match so dropping it fails this test instead of
+          // silently matching (#313 code-review round 2, finding 3).
+          hasExactSelectColumns(stmt, 'id, table_id, date::text AS date, start_time, end_time, status, surface, user_id, activated_at, created_at'),
         respond,
       })
     }

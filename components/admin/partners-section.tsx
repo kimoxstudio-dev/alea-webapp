@@ -23,7 +23,7 @@ import {
 import type { AdminPartner } from '@/lib/types'
 import { OptionalEnglishFields } from './optional-english-fields'
 import { ImageUpload } from './image-upload'
-import { isValidOptionalUrl } from '@/lib/validations/url'
+import { isValidOptionalUrl } from '@/lib/validations/url-client'
 import { useRequiredFieldFocus } from '@/lib/hooks/use-required-field-focus'
 
 interface PartnerFormState {

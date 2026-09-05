@@ -13,7 +13,7 @@ import { PasswordStrengthIndicator } from '@/components/auth/password-strength-i
 import { activationSchema, getPasswordRequirementChecks, type ActivationFormData } from '@/lib/validations/auth'
 import { apiClient } from '@/lib/api/client'
 import { endpoints } from '@/lib/api/endpoints'
-import { getAuthServiceErrorMessageKey } from '@/lib/auth/service-error-messages'
+import { getAuthServiceErrorMessageKey, extractErrorCode } from '@/lib/auth/service-error-messages'
 
 /**
  * Claims an admin-issued activation link (#299 pass 3).
@@ -48,11 +48,7 @@ export function ActivationForm({ locale, token }: ActivationFormProps) {
       router.push(`/${locale}/rooms`)
       router.refresh()
     } catch (error) {
-      const code = error instanceof Error
-        ? error.message
-        : typeof error === 'object' && error !== null && 'message' in error && typeof error.message === 'string'
-          ? error.message
-          : null
+      const code = extractErrorCode(error)
       // The server's `message` is always a machine-readable `ERROR_CODES.AUTH_*`
       // code, never end-user text — mapped to a translated message here so
       // no raw English string ever reaches this Spanish-capable page (#313).
