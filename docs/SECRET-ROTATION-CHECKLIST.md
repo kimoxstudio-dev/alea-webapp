@@ -60,7 +60,7 @@ Related issue spec: `docs/issues/migration-pre-04-rotate-p0-secrets.md`
   tree of this branch) turns up **no remaining app-runtime (`app/`, `lib/`) consumer**.
   The rest of the hits split into two groups:
   - **Accurate, not stale:** `.env.example:129-132` (this section's own template entry
-    and comment), `docs/ENVIRONMENT.md:45,200`, `docs/ROLLBACK.md:130` (all three added
+    and comment), `docs/ENVIRONMENT.md:45,206`, `docs/ROLLBACK.md:130` (all three added
     or verified in the same pass as this checklist update, and correctly describe the
     variable as present-but-unused), and this document's own section 2.
   - **Stale** (predate the discovery that the route is dead, and read as if the variable
