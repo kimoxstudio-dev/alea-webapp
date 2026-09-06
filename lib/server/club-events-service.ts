@@ -89,8 +89,15 @@ type EventEquipmentRow = Tables<'event_equipment'>
 // Includes the legacy `title` column: toAdminClubEvent falls back to it via
 // `row.title_es ?? row.title` for internal-only events (title_es is null),
 // so it must be fetched here or that fallback silently resolves to undefined.
+//
+// `date`/`end_date`'s `::text` casts are load-bearing: without them the Neon
+// driver parses those `date` columns (OID 1082) into JS `Date` objects, not
+// strings, and formatClubEventDate -> parseDateOnlyToLocalDate ->
+// isValidDateOnlyString throws on that shape once it reaches the client
+// (same failure mode documented in reservation-no-show.ts's
+// markExpiredReservationsAsNoShow).
 const ADMIN_CLUB_EVENT_RETURNING = `id, title, title_es, title_en, blurb_es, blurb_en, description_es, description_en,
-        date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url,
+        date_kind, date::text AS date, end_date::text AS end_date, recurrence_label_es, recurrence_label_en, image_url, link_url,
         category_es, category_en`
 
 const DEFAULT_PAST_LIMIT = 24
@@ -168,9 +175,11 @@ export async function listClubEvents(options: ListClubEventsOptions = {}): Promi
 
   let rows: EventRow[]
   try {
+    // `date`/`end_date`'s `::text` casts are load-bearing — see
+    // ADMIN_CLUB_EVENT_RETURNING's comment for the failure mode.
     rows = await sql`
       SELECT id, title_es, title_en, blurb_es, blurb_en, description_es, description_en,
-        date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url
+        date_kind, date::text AS date, end_date::text AS end_date, recurrence_label_es, recurrence_label_en, image_url, link_url
       FROM events
       WHERE title_es IS NOT NULL AND title_en IS NOT NULL
       ORDER BY date ASC
@@ -824,7 +833,7 @@ async function applyClubEventBlocksAndMaterials(
       deletedBlocks = await sql`
         DELETE FROM event_room_blocks
         WHERE event_id = ${eventId}
-        RETURNING id, event_id, room_id, table_id, date, start_time, end_time, all_day
+        RETURNING id, event_id, room_id, table_id, date::text AS date, start_time, end_time, all_day
       ` as EventRoomBlockRow[]
     } catch {
       serviceError('Internal server error', 500)
@@ -917,7 +926,7 @@ async function applyClubEventBlocksAndMaterials(
         const blockRows = await sql`
           INSERT INTO event_room_blocks (event_id, room_id, table_id, date, start_time, end_time, all_day)
           VALUES (${eventId}, ${block.room_id}, ${block.table_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day})
-          RETURNING id, event_id, room_id, table_id, date, start_time, end_time, all_day
+          RETURNING id, event_id, room_id, table_id, date::text AS date, start_time, end_time, all_day
         ` as EventRoomBlockRow[]
 
         const blockRow = blockRows[0]
@@ -1002,7 +1011,7 @@ async function applyClubEventBlocksAndMaterials(
   let resultBlocks: EventRoomBlockRow[]
   try {
     resultBlocks = await sql`
-      SELECT id, event_id, room_id, table_id, date, start_time, end_time, all_day
+      SELECT id, event_id, room_id, table_id, date::text AS date, start_time, end_time, all_day
       FROM event_room_blocks
       WHERE event_id = ${eventId}
       ORDER BY date ASC, start_time ASC
@@ -1216,7 +1225,7 @@ async function fetchEventRoomBlocks(eventId: string): Promise<EventRoomBlockRow[
   let rows: EventRoomBlockRow[]
   try {
     rows = await sql`
-      SELECT id, event_id, room_id, table_id, date, start_time, end_time, all_day
+      SELECT id, event_id, room_id, table_id, date::text AS date, start_time, end_time, all_day
       FROM event_room_blocks
       WHERE event_id = ${eventId}
     ` as EventRoomBlockRow[]
@@ -1241,9 +1250,12 @@ export async function listAdminClubEvents(session: SessionUser): Promise<AdminLi
     // Finding (PR #354 review): `title` must be selected here — toAdminClubEvent
     // falls back to it via `row.title_es ?? row.title` for internal-only events
     // (title_es is null), so omitting it silently breaks that fallback.
+    //
+    // `date`/`end_date`'s `::text` casts are load-bearing — see
+    // ADMIN_CLUB_EVENT_RETURNING's comment for the failure mode.
     rows = await sql`
       SELECT id, title, title_es, title_en, blurb_es, blurb_en, description_es, description_en,
-        date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url,
+        date_kind, date::text AS date, end_date::text AS end_date, recurrence_label_es, recurrence_label_en, image_url, link_url,
         category_es, category_en
       FROM events
       ORDER BY date ASC
@@ -1259,7 +1271,7 @@ export async function listAdminClubEvents(session: SessionUser): Promise<AdminLi
   let blocks: EventRoomBlockRow[]
   try {
     blocks = await sql`
-      SELECT id, event_id, room_id, table_id, date, start_time, end_time, all_day
+      SELECT id, event_id, room_id, table_id, date::text AS date, start_time, end_time, all_day
       FROM event_room_blocks
       WHERE event_id = ANY(${eventIds})
     ` as EventRoomBlockRow[]

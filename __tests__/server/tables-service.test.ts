@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createSqlMock, hasColumn, whereColumnHasOperator, whereHasColumn } from '../helpers/sql-mock'
+import { createSqlMock, hasColumn, hasExactSelectColumns, whereColumnHasOperator, whereHasColumn } from '../helpers/sql-mock'
 
 const TABLE_ID = 'c3d4e5f6-a7b8-9012-cdef-012345678901'
 const LARGE_TABLE_ID = 'd4e5f6a7-b8c9-0123-def0-123456789012'
@@ -126,7 +126,13 @@ function registerAvailabilityHandlers(options?: {
       stmt.table === 'reservations' &&
       whereHasColumn(stmt, 'table_id') &&
       whereHasColumn(stmt, 'date') &&
-      /status in \('active', 'pending'\)/.test(stmt.whereClause ?? ''),
+      /status in \('active', 'pending'\)/.test(stmt.whereClause ?? '') &&
+      // `date::text` cast is load-bearing (uncast `date` parses as a JS
+      // `Date` via the Neon driver, crashing `isPendingReservationExpired`
+      // -> `zonedDateTimeToUtc` -> `isValidDateOnlyString`). Pinned by exact
+      // column-list match so dropping it fails this test instead of silently
+      // matching (#313 code-review round 2, finding 3).
+      hasExactSelectColumns(stmt, 'id, table_id, date::text AS date, start_time, end_time, status, surface, user_id, activated_at, created_at'),
     respond: () => reservationRows,
   })
   sqlMock.addHandler({

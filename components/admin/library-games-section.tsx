@@ -20,6 +20,7 @@ import {
   useAdminDeleteLibraryGame,
   type LibraryGamePayload,
 } from '@/lib/hooks/use-admin'
+import { useRequiredFieldFocus } from '@/lib/hooks/use-required-field-focus'
 import type { AdminLibraryGame } from '@/lib/types'
 import { OptionalEnglishFields } from './optional-english-fields'
 import { ImageUpload } from './image-upload'
@@ -68,12 +69,35 @@ function formToPayload(form: LibraryGameFormState): LibraryGamePayload {
   }
 }
 
-function LibraryGameFormFields({ form, onChange, idPrefix }: {
+type LibraryGameRequiredField = 'title' | 'categoryEs' | 'players' | 'playTime'
+
+/** Fields the form marks `required` — checked client-side on submit (#313: a
+ * blank one used to fall through to the browser's native, English-only
+ * validation bubble instead of this app's Spanish-capable error display).
+ * Returns the first blank required field so the error can be anchored to it,
+ * or `null` when the form is valid. */
+function getBlankRequiredField(form: LibraryGameFormState): LibraryGameRequiredField | null {
+  if (!form.title.trim()) return 'title'
+  if (!form.categoryEs.trim()) return 'categoryEs'
+  if (!form.players.trim()) return 'players'
+  if (!form.playTime.trim()) return 'playTime'
+  return null
+}
+
+function LibraryGameFormFields({ form, onChange, idPrefix, errorField, getFieldRef }: {
   form: LibraryGameFormState
   onChange: (form: LibraryGameFormState) => void
   idPrefix: string
+  errorField: LibraryGameRequiredField | null
+  getFieldRef: ReturnType<typeof useRequiredFieldFocus<LibraryGameRequiredField>>['getRef']
 }) {
   const t = useTranslations('admin')
+  const tc = useTranslations('common')
+
+  const titleErrorId = `${idPrefix}-title-error`
+  const categoryEsErrorId = `${idPrefix}-category-es-error`
+  const playersErrorId = `${idPrefix}-players-error`
+  const playTimeErrorId = `${idPrefix}-play-time-error`
 
   return (
     <div className="space-y-4">
@@ -83,11 +107,17 @@ function LibraryGameFormFields({ form, onChange, idPrefix }: {
         </Label>
         <Input
           id={`${idPrefix}-title`}
+          ref={getFieldRef('title')}
           value={form.title}
           onChange={(e) => onChange({ ...form, title: e.target.value })}
           required
+          aria-invalid={errorField === 'title'}
+          aria-describedby={errorField === 'title' ? titleErrorId : undefined}
           className="bg-background-secondary border-border focus:border-primary/50"
         />
+        {errorField === 'title' && (
+          <p id={titleErrorId} role="alert" className="text-xs text-destructive">{tc('requiredField')}</p>
+        )}
       </div>
       <div className="space-y-2">
         <Label htmlFor={`${idPrefix}-category-es`} className="text-sm text-muted-foreground font-medium">
@@ -95,11 +125,17 @@ function LibraryGameFormFields({ form, onChange, idPrefix }: {
         </Label>
         <Input
           id={`${idPrefix}-category-es`}
+          ref={getFieldRef('categoryEs')}
           value={form.categoryEs}
           onChange={(e) => onChange({ ...form, categoryEs: e.target.value })}
           required
+          aria-invalid={errorField === 'categoryEs'}
+          aria-describedby={errorField === 'categoryEs' ? categoryEsErrorId : undefined}
           className="bg-background-secondary border-border focus:border-primary/50"
         />
+        {errorField === 'categoryEs' && (
+          <p id={categoryEsErrorId} role="alert" className="text-xs text-destructive">{tc('requiredField')}</p>
+        )}
       </div>
 
       {/* English copy is optional (OIR-206) — collapsed by default; the
@@ -126,11 +162,17 @@ function LibraryGameFormFields({ form, onChange, idPrefix }: {
           </Label>
           <Input
             id={`${idPrefix}-players`}
+            ref={getFieldRef('players')}
             value={form.players}
             onChange={(e) => onChange({ ...form, players: e.target.value })}
             required
+            aria-invalid={errorField === 'players'}
+            aria-describedby={errorField === 'players' ? playersErrorId : undefined}
             className="bg-background-secondary border-border focus:border-primary/50"
           />
+          {errorField === 'players' && (
+            <p id={playersErrorId} role="alert" className="text-xs text-destructive">{tc('requiredField')}</p>
+          )}
         </div>
         <div className="space-y-2">
           <Label htmlFor={`${idPrefix}-play-time`} className="text-sm text-muted-foreground font-medium">
@@ -138,11 +180,17 @@ function LibraryGameFormFields({ form, onChange, idPrefix }: {
           </Label>
           <Input
             id={`${idPrefix}-play-time`}
+            ref={getFieldRef('playTime')}
             value={form.playTime}
             onChange={(e) => onChange({ ...form, playTime: e.target.value })}
             required
+            aria-invalid={errorField === 'playTime'}
+            aria-describedby={errorField === 'playTime' ? playTimeErrorId : undefined}
             className="bg-background-secondary border-border focus:border-primary/50"
           />
+          {errorField === 'playTime' && (
+            <p id={playTimeErrorId} role="alert" className="text-xs text-destructive">{tc('requiredField')}</p>
+          )}
         </div>
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -215,14 +263,23 @@ function LibraryGameRow({ game }: { game: AdminLibraryGame }) {
   const [deleting, setDeleting] = useState(false)
   const [form, setForm] = useState<LibraryGameFormState>(() => formFromGame(game))
   const [saveError, setSaveError] = useState<string | null>(null)
+  const [errorField, setErrorField] = useState<LibraryGameRequiredField | null>(null)
   const [deleteError, setDeleteError] = useState<string | null>(null)
   const [toggleError, setToggleError] = useState<string | null>(null)
+  const { getRef: getFieldRef, focus: focusField } = useRequiredFieldFocus<LibraryGameRequiredField>()
 
   const updateGame = useAdminUpdateLibraryGame()
   const deleteGame = useAdminDeleteLibraryGame()
 
   async function handleSave(e: React.FormEvent) {
     e.preventDefault()
+    const blankField = getBlankRequiredField(form)
+    if (blankField) {
+      setErrorField(blankField)
+      focusField(blankField)
+      return
+    }
+    setErrorField(null)
     setSaveError(null)
     try {
       await updateGame.mutateAsync({ id: game.id, data: formToPayload(form) })
@@ -284,6 +341,7 @@ function LibraryGameRow({ game }: { game: AdminLibraryGame }) {
             onClick={() => {
               setForm(formFromGame(game))
               setSaveError(null)
+              setErrorField(null)
               setEditing(true)
             }}
             className="h-8 w-8 text-muted-foreground hover:text-primary hover:bg-primary/10 transition-colors"
@@ -310,15 +368,24 @@ function LibraryGameRow({ game }: { game: AdminLibraryGame }) {
         open={editing}
         onOpenChange={(open) => {
           setEditing(open)
-          if (!open) setSaveError(null)
+          if (!open) {
+            setSaveError(null)
+            setErrorField(null)
+          }
         }}
       >
         <DialogContent className="bg-card border-border max-h-[85vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle className="font-cinzel text-gradient-gold">{t('libraryGames.editLibraryGame')}</DialogTitle>
           </DialogHeader>
-          <form onSubmit={handleSave} className="space-y-4 py-2">
-            <LibraryGameFormFields form={form} onChange={setForm} idPrefix={`library-game-edit-${game.id}`} />
+          <form onSubmit={handleSave} noValidate className="space-y-4 py-2">
+            <LibraryGameFormFields
+              form={form}
+              onChange={setForm}
+              idPrefix={`library-game-edit-${game.id}`}
+              errorField={errorField}
+              getFieldRef={getFieldRef}
+            />
             {saveError && (
               <div role="alert" className="rounded-md bg-destructive/15 border border-destructive/30 px-3 py-2 text-sm text-destructive">
                 {saveError}
@@ -392,9 +459,18 @@ export function LibraryGamesSection() {
   const [showCreate, setShowCreate] = useState(false)
   const [form, setForm] = useState<LibraryGameFormState>(emptyForm())
   const [createError, setCreateError] = useState<string | null>(null)
+  const [errorField, setErrorField] = useState<LibraryGameRequiredField | null>(null)
+  const { getRef: getFieldRef, focus: focusField } = useRequiredFieldFocus<LibraryGameRequiredField>()
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault()
+    const blankField = getBlankRequiredField(form)
+    if (blankField) {
+      setErrorField(blankField)
+      focusField(blankField)
+      return
+    }
+    setErrorField(null)
     setCreateError(null)
     try {
       await createGame.mutateAsync(formToPayload(form))
@@ -428,6 +504,7 @@ export function LibraryGamesSection() {
           onClick={() => {
             setForm(emptyForm())
             setCreateError(null)
+            setErrorField(null)
             setShowCreate(true)
           }}
           className="gap-1.5 border-primary/30 text-primary/80 hover:bg-primary/10 hover:border-primary/50 hover:text-primary transition-colors"
@@ -486,7 +563,10 @@ export function LibraryGamesSection() {
         open={showCreate}
         onOpenChange={(open) => {
           setShowCreate(open)
-          if (!open) setCreateError(null)
+          if (!open) {
+            setCreateError(null)
+            setErrorField(null)
+          }
         }}
       >
         <DialogContent className="bg-card border-border max-h-[85vh] overflow-y-auto">
@@ -498,8 +578,14 @@ export function LibraryGamesSection() {
               <DialogTitle className="font-cinzel text-gradient-gold">{t('libraryGames.createLibraryGame')}</DialogTitle>
             </div>
           </DialogHeader>
-          <form onSubmit={handleCreate} className="space-y-4 py-2">
-            <LibraryGameFormFields form={form} onChange={setForm} idPrefix="library-game-new" />
+          <form onSubmit={handleCreate} noValidate className="space-y-4 py-2">
+            <LibraryGameFormFields
+              form={form}
+              onChange={setForm}
+              idPrefix="library-game-new"
+              errorField={errorField}
+              getFieldRef={getFieldRef}
+            />
             {createError && (
               <div role="alert" className="rounded-md bg-destructive/15 border border-destructive/30 px-3 py-2 text-sm text-destructive">
                 {createError}

@@ -103,10 +103,15 @@ const TABLE_ROOM_MAP: Record<string, string> = {
 // (the file's single shared `sql` mock, reset in the top-level beforeEach).
 // ---------------------------------------------------------------------------
 
+// `date::text as date`/`end_date::text as end_date`: production added these
+// casts (#313 smoke-pass finding) since the Neon driver otherwise parses the
+// `date` column (OID 1082) into a JS `Date` object, not a string, crashing
+// formatClubEventDate on the client. Mirror exactly or hasExactSelectColumns
+// stops matching.
 const ADMIN_RETURNING_COLUMNS =
-  'id, title, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date, end_date, recurrence_label_es, recurrence_label_en, image_url, link_url, category_es, category_en'
+  'id, title, title_es, title_en, blurb_es, blurb_en, description_es, description_en, date_kind, date::text as date, end_date::text as end_date, recurrence_label_es, recurrence_label_en, image_url, link_url, category_es, category_en'
 
-const ROOM_BLOCK_COLUMNS = 'id, event_id, room_id, table_id, date, start_time, end_time, all_day'
+const ROOM_BLOCK_COLUMNS = 'id, event_id, room_id, table_id, date::text as date, start_time, end_time, all_day'
 
 function currentEventRowFixture(overrides: Record<string, unknown> = {}) {
   return {

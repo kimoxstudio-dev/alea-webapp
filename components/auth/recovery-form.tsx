@@ -13,6 +13,7 @@ import { PasswordStrengthIndicator } from '@/components/auth/password-strength-i
 import { activationSchema, getPasswordRequirementChecks, type RecoveryFormData } from '@/lib/validations/auth'
 import { apiClient } from '@/lib/api/client'
 import { endpoints } from '@/lib/api/endpoints'
+import { getAuthServiceErrorMessageKey, extractErrorCode } from '@/lib/auth/service-error-messages'
 
 /**
  * Claims an admin-issued recovery link (#299 pass 3).
@@ -51,12 +52,12 @@ export function RecoveryForm({ locale, token }: RecoveryFormProps) {
       router.push(`/${locale}/rooms`)
       router.refresh()
     } catch (error) {
-      const message = error instanceof Error
-        ? error.message
-        : typeof error === 'object' && error !== null && 'message' in error && typeof error.message === 'string'
-          ? error.message
-          : null
-      setServerError(message ?? t('recoveryInvalidBody'))
+      const code = extractErrorCode(error)
+      // The server's `message` is always a machine-readable `ERROR_CODES.AUTH_*`
+      // code, never end-user text — mapped to a translated message here so
+      // no raw English string ever reaches this Spanish-capable page (#313).
+      const messageKey = getAuthServiceErrorMessageKey(code)
+      setServerError(messageKey ? t(messageKey as Parameters<typeof t>[0]) : t('recoveryInvalidBody'))
     }
   }
 

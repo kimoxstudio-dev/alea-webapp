@@ -481,7 +481,7 @@ export async function listEvents(): Promise<AdminEvent[]> {
   let rows: EventRow[]
   try {
     rows = await sql`
-      SELECT id, title, description, date, start_time, end_time, created_by, created_at
+      SELECT id, title, description, date::text AS date, start_time, end_time, created_by, created_at
       FROM events
       WHERE title_es IS NULL OR title_en IS NULL
       ORDER BY date ASC, start_time ASC
@@ -495,7 +495,7 @@ export async function listEvents(): Promise<AdminEvent[]> {
   let blocks: EventRoomBlockRow[]
   try {
     blocks = await sql`
-      SELECT id, event_id, room_id, date, start_time, end_time, all_day
+      SELECT id, event_id, room_id, date::text AS date, start_time, end_time, all_day
       FROM event_room_blocks
       WHERE event_id = ANY(${rows.map((r) => r.id)})
     ` as EventRoomBlockRow[]
@@ -517,7 +517,7 @@ export async function getEvent(id: string): Promise<AdminEvent> {
   let eventRows: EventRow[]
   try {
     eventRows = await sql`
-      SELECT id, title, description, date, start_time, end_time, created_by, created_at
+      SELECT id, title, description, date::text AS date, start_time, end_time, created_by, created_at
       FROM events
       WHERE id = ${id}
       LIMIT 1
@@ -531,7 +531,7 @@ export async function getEvent(id: string): Promise<AdminEvent> {
   let blocks: EventRoomBlockRow[]
   try {
     blocks = await sql`
-      SELECT id, event_id, room_id, date, start_time, end_time, all_day
+      SELECT id, event_id, room_id, date::text AS date, start_time, end_time, all_day
       FROM event_room_blocks
       WHERE event_id = ${id}
     ` as EventRoomBlockRow[]
@@ -573,7 +573,7 @@ export async function createEvent(body: {
       eventRows = await sql`
         INSERT INTO events (title, description, date, start_time, end_time, created_by)
         VALUES (${title}, ${description}, ${anchor.date}, ${anchor.start_time}, ${anchor.end_time}, ${createdBy})
-        RETURNING id, title, description, date, start_time, end_time, created_by, created_at
+        RETURNING id, title, description, date::text AS date, start_time, end_time, created_by, created_at
       ` as EventRow[]
     } catch (error) {
       mapEventWriteError(error)
@@ -603,7 +603,7 @@ export async function createEvent(body: {
         const blockRows = await sql`
           INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day)
           VALUES (${event.id}, ${block.room_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day})
-          RETURNING id, event_id, room_id, date, start_time, end_time, all_day
+          RETURNING id, event_id, room_id, date::text AS date, start_time, end_time, all_day
         ` as EventRoomBlockRow[]
 
         const blockRow = blockRows[0]
@@ -638,7 +638,7 @@ export async function createEvent(body: {
     eventRows = await sql`
       INSERT INTO events (title, description, date, start_time, end_time)
       VALUES (${title}, ${description}, ${date}, ${resolvedTimes.startTime}, ${resolvedTimes.endTime})
-      RETURNING id, title, description, date, start_time, end_time, created_by, created_at
+      RETURNING id, title, description, date::text AS date, start_time, end_time, created_by, created_at
     ` as EventRow[]
   } catch (error) {
     // #303 code-review, high-effort round, Finding 2: use the same
@@ -659,7 +659,7 @@ export async function createEvent(body: {
       blockRows = await sql`
         INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day)
         VALUES (${event.id}, ${roomId}, ${date}, ${resolvedTimes.startTime}, ${resolvedTimes.endTime}, ${allDay})
-        RETURNING id, event_id, room_id, date, start_time, end_time, all_day
+        RETURNING id, event_id, room_id, date::text AS date, start_time, end_time, all_day
       ` as EventRoomBlockRow[]
     } catch (error) {
       // #303 code-review round 3, Finding 1: the event insert above and this
@@ -716,7 +716,7 @@ export async function updateEvent(
   let currentRows: Array<Pick<EventRow, 'title' | 'description' | 'date' | 'start_time' | 'end_time' | 'title_es' | 'title_en'>>
   try {
     currentRows = await sql`
-      SELECT title, description, date, start_time, end_time, title_es, title_en
+      SELECT title, description, date::text AS date, start_time, end_time, title_es, title_en
       FROM events
       WHERE id = ${id}
       LIMIT 1
@@ -759,7 +759,7 @@ export async function updateEvent(
           start_time  = ${anchor.start_time},
           end_time    = ${anchor.end_time}
         WHERE id = ${id}
-        RETURNING id, title, description, date, start_time, end_time, created_by, created_at
+        RETURNING id, title, description, date::text AS date, start_time, end_time, created_by, created_at
       ` as EventRow[]
     } catch (error) {
       mapEventWriteError(error)
@@ -778,7 +778,7 @@ export async function updateEvent(
       preExistingBlocks = await sql`
         DELETE FROM event_room_blocks
         WHERE event_id = ${id}
-        RETURNING id, event_id, room_id, date, start_time, end_time, all_day
+        RETURNING id, event_id, room_id, date::text AS date, start_time, end_time, all_day
       ` as EventRoomBlockRow[]
     } catch {
       // Round 4 audit: the UPDATE events above already committed new field
@@ -808,7 +808,7 @@ export async function updateEvent(
         const blockRows = await sql`
           INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day)
           VALUES (${id}, ${block.room_id}, ${block.date}, ${block.start_time}, ${block.end_time}, ${block.all_day})
-          RETURNING id, event_id, room_id, date, start_time, end_time, all_day
+          RETURNING id, event_id, room_id, date::text AS date, start_time, end_time, all_day
         ` as EventRoomBlockRow[]
 
         const blockRow = blockRows[0]
@@ -889,7 +889,7 @@ export async function updateEvent(
         start_time  = ${resolvedTimes.startTime},
         end_time    = ${resolvedTimes.endTime}
       WHERE id = ${id}
-      RETURNING id, title, description, date, start_time, end_time, created_by, created_at
+      RETURNING id, title, description, date::text AS date, start_time, end_time, created_by, created_at
     ` as EventRow[]
   } catch (error) {
     // High-effort review round, Finding 2: mapEventWriteError, matching the
@@ -913,7 +913,7 @@ export async function updateEvent(
     blocksToRestoreOnFailure = await sql`
       DELETE FROM event_room_blocks
       WHERE event_id = ${id}
-      RETURNING id, event_id, room_id, date, start_time, end_time, all_day
+      RETURNING id, event_id, room_id, date::text AS date, start_time, end_time, all_day
     ` as EventRoomBlockRow[]
   } catch {
     // Round 4 audit: the UPDATE events above already committed new field
@@ -930,7 +930,7 @@ export async function updateEvent(
       blockRows = await sql`
         INSERT INTO event_room_blocks (event_id, room_id, date, start_time, end_time, all_day)
         VALUES (${id}, ${roomId}, ${date}, ${resolvedTimes.startTime}, ${resolvedTimes.endTime}, ${allDay})
-        RETURNING id, event_id, room_id, date, start_time, end_time, all_day
+        RETURNING id, event_id, room_id, date::text AS date, start_time, end_time, all_day
       ` as EventRoomBlockRow[]
     } catch (error) {
       await restoreDeletedBlocksOnUpdateFailure(blocksToRestoreOnFailure)
@@ -1044,7 +1044,7 @@ export async function deleteEventCascade(id: string): Promise<void> {
   let blocks: Array<{ room_id: string; date: string; start_time: string; end_time: string }>
   try {
     blocks = await sql`
-      SELECT room_id, date, start_time, end_time
+      SELECT room_id, date::text AS date, start_time, end_time
       FROM event_room_blocks
       WHERE event_id = ${id}
     ` as Array<{ room_id: string; date: string; start_time: string; end_time: string }>
@@ -1231,7 +1231,7 @@ export async function listEventsBlockingRoom(
   let events: EventRow[]
   try {
     events = await sql`
-      SELECT id, title, description, date, start_time, end_time, created_by, created_at
+      SELECT id, title, description, date::text AS date, start_time, end_time, created_by, created_at
       FROM events
       WHERE id = ANY(${eventIds})
     ` as EventRow[]
