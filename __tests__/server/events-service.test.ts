@@ -296,7 +296,7 @@ describe('events-service — createEvent (legacy single-block) with roomId cance
     expect(sqlMock.sql).not.toHaveBeenCalled()
   })
 
-  it('rolls back (deletes) the just-inserted event row when the room-block insert fails (#303 code-review round 3, Finding 1)', async () => {
+  it('rolls back (deletes) the just-inserted event row when the room-block insert fails', async () => {
     // The event insert and the block insert are two separate statements
     // (non-transactional, same constraint documented at the top of
     // events-service.ts). A failure here must not leave an orphaned event
@@ -331,7 +331,7 @@ describe('events-service — createEvent (legacy single-block) with roomId cance
     expect(rollbackEventDeleteSpy.mock.calls[0][0].values).toEqual(['evt-1'])
   })
 
-  it('rolls back the just-inserted event AND block rows when cancelOverlappingReservationsForRoom throws (#303 code-review round 5)', async () => {
+  it('rolls back the just-inserted event AND block rows when cancelOverlappingReservationsForRoom throws', async () => {
     // This call was previously outside any try/catch — a failure here left
     // the just-committed event + block rows with no compensation. Now
     // wrapped: rollbackPartialMultiBlockWrite(deleteEvent: true) deletes the
@@ -524,7 +524,7 @@ describe('events-service — updateEvent (legacy single-block) with cancellation
     })
   })
 
-  it('throws 404 (not 500) when the events UPDATE...RETURNING affects 0 rows — event deleted between the read and the write (#303 code-review Finding 3)', async () => {
+  it('throws 404 (not 500) when the events UPDATE...RETURNING affects 0 rows — event deleted between the read and the write', async () => {
     // Distinct from "throws 404 when event does not exist" above (which
     // fails the upfront currentRows SELECT) and from "throws 500 when the
     // events update fails" above (which throws from the UPDATE itself).
@@ -739,7 +739,7 @@ describe('events-service — updateEvent (legacy single-block) with cancellation
     ])
   })
 
-  it('undoes the event-field update, the just-inserted block, AND restores the pre-existing block(s) when cancelOverlappingReservationsForRoom throws (#303 code-review round 5)', async () => {
+  it('undoes the event-field update, the just-inserted block, AND restores the pre-existing block(s) when cancelOverlappingReservationsForRoom throws', async () => {
     // By the time this call runs, the event fields were updated, the old
     // block(s) deleted, and the new block inserted. A failure here must undo
     // all three: delete the newly-inserted block (rollbackPartialMultiBlockWrite,
@@ -847,7 +847,7 @@ describe('events-service — updateEvent (legacy single-block) with cancellation
     ])
   })
 
-  describe('isClubEventRow guard (Finding 3)', () => {
+  describe('isClubEventRow guard on legacy updateEvent/deleteEvent', () => {
     it('updateEvent rejects club event rows (both title_es and title_en set)', async () => {
       addCurrentEventHandler(() => [
         {

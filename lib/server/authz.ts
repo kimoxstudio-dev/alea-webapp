@@ -12,9 +12,13 @@ import type { SessionUser } from '@/lib/server/auth'
  * This module is intentionally decoupled from any specific query builder or
  * response wrapper: it operates on plain row objects keyed by column name,
  * matching whatever shape `sql\`...\`` (lib/db/client.ts, Neon's
- * tagged-template driver) returns. It is the Neon-era counterpart to
- * `assertMemberRowsScoped()` in `lib/server/data-scoping.ts` (kept as-is,
- * read-only, for the not-yet-migrated Supabase code paths).
+ * tagged-template driver) returns. `assertMemberRowsScoped()` in
+ * `lib/server/data-scoping.ts` is a second, independently-live guard with the
+ * same invariant (member/admin row isolation) — both are Neon-era code used
+ * by different services (`assertMemberRowsScopedSql()` here guards
+ * `users-service.ts`; `assertMemberRowsScoped()` guards
+ * `saved-games-service.ts` and `reservations-service.ts`). Neither is
+ * deprecated; keep both.
  */
 
 /** Minimal shape a raw-SQL row must have to be ownership-checkable. */

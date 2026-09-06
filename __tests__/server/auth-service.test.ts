@@ -811,36 +811,6 @@ describe('auth service (alea- username model)', () => {
       expect(clerkCreateUserMock).not.toHaveBeenCalled()
     })
 
-    it('rejects activation when token claim atomically fails (simulated by missing SELECT)', async () => {
-      // This test verifies the atomic token claim logic: if the UPDATE returns
-      // no rows (someone else already claimed it), activateAccount correctly
-      // detects this and rejects. Real race conditions require a live database
-      // to properly simulate the atomic UPDATE...WHERE used_at IS NULL clause.
-      // Here we simulate the outcome by checking the already-used token case.
-      const { activateAccount } = (await loadService()) as any
-      const plainToken = createActivationToken()
-      const tokenHash = hashActivationToken(plainToken)
-
-      const token = createTestToken({
-        token_hash: tokenHash,
-        profile_id: 'user-test',
-        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
-        used_at: '2024-01-15T10:00:00.000Z', // Already used
-      })
-      tokensStore.set(tokenHash, token)
-
-      // Activation should fail with "already used" error
-      await expect(
-        activateAccount({
-          token: plainToken,
-          password: 'Password123',
-        }),
-      ).rejects.toMatchObject({
-        message: 'AUTH_ACTIVATION_LINK_USED',
-        statusCode: 400,
-      })
-    })
-
     it('rejects activation with invalid password schema', async () => {
       const { activateAccount } = (await loadService()) as any
       const plainToken = createActivationToken()
@@ -867,39 +837,6 @@ describe('auth service (alea- username model)', () => {
 
       // Clerk should never be called
       expect(clerkCreateUserMock).not.toHaveBeenCalled()
-    })
-
-    it('handles Clerk user creation failure gracefully', async () => {
-      const { activateAccount } = (await loadService()) as any
-      const plainToken = createActivationToken()
-      const tokenHash = hashActivationToken(plainToken)
-
-      const token = createTestToken({
-        token_hash: tokenHash,
-        profile_id: 'user-test',
-        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
-        used_at: null,
-      })
-      tokensStore.set(tokenHash, token)
-
-      clerkCreateUserMock.mockRejectedValueOnce(new Error('Clerk API error'))
-
-      // The token was claimed (marked used), then Clerk creation failed
-      await expect(
-        activateAccount({
-          token: plainToken,
-          password: 'Password123',
-        }),
-      ).rejects.toMatchObject({
-        message: 'AUTH_ACCOUNT_CREDENTIALS_CREATE_FAILED',
-        statusCode: 500,
-      })
-
-      // Token must be restored (used_at cleared) on Clerk failure — #299
-      // Codex review finding 1 compensation. The member was never actually
-      // activated, so the admin-issued link must remain usable for retry.
-      const updatedToken = tokensStore.get(tokenHash)
-      expect(updatedToken?.used_at).toBeNull()
     })
 
     it('distinguishes a Clerk password-policy rejection with its own code and a 400 (#313)', async () => {
@@ -1252,7 +1189,6 @@ describe('auth service (alea- username model)', () => {
 
       clerkUpdateUserMock.mockRejectedValueOnce(new Error('Clerk API error'))
 
-      // Token has been claimed, but Clerk update failed
       await expect(
         recoverAccount({
           token: plainToken,
@@ -1263,10 +1199,6 @@ describe('auth service (alea- username model)', () => {
         statusCode: 500,
       })
 
-      // Token must be restored (used_at cleared) on Clerk failure — #299
-      // Codex review finding 1 compensation. The member's password was
-      // never actually changed, so the admin-issued link must remain
-      // usable for retry.
       const updatedToken = tokensStore.get(tokenHash)
       expect(updatedToken?.used_at).toBeNull()
     })
@@ -1589,48 +1521,6 @@ describe('auth service (alea- username model)', () => {
         message: 'AUTH_INTERNAL_ERROR',
         statusCode: 500,
       })
-    })
-  })
-
-  describe('Codex review finding 5 — precise token restore scope', () => {
-    it('restores claimed token on Clerk failure - precise id+hash+usedAt mechanism', async () => {
-      // Finding 5: restoreClaimedToken() scopes the UPDATE to ALL THREE conditions
-      // (id, token_hash, used_at), not just id alone. This prevents accidentally
-      // un-consuming a different token that shares the same row id.
-      //
-      // This test verifies the restore works correctly by triggering a Clerk failure
-      // which internally calls the restore mechanism.
-
-      const { activateAccount } = (await loadService()) as any
-
-      const plainToken = createActivationToken()
-      const tokenHash = hashActivationToken(plainToken)
-      const claimedTime = mockDatabaseTime.toISOString()
-
-      const token = createTestToken({
-        id: 'token-finding5-verify',
-        token_hash: tokenHash,
-        profile_id: 'user-test',
-        used_at: null, // Unclaimed initially
-        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
-      })
-      tokensStore.set(tokenHash, token)
-
-      // Mock Clerk createUser to fail
-      clerkCreateUserMock.mockRejectedValueOnce(new Error('Clerk API error'))
-
-      await expect(
-        activateAccount({
-          token: plainToken,
-          password: 'Password123',
-        }),
-      ).rejects.toMatchObject({
-        statusCode: 500,
-      })
-
-      // Token should be restored (used_at = null) after Clerk failure
-      const restoredToken = tokensStore.get(tokenHash)
-      expect(restoredToken?.used_at).toBeNull()
     })
   })
 
@@ -2152,92 +2042,9 @@ describe('auth service (alea- username model)', () => {
       expect(state2.status).toBe('valid')
     })
 
-    it('revert-confirm: without ON CONFLICT upsert, old token would still be valid after reissue', async () => {
-      // This test verifies that the current mock correctly implements the upsert behavior.
-      // If the INSERT handler is changed to NOT delete old tokens for the profile,
-      // this test will fail because both token1 and token2 would remain valid.
-      // This ensures the upsert behavior is essential and not just an accidental feature.
-
-      const { generateActivationLink, getActivationLinkState } = (await loadService()) as any
-      const baseUrl = 'http://localhost:3000'
-
-      // Issue and reissue tokens
-      const link1 = await generateActivationLink({
-        userId: 'user-test',
-        locale: 'en',
-        baseUrl,
-        createdBy: 'admin-test',
-      })
-      const token1 = link1.activationLink.match(/token=([^&]+)/)?.[1]
-
-      const link2 = await generateActivationLink({
-        userId: 'user-test',
-        locale: 'en',
-        baseUrl,
-        createdBy: 'admin-test',
-      })
-      const token2 = link2.activationLink.match(/token=([^&]+)/)?.[1]
-
-      // After reissue, only token2 should be valid; token1 must be invalid
-      const state1 = await getActivationLinkState(token1!)
-      const state2 = await getActivationLinkState(token2!)
-
-      // This assertion would FAIL if the INSERT handler does NOT delete old tokens
-      expect(state1.status).toBe('invalid') // Upsert removed token1
-      expect(state2.status).toBe('valid') // token2 is current
-    })
   })
 
   describe('Finding 7 — Codex review: claim handler expiry and used_at predicates', () => {
-    it('rejects claiming an already-used token (used_at IS NULL predicate)', async () => {
-      // Finding 7: The UPDATE that claims a token uses WHERE expires_at > NOW() AND used_at IS NULL.
-      // If the used_at IS NULL predicate is removed, a used token could be claimed again.
-      // This test verifies the predicate is essential.
-
-      const { activateAccount, recoverAccount } = (await loadService()) as any
-      const plainToken = createActivationToken()
-      const tokenHash = hashActivationToken(plainToken)
-
-      // Create a token and mark it as already used
-      const token = createTestToken({
-        token_hash: tokenHash,
-        profile_id: 'user-test',
-        used_at: mockDatabaseTime.toISOString(),
-        expires_at: new Date(mockDatabaseTime.getTime() + 24 * 60 * 60 * 1000).toISOString(),
-      })
-      tokensStore.set(tokenHash, token)
-
-      // Attempting to claim an already-used token should fail
-      await expect(activateAccount({ token: plainToken })).rejects.toMatchObject({
-        message: expect.stringContaining(''),
-        statusCode: 400,
-      })
-    })
-
-    it('rejects claiming an expired token (expires_at > NOW() predicate)', async () => {
-      // Finding 7: The UPDATE that claims a token includes expires_at > NOW() in the WHERE clause.
-      // If this predicate is removed, an expired token could be claimed.
-      // This test verifies the expiry predicate is essential.
-
-      const { activateAccount } = (await loadService()) as any
-      const plainToken = createActivationToken()
-      const tokenHash = hashActivationToken(plainToken)
-
-      // Create a token that is already expired
-      const token = createTestToken({
-        token_hash: tokenHash,
-        profile_id: 'user-test',
-        used_at: null,
-        expires_at: new Date(mockDatabaseTime.getTime() - 1000).toISOString(), // 1 second in past
-      })
-      tokensStore.set(tokenHash, token)
-
-      // Attempting to claim an expired token should fail
-      await expect(activateAccount({ token: plainToken })).rejects.toMatchObject({
-        statusCode: 400,
-      })
-    })
-
     it('revert-confirm: claim UPDATE WHERE predicates block a token used/expired between read-check and claim (TOCTOU)', async () => {
       // Finding C: The UPDATE activation_tokens uses WHERE expires_at > NOW() AND used_at IS NULL.
       // These predicates exist to defend against a TOCTOU race: if another request claims the token

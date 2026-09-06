@@ -573,7 +573,7 @@ describe('club-events-service', () => {
       expect(result.linkUrl).toBeNull()
     })
 
-    it('creates a club event with titleEn absent, succeeds with title_en === title_es in DB (OIR-206)', async () => {
+    it('creates a club event with titleEn absent, succeeds with title_en === title_es in DB', async () => {
       addCreateInsertHandler()
       const { createClubEvent } = await loadClubEventsService()
 
@@ -589,7 +589,7 @@ describe('club-events-service', () => {
       expect(result.titleEn).toBe('Evento en Español') // Fallback to ES
     })
 
-    it('creates a club event with titleEn empty string, succeeds with fallback (OIR-206)', async () => {
+    it('creates a club event with titleEn empty string, succeeds with fallback', async () => {
       addCreateInsertHandler()
       const { createClubEvent } = await loadClubEventsService()
 
@@ -603,7 +603,7 @@ describe('club-events-service', () => {
       expect(result.titleEn).toBe('Evento Viernes')
     })
 
-    it('creates a club event with explicit titleEn, preserves EN value (OIR-206)', async () => {
+    it('creates a club event with explicit titleEn, preserves EN value', async () => {
       addCreateInsertHandler()
       const { createClubEvent } = await loadClubEventsService()
 
@@ -617,7 +617,7 @@ describe('club-events-service', () => {
       expect(result.titleEn).toBe('Chess Tournament')
     })
 
-    it('creates a club event with blurbEn absent, falls back to blurbEs (OIR-206)', async () => {
+    it('creates a club event with blurbEn absent, falls back to blurbEs', async () => {
       addCreateInsertHandler()
       const { createClubEvent } = await loadClubEventsService()
 
@@ -634,7 +634,7 @@ describe('club-events-service', () => {
       expect(result.blurbEn).toBe('Descripción breve')
     })
 
-    it('creates a club event with categoryEn absent, falls back to categoryEs (OIR-206)', async () => {
+    it('creates a club event with categoryEn absent, falls back to categoryEs', async () => {
       addCreateInsertHandler()
       const { createClubEvent } = await loadClubEventsService()
 
@@ -652,7 +652,7 @@ describe('club-events-service', () => {
       expect(result.categoryEn).toBe('Torneo')
     })
 
-    it('rejects categoryEn as non-string object (still 400, not fallback) (OIR-206)', async () => {
+    it('rejects categoryEn as non-string object (still 400, not fallback)', async () => {
       const { createClubEvent } = await loadClubEventsService()
 
       await expect(
@@ -667,7 +667,7 @@ describe('club-events-service', () => {
       ).rejects.toMatchObject({ statusCode: 400, message: expect.stringContaining('must be a string') })
     })
 
-    it('creates a club event with blocksRooms:true, inserting a room block via the sequential SQL flow (Finding 1)', async () => {
+    it('creates a club event with blocksRooms:true, inserting a room block via the sequential SQL flow', async () => {
       addCreateInsertHandler()
       addRoomsExistHandler()
       addTablesHandler()
@@ -715,7 +715,7 @@ describe('club-events-service', () => {
       expect(result.roomBlocks[0].endTime).toBe('22:00')
     })
 
-    it('rolls back (deletes) the created event when the block/material write fails, leaving no orphan row (PR #149 review)', async () => {
+    it('rolls back (deletes) the created event when the block/material write fails, leaving no orphan row', async () => {
       addCreateInsertHandler()
       addRoomsExistHandler()
       // Simulate a transient failure in the block-write step (after the event
@@ -751,7 +751,7 @@ describe('club-events-service', () => {
       expect(deleteSpy).toHaveBeenCalledWith(['evt-new-1'])
     })
 
-    it('logs the orphaned event id when BOTH the block write and the compensating delete fail, and still rethrows the original error (PR #149 review round 2)', async () => {
+    it('logs the orphaned event id when BOTH the block write and the compensating delete fail, and still rethrows the original error', async () => {
       addCreateInsertHandler()
       addRoomsExistHandler()
       addEventExistsHandler(false)
@@ -802,7 +802,7 @@ describe('club-events-service', () => {
       consoleErrorSpy.mockRestore()
     })
 
-    it('rejects an unknown room id in schedules with 400 BEFORE inserting the event row (PR #149 review)', async () => {
+    it('rejects an unknown room id in schedules with 400 BEFORE inserting the event row', async () => {
       // No rooms "exist" — every referenced room id is unknown.
       addRoomsExistHandler(['room-does-not-exist'])
       const insertSpy = vi.fn()
@@ -840,7 +840,7 @@ describe('club-events-service', () => {
       expect(insertSpy).not.toHaveBeenCalled()
     })
 
-    it('rejects malformed schedules with 400 and no insert on events table (Finding 2)', async () => {
+    it('rejects malformed schedules with 400 and no insert on events table', async () => {
       const insertSpy = vi.fn()
       sqlMock.addHandler({
         name: 'INSERT events (should never be called)',
@@ -868,7 +868,7 @@ describe('club-events-service', () => {
       expect(insertSpy).not.toHaveBeenCalled()
     })
 
-    it('rejects blurbEs as object with 400 (Finding 5)', async () => {
+    it('rejects blurbEs as object with 400', async () => {
       const { createClubEvent } = await loadClubEventsService()
 
       await expect(
@@ -882,7 +882,7 @@ describe('club-events-service', () => {
       ).rejects.toMatchObject({ statusCode: 400 })
     })
 
-    it('rejects categoryEn as array with 400 (Finding 5)', async () => {
+    it('rejects categoryEn as array with 400', async () => {
       const { createClubEvent } = await loadClubEventsService()
 
       await expect(
@@ -952,7 +952,7 @@ describe('club-events-service', () => {
       ).rejects.toMatchObject({ statusCode: 404 })
     })
 
-    it('rejects malformed schedules with 400 and no update on events table (Finding 2)', async () => {
+    it('rejects malformed schedules with 400 and no update on events table', async () => {
       addCurrentEventSelectHandler(currentEventRow())
       const updateSpy = vi.fn()
       sqlMock.addHandler({
@@ -1008,7 +1008,7 @@ describe('club-events-service', () => {
       expect(blockInsertSpy).not.toHaveBeenCalled()
     })
 
-    it('replaces blocks when schedules differ from current blocks (Finding 4)', async () => {
+    it('replaces blocks when schedules differ from current blocks', async () => {
       const currentBlocks = [
         { id: 'block-1', event_id: 'evt-1', room_id: 'room-1', table_id: null, date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00', all_day: false },
       ]
@@ -1050,7 +1050,7 @@ describe('club-events-service', () => {
       expect(roomId).toBe('room-2')
     })
 
-    it('rejects an unknown room id in schedules with 400 BEFORE updating the event fields (PR #149 review)', async () => {
+    it('rejects an unknown room id in schedules with 400 BEFORE updating the event fields', async () => {
       addCurrentEventSelectHandler(currentEventRow())
       addRoomsExistHandler(['room-unknown'])
       const updateSpy = vi.fn()
@@ -1078,7 +1078,7 @@ describe('club-events-service', () => {
       expect(updateSpy).not.toHaveBeenCalled()
     })
 
-    it('rejects an unknown table id in schedules with 400 BEFORE updating the event fields (PR #154 review)', async () => {
+    it('rejects an unknown table id in schedules with 400 BEFORE updating the event fields', async () => {
       addCurrentEventSelectHandler(currentEventRow())
       addRoomsExistHandler()
       addTablesHandler({ missingTableIds: ['table-unknown'] })
@@ -1107,7 +1107,7 @@ describe('club-events-service', () => {
       expect(updateSpy).not.toHaveBeenCalled()
     })
 
-    it('surfaces a clear 400 (not an unhandled rejection) when room, table, AND equipment validation all fail concurrently (PR #354 Promise.all fix)', async () => {
+    it('surfaces a clear 400 (not an unhandled rejection) when room, table, AND equipment validation all fail concurrently (concurrent validation)', async () => {
       // validateRoomsExist/validateTablesExist/validateEquipmentExists now
       // run via Promise.all instead of sequential awaits — with all three
       // failing at once, Promise.all rejects with the first settled
@@ -1155,7 +1155,7 @@ describe('club-events-service', () => {
       expect(unhandledRejections).toHaveLength(0)
     })
 
-    it('rejects an unknown equipment id in materials with 400 BEFORE updating the event fields (PR #154 review)', async () => {
+    it('rejects an unknown equipment id in materials with 400 BEFORE updating the event fields', async () => {
       addCurrentEventSelectHandler(currentEventRow())
       addEquipmentExistsHandler(['equip-unknown'])
       const updateSpy = vi.fn()
@@ -1180,7 +1180,7 @@ describe('club-events-service', () => {
       expect(updateSpy).not.toHaveBeenCalled()
     })
 
-    it('reverts the event fields UPDATE when the block-replace step fails, leaving no partial update (PR #149 / PR #154 review)', async () => {
+    it('reverts the event fields UPDATE when the block-replace step fails, leaving no partial update', async () => {
       addCurrentEventSelectHandler(currentEventRow({ title_es: 'Evento Antiguo' }))
       addRoomsExistHandler()
       addTablesHandler()
@@ -1209,7 +1209,7 @@ describe('club-events-service', () => {
       expect(revertSpy.mock.calls[0][0][0]).toBe('Evento Antiguo')
     })
 
-    it('logs when both the block-replace step and the compensating revert fail, and still rethrows the original error (PR #149 / PR #154 review)', async () => {
+    it('logs when both the block-replace step and the compensating revert fail, and still rethrows the original error', async () => {
       addCurrentEventSelectHandler(currentEventRow())
       addRoomsExistHandler()
       addTablesHandler()
@@ -1368,7 +1368,7 @@ describe('club-events-service', () => {
       ).rejects.toMatchObject({ statusCode: 403 })
     })
 
-    it('falls back to the legacy `title` column for an internal-only event (title_es/title_en null) (PR #354 fix)', async () => {
+    it('falls back to the legacy `title` column for an internal-only event (title_es/title_en null)', async () => {
       // toAdminClubEvent does `row.title_es ?? row.title` / `row.title_en ??
       // row.title` — listAdminClubEvents's SELECT must fetch `title` or that
       // fallback silently resolves to undefined for internal-only rows.
@@ -1425,7 +1425,7 @@ describe('club-events-service', () => {
       expect(result.upcoming.map((e) => e.id)).toContain('evt-upcoming-1')
     })
 
-    it('filters out a row with a null title_es/title_en via assertPublicClubEventRowsHaveBilingualTitles (defense-in-depth, PR #354 fix)', async () => {
+    it('filters out a row with a null title_es/title_en via assertPublicClubEventRowsHaveBilingualTitles (defense-in-depth)', async () => {
       // The WHERE clause is the primary guarantee, but this guard is the
       // application-layer backstop for a regression in that query (RLS was
       // dropped in the Neon migration). Simulate that regression by having
@@ -1518,7 +1518,7 @@ describe('club-events-service', () => {
     })
   })
 
-  describe('updateClubEvent with fallback semantics edge cases (OIR-206 round 2)', () => {
+  describe('updateClubEvent EN/ES title fallback semantics edge cases', () => {
     it('rule 2: explicit different titleEn + blank titleEn payload = re-enable auto-copy to new ES', async () => {
       addCurrentEventSelectHandler(currentEventRow({ title_es: 'Evento Antiguo', title_en: 'Old Explicit Title' }))
       addUpdateEventHandler((values) => [currentEventRow({ title_es: values[0] as string, title_en: values[1] as string })])
@@ -1593,7 +1593,7 @@ describe('club-events-service', () => {
   // write-loop failures, not the lookup-before-the-loop or read-back-after
   // failure branches.
   // ---------------------------------------------------------------------------
-  describe('applyClubEventBlocksAndMaterials rollback resilience (#304 code-review)', () => {
+  describe('applyClubEventBlocksAndMaterials rollback resilience', () => {
     it('restores deleted blocks and materials when the batched room->table lookup fails (high-effort finding)', async () => {
       const deletedBlockRow = {
         id: 'block-old-1', event_id: 'evt-1', room_id: 'room-old', table_id: null,
@@ -1852,7 +1852,7 @@ describe('club-events-service', () => {
     })
   })
 
-  describe('cancelActiveSavedGamesForRoomBlock / restoreCancelledSavedGames (#334)', () => {
+  describe('cancelActiveSavedGamesForRoomBlock / restoreCancelledSavedGames (table-scoped vs room-wide)', () => {
     it('cancels active saved games scoped to the block\'s own table only, when block.table_id is set — not room-wide (code-review fix)', async () => {
       addCreateInsertHandler()
       addRoomsExistHandler()
