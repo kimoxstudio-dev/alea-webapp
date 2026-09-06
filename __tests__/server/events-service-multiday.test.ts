@@ -500,7 +500,7 @@ describe('events-service — createEvent multi-day (schedules)', () => {
     ).rejects.toMatchObject({ statusCode: 400 })
   })
 
-  it('maps a unique-violation (23505) from a duplicate schedule block insert to 400 (#303 code-review high-effort round)', async () => {
+  it('maps a unique-violation (23505) from a duplicate schedule block insert to 400', async () => {
     // event_room_blocks has a UNIQUE index on (event_id, room_id, date,
     // start_time, end_time) — see lib/db/schema/009_event_room_blocks.sql.
     // A duplicate block insert must 400 via mapEventWriteError, not fall
@@ -530,7 +530,7 @@ describe('events-service — createEvent multi-day (schedules)', () => {
     ).rejects.toMatchObject({ statusCode: 400 })
   })
 
-  it('preserves a roomless block (roomId: null) as a non-persisted schedule entry instead of dropping it (#303 code-review post-PR round, Finding 1)', async () => {
+  it('preserves a roomless block (roomId: null) as a non-persisted schedule entry instead of dropping it', async () => {
     addMultiBlockEventInsertHandler(() => [makeEventRow({ date: '2026-07-10', start_time: '10:00:00', end_time: '12:00:00' })])
     const blockInsertSpy = vi.fn((values: unknown[]) => [
       makeBlockRow({
@@ -714,7 +714,7 @@ describe('events-service — createEvent multi-day (schedules)', () => {
       expect(rollbackEventDeleteSpy).not.toHaveBeenCalled()
     })
 
-    it('restores a cancelled reservation to its own original status (pending), not hardcoded active (#303 code-review post-PR round, Finding 5)', async () => {
+    it('restores a cancelled reservation to its own original status (pending), not hardcoded active', async () => {
       addMultiBlockEventInsertHandler(() => [makeEventRow({ id: 'evt-rollback-status-1' })])
 
       let insertCallIndex = 0
@@ -790,7 +790,7 @@ describe('events-service — createEvent multi-day (schedules)', () => {
       expect(restoreToActiveSpy).not.toHaveBeenCalled()
     })
 
-    it('restores a cancelled reservation to active when that was its own original status (#303 code-review post-PR round, Finding 5)', async () => {
+    it('restores a cancelled reservation to active when that was its own original status', async () => {
       addMultiBlockEventInsertHandler(() => [makeEventRow({ id: 'evt-rollback-status-2' })])
 
       let insertCallIndex = 0
@@ -1078,7 +1078,7 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
     ).rejects.toMatchObject({ statusCode: 400 })
   })
 
-  it('preserves a roomless block (roomId: null) as a non-persisted schedule entry, even though the unconditional DELETE already wiped all prior blocks (#303 code-review post-PR round, Finding 2)', async () => {
+  it('preserves a roomless block (roomId: null) as a non-persisted schedule entry, even though the unconditional DELETE already wiped all prior blocks', async () => {
     addCurrentEventHandler(() => [
       { title: 'Existing', description: null, date: '2026-07-10', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null },
     ])
@@ -1246,7 +1246,7 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
       expect(eventsDeleteSpy).not.toHaveBeenCalled()
     })
 
-    it('also restores the pre-existing blocks the unconditional DELETE wiped, and reverts the event-row field mutation, when a later block insert fails (#303 code-review round 4)', async () => {
+    it('also restores the pre-existing blocks the unconditional DELETE wiped, and reverts the event-row field mutation, when a later block insert fails', async () => {
       const originalRow = { title: 'Existing', description: 'Existing desc', date: '2026-07-10', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null }
       addCurrentEventHandler(() => [originalRow])
       addMultiBlockEventUpdateHandler(() => [makeEventRow({ id: 'evt-1', title: 'Updated Multi-Day' })])
@@ -1368,7 +1368,7 @@ describe('events-service — updateEvent multi-day (schedules)', () => {
       ])
     })
 
-    it('reverts the event-row field mutation when the unconditional block DELETE itself fails (#303 code-review round 4 audit)', async () => {
+    it('reverts the event-row field mutation when the unconditional block DELETE itself fails', async () => {
       const originalRow = { title: 'Existing', description: null, date: '2026-07-10', start_time: '18:00:00', end_time: '22:00:00', title_es: null, title_en: null }
       addCurrentEventHandler(() => [originalRow])
       addMultiBlockEventUpdateHandler(() => [makeEventRow({ id: 'evt-1', title: 'Updated Multi-Day' })])

@@ -377,7 +377,7 @@ function addEventMaterialsSelectHandler(materials: unknown[] = []) {
   })
 }
 
-describe('OIR-208: Unified Events', () => {
+describe('Unified events: bilingual titles, table-scoped blocks, and availability', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     roomsSqlMock.reset()
@@ -1259,7 +1259,7 @@ describe('OIR-208: Unified Events', () => {
   // `roomsSqlMock` between them. Fixed by nesting Round 2 inside this
   // describe (closing brace moved to the very end of the file) so it
   // inherits the same reset-per-test guarantee as every other section here.
-  describe('OIR-208 Round 2: Regression tests for fix 65485a1', () => {
+  describe('anchor-field preservation regressions (updateClubEvent partial updates)', () => {
     describe('updateClubEvent preserves legacy anchor fields', () => {
       it('preserves description on update with only title change', async () => {
         // NOTE: title_es/title_en are intentionally non-null here (a
