@@ -23,6 +23,8 @@ import {
 import type { AdminPartner } from '@/lib/types'
 import { OptionalEnglishFields } from './optional-english-fields'
 import { ImageUpload } from './image-upload'
+import { isValidOptionalUrl } from '@/lib/validations/url-client'
+import { useRequiredFieldFocus } from '@/lib/hooks/use-required-field-focus'
 
 interface PartnerFormState {
   name: string
@@ -32,6 +34,26 @@ interface PartnerFormState {
   descriptionEn: string
   sortOrder: string
   active: boolean
+}
+
+type PartnerRequiredField = 'name' | 'imageUrl' | 'linkUrl'
+
+interface PartnerFieldError {
+  field: PartnerRequiredField
+  kind: 'required' | 'invalidUrl'
+}
+
+/** Client-side validation mirroring the server's required/URL-shape checks
+ * (#313: a blank/invalid field used to either fall through to the browser's
+ * native, English-only validation bubble, or round-trip to the API for a
+ * generic 400 with no field-level feedback). Returns the first field to
+ * report, or `null` when the form is valid. */
+function getPartnerFieldError(form: PartnerFormState): PartnerFieldError | null {
+  if (!form.name.trim()) return { field: 'name', kind: 'required' }
+  if (!form.imageUrl.trim()) return { field: 'imageUrl', kind: 'required' }
+  if (!isValidOptionalUrl(form.imageUrl)) return { field: 'imageUrl', kind: 'invalidUrl' }
+  if (!isValidOptionalUrl(form.linkUrl)) return { field: 'linkUrl', kind: 'invalidUrl' }
+  return null
 }
 
 function emptyForm(): PartnerFormState {
@@ -62,12 +84,20 @@ function formToPayload(form: PartnerFormState): PartnerPayload {
   }
 }
 
-function PartnerFormFields({ form, onChange, idPrefix }: {
+function PartnerFormFields({ form, onChange, idPrefix, fieldError, getFieldRef }: {
   form: PartnerFormState
   onChange: (form: PartnerFormState) => void
   idPrefix: string
+  fieldError: PartnerFieldError | null
+  getFieldRef: ReturnType<typeof useRequiredFieldFocus<PartnerRequiredField>>['getRef']
 }) {
   const t = useTranslations('admin')
+  const tc = useTranslations('common')
+
+  const fieldErrorMessage = fieldError?.kind === 'invalidUrl' ? tc('invalidUrl') : tc('requiredField')
+  const nameErrorId = `${idPrefix}-name-error`
+  const imageUrlErrorId = `${idPrefix}-image-url-error`
+  const linkUrlErrorId = `${idPrefix}-link-url-error`
 
   return (
     <div className="space-y-4">
@@ -77,11 +107,17 @@ function PartnerFormFields({ form, onChange, idPrefix }: {
         </Label>
         <Input
           id={`${idPrefix}-name`}
+          ref={getFieldRef('name')}
           value={form.name}
           onChange={(e) => onChange({ ...form, name: e.target.value })}
           required
+          aria-invalid={fieldError?.field === 'name'}
+          aria-describedby={fieldError?.field === 'name' ? nameErrorId : undefined}
           className="bg-background-secondary border-border focus:border-primary/50"
         />
+        {fieldError?.field === 'name' && (
+          <p id={nameErrorId} role="alert" className="text-xs text-destructive">{fieldErrorMessage}</p>
+        )}
       </div>
       <div className="space-y-2">
         <ImageUpload
@@ -95,12 +131,18 @@ function PartnerFormFields({ form, onChange, idPrefix }: {
         </Label>
         <Input
           id={`${idPrefix}-image-url`}
+          ref={getFieldRef('imageUrl')}
           type="url"
           value={form.imageUrl}
           onChange={(e) => onChange({ ...form, imageUrl: e.target.value })}
           required
+          aria-invalid={fieldError?.field === 'imageUrl'}
+          aria-describedby={fieldError?.field === 'imageUrl' ? imageUrlErrorId : undefined}
           className="bg-background-secondary border-border focus:border-primary/50"
         />
+        {fieldError?.field === 'imageUrl' && (
+          <p id={imageUrlErrorId} role="alert" className="text-xs text-destructive">{fieldErrorMessage}</p>
+        )}
       </div>
       <div className="space-y-2">
         <Label htmlFor={`${idPrefix}-link-url`} className="text-sm text-muted-foreground font-medium">
@@ -108,11 +150,17 @@ function PartnerFormFields({ form, onChange, idPrefix }: {
         </Label>
         <Input
           id={`${idPrefix}-link-url`}
+          ref={getFieldRef('linkUrl')}
           type="url"
           value={form.linkUrl}
           onChange={(e) => onChange({ ...form, linkUrl: e.target.value })}
+          aria-invalid={fieldError?.field === 'linkUrl'}
+          aria-describedby={fieldError?.field === 'linkUrl' ? linkUrlErrorId : undefined}
           className="bg-background-secondary border-border focus:border-primary/50"
         />
+        {fieldError?.field === 'linkUrl' && (
+          <p id={linkUrlErrorId} role="alert" className="text-xs text-destructive">{fieldErrorMessage}</p>
+        )}
       </div>
       <div className="space-y-2">
         <Label htmlFor={`${idPrefix}-desc-es`} className="text-sm text-muted-foreground font-medium">
@@ -179,14 +227,23 @@ function PartnerRow({ partner }: { partner: AdminPartner }) {
   const [deleting, setDeleting] = useState(false)
   const [form, setForm] = useState<PartnerFormState>(() => formFromPartner(partner))
   const [saveError, setSaveError] = useState<string | null>(null)
+  const [fieldError, setFieldError] = useState<PartnerFieldError | null>(null)
   const [deleteError, setDeleteError] = useState<string | null>(null)
   const [toggleError, setToggleError] = useState<string | null>(null)
+  const { getRef: getFieldRef, focus: focusField } = useRequiredFieldFocus<PartnerRequiredField>()
 
   const updatePartner = useAdminUpdatePartner()
   const deletePartner = useAdminDeletePartner()
 
   async function handleSave(e: React.FormEvent) {
     e.preventDefault()
+    const error = getPartnerFieldError(form)
+    if (error) {
+      setFieldError(error)
+      focusField(error.field)
+      return
+    }
+    setFieldError(null)
     setSaveError(null)
     try {
       await updatePartner.mutateAsync({ id: partner.id, data: formToPayload(form) })
@@ -250,6 +307,7 @@ function PartnerRow({ partner }: { partner: AdminPartner }) {
             onClick={() => {
               setForm(formFromPartner(partner))
               setSaveError(null)
+              setFieldError(null)
               setEditing(true)
             }}
             className="h-8 w-8 text-muted-foreground hover:text-primary hover:bg-primary/10 transition-colors"
@@ -276,15 +334,24 @@ function PartnerRow({ partner }: { partner: AdminPartner }) {
         open={editing}
         onOpenChange={(open) => {
           setEditing(open)
-          if (!open) setSaveError(null)
+          if (!open) {
+            setSaveError(null)
+            setFieldError(null)
+          }
         }}
       >
         <DialogContent className="bg-card border-border max-h-[85vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle className="font-cinzel text-gradient-gold">{t('partners.editPartner')}</DialogTitle>
           </DialogHeader>
-          <form onSubmit={handleSave} className="space-y-4 py-2">
-            <PartnerFormFields form={form} onChange={setForm} idPrefix={`partner-edit-${partner.id}`} />
+          <form onSubmit={handleSave} noValidate className="space-y-4 py-2">
+            <PartnerFormFields
+              form={form}
+              onChange={setForm}
+              idPrefix={`partner-edit-${partner.id}`}
+              fieldError={fieldError}
+              getFieldRef={getFieldRef}
+            />
             {saveError && (
               <div role="alert" className="rounded-md bg-destructive/15 border border-destructive/30 px-3 py-2 text-sm text-destructive">
                 {saveError}
@@ -358,9 +425,18 @@ export function PartnersSection() {
   const [showCreate, setShowCreate] = useState(false)
   const [form, setForm] = useState<PartnerFormState>(emptyForm())
   const [createError, setCreateError] = useState<string | null>(null)
+  const [fieldError, setFieldError] = useState<PartnerFieldError | null>(null)
+  const { getRef: getFieldRef, focus: focusField } = useRequiredFieldFocus<PartnerRequiredField>()
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault()
+    const error = getPartnerFieldError(form)
+    if (error) {
+      setFieldError(error)
+      focusField(error.field)
+      return
+    }
+    setFieldError(null)
     setCreateError(null)
     try {
       await createPartner.mutateAsync(formToPayload(form))
@@ -394,6 +470,7 @@ export function PartnersSection() {
           onClick={() => {
             setForm(emptyForm())
             setCreateError(null)
+            setFieldError(null)
             setShowCreate(true)
           }}
           className="gap-1.5 border-primary/30 text-primary/80 hover:bg-primary/10 hover:border-primary/50 hover:text-primary transition-colors"
@@ -452,7 +529,10 @@ export function PartnersSection() {
         open={showCreate}
         onOpenChange={(open) => {
           setShowCreate(open)
-          if (!open) setCreateError(null)
+          if (!open) {
+            setCreateError(null)
+            setFieldError(null)
+          }
         }}
       >
         <DialogContent className="bg-card border-border max-h-[85vh] overflow-y-auto">
@@ -464,8 +544,14 @@ export function PartnersSection() {
               <DialogTitle className="font-cinzel text-gradient-gold">{t('partners.createPartner')}</DialogTitle>
             </div>
           </DialogHeader>
-          <form onSubmit={handleCreate} className="space-y-4 py-2">
-            <PartnerFormFields form={form} onChange={setForm} idPrefix="partner-new" />
+          <form onSubmit={handleCreate} noValidate className="space-y-4 py-2">
+            <PartnerFormFields
+              form={form}
+              onChange={setForm}
+              idPrefix="partner-new"
+              fieldError={fieldError}
+              getFieldRef={getFieldRef}
+            />
             {createError && (
               <div role="alert" className="rounded-md bg-destructive/15 border border-destructive/30 px-3 py-2 text-sm text-destructive">
                 {createError}

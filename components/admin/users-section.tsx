@@ -19,6 +19,7 @@ import {
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { useAdminUsers, useAdminUpdateUser, useAdminDeleteUser, useAdminPatchUser, useAdminGenerateActivationLink, useAdminGenerateRecoveryLink } from '@/lib/hooks/use-admin'
+import { getAuthServiceErrorMessageKey, extractErrorCode } from '@/lib/auth/service-error-messages'
 import { ImportMembersSection } from './import-members-section'
 import type { User } from '@/lib/types'
 
@@ -52,6 +53,7 @@ function StatusBadge({ isActive }: { isActive: boolean }) {
 export function UsersSection() {
   const t = useTranslations('admin')
   const tc = useTranslations('common')
+  const tAuth = useTranslations('auth')
   const locale = useLocale()
 
   const [page, setPage] = useState(1)
@@ -172,14 +174,15 @@ export function UsersSection() {
         })
       }
     } catch (error) {
+      // The server's `message` is always a machine-readable `ERROR_CODES.AUTH_*`
+      // code, never end-user text — mapped to a translated message here so
+      // no raw English string ever reaches this Spanish-capable page (#313).
+      const code = extractErrorCode(error)
+      const messageKey = getAuthServiceErrorMessageKey(code)
       setActivationFeedback({
         userId: user.id,
         kind: 'error',
-        message: error instanceof Error
-          ? error.message
-          : typeof error === 'object' && error !== null && 'message' in error && typeof error.message === 'string'
-            ? error.message
-            : t('activationLinkFailed'),
+        message: messageKey ? tAuth(messageKey as Parameters<typeof tAuth>[0]) : t('activationLinkFailed'),
       })
     }
   }
@@ -218,14 +221,13 @@ export function UsersSection() {
         })
       }
     } catch (error) {
+      // Same server-code → translated-message mapping as handleCopyActivationLink above.
+      const code = extractErrorCode(error)
+      const messageKey = getAuthServiceErrorMessageKey(code)
       setActivationFeedback({
         userId: user.id,
         kind: 'error',
-        message: error instanceof Error
-          ? error.message
-          : typeof error === 'object' && error !== null && 'message' in error && typeof error.message === 'string'
-            ? error.message
-            : t('recoveryLinkFailed'),
+        message: messageKey ? tAuth(messageKey as Parameters<typeof tAuth>[0]) : t('recoveryLinkFailed'),
       })
     }
   }

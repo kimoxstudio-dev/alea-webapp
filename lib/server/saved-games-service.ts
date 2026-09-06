@@ -36,12 +36,17 @@ type SavedGameJoinedRow = SavedGameRow & {
 // lock rather than an event-block conflict.
 type SavedGameRenewResultRow = Partial<SavedGameJoinedRow> & { was_inactive: boolean }
 
-const SAVED_GAME_COLUMNS = 'id, table_id, user_id, start_date, end_date, status, attendance_count, renewed_from_id, created_at, updated_at'
+// `::text` casts on start_date/end_date are load-bearing: without them the
+// Neon driver parses the `date` column (OID 1082) into a JS `Date` object,
+// not a string, and mapSavedGame's addDays(row.end_date, -14) throws when it
+// calls .split('-') on that shape (same failure mode documented in
+// reservation-no-show.ts's markExpiredReservationsAsNoShow).
+const SAVED_GAME_COLUMNS = 'id, table_id, user_id, start_date::text AS start_date, end_date::text AS end_date, status, attendance_count, renewed_from_id, created_at, updated_at'
 // Same shape as SAVED_GAME_COLUMNS plus the table/room join used by
 // `listSavedGamesForSession` — used to select back out of the `ins` CTE in
 // create/renew so the response includes real roomName/tableName instead of
 // nulls (RETURNING alone has no access to joined tables).
-const SAVED_GAME_JOINED_COLUMNS = 'sg.id, sg.table_id, sg.user_id, sg.start_date, sg.end_date, sg.status, sg.attendance_count, sg.renewed_from_id, sg.created_at, sg.updated_at, t.name AS table_name, rooms.name AS room_name'
+const SAVED_GAME_JOINED_COLUMNS = 'sg.id, sg.table_id, sg.user_id, sg.start_date::text AS start_date, sg.end_date::text AS end_date, sg.status, sg.attendance_count, sg.renewed_from_id, sg.created_at, sg.updated_at, t.name AS table_name, rooms.name AS room_name'
 
 function parseDate(value: unknown, field: string) {
   const date = String(value ?? '')

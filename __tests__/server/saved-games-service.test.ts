@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SessionUser } from '@/lib/server/auth'
-import { createSqlMock, neonDbError, whereConditionCount } from '../helpers/sql-mock'
+import { createSqlMock, hasExactSelectColumns, neonDbError, whereConditionCount } from '../helpers/sql-mock'
 
 /**
  * SAVED GAMES SERVICE TEST COVERAGE — raw SQL (Neon) migration (#301)
@@ -42,6 +42,16 @@ import { createSqlMock, neonDbError, whereConditionCount } from '../helpers/sql-
 const sqlMock = createSqlMock()
 
 vi.mock('@/lib/db/client', () => ({ sql: sqlMock.sql }))
+
+// Mirrors SAVED_GAME_JOINED_COLUMNS / SAVED_GAME_COLUMNS in
+// `lib/server/saved-games-service.ts` — the `start_date::text`/`end_date::text`
+// casts are load-bearing (an uncast `date` column parses as a JS `Date` via
+// the Neon driver, and `mapSavedGame`'s `addDays(row.end_date, -14).split('-')`
+// throws on that shape). Pinned by exact column-list match below so dropping
+// either cast fails a test instead of silently matching (#313 code-review
+// round 2, finding 3).
+const SAVED_GAME_JOINED_COLUMNS = 'sg.id, sg.table_id, sg.user_id, sg.start_date::text AS start_date, sg.end_date::text AS end_date, sg.status, sg.attendance_count, sg.renewed_from_id, sg.created_at, sg.updated_at, t.name AS table_name, rooms.name AS room_name'
+const SAVED_GAME_COLUMNS = 'id, table_id, user_id, start_date::text AS start_date, end_date::text AS end_date, status, attendance_count, renewed_from_id, created_at, updated_at'
 
 vi.mock('@/lib/club-time', async () => {
   const actual = await vi.importActual<typeof import('@/lib/club-time')>('@/lib/club-time')
@@ -180,7 +190,11 @@ describe('saved games service', () => {
     sqlMock.addHandler({
       name: 'SELECT joined saved games list',
       verb: 'select',
-      match: (stmt) => stmt.table === 'saved_games' && stmt.values.length === 2 && stmt.orderBy === 'sg.start_date asc',
+      match: (stmt) =>
+        stmt.table === 'saved_games' &&
+        stmt.values.length === 2 &&
+        stmt.orderBy === 'sg.start_date asc' &&
+        hasExactSelectColumns(stmt, SAVED_GAME_JOINED_COLUMNS),
       respond: (stmt) => {
         const [isAdmin, userId] = stmt.values
         return savedGamesState
@@ -204,7 +218,11 @@ describe('saved games service', () => {
     sqlMock.addHandler({
       name: 'SELECT saved game by id',
       verb: 'select',
-      match: (stmt) => stmt.table === 'saved_games' && stmt.values.length === 1 && whereConditionCount(stmt) === 1,
+      match: (stmt) =>
+        stmt.table === 'saved_games' &&
+        stmt.values.length === 1 &&
+        whereConditionCount(stmt) === 1 &&
+        hasExactSelectColumns(stmt, SAVED_GAME_COLUMNS),
       respond: (stmt) => {
         const row = savedGamesState.find((item) => item.id === String(stmt.values[0]))
         return row ? [row] : []
