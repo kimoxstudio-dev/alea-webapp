@@ -166,6 +166,8 @@ describe('ClubEventsSection — pending buttons reserve loader space without ani
     const button = screen.getByRole('button', { name: 'save' })
 
     expect(getIconSlot(button)).toHaveClass('h-4', 'w-4', 'shrink-0')
+    expect(getIconSlot(button)).toHaveClass('absolute')
+    expect(button).toHaveClass('relative')
     expect(queryLoader(button)).toBeNull()
     expect(button).not.toHaveAttribute('aria-busy', 'true')
   })
@@ -196,6 +198,8 @@ describe('ClubEventsSection — pending buttons reserve loader space without ani
     const button = within(dialog).getByRole('button', { name: 'delete' })
 
     expect(getIconSlot(button)).toHaveClass('h-4', 'w-4', 'shrink-0')
+    expect(getIconSlot(button)).toHaveClass('absolute')
+    expect(button).toHaveClass('relative')
     expect(queryLoader(button)).toBeNull()
   })
 

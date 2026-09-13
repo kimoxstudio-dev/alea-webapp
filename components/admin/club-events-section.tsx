@@ -937,11 +937,11 @@ function ClubEventFormDialog({
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)} className="border-border">
               {tc('cancel')}
             </Button>
-            <Button type="submit" disabled={isPending} aria-busy={isPending}>
-              <span className="inline-flex h-4 w-4 shrink-0">
-                {isPending && <DiceLoader size="sm" hideRole />}
+            <Button type="submit" disabled={isPending} aria-busy={isPending} className="relative">
+              <span className="absolute left-1/2 top-1/2 inline-flex h-4 w-4 shrink-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+                {isPending && <DiceLoader size="sm" hideRole className="text-primary-foreground" />}
               </span>
-              {tc('save')}
+              <span className={isPending ? 'opacity-0' : undefined}>{tc('save')}</span>
             </Button>
           </DialogFooter>
         </form>
@@ -1000,11 +1000,12 @@ function DeleteClubEventDialog({
             onClick={onConfirm}
             disabled={isPending}
             aria-busy={isPending}
+            className="relative"
           >
-            <span className="inline-flex h-4 w-4 shrink-0">
-              {isPending && <DiceLoader size="sm" hideRole />}
+            <span className="absolute left-1/2 top-1/2 inline-flex h-4 w-4 shrink-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+              {isPending && <DiceLoader size="sm" hideRole className="text-destructive-foreground" />}
             </span>
-            {tc('delete')}
+            <span className={isPending ? 'opacity-0' : undefined}>{tc('delete')}</span>
           </Button>
         </DialogFooter>
       </DialogContent>
