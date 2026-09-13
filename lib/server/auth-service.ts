@@ -759,8 +759,8 @@ export async function logout() {
  * `register()` was already fully dead before this pass — confirmed by
  * reading both call sites: `app/api/auth/register/route.ts` already returns
  * a hardcoded `410 Gone` ("Self-registration is disabled...") without
- * calling this file at all, and `app/[locale]/register/page.tsx` already
- * unconditionally redirects to `/login`. Both were already disabled by
+ * calling this file at all, and `app/[locale]/(app)/register/page.tsx`
+ * already unconditionally redirects to `/login`. Both were already disabled by
  * closed issue #206, well before this migration. There was no live code
  * path left to port — deleting it is not a design decision, just removing
  * confirmed-dead code.
@@ -773,7 +773,7 @@ export async function logout() {
  * service) is now the only credential store. "Migrating" this function to
  * raw SQL is not possible even in principle: there is nothing in Neon to
  * check a password against. The Clerk-era replacement for "log in" is
- * Clerk's own hosted sign-in UI (`app/[locale]/sign-in`, currently
+ * Clerk's own hosted sign-in UI (`app/[locale]/(app)/sign-in`, currently
  * disabled — re-enabling it and wiring `app/api/auth/login/route.ts`
  * accordingly is the next, frontend-owned step; see this task's handoff).
  */

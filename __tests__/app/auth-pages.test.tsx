@@ -33,7 +33,7 @@ describe('auth page guards', () => {
   })
 
   it('login page redirects to sign-in (legacy shim)', async () => {
-    const { default: LoginPage } = await import('@/app/[locale]/login/page')
+    const { default: LoginPage } = await import('@/app/[locale]/(app)/login/page')
     await LoginPage({ params: Promise.resolve({ locale: 'es' }) })
 
     // /login is a legacy redirect to /sign-in (same pattern as /register post-#206)
@@ -43,7 +43,7 @@ describe('auth page guards', () => {
   it('rooms page redirects unauthenticated users to sign-in', async () => {
     getSessionFromServerCookiesMock.mockResolvedValueOnce(null)
 
-    const { default: RoomsPage } = await import('@/app/[locale]/rooms/page')
+    const { default: RoomsPage } = await import('@/app/[locale]/(app)/rooms/page')
     await RoomsPage({
       params: Promise.resolve({ locale: 'es' }),
       searchParams: Promise.resolve({ date: '2026-08-22', court: '1' }),
@@ -60,7 +60,7 @@ describe('auth page guards', () => {
     getSessionFromServerCookiesMock.mockResolvedValueOnce({ id: 'session-1', role: 'member' })
     getCurrentUserMock.mockRejectedValueOnce(new Error('stale'))
 
-    const { default: RoomsPage } = await import('@/app/[locale]/rooms/page')
+    const { default: RoomsPage } = await import('@/app/[locale]/(app)/rooms/page')
     await RoomsPage({ params: Promise.resolve({ locale: 'es' }), searchParams: Promise.resolve({}) })
 
     expect(redirectMock).toHaveBeenCalledWith('/es/sign-in?redirect_url=%2Fes%2Frooms')
@@ -71,7 +71,7 @@ describe('auth page guards', () => {
     getSessionFromServerCookiesMock.mockResolvedValueOnce({ id: 'session-1', role: 'member' })
     getCurrentUserMock.mockResolvedValueOnce({ id: 'user-1' })
 
-    const { default: RoomsPage } = await import('@/app/[locale]/rooms/page')
+    const { default: RoomsPage } = await import('@/app/[locale]/(app)/rooms/page')
     await RoomsPage({ params: Promise.resolve({ locale: 'es' }), searchParams: Promise.resolve({}) })
 
     expect(markExpiredReservationsAsNoShowMock).toHaveBeenCalledOnce()
@@ -84,7 +84,7 @@ describe('auth page guards', () => {
 
     const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
-    const { default: RoomsPage } = await import('@/app/[locale]/rooms/page')
+    const { default: RoomsPage } = await import('@/app/[locale]/(app)/rooms/page')
     const result = await RoomsPage({ params: Promise.resolve({ locale: 'es' }), searchParams: Promise.resolve({}) })
 
     // Page should resolve successfully (best-effort behavior)
@@ -100,40 +100,9 @@ describe('auth page guards', () => {
     consoleErrorSpy.mockRestore()
   })
 
-  it('root page redirects valid sessions directly to rooms', async () => {
-    getSessionFromServerCookiesMock.mockResolvedValueOnce({ id: 'session-1', role: 'member' })
-    getCurrentUserMock.mockResolvedValueOnce({ id: 'user-1' })
-
-    const { default: RootPage } = await import('@/app/page')
-    await RootPage()
-
-    expect(redirectMock).toHaveBeenCalledWith('/es/rooms')
-  })
-
-  it('root page falls through to the public landing page for stale sessions', async () => {
-    getSessionFromServerCookiesMock.mockResolvedValueOnce({ id: 'session-1', role: 'member' })
-    getCurrentUserMock.mockRejectedValueOnce(new Error('stale'))
-
-    const { default: RootPage } = await import('@/app/page')
-    await RootPage()
-
-    expect(redirectMock).toHaveBeenCalledWith('/es')
-    expect(redirectMock).not.toHaveBeenCalledWith('/es/login')
-  })
-
-  it('root page falls through to the public landing page when there is no session', async () => {
-    getSessionFromServerCookiesMock.mockResolvedValueOnce(null)
-
-    const { default: RootPage } = await import('@/app/page')
-    await RootPage()
-
-    expect(redirectMock).toHaveBeenCalledWith('/es')
-    expect(getCurrentUserMock).not.toHaveBeenCalled()
-  })
-
   it('admin page preserves deep links for signed-out users', async () => {
     getSessionFromServerCookiesMock.mockResolvedValueOnce(null)
-    const { default: AdminPage } = await import('@/app/[locale]/admin/page')
+    const { default: AdminPage } = await import('@/app/[locale]/(app)/admin/page')
 
     await AdminPage({
       params: Promise.resolve({ locale: 'en' }),
@@ -147,7 +116,7 @@ describe('auth page guards', () => {
 
   it('reservations page preserves repeated query values for signed-out users', async () => {
     getSessionFromServerCookiesMock.mockResolvedValueOnce(null)
-    const { default: ReservationsPage } = await import('@/app/[locale]/reservations/page')
+    const { default: ReservationsPage } = await import('@/app/[locale]/(app)/reservations/page')
 
     await ReservationsPage({
       params: Promise.resolve({ locale: 'es' }),
@@ -161,7 +130,7 @@ describe('auth page guards', () => {
 
   it('check-in page preserves the complete destination for signed-out users', async () => {
     getSessionFromServerCookiesMock.mockResolvedValueOnce(null)
-    const { default: CheckInPage } = await import('@/app/[locale]/check-in/[tableId]/page')
+    const { default: CheckInPage } = await import('@/app/[locale]/(app)/check-in/[tableId]/page')
     const tableId = 'a6ab66d9-4e4f-4c57-a55e-688e3f7a8b25'
 
     await CheckInPage({

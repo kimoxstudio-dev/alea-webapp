@@ -39,7 +39,7 @@ describe('FAQ page', () => {
   })
 
   it('renders public FAQ sections with semantic headings', async () => {
-    const { default: FaqPage } = await import('@/app/[locale]/faq/page')
+    const { default: FaqPage } = await import('@/app/[locale]/(app)/faq/page')
     const page = await FaqPage({ params: Promise.resolve({ locale: 'en' }) })
 
     render(page)
@@ -54,7 +54,7 @@ describe('FAQ page', () => {
 
   it('opens an accordion answer', async () => {
     const user = userEvent.setup()
-    const { default: FaqPage } = await import('@/app/[locale]/faq/page')
+    const { default: FaqPage } = await import('@/app/[locale]/(app)/faq/page')
     const page = await FaqPage({ params: Promise.resolve({ locale: 'en' }) })
 
     render(page)
@@ -67,7 +67,7 @@ describe('FAQ page', () => {
   })
 
   it('generates localized metadata', async () => {
-    const { generateMetadata } = await import('@/app/[locale]/faq/page')
+    const { generateMetadata } = await import('@/app/[locale]/(app)/faq/page')
 
     await expect(
       generateMetadata({ params: Promise.resolve({ locale: 'en' }) }),
@@ -76,7 +76,7 @@ describe('FAQ page', () => {
   })
 
   it('keeps FAQ translations complete across locales and page config', async () => {
-    const { FAQ_SECTIONS } = await import('@/app/[locale]/faq/config')
+    const { FAQ_SECTIONS } = await import('@/app/[locale]/(app)/faq/config')
     const configuredKeys = [
       'eyebrow',
       'title',

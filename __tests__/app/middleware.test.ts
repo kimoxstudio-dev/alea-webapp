@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { NextRequest, NextResponse } from 'next/server'
+import type { NextFetchEvent } from 'next/server'
 
 /**
  * Clerk middleware test setup
@@ -16,9 +17,21 @@ import { NextRequest, NextResponse } from 'next/server'
  * - CSRF cookie handling is unaffected by the removal of the Supabase
  *   auth-cookie refresh (#363)
  * - /api routes run clerkMiddleware but skip the i18n rewrite
+ * - The exact locale-root landing paths (`/`, `/es`, `/en`) never invoke
+ *   `clerkMiddleware()` at all (#414) — that's the mechanism that removes
+ *   Clerk's own auth-context overhead from the public landing page — while
+ *   every other route still does. (The mock here only observes whether
+ *   `clerkMiddleware()` was invoked; it doesn't model the real handshake
+ *   redirect or its headers.)
  */
 
 const createI18nResponse = vi.fn((request: NextRequest) => NextResponse.next())
+
+// Hoisted so the mock factory below (which vi.mock hoists above these
+// `const`s) can close over it.
+const { clerkMiddlewareInvoked } = vi.hoisted(() => ({
+  clerkMiddlewareInvoked: vi.fn(),
+}))
 
 vi.mock('next-intl/middleware', () => ({
   default: vi.fn(() => (request: NextRequest) => createI18nResponse(request)),
@@ -26,10 +39,14 @@ vi.mock('next-intl/middleware', () => ({
 
 vi.mock('@clerk/nextjs/server', () => ({
   clerkMiddleware: vi.fn((handler: (auth: () => Promise<{ userId: string | null }>, request: NextRequest) => Promise<NextResponse | undefined>) => {
-    return async (request: NextRequest) => {
+    return async (request: NextRequest, event: NextFetchEvent) => {
       // Mirrors the real clerkMiddleware(handler) shape: the handler receives
       // an `auth()` accessor (not a plain object) that resolves to the
-      // current session's userId.
+      // current session's userId. Also asserts the real middleware forwards
+      // the `NextFetchEvent` it's given — real Clerk needs it at runtime,
+      // and a regression that drops it (e.g. `withClerk(request)` instead
+      // of `withClerk(request, event)`) is otherwise invisible here.
+      clerkMiddlewareInvoked(request.nextUrl.pathname, event)
       const auth = async () => ({ userId: null })
 
       try {
@@ -117,4 +134,44 @@ describe('middleware', () => {
     // Route handlers enforce API authentication themselves.
     expect(response.status).toBe(200)
   })
+
+  it.each(['/', '/es', '/en'])(
+    'skips clerkMiddleware() entirely for the locale-root landing path %s (#414)',
+    async (landingPath) => {
+      const middleware = (await import('@/middleware')).default
+
+      await middleware(new NextRequest(`http://localhost:3000${landingPath}`))
+
+      expect(clerkMiddlewareInvoked).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['/', '/es'])(
+    'still runs i18n routing and issues a CSRF cookie for the landing path %s',
+    async (landingPath) => {
+      const middleware = (await import('@/middleware')).default
+
+      const response = await middleware(new NextRequest(`http://localhost:3000${landingPath}`))
+
+      expect(createI18nResponse).toHaveBeenCalled()
+      expect(response.cookies.get('alea-csrf-token')?.value).toBeTruthy()
+    },
+  )
+
+  it.each(['/es/rooms', '/en/sign-in', '/api/admin/health'])(
+    'still runs clerkMiddleware() for non-landing path %s (#414)',
+    async (path) => {
+      const middleware = (await import('@/middleware')).default
+
+      const request = new NextRequest(`http://localhost:3000${path}`)
+      // Only identity/reference forwarding is asserted below — a plain
+      // sentinel is enough and avoids depending on Next's internal
+      // `NextFetchEvent` implementation module.
+      const event = {} as NextFetchEvent
+
+      await middleware(request, event)
+
+      expect(clerkMiddlewareInvoked).toHaveBeenCalledWith(path, event)
+    },
+  )
 })

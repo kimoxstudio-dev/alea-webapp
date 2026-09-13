@@ -1,11 +1,10 @@
 import './globals.css'
 import type { Metadata } from 'next'
-import { ClerkProvider } from '@clerk/nextjs'
 
 export const metadata: Metadata = {
   title: 'Alea',
 }
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
-  return <ClerkProvider telemetry={{ disabled: true }}>{children}</ClerkProvider>
+  return <>{children}</>
 }
