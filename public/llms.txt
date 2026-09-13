@@ -1,0 +1,23 @@
+# Alea
+
+> Alea is a non-profit cultural and social association in Las Palmas de Gran Canaria for lovers of role-playing games, board games, wargames and miniatures, running a 24/7 members venue with a public reservation web app.
+
+Members pay a monthly fee for 24/7 access to the venue, a library of 350+ games to borrow, and 60+ events a year. The web app lets visitors browse upcoming events and the game library, and lets members sign in to book rooms and manage their reservations. Membership is issued by the club's administrators — there is no public self-service registration; existing members sign in with their member number.
+
+Every path below is also available in English by swapping the /es prefix for /en (for example, /en/faq).
+
+## Site
+
+- [Home (Spanish)](https://alea-webapp.vercel.app/es): landing page — about the association, upcoming and past events, game library, club values, partner shops, and membership pricing (€20/month).
+- [Home (English)](https://alea-webapp.vercel.app/en): same landing page in English.
+- [FAQ](https://alea-webapp.vercel.app/es/faq): frequently asked questions about account access, booking tables, optional equipment, QR check-in and Saved Game reservations.
+
+## Members
+
+- [Sign in](https://alea-webapp.vercel.app/es/sign-in): member and admin sign-in.
+- [Rooms](https://alea-webapp.vercel.app/es/rooms): browse and book club rooms (requires sign-in).
+- [Reservations](https://alea-webapp.vercel.app/es/reservations): a signed-in member's own bookings (requires sign-in).
+
+## Optional
+
+- [Public site](https://alealaspalmas.es/): the association's own site, linked from the landing page footer.
