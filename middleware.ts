@@ -37,6 +37,28 @@ function handlePageRequest(request: NextRequest): NextResponse {
 }
 
 /**
+ * Landing-only wrapper around `handlePageRequest()` (#419).
+ *
+ * Next.js sets `Cache-Control: private, no-cache, no-store, max-age=0,
+ * must-revalidate` by default on every response that passes through
+ * `middleware.ts`, which includes the `no-store` directive that disables the
+ * browser's back/forward cache (bfcache) — Lighthouse's `bf-cache` audit
+ * flags this as `MainResourceHasCacheControlNoStore`. That default is the
+ * right call for session-sensitive routes, but the public landing page
+ * (`/`, `/es`, `/en`) makes no `auth()` / `getSessionFromServerCookies()`
+ * call (#414) and has no per-visitor server-rendered content, so it doesn't
+ * need it. Overriding to a value without `no-store` still forces
+ * revalidation on every use (`private, no-cache`) but makes the response
+ * bfcache-eligible. Every other route (including `/api`) keeps Next's
+ * default `no-store` behavior unchanged.
+ */
+function handleLandingRequest(request: NextRequest): NextResponse {
+  const response = handlePageRequest(request)
+  response.headers.set('Cache-Control', 'private, no-cache, max-age=0, must-revalidate')
+  return response
+}
+
+/**
  * Clerk middleware + CSRF cookie issuance, with the landing route excluded.
  *
  * Clerk is installed and wired here (#297) so `auth()` / `currentUser()`
@@ -99,7 +121,7 @@ const withClerk = clerkMiddleware(async (_auth, request: NextRequest) => {
 
 export default function middleware(request: NextRequest, event: NextFetchEvent) {
   if (isLandingRoot(request.nextUrl.pathname)) {
-    return handlePageRequest(request)
+    return handleLandingRequest(request)
   }
 
   return withClerk(request, event)
