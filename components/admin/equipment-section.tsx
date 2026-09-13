@@ -132,11 +132,16 @@ function EquipmentRow({ item }: { item: Equipment }) {
               <Button type="button" variant="outline" onClick={() => setEditing(false)} className="border-border">
                 {tc('cancel')}
               </Button>
-              <Button type="submit" disabled={updateEquipment.isPending} aria-busy={updateEquipment.isPending}>
-                <span className="inline-flex h-4 w-4 shrink-0">
-                  {updateEquipment.isPending && <DiceLoader size="sm" hideRole />}
+              <Button
+                type="submit"
+                className="relative"
+                disabled={updateEquipment.isPending}
+                aria-busy={updateEquipment.isPending}
+              >
+                <span className="absolute left-1/2 top-1/2 inline-flex h-4 w-4 shrink-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+                  {updateEquipment.isPending && <DiceLoader size="sm" hideRole className="text-primary-foreground" />}
                 </span>
-                {tc('save')}
+                <span className={updateEquipment.isPending ? 'opacity-0' : undefined}>{tc('save')}</span>
               </Button>
             </DialogFooter>
           </form>
@@ -159,14 +164,15 @@ function EquipmentRow({ item }: { item: Equipment }) {
             <Button
               type="button"
               variant="destructive"
+              className="relative"
               onClick={handleDelete}
               disabled={deleteEquipment.isPending}
               aria-busy={deleteEquipment.isPending}
             >
-              <span className="inline-flex h-4 w-4 shrink-0">
-                {deleteEquipment.isPending && <DiceLoader size="sm" hideRole />}
+              <span className="absolute left-1/2 top-1/2 inline-flex h-4 w-4 shrink-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+                {deleteEquipment.isPending && <DiceLoader size="sm" hideRole className="text-destructive-foreground" />}
               </span>
-              {tc('delete')}
+              <span className={deleteEquipment.isPending ? 'opacity-0' : undefined}>{tc('delete')}</span>
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -312,11 +318,16 @@ export function EquipmentSection() {
               <Button type="button" variant="outline" onClick={() => { setShowCreate(false); setCreateError(null) }} className="border-border">
                 {tc('cancel')}
               </Button>
-              <Button type="submit" disabled={createEquipment.isPending} aria-busy={createEquipment.isPending}>
-                <span className="inline-flex h-4 w-4 shrink-0">
-                  {createEquipment.isPending && <DiceLoader size="sm" hideRole />}
+              <Button
+                type="submit"
+                className="relative"
+                disabled={createEquipment.isPending}
+                aria-busy={createEquipment.isPending}
+              >
+                <span className="absolute left-1/2 top-1/2 inline-flex h-4 w-4 shrink-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+                  {createEquipment.isPending && <DiceLoader size="sm" hideRole className="text-primary-foreground" />}
                 </span>
-                {tc('save')}
+                <span className={createEquipment.isPending ? 'opacity-0' : undefined}>{tc('save')}</span>
               </Button>
             </DialogFooter>
           </form>

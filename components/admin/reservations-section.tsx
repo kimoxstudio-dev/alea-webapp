@@ -191,12 +191,12 @@ export function ReservationsSection() {
               onClick={handleCancel}
               disabled={cancelReservation.isPending}
               aria-busy={cancelReservation.isPending}
-              className="bg-crimson hover:bg-crimson-light text-white border-0"
+              className="relative bg-crimson hover:bg-crimson-light text-white border-0"
             >
-              <span className="inline-flex h-4 w-4 shrink-0">
-                {cancelReservation.isPending && <DiceLoader size="sm" hideRole />}
+              <span className="absolute left-1/2 top-1/2 inline-flex h-4 w-4 shrink-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+                {cancelReservation.isPending && <DiceLoader size="sm" hideRole className="text-white" />}
               </span>
-              {tc('confirm')}
+              <span className={cancelReservation.isPending ? 'opacity-0' : undefined}>{tc('confirm')}</span>
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -10,6 +10,7 @@ import type {
 } from '@/lib/types'
 import { sql } from '@/lib/db/client'
 import { serviceError, ServiceError } from '@/lib/server/service-error'
+import { ERROR_CODES } from '@/lib/types/error-codes'
 import { getCurrentClubDate } from '@/lib/club-time'
 import type { Tables } from '@/lib/supabase/types'
 import type { SessionUser } from '@/lib/server/auth'
@@ -290,21 +291,21 @@ const CLUB_EVENT_DATE_RE = /^\d{4}-\d{2}-\d{2}$/
 
 function requireDateString(value: unknown, field: string): string {
   const str = typeof value === 'string' ? value.trim() : ''
-  if (!CLUB_EVENT_DATE_RE.test(str)) serviceError(`${field} must be in YYYY-MM-DD format`, 400)
+  if (!CLUB_EVENT_DATE_RE.test(str)) serviceError(ERROR_CODES.CLUB_EVENT_INVALID_DATE_FORMAT, 400)
   return str
 }
 
 function optionalDateString(value: unknown, field: string): string | null {
   if (value === undefined || value === null || value === '') return null
   const str = String(value).trim()
-  if (!CLUB_EVENT_DATE_RE.test(str)) serviceError(`${field} must be in YYYY-MM-DD format`, 400)
+  if (!CLUB_EVENT_DATE_RE.test(str)) serviceError(ERROR_CODES.CLUB_EVENT_INVALID_DATE_FORMAT, 400)
   return str
 }
 
 function normaliseDateKind(value: unknown): ClubEventDateKind {
   const str = String(value ?? '').trim()
   if (str !== 'single' && str !== 'range' && str !== 'recurring') {
-    serviceError('dateKind must be one of single, range, recurring', 400)
+    serviceError(ERROR_CODES.CLUB_EVENT_INVALID_DATE_KIND, 400)
   }
   return str as ClubEventDateKind
 }
@@ -464,8 +465,8 @@ function resolveClubEventFields(body: ClubEventInput, current: EventRow | null):
     endDate = body.endDate !== undefined
       ? optionalDateString(body.endDate, 'endDate')
       : (current?.end_date ?? null)
-    if (!endDate) serviceError('endDate is required when dateKind is range', 400)
-    if (endDate < startDate) serviceError('endDate must be on or after date', 400)
+    if (!endDate) serviceError(ERROR_CODES.CLUB_EVENT_END_DATE_REQUIRED, 400)
+    if (endDate < startDate) serviceError(ERROR_CODES.CLUB_EVENT_END_DATE_BEFORE_START, 400)
   }
 
   const imageUrl = body.imageUrl !== undefined ? validateOptionalUrl(body.imageUrl, 'imageUrl') : (current?.image_url ?? null)
@@ -959,8 +960,8 @@ const MAX_EVENT_MATERIALS = 100
 /** `undefined` means "materials not provided" and resolves to an empty set. */
 function validateMaterialsPayload(raw: unknown): NormalisedMaterial[] {
   if (raw === undefined) return []
-  if (!Array.isArray(raw)) serviceError('materials must be an array', 400)
-  if (raw.length > MAX_EVENT_MATERIALS) serviceError('Too many materials', 400)
+  if (!Array.isArray(raw)) serviceError(ERROR_CODES.CLUB_EVENT_MATERIALS_NOT_ARRAY, 400)
+  if (raw.length > MAX_EVENT_MATERIALS) serviceError(ERROR_CODES.CLUB_EVENT_TOO_MANY_MATERIALS, 400)
 
   const seen = new Set<string>()
   return raw.map((entry, index) => {
@@ -1036,9 +1037,9 @@ async function fetchEventMaterialsForMany(eventIds: string[]): Promise<Map<strin
 
 function validateSchedulesPayload(raw: unknown): NormalisedEventSchedule[] {
   if (!Array.isArray(raw) || raw.length === 0) {
-    serviceError('At least one schedule is required when blocksRooms is true', 400)
+    serviceError(ERROR_CODES.CLUB_EVENT_SCHEDULE_REQUIRED, 400)
   }
-  if (raw.length > 366) serviceError('Too many schedule blocks', 400)
+  if (raw.length > 366) serviceError(ERROR_CODES.CLUB_EVENT_TOO_MANY_SCHEDULES, 400)
   return raw.map((s, i) => validateAndNormaliseSchedule(s, i))
 }
 
@@ -1066,7 +1067,7 @@ async function validateRoomsExist(schedules: NormalisedEventSchedule[]): Promise
 
   const foundIds = new Set(rows.map((r) => r.id))
   const missing = roomIds.filter((id) => !foundIds.has(id))
-  if (missing.length > 0) serviceError('Invalid room id in schedules', 400)
+  if (missing.length > 0) serviceError(ERROR_CODES.CLUB_EVENT_INVALID_ROOM, 400)
 }
 
 /**
@@ -1091,7 +1092,7 @@ async function validateTablesExist(schedules: NormalisedEventSchedule[]): Promis
 
   const foundIds = new Set(rows.map((r) => r.id))
   const missing = tableIds.filter((id) => !foundIds.has(id))
-  if (missing.length > 0) serviceError('Invalid table id in schedules', 400)
+  if (missing.length > 0) serviceError(ERROR_CODES.CLUB_EVENT_INVALID_TABLE, 400)
 }
 
 /**
@@ -1113,7 +1114,7 @@ async function validateEquipmentExists(materials: NormalisedMaterial[]): Promise
 
   const foundIds = new Set(rows.map((r) => r.id))
   const missing = equipmentIds.filter((id) => !foundIds.has(id))
-  if (missing.length > 0) serviceError('Invalid equipment id in materials', 400)
+  if (missing.length > 0) serviceError(ERROR_CODES.CLUB_EVENT_INVALID_EQUIPMENT, 400)
 }
 
 async function fetchEventRoomBlocks(eventId: string): Promise<EventRoomBlockRow[]> {

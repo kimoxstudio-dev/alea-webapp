@@ -29,6 +29,8 @@ import {
 } from '@/lib/hooks/use-admin'
 import { formatClubEventDate } from '@/lib/club-events-format'
 import { useRequiredFieldFocus } from '@/lib/hooks/use-required-field-focus'
+import { getClubEventErrorMessageKey } from '@/lib/club-events/error-messages'
+import { extractErrorCode } from '@/lib/errors/extract-error-code'
 import type { AdminClubEvent, AdminEventMaterial, AdminEventRoomBlock } from '@/lib/types'
 import { OptionalEnglishFields } from './optional-english-fields'
 import { ImageUpload } from './image-upload'
@@ -391,7 +393,7 @@ function ScheduleRow({
                 id={id('start')}
                 ref={getFieldRef(scheduleFieldKey(index, 'startTime'))}
                 type="time"
-                step={3600}
+                step={60}
                 value={entry.startTime}
                 onChange={field('startTime')}
                 required={!entry.allDay}
@@ -411,7 +413,7 @@ function ScheduleRow({
                 id={id('end')}
                 ref={getFieldRef(scheduleFieldKey(index, 'endTime'))}
                 type="time"
-                step={3600}
+                step={60}
                 value={entry.endTime}
                 onChange={field('endTime')}
                 required={!entry.allDay}
@@ -935,11 +937,11 @@ function ClubEventFormDialog({
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)} className="border-border">
               {tc('cancel')}
             </Button>
-            <Button type="submit" disabled={isPending} aria-busy={isPending}>
-              <span className="inline-flex h-4 w-4 shrink-0">
-                {isPending && <DiceLoader size="sm" hideRole />}
+            <Button type="submit" disabled={isPending} aria-busy={isPending} className="relative">
+              <span className="absolute left-1/2 top-1/2 inline-flex h-4 w-4 shrink-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+                {isPending && <DiceLoader size="sm" hideRole className="text-primary-foreground" />}
               </span>
-              {tc('save')}
+              <span className={isPending ? 'opacity-0' : undefined}>{tc('save')}</span>
             </Button>
           </DialogFooter>
         </form>
@@ -998,11 +1000,12 @@ function DeleteClubEventDialog({
             onClick={onConfirm}
             disabled={isPending}
             aria-busy={isPending}
+            className="relative"
           >
-            <span className="inline-flex h-4 w-4 shrink-0">
-              {isPending && <DiceLoader size="sm" hideRole />}
+            <span className="absolute left-1/2 top-1/2 inline-flex h-4 w-4 shrink-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+              {isPending && <DiceLoader size="sm" hideRole className="text-destructive-foreground" />}
             </span>
-            {tc('delete')}
+            <span className={isPending ? 'opacity-0' : undefined}>{tc('delete')}</span>
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -1157,10 +1160,20 @@ export function ClubEventsSection() {
     setDeleteError(null)
   }
 
+  /**
+   * The server's `message` for a club-event validation failure is a
+   * machine-readable `ERROR_CODES.CLUB_EVENT_*` code, never end-user text
+   * (same convention as auth errors, see `lib/auth/service-error-messages.ts`
+   * and `components/admin/users-section.tsx`) — mapped to a translated
+   * message here so no raw English string ever reaches this Spanish-capable
+   * page. A code with no mapping (e.g. an internal-error code, or a network
+   * failure's message) falls back to the generic, already-translated
+   * `clubEvents.saveError`.
+   */
   function extractErrorMessage(err: unknown): string {
-    return err instanceof Error
-      ? err.message
-      : (err as { message?: string })?.message ?? String(err)
+    const code = extractErrorCode(err)
+    const messageKey = getClubEventErrorMessageKey(code)
+    return messageKey ? t(messageKey as Parameters<typeof t>[0]) : t('clubEvents.saveError')
   }
 
   async function handleCreate(e: React.FormEvent) {

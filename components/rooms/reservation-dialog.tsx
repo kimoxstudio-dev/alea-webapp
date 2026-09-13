@@ -280,7 +280,7 @@ export function ReservationDialog({ table, open, onClose }: ReservationDialogPro
                   setSavedGameEndDate(addDaysToDateOnly(addMonthsClamped(e.target.value, 3), -1))
                 }
               }}
-              className="flex h-10 w-full rounded-md border border-input bg-background-surface px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="flex h-10 w-full rounded-md border border-input bg-background-surface px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [color-scheme:dark]"
               aria-label={t('selectDate')}
             />
             <p className="text-xs text-muted-foreground">{formatDate(selectedDate)}</p>
@@ -304,7 +304,7 @@ export function ReservationDialog({ table, open, onClose }: ReservationDialogPro
                   min={selectedDate}
                   max={addDaysToDateOnly(addMonthsClamped(selectedDate, 3), -1)}
                   onChange={(event) => setSavedGameEndDate(event.target.value)}
-                  className="flex h-11 w-full rounded-md border border-input bg-background-surface px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  className="flex h-11 w-full rounded-md border border-input bg-background-surface px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [color-scheme:dark]"
                 />
               </div>
               <p className="text-xs text-muted-foreground">{t('savedGame.upperReservationRule')}</p>

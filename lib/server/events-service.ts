@@ -2,6 +2,7 @@ import 'server-only'
 import { sql } from '@/lib/db/client'
 import { NeonDbError } from '@neondatabase/serverless'
 import { serviceError } from '@/lib/server/service-error'
+import { ERROR_CODES } from '@/lib/types/error-codes'
 import type { Tables } from '@/lib/supabase/types'
 import { cancelActiveSavedGamesForRoomBlock, restoreCancelledSavedGames } from '@/lib/server/saved-games-service'
 
@@ -62,15 +63,12 @@ export function isClubEventRow(row: Pick<EventRow, 'title_es' | 'title_en'>): bo
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/
-const WHOLE_HOUR_TIME_RE = /^([01]\d|2[0-3]):00$/
 
 function validateDateTimeFields(date: string, startTime: string, endTime: string): void {
-  if (!DATE_RE.test(date)) serviceError('date must be in YYYY-MM-DD format', 400)
-  if (!TIME_RE.test(startTime)) serviceError('startTime must be in HH:MM format', 400)
-  if (!TIME_RE.test(endTime)) serviceError('endTime must be in HH:MM format', 400)
-  if (!WHOLE_HOUR_TIME_RE.test(startTime)) serviceError('startTime must be on a whole-hour boundary', 400)
-  if (!WHOLE_HOUR_TIME_RE.test(endTime)) serviceError('endTime must be on a whole-hour boundary', 400)
-  if (endTime <= startTime) serviceError('endTime must be after startTime', 400)
+  if (!DATE_RE.test(date)) serviceError(ERROR_CODES.CLUB_EVENT_INVALID_DATE_FORMAT, 400)
+  if (!TIME_RE.test(startTime)) serviceError(ERROR_CODES.CLUB_EVENT_INVALID_TIME_FORMAT, 400)
+  if (!TIME_RE.test(endTime)) serviceError(ERROR_CODES.CLUB_EVENT_INVALID_TIME_FORMAT, 400)
+  if (endTime <= startTime) serviceError(ERROR_CODES.CLUB_EVENT_END_BEFORE_START, 400)
 }
 
 function parseAllDay(value: unknown): boolean {
@@ -78,7 +76,7 @@ function parseAllDay(value: unknown): boolean {
 }
 
 function resolveBlockTimes(date: string, startTime: string, endTime: string, allDay: boolean) {
-  if (!DATE_RE.test(date)) serviceError('date must be in YYYY-MM-DD format', 400)
+  if (!DATE_RE.test(date)) serviceError(ERROR_CODES.CLUB_EVENT_INVALID_DATE_FORMAT, 400)
   if (allDay) {
     return { startTime: '00:00', endTime: '23:59' }
   }

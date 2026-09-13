@@ -61,6 +61,24 @@ export const ERROR_CODES = {
   AUTH_ACCOUNT_CREDENTIALS_UPDATE_FAILED: 'AUTH_ACCOUNT_CREDENTIALS_UPDATE_FAILED',
   AUTH_RECOVERY_FAILED: 'AUTH_RECOVERY_FAILED',
   AUTH_UNAUTHORIZED: 'AUTH_UNAUTHORIZED',
+
+  // Club events (schedule/date/time/material validation) — user-reachable
+  // validation failures from the admin "Eventos" create/edit form. Client
+  // components map each code to a translated message (messages/*.json,
+  // `admin.clubEvents.errors.*`); see `lib/club-events/error-messages.ts`.
+  CLUB_EVENT_INVALID_DATE_FORMAT: 'CLUB_EVENT_INVALID_DATE_FORMAT',
+  CLUB_EVENT_INVALID_TIME_FORMAT: 'CLUB_EVENT_INVALID_TIME_FORMAT',
+  CLUB_EVENT_END_BEFORE_START: 'CLUB_EVENT_END_BEFORE_START',
+  CLUB_EVENT_INVALID_DATE_KIND: 'CLUB_EVENT_INVALID_DATE_KIND',
+  CLUB_EVENT_END_DATE_REQUIRED: 'CLUB_EVENT_END_DATE_REQUIRED',
+  CLUB_EVENT_END_DATE_BEFORE_START: 'CLUB_EVENT_END_DATE_BEFORE_START',
+  CLUB_EVENT_SCHEDULE_REQUIRED: 'CLUB_EVENT_SCHEDULE_REQUIRED',
+  CLUB_EVENT_TOO_MANY_SCHEDULES: 'CLUB_EVENT_TOO_MANY_SCHEDULES',
+  CLUB_EVENT_INVALID_ROOM: 'CLUB_EVENT_INVALID_ROOM',
+  CLUB_EVENT_INVALID_TABLE: 'CLUB_EVENT_INVALID_TABLE',
+  CLUB_EVENT_MATERIALS_NOT_ARRAY: 'CLUB_EVENT_MATERIALS_NOT_ARRAY',
+  CLUB_EVENT_TOO_MANY_MATERIALS: 'CLUB_EVENT_TOO_MANY_MATERIALS',
+  CLUB_EVENT_INVALID_EQUIPMENT: 'CLUB_EVENT_INVALID_EQUIPMENT',
 } as const
 
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES]
@@ -74,3 +92,12 @@ export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES]
  */
 type AuthErrorCodeKey = Extract<keyof typeof ERROR_CODES, `AUTH_${string}`>
 export type AuthErrorCode = (typeof ERROR_CODES)[AuthErrorCodeKey]
+
+/**
+ * Union of just the `CLUB_EVENT_*` error codes, same rationale as
+ * `AuthErrorCode` — makes `lib/club-events/error-messages.ts`'s message map
+ * `Record<ClubEventErrorCode, string>` so a new code with no translation-key
+ * entry is a compile error.
+ */
+type ClubEventErrorCodeKey = Extract<keyof typeof ERROR_CODES, `CLUB_EVENT_${string}`>
+export type ClubEventErrorCode = (typeof ERROR_CODES)[ClubEventErrorCodeKey]

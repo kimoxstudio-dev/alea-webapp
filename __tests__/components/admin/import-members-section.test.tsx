@@ -39,6 +39,8 @@ describe('ImportMembersSection — pending import button reserves loader space w
     render(<ImportMembersSection />)
     const button = screen.getByRole('button', { name: 'importMembersAction' })
     expect(getIconSlot(button)).toHaveClass('h-4', 'w-4', 'shrink-0')
+    expect(getIconSlot(button)).toHaveClass('absolute')
+    expect(button).toHaveClass('relative')
     expect(queryLoader(button)).toBeNull()
   })
 

@@ -317,12 +317,12 @@
     "unblockUser": "Desbloquear",
     "copyActivationLink": "Copiar enlace de activación",
     "copyRecoveryLink": "Copiar enlace de recuperación",
-    "activationLinkCopied": "Enlace de activación copiado.",
+    "activationLinkCopied": "Enlace copiado.",
     "activationLinkReady": "Enlace de activación listo para copiar.",
     "activationLinkFailed": "No se pudo generar el enlace de activación.",
     "activationLinkPrompt": "Copia y comparte este enlace de activación:",
-    "recoveryLinkCopied": "Enlace de recuperación copiado. Compártelo solo con el socio verificado: le permite establecer una nueva contraseña para esta cuenta.",
-    "recoveryLinkReady": "Enlace de recuperación listo para copiar. Compártelo solo con el socio verificado: le permite establecer una nueva contraseña para esta cuenta.",
+    "recoveryLinkCopied": "Enlace copiado.",
+    "recoveryLinkReady": "Enlace de recuperación listo para copiar.",
     "recoveryLinkFailed": "No se pudo generar el enlace de recuperación.",
     "recoveryLinkPrompt": "Copia y comparte este enlace de recuperación solo con el socio verificado: cualquiera que lo abra puede establecer una nueva contraseña para esta cuenta:",
     "recoveryLinkWarning": "Este enlace de recuperación permite a quien lo abra establecer una nueva contraseña para la cuenta del socio #{memberNumber}. Es una credencial, no un simple enlace de \"olvidé mi contraseña\": entrégalo directamente solo al socio verificado. ¿Continuar?",
@@ -424,7 +424,22 @@
       "removeMaterial": "Eliminar material",
       "selectMaterial": "Selecciona material",
       "materialQuantity": "Cantidad",
-      "noMaterials": "Sin materiales añadidos"
+      "noMaterials": "Sin materiales añadidos",
+      "errors": {
+        "invalidDateFormat": "La fecha debe tener el formato AAAA-MM-DD.",
+        "invalidTimeFormat": "La hora debe tener el formato HH:MM.",
+        "endBeforeStart": "La hora de fin debe ser posterior a la hora de inicio.",
+        "invalidDateKind": "El tipo de fecha debe ser única, rango o recurrente.",
+        "endDateRequired": "Se requiere una fecha de fin para un rango de fechas.",
+        "endDateBeforeStart": "La fecha de fin debe ser igual o posterior a la fecha de inicio.",
+        "scheduleRequired": "Se requiere al menos un horario para bloquear salas.",
+        "tooManySchedules": "Demasiados bloques de horario.",
+        "invalidRoom": "Una de las salas seleccionadas no es válida.",
+        "invalidTable": "Una de las mesas seleccionadas no es válida.",
+        "materialsNotArray": "Los materiales deben ser una lista.",
+        "tooManyMaterials": "Demasiados materiales.",
+        "invalidEquipment": "Uno de los materiales seleccionados no es válido."
+      }
     },
     "partners": {
       "title": "Colaboradores",
@@ -487,7 +502,7 @@
       "contact": "Contacto"
     },
     "cta": {
-      "join": "Hazte socio",
+      "join": "Reservar sala",
       "members": "Entrar al club",
       "discover": "Ver eventos",
       "calendar": "Calendario completo"

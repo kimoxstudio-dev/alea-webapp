@@ -122,6 +122,8 @@ describe('PartnersSection — pending buttons reserve loader space without anima
     const button = screen.getByRole('button', { name: 'save' })
 
     expect(getIconSlot(button)).toHaveClass('h-4', 'w-4', 'shrink-0')
+    expect(getIconSlot(button)).toHaveClass('absolute')
+    expect(button).toHaveClass('relative')
     expect(queryLoader(button)).toBeNull()
   })
 
@@ -147,6 +149,8 @@ describe('PartnersSection — pending buttons reserve loader space without anima
     const button = screen.getByRole('button', { name: 'save' })
 
     expect(getIconSlot(button)).toHaveClass('h-4', 'w-4', 'shrink-0')
+    expect(getIconSlot(button)).toHaveClass('absolute')
+    expect(button).toHaveClass('relative')
     expect(queryLoader(button)).toBeNull()
   })
 
@@ -172,6 +176,8 @@ describe('PartnersSection — pending buttons reserve loader space without anima
     const button = screen.getByRole('button', { name: 'delete' })
 
     expect(getIconSlot(button)).toHaveClass('h-4', 'w-4', 'shrink-0')
+    expect(getIconSlot(button)).toHaveClass('absolute')
+    expect(button).toHaveClass('relative')
     expect(queryLoader(button)).toBeNull()
   })
 

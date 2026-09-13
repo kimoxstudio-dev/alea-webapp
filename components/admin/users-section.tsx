@@ -340,30 +340,30 @@ export function UsersSection() {
                             <Button
                               variant="ghost"
                               size="sm"
-                              className="text-xs text-amber-400 hover:bg-amber-900/20 hover:text-amber-300"
+                              className="relative text-xs text-amber-400 hover:bg-amber-900/20 hover:text-amber-300"
                               disabled={patchMutation.isPending}
                               onClick={() => patchMutation.mutate({ id: user.id, action: 'reset_no_shows' })}
                               aria-label={t('resetNoShows')}
                             >
-                              <span className="inline-flex h-4 w-4 shrink-0">
-                                {isResettingNoShows && <DiceLoader size="sm" hideRole />}
+                              <span className="absolute left-1/2 top-1/2 inline-flex h-4 w-4 shrink-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+                                {isResettingNoShows && <DiceLoader size="sm" hideRole className="text-amber-400" />}
                               </span>
-                              {t('resetNoShows')}
+                              <span className={isResettingNoShows ? 'opacity-0' : undefined}>{t('resetNoShows')}</span>
                             </Button>
                           )}
                           {user.blockedUntil && (
                             <Button
                               variant="ghost"
                               size="sm"
-                              className="text-xs text-emerald-400 hover:bg-emerald-900/20 hover:text-emerald-300"
+                              className="relative text-xs text-emerald-400 hover:bg-emerald-900/20 hover:text-emerald-300"
                               disabled={patchMutation.isPending}
                               onClick={() => patchMutation.mutate({ id: user.id, action: 'unblock' })}
                               aria-label={t('unblockUser')}
                             >
-                              <span className="inline-flex h-4 w-4 shrink-0">
-                                {isUnblocking && <DiceLoader size="sm" hideRole />}
+                              <span className="absolute left-1/2 top-1/2 inline-flex h-4 w-4 shrink-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+                                {isUnblocking && <DiceLoader size="sm" hideRole className="text-emerald-400" />}
                               </span>
-                              {t('unblockUser')}
+                              <span className={isUnblocking ? 'opacity-0' : undefined}>{t('unblockUser')}</span>
                             </Button>
                           )}
                           {!user.isActive && user.role === 'member' && (
@@ -553,13 +553,14 @@ export function UsersSection() {
               {tc('cancel')}
             </Button>
             <Button
+              className="relative"
               onClick={handleSaveEdit}
               disabled={updateMutation.isPending || !editState.memberNumber.trim()}
             >
-              <span className="inline-flex h-4 w-4 shrink-0">
-                {updateMutation.isPending && <DiceLoader size="sm" hideRole />}
+              <span className="absolute left-1/2 top-1/2 inline-flex h-4 w-4 shrink-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+                {updateMutation.isPending && <DiceLoader size="sm" hideRole className="text-primary-foreground" />}
               </span>
-              {tc('save')}
+              <span className={updateMutation.isPending ? 'opacity-0' : undefined}>{tc('save')}</span>
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -578,12 +579,12 @@ export function UsersSection() {
             <AlertDialogCancel>{tc('cancel')}</AlertDialogCancel>
             <AlertDialogAction
               onClick={handleDeleteConfirm}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              className="relative bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
-              <span className="inline-flex h-4 w-4 shrink-0">
-                {deleteMutation.isPending && <DiceLoader size="sm" hideRole />}
+              <span className="absolute left-1/2 top-1/2 inline-flex h-4 w-4 shrink-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+                {deleteMutation.isPending && <DiceLoader size="sm" hideRole className="text-destructive-foreground" />}
               </span>
-              {tc('delete')}
+              <span className={deleteMutation.isPending ? 'opacity-0' : undefined}>{tc('delete')}</span>
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

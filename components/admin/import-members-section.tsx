@@ -102,11 +102,16 @@ export function ImportMembersSection({ inDialog = false }: ImportMembersSectionP
               />
             </div>
 
-            <Button type="submit" size="lg" className="w-full min-w-0 sm:min-w-52 lg:w-auto lg:self-stretch" disabled={!importFile || importMutation.isPending}>
-              <span className="inline-flex h-4 w-4 shrink-0">
-                {importMutation.isPending && <DiceLoader size="sm" hideRole />}
+            <Button
+              type="submit"
+              size="lg"
+              className="relative w-full min-w-0 sm:min-w-52 lg:w-auto lg:self-stretch"
+              disabled={!importFile || importMutation.isPending}
+            >
+              <span className="absolute left-1/2 top-1/2 inline-flex h-4 w-4 shrink-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+                {importMutation.isPending && <DiceLoader size="sm" hideRole className="text-primary-foreground" />}
               </span>
-              {t('importMembersAction')}
+              <span className={importMutation.isPending ? 'opacity-0' : undefined}>{t('importMembersAction')}</span>
             </Button>
           </div>
 
