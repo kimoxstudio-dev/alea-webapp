@@ -424,7 +424,22 @@
       "removeMaterial": "Eliminar material",
       "selectMaterial": "Selecciona material",
       "materialQuantity": "Cantidad",
-      "noMaterials": "Sin materiales añadidos"
+      "noMaterials": "Sin materiales añadidos",
+      "errors": {
+        "invalidDateFormat": "La fecha debe tener el formato AAAA-MM-DD.",
+        "invalidTimeFormat": "La hora debe tener el formato HH:MM.",
+        "endBeforeStart": "La hora de fin debe ser posterior a la hora de inicio.",
+        "invalidDateKind": "El tipo de fecha debe ser única, rango o recurrente.",
+        "endDateRequired": "Se requiere una fecha de fin para un rango de fechas.",
+        "endDateBeforeStart": "La fecha de fin debe ser igual o posterior a la fecha de inicio.",
+        "scheduleRequired": "Se requiere al menos un horario para bloquear salas.",
+        "tooManySchedules": "Demasiados bloques de horario.",
+        "invalidRoom": "Una de las salas seleccionadas no es válida.",
+        "invalidTable": "Una de las mesas seleccionadas no es válida.",
+        "materialsNotArray": "Los materiales deben ser una lista.",
+        "tooManyMaterials": "Demasiados materiales.",
+        "invalidEquipment": "Uno de los materiales seleccionados no es válido."
+      }
     },
     "partners": {
       "title": "Colaboradores",

@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { createSqlMock, hasExactSelectColumns, whereHasColumn, neonDbError, type ParsedStatement } from '../helpers/sql-mock'
+import { ERROR_CODES } from '@/lib/types/error-codes'
 
 /**
  * CLUB EVENTS SERVICE TEST COVERAGE (OIR-203, raw-SQL Neon port #304)
@@ -772,6 +773,51 @@ describe('club-events-service', () => {
       expect(result.roomBlocks[0].endTime).toBe('22:00')
     })
 
+    it('creates a club event with a non-whole-hour schedule block (14:15-15:30), no longer rejected (Fix 1)', async () => {
+      addCreateInsertHandler()
+      addRoomsExistHandler()
+      addTablesHandler()
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      addMaterialsDeleteHandler([])
+      const insertedBlocks: unknown[] = []
+      addBlockInsertHandler('block', (values) => {
+        const [event_id, room_id, table_id, date, start_time, end_time, all_day] = values
+        insertedBlocks.push({ id: `block-${insertedBlocks.length + 1}`, event_id, room_id, table_id, date, start_time, end_time, all_day })
+      })
+      addReservationsCancelHandler()
+      addMaterialsInsertHandler()
+      sqlMock.addHandler({
+        name: 'SELECT event_room_blocks WHERE event_id (result, tracks inserted)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, ROOM_BLOCK_COLUMNS),
+        respond: () => insertedBlocks,
+      })
+      addEventMaterialsSelectHandler([])
+
+      const { createClubEvent } = await loadClubEventsService()
+
+      const result = await createClubEvent(createAdminSession(), {
+        titleEs: 'Torneo con Horario Libre',
+        titleEn: 'Free-Time Tournament',
+        date: '2026-05-01',
+        dateKind: 'single',
+        blocksRooms: true,
+        schedules: [
+          {
+            date: '2026-05-01',
+            startTime: '14:15',
+            endTime: '15:30',
+            allDay: false,
+            roomId: 'room-1',
+          },
+        ],
+      })
+
+      expect(result.roomBlocks[0].startTime).toBe('14:15')
+      expect(result.roomBlocks[0].endTime).toBe('15:30')
+    })
+
     it('skips the room-wide table lookup when every block is table-scoped (#378)', async () => {
       // Regression guard for #378: `fetchRoomTableMap`'s room-id list used
       // to be built from EVERY block's room_id regardless of table_id, so
@@ -1034,7 +1080,7 @@ describe('club-events-service', () => {
             },
           ],
         })
-      ).rejects.toMatchObject({ statusCode: 400 })
+      ).rejects.toMatchObject({ statusCode: 400, message: ERROR_CODES.CLUB_EVENT_INVALID_ROOM })
 
       expect(insertSpy).not.toHaveBeenCalled()
     })
@@ -1062,9 +1108,63 @@ describe('club-events-service', () => {
           blocksRooms: true,
           schedules: 'not-an-array',
         })
-      ).rejects.toMatchObject({ statusCode: 400 })
+      ).rejects.toMatchObject({ statusCode: 400, message: ERROR_CODES.CLUB_EVENT_SCHEDULE_REQUIRED })
 
       expect(insertSpy).not.toHaveBeenCalled()
+    })
+
+    it('rejects an invalid dateKind with CLUB_EVENT_INVALID_DATE_KIND', async () => {
+      const { createClubEvent } = await loadClubEventsService()
+
+      await expect(
+        createClubEvent(createAdminSession(), {
+          titleEs: 'Event',
+          titleEn: 'Event',
+          date: '2026-05-01',
+          dateKind: 'not-a-real-kind',
+        })
+      ).rejects.toMatchObject({ statusCode: 400, message: ERROR_CODES.CLUB_EVENT_INVALID_DATE_KIND })
+    })
+
+    it('rejects a range event with no endDate with CLUB_EVENT_END_DATE_REQUIRED', async () => {
+      const { createClubEvent } = await loadClubEventsService()
+
+      await expect(
+        createClubEvent(createAdminSession(), {
+          titleEs: 'Event',
+          titleEn: 'Event',
+          date: '2026-05-01',
+          dateKind: 'range',
+        })
+      ).rejects.toMatchObject({ statusCode: 400, message: ERROR_CODES.CLUB_EVENT_END_DATE_REQUIRED })
+    })
+
+    it('rejects a range event whose endDate is before date with CLUB_EVENT_END_DATE_BEFORE_START', async () => {
+      const { createClubEvent } = await loadClubEventsService()
+
+      await expect(
+        createClubEvent(createAdminSession(), {
+          titleEs: 'Event',
+          titleEn: 'Event',
+          date: '2026-05-10',
+          dateKind: 'range',
+          endDate: '2026-05-01',
+        })
+      ).rejects.toMatchObject({ statusCode: 400, message: ERROR_CODES.CLUB_EVENT_END_DATE_BEFORE_START })
+    })
+
+    it('rejects materials that is not an array with CLUB_EVENT_MATERIALS_NOT_ARRAY', async () => {
+      const { createClubEvent } = await loadClubEventsService()
+
+      await expect(
+        createClubEvent(createAdminSession(), {
+          titleEs: 'Event',
+          titleEn: 'Event',
+          date: '2026-05-01',
+          dateKind: 'single',
+          materials: 'not-an-array',
+        })
+      ).rejects.toMatchObject({ statusCode: 400, message: ERROR_CODES.CLUB_EVENT_MATERIALS_NOT_ARRAY })
     })
 
     it('rejects blurbEs as object with 400', async () => {
@@ -1272,7 +1372,7 @@ describe('club-events-service', () => {
             { date: '2026-04-20', startTime: '18:00', endTime: '22:00', allDay: false, roomId: 'room-unknown' },
           ],
         })
-      ).rejects.toMatchObject({ statusCode: 400 })
+      ).rejects.toMatchObject({ statusCode: 400, message: ERROR_CODES.CLUB_EVENT_INVALID_ROOM })
 
       expect(updateSpy).not.toHaveBeenCalled()
     })
@@ -1301,7 +1401,7 @@ describe('club-events-service', () => {
             { date: '2026-04-20', startTime: '18:00', endTime: '22:00', allDay: false, roomId: 'room-1', tableId: 'table-unknown' },
           ],
         })
-      ).rejects.toMatchObject({ statusCode: 400 })
+      ).rejects.toMatchObject({ statusCode: 400, message: ERROR_CODES.CLUB_EVENT_INVALID_TABLE })
 
       expect(updateSpy).not.toHaveBeenCalled()
     })
@@ -1374,7 +1474,7 @@ describe('club-events-service', () => {
         updateClubEvent(createAdminSession(), 'evt-1', {
           materials: [{ equipmentId: 'equip-unknown', quantity: 1 }],
         })
-      ).rejects.toMatchObject({ statusCode: 400 })
+      ).rejects.toMatchObject({ statusCode: 400, message: ERROR_CODES.CLUB_EVENT_INVALID_EQUIPMENT })
 
       expect(updateSpy).not.toHaveBeenCalled()
     })
@@ -2761,6 +2861,48 @@ describe('events-service shared helpers', () => {
       expect(result.all_day).toBe(true)
       expect(result.start_time).toBe('00:00')
       expect(result.end_time).toBe('23:59')
+    })
+
+    // Fix 1: club events must support arbitrary start/end times, not just
+    // whole-hour boundaries — the WHOLE_HOUR_TIME_RE check this used to
+    // enforce was wrong per product confirmation and has been removed.
+    it('accepts a non-whole-hour start/end time (14:15-15:30)', async () => {
+      const { validateAndNormaliseSchedule } = await import('@/lib/server/events-service')
+
+      const result = validateAndNormaliseSchedule(
+        { date: '2026-05-01', allDay: false, startTime: '14:15', endTime: '15:30', roomId: 'room-1' },
+        0,
+      )
+
+      expect(result.start_time).toBe('14:15')
+      expect(result.end_time).toBe('15:30')
+    })
+
+    it('rejects a malformed time with CLUB_EVENT_INVALID_TIME_FORMAT', async () => {
+      const { validateAndNormaliseSchedule } = await import('@/lib/server/events-service')
+
+      expect(() => validateAndNormaliseSchedule(
+        { date: '2026-05-01', allDay: false, startTime: '14:5', endTime: '15:30', roomId: 'room-1' },
+        0,
+      )).toThrow(expect.objectContaining({ statusCode: 400, message: ERROR_CODES.CLUB_EVENT_INVALID_TIME_FORMAT }))
+    })
+
+    it('rejects a malformed date with CLUB_EVENT_INVALID_DATE_FORMAT', async () => {
+      const { validateAndNormaliseSchedule } = await import('@/lib/server/events-service')
+
+      expect(() => validateAndNormaliseSchedule(
+        { date: 'not-a-date', allDay: false, startTime: '14:00', endTime: '15:00', roomId: 'room-1' },
+        0,
+      )).toThrow(expect.objectContaining({ statusCode: 400, message: ERROR_CODES.CLUB_EVENT_INVALID_DATE_FORMAT }))
+    })
+
+    it('rejects endTime not after startTime with CLUB_EVENT_END_BEFORE_START', async () => {
+      const { validateAndNormaliseSchedule } = await import('@/lib/server/events-service')
+
+      expect(() => validateAndNormaliseSchedule(
+        { date: '2026-05-01', allDay: false, startTime: '15:00', endTime: '14:00', roomId: 'room-1' },
+        0,
+      )).toThrow(expect.objectContaining({ statusCode: 400, message: ERROR_CODES.CLUB_EVENT_END_BEFORE_START }))
     })
   })
 

@@ -424,7 +424,22 @@
       "removeMaterial": "Remove material",
       "selectMaterial": "Select equipment",
       "materialQuantity": "Quantity",
-      "noMaterials": "No materials added"
+      "noMaterials": "No materials added",
+      "errors": {
+        "invalidDateFormat": "The date must be in YYYY-MM-DD format.",
+        "invalidTimeFormat": "The time must be in HH:MM format.",
+        "endBeforeStart": "The end time must be after the start time.",
+        "invalidDateKind": "The date type must be single, range, or recurring.",
+        "endDateRequired": "An end date is required for a date range.",
+        "endDateBeforeStart": "The end date must be on or after the start date.",
+        "scheduleRequired": "At least one schedule is required to block rooms.",
+        "tooManySchedules": "Too many schedule blocks.",
+        "invalidRoom": "One of the selected rooms is invalid.",
+        "invalidTable": "One of the selected tables is invalid.",
+        "materialsNotArray": "Materials must be a list.",
+        "tooManyMaterials": "Too many materials.",
+        "invalidEquipment": "One of the selected materials is invalid."
+      }
     },
     "partners": {
       "title": "Partners",

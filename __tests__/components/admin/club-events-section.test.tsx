@@ -115,6 +115,27 @@ describe('ClubEventsSection — schedule-row required-field focus routing (#313)
     // never fire.
     expect(mockCreateMutateAsync).not.toHaveBeenCalled()
   })
+
+  // kx-reviewer round 1, finding 1: the server-side whole-hour restriction
+  // was removed (club events must support arbitrary times, e.g. 14:15), but
+  // the native time inputs still carried `step={3600}` — the UI half of the
+  // same restriction, which makes the browser flag any non-`:00` value as
+  // `stepMismatch`/invalid regardless of the server accepting it.
+  it('schedule start/end time inputs do not constrain to whole hours', async () => {
+    const user = userEvent.setup()
+    render(<ClubEventsSection />)
+
+    await user.click(screen.getByRole('button', { name: 'clubEvents.createEvent' }))
+    await user.click(screen.getByRole('checkbox', { name: 'clubEvents.blocksRooms' }))
+
+    const startInput = screen.getByLabelText('clubEvents.startTime')
+    const endInput = screen.getByLabelText('clubEvents.endTime')
+
+    expect(startInput).not.toHaveAttribute('step', '3600')
+    expect(endInput).not.toHaveAttribute('step', '3600')
+    expect(startInput).toHaveAttribute('step', '60')
+    expect(endInput).toHaveAttribute('step', '60')
+  })
 })
 
 // #408 — same fixed-slot fix as #399/#404, applied to this file's two
