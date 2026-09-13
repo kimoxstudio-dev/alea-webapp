@@ -22,14 +22,13 @@ function LangToggle({ locale, className }: { locale: string; className?: string 
   const switchLabel = t('switchLocaleFull', { current: currentLangName, other: otherLangName })
 
   return (
-    <Link
-      href={href}
-      className={`alea-lang-toggle ${className ?? ''}`}
-      aria-label={`ES · EN — ${switchLabel}`}
-    >
-      <span className={locale === 'es' ? 'on' : undefined}>ES</span>
-      <span aria-hidden="true">·</span>
-      <span className={locale === 'en' ? 'on' : undefined}>EN</span>
+    <Link href={href} className={`alea-lang-toggle ${className ?? ''}`}>
+      <span className="sr-only">{switchLabel}</span>
+      <span aria-hidden="true" className="alea-lang-codes">
+        <span className={locale === 'es' ? 'on' : undefined}>ES</span>
+        <span className="alea-lang-sep">·</span>
+        <span className={locale === 'en' ? 'on' : undefined}>EN</span>
+      </span>
     </Link>
   )
 }

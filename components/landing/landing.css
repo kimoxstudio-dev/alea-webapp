@@ -81,7 +81,8 @@
 .alea-lang-toggle { position: fixed; top: 22px; right: 24px; z-index: 60; background: rgba(13,18,24,0.7); backdrop-filter: blur(10px); border: 1px solid rgba(200,162,91,0.3); color: rgba(244,234,213,0.7); padding: 8px 14px; border-radius: 999px; font-family: "Space Grotesk", sans-serif; font-size: 11px; letter-spacing: 2px; font-weight: 700; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; transition: border-color .2s, color .2s; text-decoration: none; }
 .alea-lang-toggle:hover { border-color: #c8a25b; }
 .alea-lang-toggle span.on { color: #e6c281; }
-.alea-lang-toggle span[aria-hidden] { opacity: 0.3; }
+.alea-lang-toggle .alea-lang-codes { display: inline-flex; align-items: center; gap: 8px; }
+.alea-lang-toggle .alea-lang-sep { opacity: 0.3; }
 .alea-lang-toggle.alea-lang-toggle-in-menu { display: none; }
 
 /* Hero */
