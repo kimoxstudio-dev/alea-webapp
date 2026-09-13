@@ -235,12 +235,12 @@ export async function createSavedGameForSession(
   // #334 code-review finding: `assertTableAndEventAvailability` above and
   // this insert are two separate Neon HTTP round trips (no shared session or
   // transaction between them), so an event-block cancellation
-  // (`cancelActiveSavedGamesForRoomBlock` in club-events-service.ts) can run
-  // in between and this insert would still land as 'active' even though the
-  // table is now blocked. Both sides take the same per-table
-  // `pg_advisory_xact_lock` (keyed by `hashtext(table_id::uuid::text)`,
-  // matching `cancelActiveSavedGamesForRoomBlock`) as the first statement of
-  // a `sql.transaction()`, before touching `event_room_blocks`/`saved_games`.
+  // (`cancelActiveSavedGamesForRoomBlock` below) can run in between and this
+  // insert would still land as 'active' even though the table is now
+  // blocked. Both sides take the same per-table `pg_advisory_xact_lock`
+  // (keyed by `hashtext(table_id::uuid::text)`, matching
+  // `cancelActiveSavedGamesForRoomBlock`) as the first statement of a
+  // `sql.transaction()`, before touching `event_room_blocks`/`saved_games`.
   // The `::uuid::text` cast canonicalizes `tableId` before hashing
   // (code-review finding) — it's client-supplied here, so a non-canonical
   // spelling Postgres would still accept (uppercase, brace-wrapped) must
@@ -258,10 +258,10 @@ export async function createSavedGameForSession(
   // `renewSavedGameForSession` below — see its own comment.
   // #350: this is the shared `runAdvisoryLockedTransaction` helper's proving
   // call site — it encodes exactly this lock-then-guarded-write shape (see
-  // lib/db/transaction.ts), so `renewSavedGameForSession` below and
-  // club-events-service.ts's `cancelActiveSavedGamesForRoomBlock` still
-  // build their own `sql.transaction([...], { isolationLevel: 'ReadCommitted' })`
-  // calls directly rather than being retrofitted in this same change.
+  // lib/db/transaction.ts), so `renewSavedGameForSession` and
+  // `cancelActiveSavedGamesForRoomBlock` below still build their own
+  // `sql.transaction([...], { isolationLevel: 'ReadCommitted' })` calls
+  // directly rather than being retrofitted in this same change.
   let rows: SavedGameJoinedRow[]
   try {
     rows = await runAdvisoryLockedTransaction<SavedGameJoinedRow[]>(
@@ -356,9 +356,8 @@ export async function renewSavedGameForSession(session: SessionUser, id: string)
   // lock, in the same statement as the insert. `current.table_id` is read
   // back from the DB just above, so it's already canonical and the
   // `::uuid::text` cast below is a no-op for correctness — kept anyway so
-  // all three lock sites in this file/`club-events-service.ts` stay
-  // textually identical rather than relying on the reader noticing which
-  // ones can skip it.
+  // all three lock sites in this file stay textually identical rather than
+  // relying on the reader noticing which ones can skip it.
   //
   // Second #334 code-review finding: `current.status` above is read BEFORE
   // this lock is acquired, and is never rechecked inside the transaction. If
@@ -474,5 +473,160 @@ export async function recordSavedGameAttendance(playReservation: Tables<'reserva
   } catch (error) {
     if (isAttendanceConflict(error)) return
     serviceError('Internal server error', 500)
+  }
+}
+
+/**
+ * #334 — port of the legacy `cancel_saved_games_for_event_block()` trigger
+ * function, with two deliberate departures from the original SQL (both
+ * code-review findings, fixed after the initial port):
+ *   - Fires per newly-written `event_room_blocks` row (`NEW`), matched here
+ *     to a single inserted block (`tableIds`/`date` = that row's scope and
+ *     date).
+ *   - Cancels `saved_games` rows whose `table_id` is in `tableIds` — the
+ *     caller passes the SAME scoped table-id list it already computed
+ *     for the reservation cancellation right above this call site
+ *     (table-scoped when the block's own `table_id` is set, room-wide only
+ *     when it's null). The legacy trigger always cancelled room-wide,
+ *     ignoring the block's own `table_id`, because it predates OIR-208's
+ *     per-table `event_room_blocks` scoping; that room-wide-always behavior
+ *     was a bug relative to `assertTableAndEventAvailability` above (which
+ *     only rejects new games on the specifically blocked table), not a
+ *     semantic worth preserving, so this port does not carry it forward.
+ *   - Only rows with `status = 'active'` are eligible.
+ *   - Overlap condition: `date BETWEEN saved.start_date AND saved.end_date`
+ *     (inclusive on both ends), where `date` is the block's date — not a
+ *     start/end-time overlap, since saved_games are whole-day date ranges.
+ * The original function also took an advisory xact lock per table in the
+ * room before the UPDATE, guarding concurrent saved-game inserts/renewals
+ * inside the same DB transaction. This port now has an equivalent (see the
+ * race-condition paragraph below) instead of omitting it.
+ *
+ * Captures each cancelled row's id AND its pre-cancellation `updated_at`
+ * (via `UPDATE ... FROM (subquery) ... RETURNING`, same reservation-capturing
+ * pattern used in `events-service.ts`'s `restoreCancelledReservations`) so a
+ * later failure in the same call can restore it exactly — including the
+ * timestamp, not just the status (code-review finding: the original restore
+ * flipped `status` back but left `updated_at` at the cancellation-time
+ * value, so a rolled-back event mutation still left the saved game's public
+ * `updatedAt` changed). Every cancelled row's pre-cancellation status was
+ * always `'active'` (the trigger's own WHERE clause), so no status needs
+ * capturing, only the timestamp.
+ *
+ * Takes the room's already-resolved table ids (`tableIds`) rather than
+ * re-joining `tables` by `room_id` itself (code-review finding, high-effort
+ * pass) — every caller already batches every room's table ids into a
+ * room->table-ids map up front specifically to avoid a redundant per-block
+ * `tables` lookup (the #304/#354 code-review optimization); joining inline
+ * here would reintroduce exactly that redundant lookup, once per block.
+ *
+ * Race with `createSavedGameForSession` above (code-review finding):
+ * removing the legacy trigger's advisory lock left a check-then-insert race —
+ * that function's event-block precheck and its insert are two separate Neon
+ * HTTP round trips, so this UPDATE could run between them and the new saved
+ * game would stay `'active'` even though it should have been blocked. Both
+ * sides now take the same per-table `pg_advisory_xact_lock` (keyed by
+ * `hashtext(table_id)`) as the first statement of a `sql.transaction()`,
+ * before touching `saved_games` — the lock statement blocks until any
+ * concurrent holder commits and releases it, and (per Neon's
+ * `sql.transaction()`, a real non-interactive Postgres transaction) each
+ * statement after it gets its own fresh READ COMMITTED snapshot, so the
+ * second statement here always runs after any concurrent
+ * `createSavedGameForSession` insert has either committed or is blocked
+ * behind this same lock.
+ *
+ * Called from two places: `club-events-service.ts`'s
+ * `applyClubEventBlocksAndMaterials` (the create/update path) and
+ * `events-service.ts`'s `deleteEventCascade` (#375 — the delete path used to
+ * cancel overlapping reservations but not overlapping saved games). Lives
+ * here rather than in either of those files because it's pure `saved_games`
+ * mutation logic that has to stay lock-compatible with
+ * `createSavedGameForSession`/`renewSavedGameForSession` above, not because
+ * either caller owns it.
+ */
+export async function cancelActiveSavedGamesForRoomBlock(
+  tableIds: string[],
+  date: string,
+): Promise<Array<{ id: string; updatedAt: string }>> {
+  if (tableIds.length === 0) return []
+
+  let cancelledRows: Array<{ id: string; updated_at: string | Date }>
+  try {
+    const results = await sql.transaction(
+      [
+        sql`
+          SELECT pg_advisory_xact_lock(hashtext(t::text))
+          FROM (
+            -- Cast to uuid before hashtext (code-review finding): canonicalizes
+            -- each id's text form so this always hashes to the same lock key
+            -- createSavedGameForSession's own lock derives, regardless of
+            -- spelling — matters there since that id is client-supplied, and
+            -- kept consistent here too so both sides key off the identical
+            -- canonicalization rule. Ordered ascending (ORDER BY 1) so two
+            -- concurrent calls whose tableIds overlap always acquire the
+            -- per-table locks in the same order — without this, call A locking
+            -- [x, y] while call B locks [y, x] concurrently can deadlock.
+            SELECT unnest(${tableIds}::uuid[]) AS t ORDER BY 1
+          ) AS ordered_tables
+        `,
+        sql`
+          UPDATE saved_games AS saved
+          SET status = 'cancelled', updated_at = now()
+          FROM (
+            SELECT id, updated_at FROM saved_games
+            WHERE table_id = ANY(${tableIds})
+              AND status = 'active'
+              AND ${date} BETWEEN start_date AND end_date
+          ) AS prior
+          WHERE saved.id = prior.id
+          RETURNING saved.id, prior.updated_at
+        `,
+      ],
+      { isolationLevel: 'ReadCommitted' },
+    )
+    cancelledRows = results[1] as Array<{ id: string; updated_at: string | Date }>
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+  // @neondatabase/serverless returns `timestamptz` columns as `Date`
+  // instances, not strings (code-review finding) — normalize here so
+  // `restoreCancelledSavedGames`'s "restore it exactly" round-trips through
+  // the same `timestamptz` cast it started from, matching the
+  // `instanceof Date` normalization pattern already used in
+  // equipment-service.ts's `toEquipment`.
+  return cancelledRows.map((row) => ({
+    id: row.id,
+    updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at,
+  }))
+}
+
+/**
+ * Compensating restore for `cancelActiveSavedGamesForRoomBlock` above (#334,
+ * mirrors `events-service.ts`'s `restoreCancelledReservations`). Every row
+ * cancelled by that function was `'active'` beforehand, so restoration is a
+ * plain status flip back — no per-row status needs to be tracked, unlike
+ * reservations (which can be 'active' or 'pending'). Restores each row's own
+ * captured pre-cancellation `updated_at` alongside its status (code-review
+ * finding — see `cancelActiveSavedGamesForRoomBlock`'s doc comment), not
+ * just the status, so a rolled-back event mutation leaves no trace on the
+ * saved game's public `updatedAt`. Best-effort: errors are logged and
+ * swallowed, matching every other compensating step in this codebase's
+ * raw-SQL services.
+ */
+export async function restoreCancelledSavedGames(cancelled: Array<{ id: string; updatedAt: string }>): Promise<void> {
+  if (cancelled.length === 0) return
+  try {
+    const ids = cancelled.map((row) => row.id)
+    const updatedAts = cancelled.map((row) => row.updatedAt)
+    await sql`
+      UPDATE saved_games
+      SET status = 'active', updated_at = restored.updated_at
+      FROM (
+        SELECT * FROM unnest(${ids}::uuid[], ${updatedAts}::timestamptz[]) AS restored(id, updated_at)
+      ) AS restored
+      WHERE saved_games.id = restored.id AND saved_games.status = 'cancelled'
+    `
+  } catch (rollbackError) {
+    console.error('saved-games-service: compensating saved-game restore failed (non-fatal):', rollbackError)
   }
 }

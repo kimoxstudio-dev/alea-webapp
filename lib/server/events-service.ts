@@ -3,6 +3,7 @@ import { sql } from '@/lib/db/client'
 import { NeonDbError } from '@neondatabase/serverless'
 import { serviceError } from '@/lib/server/service-error'
 import type { Tables } from '@/lib/supabase/types'
+import { cancelActiveSavedGamesForRoomBlock, restoreCancelledSavedGames } from '@/lib/server/saved-games-service'
 
 /**
  * Shared Neon-backed helpers reused by `lib/server/club-events-service.ts`
@@ -35,6 +36,16 @@ import type { Tables } from '@/lib/supabase/types'
  * runtime result), so multi-step writes here use sequential non-transactional
  * statements with compensating rollback on failure, matching
  * `reservations-service.ts`'s established precedent.
+ *
+ * `deleteEventCascade` (#375) also cancels overlapping active `saved_games`
+ * alongside reservations, via `cancelActiveSavedGamesForRoomBlock`/
+ * `restoreCancelledSavedGames` imported from `saved-games-service.ts` — the
+ * same functions `club-events-service.ts`'s `applyClubEventBlocksAndMaterials`
+ * already used for the create/update path. Both live in
+ * `saved-games-service.ts` (not here or in `club-events-service.ts`) because
+ * they're pure `saved_games` mutation logic whose advisory-lock protocol has
+ * to stay coordinated with that file's own `createSavedGameForSession`/
+ * `renewSavedGameForSession` lock sites.
  */
 
 type EventRow = Tables<'events'>
@@ -211,10 +222,10 @@ export function resolveBlockCancellationTableIds(
 }
 
 /**
- * Cancel overlapping reservations for every room block attached to `id`,
- * then delete the event row (blocks cascade via FK). Used by
- * `lib/server/club-events-service.ts`'s `deleteClubEvent`, which performs its
- * own club-event-row validation before calling this directly.
+ * Cancel overlapping reservations AND active saved games for every room
+ * block attached to `id`, then delete the event row (blocks cascade via FK).
+ * Used by `lib/server/club-events-service.ts`'s `deleteClubEvent`, which
+ * performs its own club-event-row validation before calling this directly.
  *
  * Table-level scoping (OIR-208, #353 fix): a block with a `table_id` only
  * cancels reservations for that single table; a null `table_id` cancels
@@ -230,6 +241,15 @@ export function resolveBlockCancellationTableIds(
  * `DELETE FROM events` fails — previously a failed final delete left those
  * cancellations un-reverted, the same bug class fixed elsewhere in #303's
  * rollback work.
+ *
+ * Saved-games cancellation (#375 fix): the create/update path
+ * (`applyClubEventBlocksAndMaterials`) has always cancelled overlapping
+ * active `saved_games` alongside reservations via
+ * `cancelActiveSavedGamesForRoomBlock`, but this cascade never did — deleting
+ * a club event left conflicting saved games active. Fixed to call the same
+ * helper, with the same table-scoped/room-wide `tableIds` already resolved
+ * for reservations, and the same restore-on-failure treatment as
+ * `cancelledReservations` in both failure branches below.
  */
 export async function deleteEventCascade(id: string): Promise<void> {
   let blocks: Array<{ room_id: string; table_id: string | null; date: string; start_time: string; end_time: string }>
@@ -264,12 +284,13 @@ export async function deleteEventCascade(id: string): Promise<void> {
     }
   }
 
-  // Cancel overlapping reservations for every block (multi-day aware),
-  // capturing each cancelled reservation's id AND pre-cancellation status
-  // (via an `UPDATE ... FROM` `RETURNING`) so they can be restored if a
-  // later cancellation or the final DELETE FROM events below fails
-  // (#304 fix).
+  // Cancel overlapping reservations AND active saved games for every block
+  // (multi-day aware), capturing each cancelled row's id (+ pre-cancellation
+  // status for reservations, + pre-cancellation updatedAt for saved games)
+  // so they can be restored if a later cancellation or the final
+  // DELETE FROM events below fails (#304 fix; saved games added in #375).
   const cancelledReservations: CancelledReservation[] = []
+  const cancelledSavedGames: Array<{ id: string; updatedAt: string }> = []
   for (const block of blocks) {
     // Table-level scoping (OIR-208, #353 fix): a block with a table_id only
     // cancels reservations for that single table; a null table_id cancels
@@ -303,9 +324,28 @@ export async function deleteEventCascade(id: string): Promise<void> {
         // that just failed — same compensating shape as the final-DELETE
         // failure branch below.
         await restoreCancelledReservations(cancelledReservations)
+        await restoreCancelledSavedGames(cancelledSavedGames)
         serviceError('Internal server error', 500)
       }
       cancelledReservations.push(...cancelledRows)
+
+      // #375: mirrors `applyClubEventBlocksAndMaterials` — cancel active
+      // saved games conflicting with this block, using the SAME scoped
+      // `tableIds` already resolved above for the reservation cancellation
+      // (table-scoped when `block.table_id` is set, room-wide only when
+      // it's null). `cancelActiveSavedGamesForRoomBlock` throws its own
+      // ServiceError on failure (it isn't wrapped in a try/catch itself), so
+      // this call needs its own try/catch here too — otherwise that error
+      // would propagate past the restore calls below, same bug class the
+      // reservations branch above already guards against.
+      try {
+        const blockCancelledSavedGames = await cancelActiveSavedGamesForRoomBlock(tableIds, block.date)
+        cancelledSavedGames.push(...blockCancelledSavedGames)
+      } catch (error) {
+        await restoreCancelledReservations(cancelledReservations)
+        await restoreCancelledSavedGames(cancelledSavedGames)
+        throw error
+      }
     }
   }
 
@@ -313,10 +353,11 @@ export async function deleteEventCascade(id: string): Promise<void> {
     await sql`DELETE FROM events WHERE id = ${id}`
   } catch {
     // #304 fix: the final DELETE is the last statement in this cascade — if
-    // it fails, the reservation cancellations performed above must not be
-    // left in place (they were only ever valid alongside the event's
-    // removal).
+    // it fails, the reservation and saved-game cancellations performed above
+    // must not be left in place (they were only ever valid alongside the
+    // event's removal).
     await restoreCancelledReservations(cancelledReservations)
+    await restoreCancelledSavedGames(cancelledSavedGames)
     serviceError('Internal server error', 500)
   }
 }

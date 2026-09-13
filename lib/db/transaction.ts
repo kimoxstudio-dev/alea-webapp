@@ -12,15 +12,17 @@ import { sql } from './client'
  *   `equipment-service.ts`'s `setRoomDefaultEquipment` (DELETE + INSERT, so
  *   a failing INSERT never leaves a room's defaults deleted with nothing
  *   replacing them) — now retrofitted onto `runTransaction` below.
- * - #334 (`club-events-service.ts` / `saved-games-service.ts`): a leading
+ * - #334 (`saved-games-service.ts`): a leading
  *   `pg_advisory_xact_lock(hashtext(id::uuid::text))` statement followed by
  *   a guarded check+write, pinned to `isolationLevel: 'ReadCommitted'`. This
- *   exact shape was hand-written three separate times across two files
- *   (`cancelActiveSavedGamesForRoomBlock`, `createSavedGameForSession`,
- *   `renewSavedGameForSession`). `saved-games-service.ts`'s
- *   `createSavedGameForSession` — the smallest of the three — is retrofitted
- *   onto `runAdvisoryLockedTransaction` below, as the proof this API fits a
- *   real call site; `cancelActiveSavedGamesForRoomBlock` and
+ *   exact shape was hand-written three separate times, all in
+ *   `saved-games-service.ts` (`cancelActiveSavedGamesForRoomBlock`,
+ *   `createSavedGameForSession`, `renewSavedGameForSession` — the first of
+ *   these moved into that file from `club-events-service.ts` in #375, after
+ *   this comment was written, but the lock shape and its history predate
+ *   that move). `createSavedGameForSession` — the smallest of the three — is
+ *   retrofitted onto `runAdvisoryLockedTransaction` below, as the proof this
+ *   API fits a real call site; `cancelActiveSavedGamesForRoomBlock` and
  *   `renewSavedGameForSession` are not touched by this change (see retrofit
  *   scope decision below).
  *
