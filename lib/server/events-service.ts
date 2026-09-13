@@ -306,7 +306,7 @@ export async function deleteEventCascade(id: string): Promise<void> {
   // blocks are all table-scoped skips this query entirely instead of always
   // fetching every referenced room's tables regardless of use.
   const roomIdsNeedingRoomWideFallback = [
-    ...new Set(blocks.filter((b) => b.table_id === null).map((b) => b.room_id).filter(Boolean)),
+    ...new Set(blocks.filter((b) => b.table_id === null).map((b) => b.room_id)),
   ]
   const roomTableMap = await fetchRoomTableMap(roomIdsNeedingRoomWideFallback)
 
