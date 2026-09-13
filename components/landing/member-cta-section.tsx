@@ -41,7 +41,7 @@ export async function MemberCtaSection({ locale }: MemberCtaSectionProps) {
         <div className="mod-cta-art">
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
-            src="https://alealaspalmas.es/wp-content/uploads/2025/10/image-removebg-preview.png"
+            src="/image-removebg-preview.png"
             alt="Personajes Alea"
           />
         </div>

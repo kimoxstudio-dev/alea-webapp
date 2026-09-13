@@ -22,7 +22,7 @@ export async function LandingFooterSection({ locale }: LandingFooterSectionProps
           <div className="mod-logo">
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
-              src="https://alealaspalmas.es/wp-content/uploads/2025/11/logo_final_sin_fondo.png"
+              src="/alea-logo.png"
               alt="Alea"
               width={40}
               height={40}
