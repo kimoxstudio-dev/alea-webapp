@@ -37,6 +37,21 @@ export function normalizeTime(time: string) {
   return time.slice(0, 5)
 }
 
+/**
+ * OIR-208: a room block with a `table_id` only applies to that single table;
+ * `table_id === null` (the pre-OIR-208 default) applies to every table of
+ * the room.
+ *
+ * Raw-SQL mirrors of this rule carry a pointer comment back here — keep them
+ * in sync if this rule ever changes.
+ */
+export function blockAppliesToTable(
+  block: { table_id: string | null },
+  tableId: string,
+): boolean {
+  return block.table_id == null || block.table_id === tableId
+}
+
 export function generateDaySlots(reservedSlots: ReservedSlot[]): TimeSlot[] {
   return Array.from({ length: DAY_MINUTES / SLOT_INTERVAL_MINUTES }, (_, i) => {
     const slotStartMinutes = i * SLOT_INTERVAL_MINUTES

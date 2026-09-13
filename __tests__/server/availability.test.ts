@@ -2,7 +2,13 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest'
 import type { GameTable } from '@/lib/types'
 import type { Tables } from '@/lib/supabase/types'
-import { resolveDate, normalizeTime, generateDaySlots, buildAvailability } from '@/lib/server/availability'
+import {
+  resolveDate,
+  normalizeTime,
+  generateDaySlots,
+  buildAvailability,
+  blockAppliesToTable,
+} from '@/lib/server/availability'
 
 type ReservationRow = Tables<'reservations'>
 
@@ -84,6 +90,20 @@ describe('resolveDate', () => {
     expect(() => resolveDate('2025-13-01')).toThrow(
       expect.objectContaining({ name: 'ServiceError', statusCode: 400 }),
     )
+  })
+})
+
+describe('blockAppliesToTable', () => {
+  it('matches any table when table_id is null', () => {
+    expect(blockAppliesToTable({ table_id: null }, 't1')).toBe(true)
+  })
+
+  it('matches when table_id equals the given table', () => {
+    expect(blockAppliesToTable({ table_id: 't1' }, 't1')).toBe(true)
+  })
+
+  it('does not match a different table_id', () => {
+    expect(blockAppliesToTable({ table_id: 't2' }, 't1')).toBe(false)
   })
 })
 

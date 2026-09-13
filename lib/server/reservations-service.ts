@@ -9,7 +9,7 @@ import { assertMemberRowsScopedSql } from '@/lib/server/authz'
 import { sql } from '@/lib/db/client'
 import { NeonDbError } from '@neondatabase/serverless'
 import type { Tables } from '@/lib/supabase/types'
-import { normalizeTime } from '@/lib/server/availability'
+import { normalizeTime, blockAppliesToTable } from '@/lib/server/availability'
 import {
   CHECK_IN_LATE_MINUTES,
   getPendingCheckInDeadline,
@@ -173,11 +173,7 @@ async function hasEventBlockConflict(input: {
     serviceError('Internal server error', 500)
   }
 
-  // OIR-208: a block with a table_id only conflicts with that single table;
-  // NULL (the pre-OIR-208 default) conflicts with every table of the room.
-  return rows.some(
-    (block) => block.table_id == null || block.table_id === input.tableId,
-  )
+  return rows.some((block) => blockAppliesToTable(block, input.tableId))
 }
 
 async function hasSavedGameBottomConflict(input: {

@@ -19,6 +19,7 @@ import type { SessionUser } from '@/lib/server/auth'
 import { getCurrentClubDate, isValidDateOnlyString } from '@/lib/club-time'
 import { serviceError } from '@/lib/server/service-error'
 import { assertMemberRowsScoped } from '@/lib/server/data-scoping'
+import { blockAppliesToTable } from '@/lib/server/availability'
 import { sql } from '@/lib/db/client'
 import { runAdvisoryLockedTransaction } from '@/lib/db/transaction'
 import { NeonDbError } from '@neondatabase/serverless'
@@ -149,12 +150,7 @@ async function assertTableAndEventAvailability(tableId: string, startDate: strin
     serviceError('Internal server error', 500)
   }
 
-  // OIR-208: a block with a table_id only conflicts with that single table;
-  // NULL (the pre-OIR-208 default) conflicts with every table of the room —
-  // saved games only ever live on a single removable-top table.
-  const hasConflict = blocks.some(
-    (block) => block.table_id == null || block.table_id === tableId,
-  )
+  const hasConflict = blocks.some((block) => blockAppliesToTable(block, tableId))
   if (hasConflict) serviceError(ERROR_CODES.SAVED_GAME_EVENT_CONFLICT, 409)
 }
 
@@ -278,6 +274,7 @@ export async function createSavedGameForSession(
           WHERE t.id = input.table_id
             AND b.date >= input.start_date
             AND b.date <= input.end_date
+            -- Mirrors blockAppliesToTable() in lib/server/availability.ts — keep in sync
             AND (b.table_id IS NULL OR b.table_id = input.table_id)
           LIMIT 1
         ),
@@ -384,6 +381,7 @@ export async function renewSavedGameForSession(session: SessionUser, id: string)
             WHERE t.id = input.table_id
               AND b.date >= input.start_date
               AND b.date <= input.end_date
+              -- Mirrors blockAppliesToTable() in lib/server/availability.ts — keep in sync
               AND (b.table_id IS NULL OR b.table_id = input.table_id)
             LIMIT 1
           ),
