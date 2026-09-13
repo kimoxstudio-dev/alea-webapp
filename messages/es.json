@@ -41,7 +41,8 @@
     "skipToContent": "Ir al contenido principal",
     "logoAriaLabel": "Alea - Inicio",
     "menuAriaLabel": "Menú",
-    "switchLocale": "Cambiar a {locale}"
+    "switchLocale": "Cambiar a {locale}",
+    "switchLocaleFull": "Idioma: {current}. Cambiar a {other}"
   },
   "auth": {
     "login": "Iniciar Sesión",

@@ -41,7 +41,8 @@
     "skipToContent": "Skip to main content",
     "logoAriaLabel": "Alea - Home",
     "menuAriaLabel": "Menu",
-    "switchLocale": "Switch to {locale}"
+    "switchLocale": "Switch to {locale}",
+    "switchLocaleFull": "Language: {current}. Switch to {other}"
   },
   "auth": {
     "login": "Sign In",

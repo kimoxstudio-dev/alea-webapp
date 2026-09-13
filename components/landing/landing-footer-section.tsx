@@ -1,3 +1,4 @@
+import Image from 'next/image'
 import Link from 'next/link'
 import { getTranslations } from 'next-intl/server'
 
@@ -20,8 +21,7 @@ export async function LandingFooterSection({ locale }: LandingFooterSectionProps
       <div className="mod-foot-grid">
         <div>
           <div className="mod-logo">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
+            <Image
               src="/alea-logo.png"
               alt="Alea"
               width={40}
@@ -39,7 +39,7 @@ export async function LandingFooterSection({ locale }: LandingFooterSectionProps
           <p className="mod-egg-hint">{t('easter.hint')}</p>
         </div>
         <div>
-          <h5>{t('footer.find')}</h5>
+          <h3>{t('footer.find')}</h3>
           <p>
             <a href={mapsUrl} target="_blank" rel="noopener noreferrer">
               {address}
@@ -47,13 +47,13 @@ export async function LandingFooterSection({ locale }: LandingFooterSectionProps
           </p>
         </div>
         <div>
-          <h5>{t('footer.write')}</h5>
+          <h3>{t('footer.write')}</h3>
           <p>
             <a href={`mailto:${email}`}>{email}</a>
           </p>
         </div>
         <div>
-          <h5>{t('footer.follow')}</h5>
+          <h3>{t('footer.follow')}</h3>
           <p>
             <a href={instagram} target="_blank" rel="noopener noreferrer">
               Instagram

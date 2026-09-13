@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import Image from 'next/image'
 import Link from 'next/link'
 import { useTranslations } from 'next-intl'
 import type { ClubEvent } from '@/lib/types'
@@ -63,12 +64,15 @@ export function HeroSection({ locale, upcomingEvents, onPickEvent }: HeroSection
 
   return (
     <section className="mod-hero" id="top">
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img
+      <Image
         className="mod-hero-bg-img"
         src="/fondo-oscuro.png"
         alt=""
         aria-hidden="true"
+        fill
+        sizes="100vw"
+        priority
+        fetchPriority="high"
       />
       <div className="mod-hero-grid">
         <div className="mod-hero-left">
@@ -127,6 +131,7 @@ export function HeroSection({ locale, upcomingEvents, onPickEvent }: HeroSection
               onClick={() => {
                 if (pick && !nat20) onPickEvent(pick)
               }}
+              aria-hidden={!pick && !nat20 ? true : undefined}
               aria-label={pick && !nat20 && pickTitle ? `${locale === 'en' ? 'See' : 'Ver'} ${pickTitle}` : undefined}
             >
               {nat20 ? (
@@ -148,6 +153,9 @@ export function HeroSection({ locale, upcomingEvents, onPickEvent }: HeroSection
                 )
               )}
             </button>
+            <span role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+              {nat20 ? t('egg.title') : pick && pickTitle ? `${t('roll.you')} ${pickTitle}` : ''}
+            </span>
           </div>
         </div>
       </div>

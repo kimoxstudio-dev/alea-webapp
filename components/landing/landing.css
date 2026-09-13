@@ -81,7 +81,8 @@
 .alea-lang-toggle { position: fixed; top: 22px; right: 24px; z-index: 60; background: rgba(13,18,24,0.7); backdrop-filter: blur(10px); border: 1px solid rgba(200,162,91,0.3); color: rgba(244,234,213,0.7); padding: 8px 14px; border-radius: 999px; font-family: "Space Grotesk", sans-serif; font-size: 11px; letter-spacing: 2px; font-weight: 700; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; transition: border-color .2s, color .2s; text-decoration: none; }
 .alea-lang-toggle:hover { border-color: #c8a25b; }
 .alea-lang-toggle span.on { color: #e6c281; }
-.alea-lang-toggle span[aria-hidden] { opacity: 0.3; }
+.alea-lang-toggle .alea-lang-codes { display: inline-flex; align-items: center; gap: 8px; }
+.alea-lang-toggle .alea-lang-sep { opacity: 0.3; }
 .alea-lang-toggle.alea-lang-toggle-in-menu { display: none; }
 
 /* Hero */
@@ -338,14 +339,14 @@
 .mod-benefits svg { flex-shrink: 0; }
 .mod-cta-buttons { display: flex; gap: 14px; flex-wrap: wrap; }
 .mod-cta-art { position: relative; height: 100%; min-height: 320px; display: grid; place-items: center; }
-.mod-cta-art img { max-width: 100%; max-height: 460px; object-fit: contain; filter: drop-shadow(0 30px 60px rgba(0,0,0,0.5)); animation: mod-float 5s ease-in-out infinite; }
+.mod-cta-art img { max-width: 100%; max-height: 460px; height: auto; object-fit: contain; filter: drop-shadow(0 30px 60px rgba(0,0,0,0.5)); animation: mod-float 5s ease-in-out infinite; }
 @keyframes mod-float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-12px); } }
 
 /* Footer */
 .mod-footer { position: relative; z-index: 2; padding: 80px 32px 40px; border-top: 1px solid rgba(200,162,91,0.18); }
 .mod-foot-grid { max-width: 1400px; margin: 0 auto; display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr; gap: 40px; }
 .mod-foot-tag { font-size: 14px; opacity: 0.7; margin: 16px 0 6px; }
-.mod-foot-grid h5 { font-size: 11px; letter-spacing: 3px; text-transform: uppercase; color: var(--gold); margin: 0 0 12px; }
+.mod-foot-grid h3 { font-family: "Space Grotesk", "Inter Tight", system-ui, sans-serif; font-size: 11px; letter-spacing: 3px; text-transform: uppercase; color: var(--gold); margin: 0 0 12px; }
 .mod-foot-grid p { font-size: 14px; opacity: 0.78; margin: 6px 0; }
 .mod-foot-grid p a { color: inherit; text-decoration: none; border-bottom: 1px dotted rgba(244,234,213,0.3); transition: border-color .2s, color .2s; }
 .mod-foot-grid p a:hover { color: var(--gold-2); border-color: var(--gold-2); }

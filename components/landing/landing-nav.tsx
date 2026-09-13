@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
+import Image from 'next/image'
 import Link from 'next/link'
 import { usePathname, useSearchParams } from 'next/navigation'
 import { useTranslations } from 'next-intl'
@@ -17,12 +18,18 @@ function LangToggle({ locale, className }: { locale: string; className?: string 
   const pathWithoutLocale = pathname.replace(/^\/[a-z]{2}(?=\/|$)/, '')
   const qs = searchParams.toString()
   const href = `/${otherLocale}${pathWithoutLocale}${qs ? `?${qs}` : ''}`
+  const currentLangName = locale === 'es' ? 'Español' : 'English'
+  const otherLangName = otherLocale === 'es' ? 'Español' : 'English'
+  const switchLabel = t('switchLocaleFull', { current: currentLangName, other: otherLangName })
 
   return (
-    <Link href={href} className={`alea-lang-toggle ${className ?? ''}`} aria-label={t('switchLocale', { locale: otherLocale })}>
-      <span className={locale === 'es' ? 'on' : undefined}>ES</span>
-      <span aria-hidden="true">·</span>
-      <span className={locale === 'en' ? 'on' : undefined}>EN</span>
+    <Link href={href} className={`alea-lang-toggle ${className ?? ''}`}>
+      <span className="sr-only">{switchLabel}</span>
+      <span aria-hidden="true" className="alea-lang-codes">
+        <span className={locale === 'es' ? 'on' : undefined}>ES</span>
+        <span className="alea-lang-sep">·</span>
+        <span className={locale === 'en' ? 'on' : undefined}>EN</span>
+      </span>
     </Link>
   )
 }
@@ -52,12 +59,12 @@ export function LandingNav({ locale }: LandingNavProps) {
     <>
       <header className="mod-nav">
         <a href="#top" className="mod-logo" data-egg-tap title="Alea Las Palmas">
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img
+          <Image
             src="/alea-logo.png"
             alt="Alea"
             width={40}
             height={40}
+            priority
           />
           <span>
             <strong>ALEA</strong>

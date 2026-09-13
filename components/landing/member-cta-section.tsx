@@ -1,3 +1,4 @@
+import Image from 'next/image'
 import Link from 'next/link'
 import { getTranslations } from 'next-intl/server'
 
@@ -39,10 +40,11 @@ export async function MemberCtaSection({ locale }: MemberCtaSectionProps) {
           </div>
         </div>
         <div className="mod-cta-art">
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img
+          <Image
             src="/image-removebg-preview.png"
             alt="Personajes Alea"
+            width={500}
+            height={500}
           />
         </div>
       </div>
