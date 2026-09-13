@@ -1,7 +1,6 @@
 'use client'
 
 import Link from 'next/link'
-import { usePathname } from 'next/navigation'
 import { useTranslations } from 'next-intl'
 import { Sword, ExternalLink } from 'lucide-react'
 
@@ -12,15 +11,8 @@ interface FooterProps {
 export function Footer({ locale }: FooterProps) {
   const t = useTranslations('footer')
   const tAuth = useTranslations('auth')
-  const pathname = usePathname()
 
   const associationUrl = process.env.NEXT_PUBLIC_ASSOCIATION_URL || null
-
-  // The public landing page (locale root, e.g. `/es` or `/en`) renders its own
-  // design footer (LandingFooterSection); skip the global one there so it
-  // isn't duplicated. Every other route (incl. authenticated ones) keeps it.
-  const isLocaleRoot = /^\/[a-z]{2}$/.test(pathname)
-  if (isLocaleRoot) return null
 
   return (
     <footer className="border-t border-border bg-background-secondary mt-auto" role="contentinfo">

@@ -54,8 +54,9 @@ describe('LoginForm', () => {
   })
 
   // #391: the fix has two parts, and this test only proves the first.
-  // `router.refresh()` makes `app/[locale]/layout.tsx` re-run and produce a
-  // fresh `initialUser` prop for `AuthProvider` — that part is asserted here.
+  // `router.refresh()` makes `app/[locale]/(app)/layout.tsx` re-run and
+  // produce a fresh `initialUser` prop for `AuthProvider` — that part is
+  // asserted here.
   // Whether `AuthProvider` actually *adopts* that new prop into its `user`
   // state (the part that determines if the header renders) is a separate
   // question, covered in `__tests__/lib/auth-context.test.tsx`

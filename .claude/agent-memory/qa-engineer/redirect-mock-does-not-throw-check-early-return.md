@@ -8,8 +8,8 @@ metadata:
 `__tests__/app/*.test.tsx` (e.g. `auth-pages.test.tsx`, `check-in-page.test.tsx`) mock `next/navigation`'s
 `redirect` as a bare `vi.fn()` that does not throw. In production, Next's real `redirect()` throws
 `NEXT_REDIRECT` and execution never continues past the call. Some pages guard against this correctly with
-an explicit `return redirect(...)` (e.g. `app/[locale]/rooms/page.tsx`); others (e.g.
-`app/[locale]/check-in/[tableId]/page.tsx` as of commit 4600763) call `redirect(...)` with no `return`,
+an explicit `return redirect(...)` (e.g. `app/[locale]/(app)/rooms/page.tsx`); others (e.g.
+`app/[locale]/(app)/check-in/[tableId]/page.tsx` as of commit 4600763) call `redirect(...)` with no `return`,
 relying on the real throw to stop execution — under the non-throwing test mock, code after the call (e.g.
 `markExpiredReservationsAsNoShow()`, the JSX return) still executes.
 

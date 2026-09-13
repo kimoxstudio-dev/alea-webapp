@@ -57,9 +57,10 @@ export default async function HomePage({ params }: HomePageProps) {
   const { locale } = await params
 
   // Authenticated users deliberately view this same public landing page —
-  // it doubles as the club's marketing/info entry point. The webapp chrome
-  // (header/footer) is already hidden here via pathname gates, so there is
-  // no redirect to /rooms for signed-in users. Do NOT add one back.
+  // it doubles as the club's marketing/info entry point. This route lives
+  // outside the `(app)` route group, so Clerk/AuthProvider/Header/Footer
+  // are never part of its tree at all — there is no redirect to /rooms for
+  // signed-in users. Do NOT add one back.
 
   const [{ upcoming, past }, partners, games] = await Promise.all([
     loadClubEvents(),

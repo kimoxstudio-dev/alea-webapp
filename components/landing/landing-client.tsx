@@ -76,15 +76,17 @@ export function LandingClient({
       <HexGridBackground />
       <CustomCursor variant="die" color="#e6c281" />
       <LandingNav locale={locale} />
-      <HeroSection locale={locale} upcomingEvents={upcomingEvents} onPickEvent={setSelectedEvent} />
-      <Ticker locale={locale} />
-      <EventsSection events={upcomingEvents} locale={locale} variant="upcoming" onSelectEvent={setSelectedEvent} />
-      {gameLibrarySlot}
-      <EventsSection events={pastEvents} locale={locale} variant="past" onSelectEvent={setSelectedEvent} />
-      {aboutSlot}
-      {cultureSlot}
-      {partnersSlot}
-      {ctaSlot}
+      <main id="main-content">
+        <HeroSection locale={locale} upcomingEvents={upcomingEvents} onPickEvent={setSelectedEvent} />
+        <Ticker locale={locale} />
+        <EventsSection events={upcomingEvents} locale={locale} variant="upcoming" onSelectEvent={setSelectedEvent} />
+        {gameLibrarySlot}
+        <EventsSection events={pastEvents} locale={locale} variant="past" onSelectEvent={setSelectedEvent} />
+        {aboutSlot}
+        {cultureSlot}
+        {partnersSlot}
+        {ctaSlot}
+      </main>
       {footerSlot}
 
       <EventDetailsDialog

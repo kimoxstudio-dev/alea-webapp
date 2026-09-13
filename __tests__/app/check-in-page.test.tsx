@@ -35,7 +35,7 @@ describe('check-in page sign-in redirect', () => {
   it('preserves every query param (not just side) when redirecting an unauthenticated request to sign-in', async () => {
     getSessionFromServerCookiesMock.mockResolvedValueOnce(null)
 
-    const { default: CheckInPage } = await import('@/app/[locale]/check-in/[tableId]/page')
+    const { default: CheckInPage } = await import('@/app/[locale]/(app)/check-in/[tableId]/page')
     await CheckInPage({
       params: Promise.resolve({ locale: 'es', tableId: TABLE_ID }),
       searchParams: Promise.resolve({ side: 'inf', foo: 'bar' }),
@@ -51,7 +51,7 @@ describe('check-in page sign-in redirect', () => {
   it('preserves repeated query keys as multiple values, matching URLSearchParams array semantics', async () => {
     getSessionFromServerCookiesMock.mockResolvedValueOnce(null)
 
-    const { default: CheckInPage } = await import('@/app/[locale]/check-in/[tableId]/page')
+    const { default: CheckInPage } = await import('@/app/[locale]/(app)/check-in/[tableId]/page')
     await CheckInPage({
       params: Promise.resolve({ locale: 'es', tableId: TABLE_ID }),
       // Next.js resolves a repeated query key (e.g. ?tag=a&tag=b) to an array.
@@ -66,7 +66,7 @@ describe('check-in page sign-in redirect', () => {
   it('does not append a query string to the redirect target when there are no query params', async () => {
     getSessionFromServerCookiesMock.mockResolvedValueOnce(null)
 
-    const { default: CheckInPage } = await import('@/app/[locale]/check-in/[tableId]/page')
+    const { default: CheckInPage } = await import('@/app/[locale]/(app)/check-in/[tableId]/page')
     await CheckInPage({
       params: Promise.resolve({ locale: 'es', tableId: TABLE_ID }),
       searchParams: Promise.resolve({}),

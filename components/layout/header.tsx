@@ -51,13 +51,6 @@ export function Header({ locale }: HeaderProps) {
   const t = useTranslations()
   const { user, logout, isAuthenticated } = useAuth()
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
-  const pathname = usePathname()
-
-  // The public landing page (locale root, e.g. `/es` or `/en`) renders its own
-  // design nav; skip the global header there so it isn't duplicated. Every
-  // other route (incl. authenticated ones) keeps it.
-  const isLocaleRoot = /^\/[a-z]{2}$/.test(pathname)
-  if (isLocaleRoot) return null
 
   if (!isAuthenticated) return null
 
