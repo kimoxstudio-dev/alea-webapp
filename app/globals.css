@@ -67,7 +67,7 @@
   }
   /* #407 — kx-ux non-negotiable: honour prefers-reduced-motion wherever
      anything moves. This app has several infinite CSS animations
-     (dice-roll/dice-fade in components/ui/dice-loader.tsx, glow, shimmer,
+     (dice-roll in components/ui/dice-loader.tsx, glow, shimmer,
      mod-pulse, mod-marq, mod-float — all in tailwind.config.ts) plus short
      transitions (accordion, .rpg-card hover), none of which previously
      checked this. A single global rule here is the safety net for all

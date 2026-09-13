@@ -149,10 +149,6 @@ const config: Config = {
           '75%':  { transform: 'rotate(270deg) scale(1.08)' },
           '100%': { transform: 'rotate(360deg) scale(1)' },
         },
-        'dice-fade': {
-          '0%, 100%': { opacity: '1' },
-          '50%':      { opacity: '0.6' },
-        },
         'mod-pulse': { '0%,100%': { opacity: '1', transform: 'scale(1)' }, '50%': { opacity: '0.4', transform: 'scale(0.8)' } },
         'mod-marq': { from: { transform: 'translateX(0)' }, to: { transform: 'translateX(-50%)' } },
         'mod-float': { '0%,100%': { transform: 'translateY(0)' }, '50%': { transform: 'translateY(-12px)' } },
@@ -163,7 +159,6 @@ const config: Config = {
         shimmer: 'shimmer 2s infinite',
         glow: 'glow 2s ease-in-out infinite',
         'dice-roll': 'dice-roll 1.2s cubic-bezier(0.4, 0, 0.6, 1) infinite',
-        'dice-fade': 'dice-fade 1.2s ease-in-out infinite',
         'mod-pulse': 'mod-pulse 1.6s infinite',
         'mod-marq': 'mod-marq 38s linear infinite',
         'mod-float': 'mod-float 5s ease-in-out infinite',

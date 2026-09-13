@@ -90,6 +90,8 @@ describe('UsersSection — pending buttons reserve loader space without animatin
     render(<UsersSection />)
     const [button] = screen.getAllByRole('button', { name: 'resetNoShows' })
     expect(getIconSlot(button)).toHaveClass('h-4', 'w-4', 'shrink-0')
+    expect(getIconSlot(button)).toHaveClass('absolute')
+    expect(button).toHaveClass('relative')
     expect(queryLoader(button)).toBeNull()
     expect(button).not.toBeDisabled()
   })
@@ -124,6 +126,8 @@ describe('UsersSection — pending buttons reserve loader space without animatin
     render(<UsersSection />)
     const [button] = screen.getAllByRole('button', { name: 'unblockUser' })
     expect(getIconSlot(button)).toHaveClass('h-4', 'w-4', 'shrink-0')
+    expect(getIconSlot(button)).toHaveClass('absolute')
+    expect(button).toHaveClass('relative')
     expect(queryLoader(button)).toBeNull()
   })
 
@@ -159,6 +163,8 @@ describe('UsersSection — pending buttons reserve loader space without animatin
     await user.click(editButton)
     const button = screen.getByRole('button', { name: 'save' })
     expect(getIconSlot(button)).toHaveClass('h-4', 'w-4', 'shrink-0')
+    expect(getIconSlot(button)).toHaveClass('absolute')
+    expect(button).toHaveClass('relative')
     expect(queryLoader(button)).toBeNull()
   })
 
@@ -180,6 +186,8 @@ describe('UsersSection — pending buttons reserve loader space without animatin
     await user.click(deleteButton)
     const button = screen.getByRole('button', { name: 'delete' })
     expect(getIconSlot(button)).toHaveClass('h-4', 'w-4', 'shrink-0')
+    expect(getIconSlot(button)).toHaveClass('absolute')
+    expect(button).toHaveClass('relative')
     expect(queryLoader(button)).toBeNull()
   })
 

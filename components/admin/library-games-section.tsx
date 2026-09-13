@@ -395,11 +395,16 @@ function LibraryGameRow({ game }: { game: AdminLibraryGame }) {
               <Button type="button" variant="outline" onClick={() => setEditing(false)} className="border-border">
                 {tc('cancel')}
               </Button>
-              <Button type="submit" disabled={updateGame.isPending} aria-busy={updateGame.isPending}>
-                <span className="inline-flex h-4 w-4 shrink-0">
-                  {updateGame.isPending && <DiceLoader size="sm" hideRole />}
+              <Button
+                type="submit"
+                className="relative"
+                disabled={updateGame.isPending}
+                aria-busy={updateGame.isPending}
+              >
+                <span className="absolute left-1/2 top-1/2 inline-flex h-4 w-4 shrink-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+                  {updateGame.isPending && <DiceLoader size="sm" hideRole className="text-primary-foreground" />}
                 </span>
-                {tc('save')}
+                <span className={updateGame.isPending ? 'opacity-0' : undefined}>{tc('save')}</span>
               </Button>
             </DialogFooter>
           </form>
@@ -435,14 +440,15 @@ function LibraryGameRow({ game }: { game: AdminLibraryGame }) {
             <Button
               type="button"
               variant="destructive"
+              className="relative"
               onClick={handleDelete}
               disabled={deleteGame.isPending}
               aria-busy={deleteGame.isPending}
             >
-              <span className="inline-flex h-4 w-4 shrink-0">
-                {deleteGame.isPending && <DiceLoader size="sm" hideRole />}
+              <span className="absolute left-1/2 top-1/2 inline-flex h-4 w-4 shrink-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+                {deleteGame.isPending && <DiceLoader size="sm" hideRole className="text-destructive-foreground" />}
               </span>
-              {tc('delete')}
+              <span className={deleteGame.isPending ? 'opacity-0' : undefined}>{tc('delete')}</span>
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -597,11 +603,16 @@ export function LibraryGamesSection() {
               <Button type="button" variant="outline" onClick={() => setShowCreate(false)} className="border-border">
                 {tc('cancel')}
               </Button>
-              <Button type="submit" disabled={createGame.isPending} aria-busy={createGame.isPending}>
-                <span className="inline-flex h-4 w-4 shrink-0">
-                  {createGame.isPending && <DiceLoader size="sm" hideRole />}
+              <Button
+                type="submit"
+                className="relative"
+                disabled={createGame.isPending}
+                aria-busy={createGame.isPending}
+              >
+                <span className="absolute left-1/2 top-1/2 inline-flex h-4 w-4 shrink-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+                  {createGame.isPending && <DiceLoader size="sm" hideRole className="text-primary-foreground" />}
                 </span>
-                {tc('save')}
+                <span className={createGame.isPending ? 'opacity-0' : undefined}>{tc('save')}</span>
               </Button>
             </DialogFooter>
           </form>

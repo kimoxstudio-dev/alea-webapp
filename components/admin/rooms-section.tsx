@@ -461,13 +461,18 @@ function RoomRow({ room }: { room: Room }) {
               </Button>
               <Button
                 type="submit"
+                className="relative"
                 disabled={updateRoom.isPending || setRoomDefaultEquipment.isPending}
                 aria-busy={updateRoom.isPending || setRoomDefaultEquipment.isPending}
               >
-                <span className="inline-flex h-4 w-4 shrink-0">
-                  {(updateRoom.isPending || setRoomDefaultEquipment.isPending) && <DiceLoader size="sm" hideRole />}
+                <span className="absolute left-1/2 top-1/2 inline-flex h-4 w-4 shrink-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+                  {(updateRoom.isPending || setRoomDefaultEquipment.isPending) && (
+                    <DiceLoader size="sm" hideRole className="text-primary-foreground" />
+                  )}
                 </span>
-                {tc('save')}
+                <span className={updateRoom.isPending || setRoomDefaultEquipment.isPending ? 'opacity-0' : undefined}>
+                  {tc('save')}
+                </span>
               </Button>
             </DialogFooter>
           </form>
@@ -670,13 +675,18 @@ export function RoomsSection() {
               </Button>
               <Button
                 type="submit"
+                className="relative"
                 disabled={createRoom.isPending || setRoomDefaultEquipment.isPending}
                 aria-busy={createRoom.isPending || setRoomDefaultEquipment.isPending}
               >
-                <span className="inline-flex h-4 w-4 shrink-0">
-                  {(createRoom.isPending || setRoomDefaultEquipment.isPending) && <DiceLoader size="sm" hideRole />}
+                <span className="absolute left-1/2 top-1/2 inline-flex h-4 w-4 shrink-0 -translate-x-1/2 -translate-y-1/2 items-center justify-center">
+                  {(createRoom.isPending || setRoomDefaultEquipment.isPending) && (
+                    <DiceLoader size="sm" hideRole className="text-primary-foreground" />
+                  )}
                 </span>
-                {tc('save')}
+                <span className={createRoom.isPending || setRoomDefaultEquipment.isPending ? 'opacity-0' : undefined}>
+                  {tc('save')}
+                </span>
               </Button>
             </DialogFooter>
           </form>

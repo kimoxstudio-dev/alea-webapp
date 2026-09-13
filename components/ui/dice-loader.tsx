@@ -1,6 +1,7 @@
 'use client'
 
 import { useTranslations } from 'next-intl'
+import { cn } from '@/lib/utils'
 
 interface DiceLoaderProps {
   size?: 'sm' | 'md' | 'lg'
@@ -17,7 +18,7 @@ const sizeMap = {
 
 function D20Svg({ px, strokeWidth = 1.5 }: { px: number; strokeWidth?: number }) {
   return (
-    <span className="inline-flex animate-dice-fade">
+    <span className="inline-flex">
       <svg
         width={px}
         height={px}
@@ -55,7 +56,7 @@ export function DiceLoader({ size = 'md', label, className, hideRole = false }: 
       <span
         {...roleProps}
         data-testid="dice-loader"
-        className={`inline-flex items-center justify-center text-primary${className ? ` ${className}` : ''}`}
+        className={cn('inline-flex items-center justify-center text-primary', className)}
       >
         <span className="relative">
           <span className="absolute inset-0 blur-md opacity-40 text-primary flex items-center justify-center">
@@ -71,7 +72,7 @@ export function DiceLoader({ size = 'md', label, className, hideRole = false }: 
     <span
       {...roleProps}
       data-testid="dice-loader"
-      className={`inline-flex items-center justify-center text-primary${className ? ` ${className}` : ''}`}
+      className={cn('inline-flex items-center justify-center text-primary', className)}
     >
       <D20Svg px={px} />
     </span>
