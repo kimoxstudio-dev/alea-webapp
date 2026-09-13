@@ -23,6 +23,12 @@ export type RateLimitPolicy = {
   bucket: string
   limit: number
   windowMs: number
+  /**
+   * Marks a policy as security-critical (gates credential/token guessing).
+   * When true and production falls back to the in-memory limiter (no Redis
+   * configured), `enforceRateLimit` throws instead of silently degrading.
+   */
+  critical?: boolean
 }
 
 type RateLimitEntry = {
@@ -356,8 +362,13 @@ export function enforceMutationSecurity(request: NextRequest): NextResponse | nu
 // ---------------------------------------------------------------------------
 
 export const RATE_LIMIT_POLICIES = {
+  // authLogin and authRegister are NOT critical: both routes are permanently
+  // disabled stubs that unconditionally return 410 with no credential check,
+  // so there is no brute-force surface to protect. authActivate is critical
+  // because it (and auth/recover, which reuses it) performs real token
+  // validation.
   authLogin: { bucket: 'auth-login', limit: 5, windowMs: 60_000 },
-  authActivate: { bucket: 'auth-activate', limit: 5, windowMs: 60_000 },
+  authActivate: { bucket: 'auth-activate', limit: 5, windowMs: 60_000, critical: true },
   authRegister: { bucket: 'auth-register', limit: 3, windowMs: 60_000 },
   authLogout: { bucket: 'auth-logout', limit: 10, windowMs: 60_000 },
   adminMutation: { bucket: 'admin-mutation', limit: 30, windowMs: 60_000 },
@@ -429,6 +440,13 @@ function enforceRateLimitMemory(
   request: NextRequest,
   policy: RateLimitPolicy,
 ): NextResponse | null {
+  if (process.env.NODE_ENV === 'production' && policy.critical) {
+    throw new Error(
+      `Critical rate limit policy "${policy.bucket}" is running in-memory in production — ` +
+        'configure UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN.',
+    )
+  }
+
   if (!_warnedAboutInMemoryRateLimit && process.env.NODE_ENV === 'production') {
     _warnedAboutInMemoryRateLimit = true
     console.warn(

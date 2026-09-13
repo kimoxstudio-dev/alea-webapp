@@ -507,4 +507,109 @@ describe('server security helpers', () => {
       expect(mockLimit).toHaveBeenCalledTimes(3)
     })
   })
+
+  // ---------------------------------------------------------------------------
+  // #383 — critical policies must not silently degrade to the in-memory
+  // limiter in production when Redis is not configured.
+  // ---------------------------------------------------------------------------
+  describe('critical policy fallback (#383)', () => {
+    // Hand-rolled literals for the "critical: false" (explicit) shape.
+    const criticalPolicy = { bucket: 'test-critical', limit: 5, windowMs: 60_000, critical: true }
+    const explicitlyNonCriticalPolicy = {
+      bucket: 'test-non-critical',
+      limit: 5,
+      windowMs: 60_000,
+      critical: false,
+    }
+
+    const makeRequest = () =>
+      new NextRequest('http://localhost:3000/api/auth/login', {
+        method: 'POST',
+        headers: { 'x-real-ip': '203.0.113.50' },
+      })
+
+    it('throws instead of falling back to in-memory when a critical policy has no Redis in production', async () => {
+      vi.stubEnv('NODE_ENV', 'production')
+      const { enforceRateLimit } = await import('@/lib/server/security')
+
+      await expect(enforceRateLimit(makeRequest(), criticalPolicy)).rejects.toThrow(
+        /Critical rate limit policy "test-critical" is running in-memory in production/,
+      )
+    })
+
+    it('still falls back to in-memory without throwing for an explicitly non-critical policy in production with no Redis', async () => {
+      vi.stubEnv('NODE_ENV', 'production')
+      const { enforceRateLimit } = await import('@/lib/server/security')
+
+      const result = await enforceRateLimit(makeRequest(), explicitlyNonCriticalPolicy)
+
+      expect(result).toBeNull()
+    })
+
+    it('never throws for a critical policy outside production even without Redis', async () => {
+      vi.stubEnv('NODE_ENV', 'test')
+      const { enforceRateLimit } = await import('@/lib/server/security')
+
+      const result = await enforceRateLimit(makeRequest(), criticalPolicy)
+
+      expect(result).toBeNull()
+    })
+
+    it('never throws for a critical policy in production when Redis IS configured', async () => {
+      vi.stubEnv('NODE_ENV', 'production')
+      vi.stubEnv('UPSTASH_REDIS_REST_URL', 'https://example.upstash.io')
+      vi.stubEnv('UPSTASH_REDIS_REST_TOKEN', 'test-token')
+      mockLimit.mockResolvedValue({ success: true, reset: Date.now() + 60_000 })
+      const { enforceRateLimit } = await import('@/lib/server/security')
+
+      const result = await enforceRateLimit(makeRequest(), criticalPolicy)
+
+      expect(result).toBeNull()
+      expect(mockLimit).toHaveBeenCalledTimes(1)
+    })
+
+    // Real RATE_LIMIT_POLICIES table, not hand-rolled literals — proves the
+    // `critical` flag is actually wired on the exported policies, and that
+    // policies which omit the key entirely (the real shape, not `critical:
+    // false`) still resolve instead of throwing.
+    describe('real RATE_LIMIT_POLICIES table', () => {
+      it('throws for RATE_LIMIT_POLICIES.authActivate in production with no Redis (real token-validation surface)', async () => {
+        vi.stubEnv('NODE_ENV', 'production')
+        const { enforceRateLimit, RATE_LIMIT_POLICIES } = await import('@/lib/server/security')
+
+        await expect(
+          enforceRateLimit(makeRequest(), RATE_LIMIT_POLICIES.authActivate),
+        ).rejects.toThrow(/Critical rate limit policy "auth-activate" is running in-memory in production/)
+      })
+
+      it('does not throw for RATE_LIMIT_POLICIES.authLogin in production with no Redis (disabled 410 stub, no brute-force surface)', async () => {
+        vi.stubEnv('NODE_ENV', 'production')
+        const { enforceRateLimit, RATE_LIMIT_POLICIES } = await import('@/lib/server/security')
+
+        const result = await enforceRateLimit(makeRequest(), RATE_LIMIT_POLICIES.authLogin)
+
+        expect(result).toBeNull()
+      })
+
+      it('does not throw for RATE_LIMIT_POLICIES.authRegister in production with no Redis (disabled 410 stub, no brute-force surface)', async () => {
+        vi.stubEnv('NODE_ENV', 'production')
+        const { enforceRateLimit, RATE_LIMIT_POLICIES } = await import('@/lib/server/security')
+
+        const result = await enforceRateLimit(makeRequest(), RATE_LIMIT_POLICIES.authRegister)
+
+        expect(result).toBeNull()
+      })
+
+      it('resolves null for RATE_LIMIT_POLICIES.adminMutation in production with no Redis, where `critical` is omitted (undefined), not set to false', async () => {
+        vi.stubEnv('NODE_ENV', 'production')
+        const { enforceRateLimit, RATE_LIMIT_POLICIES } = await import('@/lib/server/security')
+
+        expect(RATE_LIMIT_POLICIES.adminMutation).not.toHaveProperty('critical')
+
+        const result = await enforceRateLimit(makeRequest(), RATE_LIMIT_POLICIES.adminMutation)
+
+        expect(result).toBeNull()
+      })
+    })
+  })
 })
