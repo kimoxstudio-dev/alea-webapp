@@ -1,0 +1,49 @@
+-- Documents two facts about "event_room_blocks"."table_id" in one combined
+-- COMMENT ON COLUMN, since Postgres stores exactly one comment per column (a
+-- single pg_description row) — a second COMMENT ON COLUMN would silently
+-- replace the first rather than append. This file originally covered only
+-- the invariant below (#377); issue #379 added the sentinel-semantics fact,
+-- folded in here rather than as a separate file for that reason.
+--
+-- Fact 1 — invariant (#377): when non-null, "table_id" must belong to the
+-- room identified by that row's "room_id" — i.e. "tables"."room_id" for that
+-- table id must equal "room_id" above. There is no DB-level CHECK or trigger
+-- enforcing this: a plain CHECK constraint can't reference another table,
+-- and a constraint trigger's correctness can't be verified without executing
+-- and testing it against a live database (out of scope here — see issue
+-- #377 for that tradeoff). It is enforced only in application code, in
+-- applyClubEventBlocksAndMaterials() (lib/server/club-events-service.ts).
+-- Any future insert path into "event_room_blocks" that bypasses that guard
+-- could silently violate the invariant.
+--
+-- Fact 2 — sentinel semantics (#379): a null "table_id" is not "unset" or
+-- "unknown" — it means the block covers the whole room, every table in it.
+-- A non-null "table_id" scopes the block to that single table. This mirrors
+-- blockAppliesToTable() (lib/server/availability.ts), and the room-wide
+-- fallback in resolveBlockCancellationTableIds() (fed by
+-- fetchRoomTableMap()'s batched room -> tables lookup, in
+-- lib/server/events-service.ts), which resolves a null table_id to every
+-- table of the block's room rather than treating it as absent data.
+--
+-- This is a prepared-but-unexecuted migration file, per this project's "agent
+-- prepares, user applies" DB rule (see CLAUDE.md) — it must be run manually
+-- with scripts/apply-neon-schema.mjs, same as every other file here.
+--
+-- Added as a new file rather than edited into 009_event_room_blocks.sql:
+-- apply-neon-schema.mjs keeps a SHA-256 checksum of each schema file's raw
+-- text and hard-aborts with "Schema drift detected" if an already-applied
+-- file's content changes. A COMMENT ON COLUMN is also actual DDL (visible in
+-- \d+ output), unlike a "--" line comment, which splitStatements() strips
+-- before anything reaches Postgres and would therefore never have reached
+-- the database at all.
+--
+-- Renamed in place from 020_event_room_blocks_table_id_invariant.sql
+-- (#379), which was safe only because it had never been applied to any
+-- database — no schema_migrations ledger row existed for it. If it had been
+-- applied, this rename would abort apply-neon-schema.mjs with a
+-- missing-file drift error and require
+-- --allow-removed 020_event_room_blocks_table_id_invariant.sql to
+-- acknowledge.
+
+COMMENT ON COLUMN "event_room_blocks"."table_id" IS
+  'Invariant (#377): when non-null, must belong to this row''s room_id — i.e. tables.room_id for this table id must equal room_id above. Enforced only in application code (applyClubEventBlocksAndMaterials() in lib/server/club-events-service.ts) — no DB-level CHECK/trigger, since a plain CHECK can''t reference another table. Any insert path bypassing that guard could silently violate it. Sentinel semantics (#379): a null table_id is not unset/unknown — it means the block covers the whole room (every table in it). A non-null table_id scopes the block to that single table. Mirrors blockAppliesToTable() in lib/server/availability.ts and the room-wide fallback in resolveBlockCancellationTableIds() (fed by fetchRoomTableMap()''s batched room-to-tables lookup) in lib/server/events-service.ts.';
