@@ -54,7 +54,7 @@ export function LandingNav({ locale }: LandingNavProps) {
         <a href="#top" className="mod-logo" data-egg-tap title="Alea Las Palmas">
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
-            src="https://alealaspalmas.es/wp-content/uploads/2025/11/logo_final_sin_fondo.png"
+            src="/alea-logo.png"
             alt="Alea"
             width={40}
             height={40}

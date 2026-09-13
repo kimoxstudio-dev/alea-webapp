@@ -23,10 +23,6 @@ const CLERK_PROTECT = 'https://*.protect.clerk.com'
 // *.public.blob.vercel-storage.com and rendered directly via <img src> in
 // components/landing/*.
 const VERCEL_BLOB = 'https://*.public.blob.vercel-storage.com'
-// The only entry in `images.remotePatterns` below, already in production
-// use for next/image-sourced WordPress media.
-const WP_MEDIA = 'https://alealaspalmas.es'
-
 const isDev = process.env.NODE_ENV !== 'production'
 
 /**
@@ -60,7 +56,7 @@ const CSP_DIRECTIVES: Record<string, string[]> = {
   ],
   'connect-src': ["'self'", CLERK_FAPI, CLERK_PROTECT],
   'frame-src': [CLERK_PROTECT],
-  'img-src': ["'self'", 'data:', WP_MEDIA, VERCEL_BLOB],
+  'img-src': ["'self'", 'data:', VERCEL_BLOB],
   'font-src': ["'self'", 'data:', 'https://fonts.gstatic.com'],
   'style-src': ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
   'worker-src': ["'self'", 'blob:'],
@@ -74,15 +70,6 @@ const CONTENT_SECURITY_POLICY = Object.entries(CSP_DIRECTIVES)
   .join('; ')
 
 const nextConfig: NextConfig = {
-  images: {
-    remotePatterns: [
-      {
-        protocol: 'https',
-        hostname: 'alealaspalmas.es',
-        pathname: '/wp-content/uploads/**',
-      },
-    ],
-  },
   async headers() {
     return [
       {

@@ -29,7 +29,7 @@ export async function AboutSection() {
         <Reveal delay={140} className="mod-about-img">
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
-            src="https://alealaspalmas.es/wp-content/uploads/2025/10/image-12-e1761825612963.jpg"
+            src="/image-12-e1761825612963.jpg"
             alt="Mago de Alea"
           />
           <div className="mod-about-img-tag">
