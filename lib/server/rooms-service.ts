@@ -3,7 +3,7 @@ import { sql } from '@/lib/db/client'
 import { NeonDbError } from '@neondatabase/serverless'
 import type { Tables } from '@/lib/supabase/types'
 import { serviceError } from '@/lib/server/service-error'
-import { resolveDate, buildAvailability } from '@/lib/server/availability'
+import { resolveDate, buildAvailability, blockAppliesToTable } from '@/lib/server/availability'
 import { regenerateQrCodes } from '@/lib/server/tables-service'
 import { toGameTable } from '@/lib/server/table-mappers'
 import { getDatabaseNow } from '@/lib/server/database-time'
@@ -255,11 +255,9 @@ export async function getRoomTablesAvailability(roomId: string, date?: string | 
     reservationsByTable.set(reservation.table_id, items)
   }
 
-  // OIR-208: a block with a table_id only blocks that single table; NULL
-  // (the pre-OIR-208 default) blocks every table of the room, unchanged.
   function eventSlotsForTable(tableId: string) {
     return eventBlocks
-      .filter((block) => block.table_id == null || block.table_id === tableId)
+      .filter((block) => blockAppliesToTable(block, tableId))
       .map((block) => ({
         start: block.start_time.slice(0, 5),
         end: block.end_time.slice(0, 5),

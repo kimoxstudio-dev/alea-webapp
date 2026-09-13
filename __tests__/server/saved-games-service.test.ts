@@ -299,6 +299,7 @@ describe('saved games service', () => {
               block.room_id === table?.room_id &&
               block.date >= startDate &&
               block.date <= endDate &&
+              // Mirrors blockAppliesToTable() in lib/server/availability.ts — keep in sync
               (block.table_id == null || block.table_id === tableId),
           )
         if (conflict) return []
@@ -356,6 +357,7 @@ describe('saved games service', () => {
               block.room_id === table?.room_id &&
               block.date >= startDate! &&
               block.date <= endDate! &&
+              // Mirrors blockAppliesToTable() in lib/server/availability.ts — keep in sync
               (block.table_id == null || block.table_id === tableId),
           )
         // #334 code-review finding (renewal race with source-row

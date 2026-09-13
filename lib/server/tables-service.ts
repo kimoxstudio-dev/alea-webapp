@@ -3,7 +3,7 @@ import { put } from '@vercel/blob'
 import type { GameTable } from '@/lib/types'
 import { sql } from '@/lib/db/client'
 import { serviceError } from '@/lib/server/service-error'
-import { resolveDate, buildAvailability } from '@/lib/server/availability'
+import { resolveDate, buildAvailability, blockAppliesToTable } from '@/lib/server/availability'
 import type { Tables } from '@/lib/supabase/types'
 import { toGameTable } from '@/lib/server/table-mappers'
 import { getDatabaseNow } from '@/lib/server/database-time'
@@ -156,10 +156,8 @@ export async function getTableAvailability(tableId: string, date?: string | null
     return true
   })
 
-  // OIR-208: a block with a table_id only blocks that single table; NULL
-  // (the pre-OIR-208 default) blocks every table of the room, unchanged.
   const eventBlocks = allEventBlocks
-    .filter((block) => block.table_id == null || block.table_id === tableId)
+    .filter((block) => blockAppliesToTable(block, tableId))
 
   let eventTitleById = new Map<string, string>()
   const eventIds = [...new Set(eventBlocks.map((block) => block.event_id))]
