@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { createSqlMock, hasExactSelectColumns, whereHasColumn, neonDbError } from '../helpers/sql-mock'
+import { createSqlMock, hasExactSelectColumns, whereHasColumn, neonDbError, type ParsedStatement } from '../helpers/sql-mock'
 
 /**
  * CLUB EVENTS SERVICE TEST COVERAGE (OIR-203, raw-SQL Neon port #304)
@@ -372,7 +372,7 @@ function addSavedGamesLockHandler() {
  * registers the lock handler above, since production code always issues
  * both statements together.
  */
-function addSavedGamesCancelHandler(respond: () => unknown = () => []) {
+function addSavedGamesCancelHandler(respond: (stmt: ParsedStatement) => unknown = () => []) {
   addSavedGamesLockHandler()
   sqlMock.addHandler({
     name: 'UPDATE saved_games cancel active (#334)',
@@ -1362,6 +1362,7 @@ describe('club-events-service', () => {
       addCascadeTablesFetchHandler([{ id: 'table-1', room_id: 'room-1' }])
       const cancelSpy = vi.fn(() => [])
       addReservationsCancelHandler(cancelSpy)
+      addSavedGamesCancelHandler(() => [])
       const deleteSpy = vi.fn()
       addEventsDeleteHandler(deleteSpy)
 
@@ -1405,6 +1406,7 @@ describe('club-events-service', () => {
             .map((r) => ({ id: r.id, status: r.status }))
         },
       })
+      addSavedGamesCancelHandler(() => [])
       const deleteSpy = vi.fn()
       addEventsDeleteHandler(deleteSpy)
 
@@ -1479,6 +1481,10 @@ describe('club-events-service', () => {
           return [{ id: 'res-1', status: 'active' }]
         },
       })
+      // Saved games cancellation must succeed for both blocks so this test
+      // still exercises its intended failure point (the second block's
+      // reservation cancel), not an incidental unmocked saved_games query.
+      addSavedGamesCancelHandler(() => [])
       const restoreActiveSpy = vi.fn()
       const restorePendingSpy = vi.fn()
       addReservationsRestoreActiveHandler(restoreActiveSpy)
@@ -1505,6 +1511,10 @@ describe('club-events-service', () => {
       ])
       addCascadeTablesFetchHandler([{ id: 'table-1', room_id: 'room-1' }])
       addReservationsCancelHandler(() => [{ id: 'res-1', status: 'pending' }])
+      // Saved games cancellation must succeed so this test reaches its
+      // intended failure point (the final DELETE FROM events), not an
+      // incidental unmocked saved_games query.
+      addSavedGamesCancelHandler(() => [])
       const restoreActiveSpy = vi.fn()
       const restorePendingSpy = vi.fn()
       addReservationsRestoreActiveHandler(restoreActiveSpy)
@@ -1526,6 +1536,198 @@ describe('club-events-service', () => {
       // route through the 'pending' branch, not 'active'.
       expect(restorePendingSpy).toHaveBeenCalledWith([['res-1']])
       expect(restoreActiveSpy).not.toHaveBeenCalled()
+    })
+
+    // Regression for #375: deleteEventCascade cancelled overlapping
+    // reservations but never overlapping active saved_games, unlike the
+    // create/update path (applyClubEventBlocksAndMaterials, tested above
+    // under "cancelActiveSavedGamesForRoomBlock / restoreCancelledSavedGames").
+    it('cancels active saved games scoped to the block\'s own table when deleting an event with a table-scoped block (#375)', async () => {
+      addDeleteGuardHandler({ id: 'evt-1', title_es: null, title_en: null })
+      addCascadeBlocksFetchHandler([
+        { room_id: 'room-1', table_id: 'table-A', date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00' },
+      ])
+      addCascadeTablesFetchHandler([
+        { id: 'table-A', room_id: 'room-1' },
+        { id: 'table-B', room_id: 'room-1' },
+      ])
+      addReservationsCancelHandler(() => [])
+      const savedGamesCancelSpy = vi.fn()
+      addSavedGamesCancelHandler((stmt) => {
+        savedGamesCancelSpy(stmt.values)
+        return [{ id: 'sg-1', updated_at: '2026-04-01T10:00:00.000Z' }]
+      })
+      const deleteSpy = vi.fn()
+      addEventsDeleteHandler(deleteSpy)
+
+      const { deleteClubEvent } = await loadClubEventsService()
+
+      await deleteClubEvent(createAdminSession(), 'evt-1')
+
+      // Table-scoped: only the block's own table (table-A) is passed, not
+      // table-B, which is in the same room but outside the block's scope.
+      // Also asserts the block's own date is the second bound param — a
+      // mutation swapping in e.g. `block.start_time` instead of `block.date`
+      // would otherwise go undetected (the date is the entire overlap
+      // predicate: `${date} BETWEEN start_date AND end_date`).
+      expect(savedGamesCancelSpy).toHaveBeenCalledTimes(1)
+      expect(savedGamesCancelSpy.mock.calls[0][0]).toEqual([['table-A'], '2026-04-20'])
+      expect(deleteSpy).toHaveBeenCalledWith(['evt-1'])
+    })
+
+    it('cancels active saved games room-wide when deleting an event with a room-wide block (#375)', async () => {
+      addDeleteGuardHandler({ id: 'evt-1', title_es: null, title_en: null })
+      addCascadeBlocksFetchHandler([
+        { room_id: 'room-1', table_id: null, date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00' },
+      ])
+      addCascadeTablesFetchHandler([
+        { id: 'table-A', room_id: 'room-1' },
+        { id: 'table-B', room_id: 'room-1' },
+      ])
+      addReservationsCancelHandler(() => [])
+      const savedGamesCancelSpy = vi.fn()
+      addSavedGamesCancelHandler((stmt) => {
+        savedGamesCancelSpy(stmt.values)
+        return [{ id: 'sg-1', updated_at: '2026-04-01T10:00:00.000Z' }]
+      })
+      const deleteSpy = vi.fn()
+      addEventsDeleteHandler(deleteSpy)
+
+      const { deleteClubEvent } = await loadClubEventsService()
+
+      await deleteClubEvent(createAdminSession(), 'evt-1')
+
+      // Room-wide (table_id null): every table in the room is passed, and
+      // (same rationale as the table-scoped test above) the block's own date
+      // is asserted as the second bound param, not just the table list.
+      expect(savedGamesCancelSpy).toHaveBeenCalledTimes(1)
+      expect(savedGamesCancelSpy.mock.calls[0][0]).toEqual([['table-A', 'table-B'], '2026-04-20'])
+      expect(deleteSpy).toHaveBeenCalledWith(['evt-1'])
+    })
+
+    it('restores a cancelled saved game to active when the final DELETE FROM events fails (deleteEventCascade, #375)', async () => {
+      addDeleteGuardHandler({ id: 'evt-1', title_es: null, title_en: null })
+      addCascadeBlocksFetchHandler([
+        { room_id: 'room-1', table_id: null, date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00' },
+      ])
+      addCascadeTablesFetchHandler([{ id: 'table-1', room_id: 'room-1' }])
+      addReservationsCancelHandler(() => [])
+      addSavedGamesCancelHandler(() => [{ id: 'sg-1', updated_at: '2026-04-01T10:00:00.000Z' }])
+      const savedGamesRestoreSpy = vi.fn()
+      addSavedGamesRestoreHandler(savedGamesRestoreSpy)
+      sqlMock.addHandler({
+        name: 'DELETE events WHERE id (failing, #375)',
+        verb: 'delete',
+        match: (stmt) => stmt.table === 'events',
+        respond: () => { throw new Error('delete failed') },
+      })
+
+      const { deleteClubEvent } = await loadClubEventsService()
+
+      await expect(
+        deleteClubEvent(createAdminSession(), 'evt-1')
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      // The saved game cancelled above must be restored to 'active', with
+      // its exact pre-cancellation updated_at (not just the status flipped),
+      // mirroring the reservation-restore-on-final-delete-failure test above.
+      expect(savedGamesRestoreSpy).toHaveBeenCalledTimes(1)
+      expect(savedGamesRestoreSpy.mock.calls[0][0][0]).toEqual(['sg-1'])
+      expect(savedGamesRestoreSpy.mock.calls[0][0][1]).toEqual(['2026-04-01T10:00:00.000Z'])
+    })
+
+    // kx-reviewer round 1, HIGH: the per-block rollback branch had zero test
+    // coverage that could actually fail — a mutation dropping both restore
+    // calls from that catch, or dropping just the saved-games restore call,
+    // left 72/72 tests green. These two tests each fail without the
+    // corresponding restore call in events-service.ts's deleteEventCascade.
+    it('restores both reservations and saved games cancelled by earlier blocks when a later block\'s saved-games cancel fails (deleteEventCascade, multi-block, #375)', async () => {
+      addDeleteGuardHandler({ id: 'evt-1', title_es: null, title_en: null })
+      addCascadeBlocksFetchHandler([
+        { room_id: 'room-1', table_id: null, date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00' },
+        { room_id: 'room-1', table_id: null, date: '2026-04-21', start_time: '18:00:00', end_time: '22:00:00' },
+      ])
+      addCascadeTablesFetchHandler([{ id: 'table-1', room_id: 'room-1' }])
+
+      let reservationCallCount = 0
+      addReservationsCancelHandler(() => {
+        reservationCallCount += 1
+        return [{ id: `res-${reservationCallCount}`, status: 'active' }]
+      })
+
+      let savedGamesCallCount = 0
+      addSavedGamesCancelHandler(() => {
+        savedGamesCallCount += 1
+        if (savedGamesCallCount === 2) throw new Error('second saved-games cancel failed')
+        return [{ id: 'sg-1', updated_at: '2026-04-01T10:00:00.000Z' }]
+      })
+
+      const restoreActiveSpy = vi.fn()
+      const restorePendingSpy = vi.fn()
+      addReservationsRestoreActiveHandler(restoreActiveSpy)
+      addReservationsRestorePendingHandler(restorePendingSpy)
+      const savedGamesRestoreSpy = vi.fn()
+      addSavedGamesRestoreHandler(savedGamesRestoreSpy)
+
+      const { deleteClubEvent } = await loadClubEventsService()
+
+      await expect(
+        deleteClubEvent(createAdminSession(), 'evt-1')
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      // Block 1's reservation AND saved game were already cancelled by the
+      // time block 2's saved-games cancel fails — both must be restored, not
+      // just the reservation (which the code already restored before #375;
+      // the saved-games restore is what #375 added to this exact branch).
+      expect(restoreActiveSpy).toHaveBeenCalledWith([['res-1', 'res-2']])
+      expect(restorePendingSpy).not.toHaveBeenCalled()
+      expect(savedGamesRestoreSpy).toHaveBeenCalledTimes(1)
+      expect(savedGamesRestoreSpy.mock.calls[0][0][0]).toEqual(['sg-1'])
+    })
+
+    it('restores a saved game cancelled by an earlier block when a later block\'s reservation cancel fails (deleteEventCascade, multi-block, #375)', async () => {
+      addDeleteGuardHandler({ id: 'evt-1', title_es: null, title_en: null })
+      addCascadeBlocksFetchHandler([
+        { room_id: 'room-1', table_id: null, date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00' },
+        { room_id: 'room-1', table_id: null, date: '2026-04-21', start_time: '18:00:00', end_time: '22:00:00' },
+      ])
+      addCascadeTablesFetchHandler([{ id: 'table-1', room_id: 'room-1' }])
+
+      let reservationCallCount = 0
+      sqlMock.addHandler({
+        name: 'UPDATE reservations cancel overlapping (second block\'s reservation cancel fails, #375)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'table_id'),
+        respond: () => {
+          reservationCallCount += 1
+          if (reservationCallCount === 2) throw new Error('second reservation cancel failed')
+          return [{ id: 'res-1', status: 'active' }]
+        },
+      })
+      addSavedGamesCancelHandler(() => [{ id: 'sg-1', updated_at: '2026-04-01T10:00:00.000Z' }])
+
+      const restoreActiveSpy = vi.fn()
+      const restorePendingSpy = vi.fn()
+      addReservationsRestoreActiveHandler(restoreActiveSpy)
+      addReservationsRestorePendingHandler(restorePendingSpy)
+      const savedGamesRestoreSpy = vi.fn()
+      addSavedGamesRestoreHandler(savedGamesRestoreSpy)
+
+      const { deleteClubEvent } = await loadClubEventsService()
+
+      await expect(
+        deleteClubEvent(createAdminSession(), 'evt-1')
+      ).rejects.toMatchObject({ statusCode: 500 })
+
+      // The failure this time is in block 2's RESERVATION cancel (not its
+      // saved-games cancel) — proving the reservation-failure catch also
+      // restores a saved game cancelled by an earlier block, not just its
+      // own reservations. Block 2 never reaches its own saved-games call, so
+      // only block 1's sg-1 was ever cancelled.
+      expect(restoreActiveSpy).toHaveBeenCalledWith([['res-1']])
+      expect(restorePendingSpy).not.toHaveBeenCalled()
+      expect(savedGamesRestoreSpy).toHaveBeenCalledTimes(1)
+      expect(savedGamesRestoreSpy.mock.calls[0][0][0]).toEqual(['sg-1'])
     })
   })
 
