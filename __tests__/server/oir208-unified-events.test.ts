@@ -191,20 +191,19 @@ function addRoomsExistHandler(missing: string[] = []) {
 }
 
 /**
- * Handles both "tables" SELECT shapes club-events-service.ts issues (#354
- * folded the old per-block `id = $1 AND room_id = $2` mismatch guard and the
- * single-room `room_id = $1` fetchTableIdsForRoom lookup into one batched
- * query, so only two shapes remain):
+ * Handles the three "tables" SELECT shapes club-events-service.ts issues:
  * - `SELECT id FROM tables WHERE id = ANY(...)` (validateTablesExist)
- * - `SELECT id, room_id FROM tables WHERE room_id = ANY(...)` (batched
- *   room->table lookup: builds both `roomTableMap` for null-table_id blocks
- *   AND `tableRoomMap` for the table_id/room_id mismatch guard, so it must
- *   return `room_id` on every row — an `{ id }`-only row silently breaks the
- *   mismatch guard for non-null-table_id blocks).
- * These two shapes select different, non-overlapping column lists (`id` vs
- * `id, room_id`), so they're distinguished by exact SELECT projection
- * (`hasExactSelectColumns`) rather than by a shared `any(` substring check,
- * which would conflate them since both queries use `= ANY(...)`.
+ * - `SELECT id, room_id FROM tables WHERE room_id = ANY(...)` — the
+ *   room-wide fallback lookup (`fetchRoomTableMap`, events-service.ts),
+ *   narrowed (#378) to only rooms referenced by a block with a null
+ *   `table_id`.
+ * - `SELECT id, room_id FROM tables WHERE id = ANY(...)` — the table/room
+ *   mismatch guard's own lookup (#378), split out from the room-wide query
+ *   above so a call whose blocks are all table-scoped still gets a correct
+ *   `tableRoomMap` even though the room-wide query is skipped entirely.
+ * The last two shapes share a column list (`id, room_id`) but differ in
+ * WHERE column (`room_id` vs `id`), so they're distinguished by
+ * `whereHasColumn` rather than by a shared `any(` substring check.
  * Defaults `roomTableIds` to TABLE_ROOM_MAP inverted, matching this file's
  * fixed table->room ownership convention.
  */
@@ -217,6 +216,10 @@ function addTablesHandler(opts: { missingTableIds?: string[]; roomTableIds?: Rec
     },
     {},
   )
+  const tableToRoom: Record<string, string> = {}
+  for (const [roomId, tableIds] of Object.entries(roomTableIds)) {
+    for (const tableId of tableIds) tableToRoom[tableId] = roomId
+  }
   roomsSqlMock.addHandler({
     name: 'SELECT id FROM tables WHERE id = ANY(...) (validateTablesExist)',
     verb: 'select',
@@ -227,12 +230,23 @@ function addTablesHandler(opts: { missingTableIds?: string[]; roomTableIds?: Rec
     },
   })
   roomsSqlMock.addHandler({
-    name: 'SELECT id, room_id FROM tables WHERE room_id = ANY(...) (batched room->table lookup)',
+    name: 'SELECT id, room_id FROM tables WHERE room_id = ANY(...) (room-wide fallback lookup)',
     verb: 'select',
     match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id, room_id') && whereHasColumn(stmt, 'room_id'),
     respond: (stmt) => {
       const roomIds = stmt.values[0] as string[]
       return roomIds.flatMap((roomId) => (roomTableIds[roomId] ?? []).map((id) => ({ id, room_id: roomId })))
+    },
+  })
+  roomsSqlMock.addHandler({
+    name: 'SELECT id, room_id FROM tables WHERE id = ANY(...) (table/room mismatch guard, #378)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id, room_id') && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'room_id'),
+    respond: (stmt) => {
+      const tableIds = stmt.values[0] as string[]
+      return tableIds
+        .filter((id) => Object.hasOwn(tableToRoom, id) && !missingTableIds.includes(id))
+        .map((id) => ({ id, room_id: tableToRoom[id] }))
     },
   })
 }

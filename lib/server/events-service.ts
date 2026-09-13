@@ -222,6 +222,43 @@ export function resolveBlockCancellationTableIds(
 }
 
 /**
+ * Batches the room_id -> table ids lookup consumed by
+ * `resolveBlockCancellationTableIds`'s room-wide fallback branch, instead of
+ * one round trip per room. Returns an empty map without querying when
+ * `roomIds` is empty.
+ *
+ * Extracted (#378) from `deleteEventCascade` below and
+ * `club-events-service.ts`'s `applyClubEventBlocksAndMaterials`, which had
+ * each rebuilt this exact loop verbatim after only the 3-line consumer
+ * (`resolveBlockCancellationTableIds` above) was shared in #353. Callers
+ * should pass only the room ids that actually need the room-wide fallback —
+ * i.e. rooms with at least one block whose `table_id` is null — since a
+ * table-scoped block never consults this map; narrowing the list this way is
+ * what lets an event/call whose blocks are all table-scoped skip the query
+ * entirely.
+ */
+export async function fetchRoomTableMap(roomIds: string[]): Promise<Map<string, string[]>> {
+  const roomTableMap = new Map<string, string[]>()
+  if (roomIds.length === 0) return roomTableMap
+
+  let tables: Array<{ id: string; room_id: string }>
+  try {
+    tables = await sql`
+      SELECT id, room_id FROM tables WHERE room_id = ANY(${roomIds})
+    ` as Array<{ id: string; room_id: string }>
+  } catch {
+    serviceError('Internal server error', 500)
+  }
+
+  for (const t of tables) {
+    const list = roomTableMap.get(t.room_id) ?? []
+    list.push(t.id)
+    roomTableMap.set(t.room_id, list)
+  }
+  return roomTableMap
+}
+
+/**
  * Cancel overlapping reservations AND active saved games for every room
  * block attached to `id`, then delete the event row (blocks cascade via FK).
  * Used by `lib/server/club-events-service.ts`'s `deleteClubEvent`, which
@@ -263,26 +300,15 @@ export async function deleteEventCascade(id: string): Promise<void> {
     serviceError('Internal server error', 500)
   }
 
-  // Collect distinct room_ids and pre-fetch their table ids into a Map to avoid N+1 round trips
-  const distinctRoomIds = [...new Set(blocks.map((b) => b.room_id).filter(Boolean))]
-
-  const roomTableMap = new Map<string, string[]>()
-  if (distinctRoomIds.length > 0) {
-    let tables: Array<{ id: string; room_id: string }>
-    try {
-      tables = await sql`
-        SELECT id, room_id FROM tables WHERE room_id = ANY(${distinctRoomIds})
-      ` as Array<{ id: string; room_id: string }>
-    } catch {
-      serviceError('Internal server error', 500)
-    }
-
-    for (const t of tables) {
-      const list = roomTableMap.get(t.room_id) ?? []
-      list.push(t.id)
-      roomTableMap.set(t.room_id, list)
-    }
-  }
+  // Pre-fetch table ids for only the rooms that actually need the room-wide
+  // fallback (blocks with a null table_id), via `fetchRoomTableMap` (#378) —
+  // a block with its own table_id never consults this map, so a delete whose
+  // blocks are all table-scoped skips this query entirely instead of always
+  // fetching every referenced room's tables regardless of use.
+  const roomIdsNeedingRoomWideFallback = [
+    ...new Set(blocks.filter((b) => b.table_id === null).map((b) => b.room_id).filter(Boolean)),
+  ]
+  const roomTableMap = await fetchRoomTableMap(roomIdsNeedingRoomWideFallback)
 
   // Cancel overlapping reservations AND active saved games for every block
   // (multi-day aware), capturing each cancelled row's id (+ pre-cancellation

@@ -256,29 +256,53 @@ function addRoomsExistHandler(missing: string[] = []) {
 }
 
 /**
- * Handles all three "tables" SELECT shapes club-events-service.ts issues:
- * - `WHERE id = ANY(...)` (validateTablesExist)
- * - `WHERE id = $1 AND room_id = $2` (table/room mismatch guard)
- * - `WHERE room_id = $1` (fetchTableIdsForRoom)
+ * Handles the three "tables" SELECT shapes club-events-service.ts issues:
+ * - `SELECT id FROM tables WHERE id = ANY(...)` (validateTablesExist)
+ * - `SELECT id, room_id FROM tables WHERE room_id = ANY(...)` — the
+ *   room-wide fallback lookup (`fetchRoomTableMap`, events-service.ts),
+ *   narrowed (#378) to only rooms referenced by a block with a null
+ *   `table_id`.
+ * - `SELECT id, room_id FROM tables WHERE id = ANY(...)` — the table/room
+ *   mismatch guard's own lookup (#378), split out from the room-wide query
+ *   above so a call whose blocks are all table-scoped still gets a correct
+ *   `tableRoomMap` even though the room-wide query is skipped entirely.
+ * The last two shapes share a column list (`id, room_id`) but differ in
+ * WHERE column (`room_id` vs `id`), so they're distinguished by
+ * `whereHasColumn` rather than by a shared `any(` substring check.
  */
 function addTablesHandler(opts: { missingTableIds?: string[]; roomTableIds?: Record<string, string[]> } = {}) {
   const { missingTableIds = [], roomTableIds = {} } = opts
+  const tableToRoom: Record<string, string> = {}
+  for (const [roomId, tableIds] of Object.entries(roomTableIds)) {
+    for (const tableId of tableIds) tableToRoom[tableId] = roomId
+  }
   sqlMock.addHandler({
-    name: 'SELECT id FROM tables (validateTablesExist / mismatch guard / fetchTableIdsForRoom)',
+    name: 'SELECT id FROM tables WHERE id = ANY(...) (validateTablesExist)',
     verb: 'select',
-    match: (stmt) => stmt.table === 'tables',
+    match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id'),
     respond: (stmt) => {
-      if (stmt.whereClause?.includes('any(')) {
-        const ids = stmt.values[0] as string[]
-        return ids.filter((id) => !missingTableIds.includes(id)).map((id) => ({ id }))
-      }
-      if (whereHasColumn(stmt, 'id') && whereHasColumn(stmt, 'room_id')) {
-        const [tableId, roomId] = stmt.values as [string, string]
-        const valid = (roomTableIds[roomId] ?? []).includes(tableId)
-        return valid ? [{ id: tableId }] : []
-      }
-      const roomId = stmt.values[0] as string
-      return (roomTableIds[roomId] ?? []).map((id) => ({ id }))
+      const ids = stmt.values[0] as string[]
+      return ids.filter((id) => !missingTableIds.includes(id)).map((id) => ({ id }))
+    },
+  })
+  sqlMock.addHandler({
+    name: 'SELECT id, room_id FROM tables WHERE room_id = ANY(...) (room-wide fallback lookup)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id, room_id') && whereHasColumn(stmt, 'room_id'),
+    respond: (stmt) => {
+      const roomIds = stmt.values[0] as string[]
+      return roomIds.flatMap((roomId) => (roomTableIds[roomId] ?? []).map((id) => ({ id, room_id: roomId })))
+    },
+  })
+  sqlMock.addHandler({
+    name: 'SELECT id, room_id FROM tables WHERE id = ANY(...) (table/room mismatch guard, #378)',
+    verb: 'select',
+    match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id, room_id') && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'room_id'),
+    respond: (stmt) => {
+      const tableIds = stmt.values[0] as string[]
+      return tableIds
+        .filter((id) => Object.hasOwn(tableToRoom, id) && !missingTableIds.includes(id))
+        .map((id) => ({ id, room_id: tableToRoom[id] }))
     },
   })
 }
@@ -746,6 +770,148 @@ describe('club-events-service', () => {
       expect(result.roomBlocks[0].roomId).toBe('room-1')
       expect(result.roomBlocks[0].startTime).toBe('18:00')
       expect(result.roomBlocks[0].endTime).toBe('22:00')
+    })
+
+    it('skips the room-wide table lookup when every block is table-scoped (#378)', async () => {
+      // Regression guard for #378: `fetchRoomTableMap`'s room-id list used
+      // to be built from EVERY block's room_id regardless of table_id, so
+      // this SELECT ran even though a table-scoped block never consults the
+      // room-wide map. No handler for that `room_id = ANY(...)` shape is
+      // registered here (only validateTablesExist's `id = ANY(...)` and the
+      // separate table/room mismatch-guard lookup are) — if the room-wide
+      // fetch is (re)issued unconditionally, the sql-mock's "no handler
+      // matched" throw (no silent [] fallback) fails this test.
+      addCreateInsertHandler()
+      addRoomsExistHandler()
+      sqlMock.addHandler({
+        name: 'SELECT id FROM tables WHERE id = ANY(...) (validateTablesExist)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id'),
+        respond: (stmt) => (stmt.values[0] as string[]).map((id) => ({ id })),
+      })
+      sqlMock.addHandler({
+        name: 'SELECT id, room_id FROM tables WHERE id = ANY(...) (mismatch guard)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id, room_id') && whereHasColumn(stmt, 'id') && !whereHasColumn(stmt, 'room_id'),
+        respond: (stmt) => (stmt.values[0] as string[]).map((id) => ({ id, room_id: 'room-1' })),
+      })
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      addMaterialsDeleteHandler([])
+      const insertedBlocks: unknown[] = []
+      addBlockInsertHandler('block', (values) => {
+        const [event_id, room_id, table_id, date, start_time, end_time, all_day] = values
+        insertedBlocks.push({ id: `block-${insertedBlocks.length + 1}`, event_id, room_id, table_id, date, start_time, end_time, all_day })
+      })
+      addReservationsCancelHandler()
+      addSavedGamesCancelHandler()
+      addMaterialsInsertHandler()
+      sqlMock.addHandler({
+        name: 'SELECT event_room_blocks WHERE event_id (result, tracks inserted)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, ROOM_BLOCK_COLUMNS),
+        respond: () => insertedBlocks,
+      })
+      addEventMaterialsSelectHandler([])
+
+      const { createClubEvent } = await loadClubEventsService()
+
+      const result = await createClubEvent(createAdminSession(), {
+        titleEs: 'Torneo con Mesa',
+        titleEn: 'Tournament with Table',
+        date: '2026-05-01',
+        dateKind: 'single',
+        blocksRooms: true,
+        schedules: [
+          {
+            date: '2026-05-01',
+            startTime: '18:00',
+            endTime: '22:00',
+            allDay: false,
+            roomId: 'room-1',
+            tableId: 'table-1',
+          },
+        ],
+      })
+
+      expect(result.roomBlocks[0].tableId).toBe('table-1')
+    })
+
+    it('resolves a table-scoped block and a room-wide block sharing the same room independently (#378 mismatch-guard coverage)', async () => {
+      // kx-reviewer round 1 (#378): the two-query split's whole point is that
+      // `tableRoomMap` (mismatch guard) must cover every table-scoped block
+      // regardless of whether that block's room ALSO has a room-wide block —
+      // narrowing that lookup to only rooms WITHOUT a room-wide block would
+      // wrongly 400 this exact scenario. Two schedules in the same room:
+      // one table-scoped ('table-1'), one room-wide (no tableId).
+      addCreateInsertHandler()
+      addRoomsExistHandler()
+      addTablesHandler({ roomTableIds: { 'room-1': ['table-1', 'table-2'] } })
+      addEventExistsHandler(true)
+      addBlocksDeleteHandler([])
+      addMaterialsDeleteHandler([])
+      const insertedBlocks: unknown[] = []
+      addBlockInsertHandler('block', (values) => {
+        const [event_id, room_id, table_id, date, start_time, end_time, all_day] = values
+        insertedBlocks.push({ id: `block-${insertedBlocks.length + 1}`, event_id, room_id, table_id, date, start_time, end_time, all_day })
+      })
+      const cancelSpy = vi.fn()
+      sqlMock.addHandler({
+        name: 'UPDATE reservations cancel overlapping (mixed room-wide + table-scoped, #378)',
+        verb: 'update',
+        match: (stmt) => stmt.table === 'reservations' && whereHasColumn(stmt, 'table_id'),
+        respond: (stmt) => {
+          cancelSpy(stmt.values[0])
+          return []
+        },
+      })
+      addSavedGamesCancelHandler()
+      addMaterialsInsertHandler()
+      sqlMock.addHandler({
+        name: 'SELECT event_room_blocks WHERE event_id (result, tracks inserted)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'event_room_blocks' && hasExactSelectColumns(stmt, ROOM_BLOCK_COLUMNS),
+        respond: () => insertedBlocks,
+      })
+      addEventMaterialsSelectHandler([])
+
+      const { createClubEvent } = await loadClubEventsService()
+
+      const result = await createClubEvent(createAdminSession(), {
+        titleEs: 'Torneo Mixto',
+        titleEn: 'Mixed Tournament',
+        date: '2026-05-01',
+        dateKind: 'single',
+        blocksRooms: true,
+        schedules: [
+          {
+            date: '2026-05-01',
+            startTime: '18:00',
+            endTime: '20:00',
+            allDay: false,
+            roomId: 'room-1',
+            tableId: 'table-1',
+          },
+          {
+            date: '2026-05-01',
+            startTime: '20:00',
+            endTime: '22:00',
+            allDay: false,
+            roomId: 'room-1',
+          },
+        ],
+      })
+
+      // The mismatch guard didn't fire for the table-scoped block despite its
+      // room also carrying a room-wide block — proving createClubEvent as a
+      // whole didn't reject with 400.
+      expect(result.roomBlocks).toHaveLength(2)
+      expect(cancelSpy).toHaveBeenCalledTimes(2)
+      // Block 1 (table-scoped): cancellation is scoped to 'table-1' only.
+      expect(cancelSpy.mock.calls[0][0]).toEqual(['table-1'])
+      // Block 2 (room-wide, null table_id): cancellation covers every table
+      // in the room, resolved via the room-wide roomTableMap.
+      expect(cancelSpy.mock.calls[1][0]).toEqual(['table-1', 'table-2'])
     })
 
     it('rolls back (deletes) the created event when the block/material write fails, leaving no orphan row', async () => {
@@ -1424,6 +1590,29 @@ describe('club-events-service', () => {
       // (returned from the mocked UPDATE...RETURNING), res-table-b was not
       // (never matched table_id = ANY(['table-A'])) — proving the reservation
       // on the other table in the room survives the cascade.
+      expect(deleteSpy).toHaveBeenCalledWith(['evt-1'])
+    })
+
+    it('skips the room->table lookup entirely when every block is table-scoped (#378)', async () => {
+      // Regression guard for #378: `fetchRoomTableMap`'s room-id list used
+      // to be built from EVERY block's room_id regardless of table_id, so
+      // this SELECT ran even when no block needed the room-wide fallback.
+      // No 'tables' handler is registered in this test — if the lookup is
+      // (re)issued unconditionally, the sql-mock's "no handler matched"
+      // throw (no silent [] fallback) fails this test.
+      addDeleteGuardHandler({ id: 'evt-1', title_es: null, title_en: null })
+      addCascadeBlocksFetchHandler([
+        { room_id: 'room-1', table_id: 'table-A', date: '2026-04-20', start_time: '18:00:00', end_time: '22:00:00' },
+      ])
+      addReservationsCancelHandler(() => [])
+      addSavedGamesCancelHandler(() => [])
+      const deleteSpy = vi.fn()
+      addEventsDeleteHandler(deleteSpy)
+
+      const { deleteClubEvent } = await loadClubEventsService()
+
+      await deleteClubEvent(createAdminSession(), 'evt-1')
+
       expect(deleteSpy).toHaveBeenCalledWith(['evt-1'])
     })
 
@@ -2624,6 +2813,43 @@ describe('events-service shared helpers', () => {
       const roomTableMap = new Map<string, string[]>()
 
       expect(resolveBlockCancellationTableIds(null, 'room-1', roomTableMap)).toEqual([])
+    })
+  })
+
+  describe('fetchRoomTableMap (#378)', () => {
+    beforeEach(() => {
+      sqlMock.reset()
+    })
+
+    it('returns a room_id -> table ids map for the given room ids', async () => {
+      sqlMock.addHandler({
+        name: 'SELECT id, room_id FROM tables WHERE room_id = ANY(...)',
+        verb: 'select',
+        match: (stmt) => stmt.table === 'tables' && hasExactSelectColumns(stmt, 'id, room_id'),
+        respond: () => [
+          { id: 'table-1', room_id: 'room-1' },
+          { id: 'table-2', room_id: 'room-1' },
+          { id: 'table-3', room_id: 'room-2' },
+        ],
+      })
+      const { fetchRoomTableMap } = await import('@/lib/server/events-service')
+
+      const result = await fetchRoomTableMap(['room-1', 'room-2'])
+
+      expect(result.get('room-1')).toEqual(['table-1', 'table-2'])
+      expect(result.get('room-2')).toEqual(['table-3'])
+    })
+
+    it('returns an empty map without querying when roomIds is empty', async () => {
+      // No handler is registered — if the query is (re)issued despite the
+      // empty-guard, the sql-mock's "no handler matched" throw fails this
+      // test in addition to the explicit call-count assertion below.
+      const { fetchRoomTableMap } = await import('@/lib/server/events-service')
+
+      const result = await fetchRoomTableMap([])
+
+      expect(result.size).toBe(0)
+      expect(sqlMock.sql).not.toHaveBeenCalled()
     })
   })
 })

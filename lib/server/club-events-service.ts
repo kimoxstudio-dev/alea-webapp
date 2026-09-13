@@ -15,6 +15,7 @@ import type { Tables } from '@/lib/supabase/types'
 import type { SessionUser } from '@/lib/server/auth'
 import {
   deleteEventCascade,
+  fetchRoomTableMap,
   isClubEventRow,
   mapEventWriteError,
   resolveBlockCancellationTableIds,
@@ -737,35 +738,58 @@ async function applyClubEventBlocksAndMaterials(
   const cancelledSavedGames: Array<{ id: string; updatedAt: string }> = []
   const insertedMaterialEquipmentIds: string[] = []
 
-  // Batch the room->table id lookups for every block that needs one (no
-  // table_id, so the whole room's tables are cancelled), instead of one
-  // round trip per block inside the loop below (#304 code-review, medium
-  // effort) — mirrors events-service.ts's deleteEventCascade, which
-  // pre-fetches all rooms' table ids into a Map before its own block loop.
-  // The same query also covers every distinct room referenced by a block
-  // that DOES have a table_id, so the per-block table_id/room_id mismatch
-  // guard below can be answered from an in-memory Map instead of issuing a
-  // redundant per-block SELECT (#354 code-review).
-  const roomTableMap = new Map<string, string[]>()
+  // Room-wide fallback map (#378, via events-service.ts's shared
+  // `fetchRoomTableMap` — mirrors `deleteEventCascade`, which pre-fetches the
+  // same shape instead of one round trip per block inside the loop below).
+  // Narrowed to only rooms referenced by a block with a null table_id: a
+  // table-scoped block never consults this map (see
+  // `resolveBlockCancellationTableIds`), so a call whose blocks are all
+  // table-scoped skips this query entirely instead of always fetching every
+  // referenced room's tables regardless of use (#304 code-review, medium
+  // effort, originally batched this per event rather than per block; #378
+  // added the conditional skip).
+  const roomIdsNeedingRoomWideFallback = blocks === null ? [] : [...new Set(
+    blocks
+      .filter((b): b is NormalisedEventSchedule & { room_id: string } => b.room_id !== null && b.table_id === null)
+      .map((b) => b.room_id),
+  )]
+  let roomTableMap: Map<string, string[]>
+  try {
+    roomTableMap = await fetchRoomTableMap(roomIdsNeedingRoomWideFallback)
+  } catch {
+    // #304 code-review (high): this batched lookup runs after the DELETEs
+    // above have already captured deletedBlocks/deletedMaterials — on
+    // failure here those rows must be restored just like every other
+    // failure branch in this function, or they stay deleted with nothing
+    // to put them back.
+    await rollbackClubEventBlocksWrite({
+      eventId, insertedBlockIds: [], cancelledReservations: [], cancelledSavedGames: [], deletedBlocks, deletedMaterials,
+      insertedMaterialEquipmentIds: [],
+    })
+    serviceError('Internal server error', 500)
+  }
+
+  // Table -> room lookup for the per-block table_id/room_id mismatch guard
+  // below (#354 code-review). Kept as its own query, keyed by table id
+  // rather than room id, because it must cover every block that carries a
+  // table_id regardless of whether any block also needs the room-wide
+  // fallback above — narrowing `roomTableMap`'s room list (#378) would
+  // otherwise leave this guard unable to verify a table-scoped block whose
+  // room has no room-wide block.
   const tableRoomMap = new Map<string, string>()
   if (blocks !== null) {
-    const distinctRoomIds = [...new Set(
+    const tableIdsNeedingRoomCheck = [...new Set(
       blocks
-        .filter((b): b is NormalisedEventSchedule & { room_id: string } => b.room_id !== null)
-        .map((b) => b.room_id),
+        .filter((b): b is NormalisedEventSchedule & { room_id: string; table_id: string } => b.room_id !== null && b.table_id !== null)
+        .map((b) => b.table_id),
     )]
-    if (distinctRoomIds.length > 0) {
+    if (tableIdsNeedingRoomCheck.length > 0) {
       let tables: Array<{ id: string; room_id: string }>
       try {
         tables = await sql`
-          SELECT id, room_id FROM tables WHERE room_id = ANY(${distinctRoomIds})
+          SELECT id, room_id FROM tables WHERE id = ANY(${tableIdsNeedingRoomCheck})
         ` as Array<{ id: string; room_id: string }>
       } catch {
-        // #304 code-review (high): this batched lookup runs after the DELETEs
-        // above have already captured deletedBlocks/deletedMaterials — on
-        // failure here those rows must be restored just like every other
-        // failure branch in this function, or they stay deleted with nothing
-        // to put them back.
         await rollbackClubEventBlocksWrite({
           eventId, insertedBlockIds: [], cancelledReservations: [], cancelledSavedGames: [], deletedBlocks, deletedMaterials,
           insertedMaterialEquipmentIds: [],
@@ -773,9 +797,6 @@ async function applyClubEventBlocksAndMaterials(
         serviceError('Internal server error', 500)
       }
       for (const t of tables) {
-        const list = roomTableMap.get(t.room_id) ?? []
-        list.push(t.id)
-        roomTableMap.set(t.room_id, list)
         tableRoomMap.set(t.id, t.room_id)
       }
     }
