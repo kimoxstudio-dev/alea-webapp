@@ -174,4 +174,33 @@ describe('middleware', () => {
       expect(clerkMiddlewareInvoked).toHaveBeenCalledWith(path, event)
     },
   )
+
+  it.each(['/', '/es', '/en'])(
+    'overrides Cache-Control on the landing path %s to a bfcache-eligible value without no-store (#419)',
+    async (landingPath) => {
+      const middleware = (await import('@/middleware')).default
+
+      const response = await middleware(new NextRequest(`http://localhost:3000${landingPath}`))
+
+      const cacheControl = response.headers.get('Cache-Control')
+      expect(cacheControl).toBe('private, no-cache, max-age=0, must-revalidate')
+      expect(cacheControl).not.toContain('no-store')
+    },
+  )
+
+  it.each(['/es/rooms', '/en/sign-in', '/api/admin/health'])(
+    'does not touch Cache-Control for non-landing path %s (#419)',
+    async (path) => {
+      const middleware = (await import('@/middleware')).default
+
+      const response = await middleware(new NextRequest(`http://localhost:3000${path}`))
+
+      // The middleware itself never sets Cache-Control on non-landing
+      // responses — Next.js applies its own `no-store` default downstream
+      // of middleware, which this mocked unit test does not reproduce.
+      // Asserting the header is absent here proves #419's override is
+      // scoped to the landing branch only.
+      expect(response.headers.get('Cache-Control')).toBeNull()
+    },
+  )
 })
