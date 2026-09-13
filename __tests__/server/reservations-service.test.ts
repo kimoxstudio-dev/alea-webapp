@@ -1,21 +1,8 @@
 // @vitest-environment node
 import type { SessionUser } from '@/lib/server/auth'
 import { beforeEach, describe, expect, it, vi, afterEach } from 'vitest'
-import { createSqlMock, hasExactSelectColumns, parseStatement, whereColumnHasOperator, whereConditionCount, whereHasColumn } from '../helpers/sql-mock'
-import { NeonDbError } from '@neondatabase/serverless'
-
-/**
- * Builds a real `NeonDbError` instance with the given Postgres error code.
- * `isConflictError` (#348 code-review fix) narrows on `instanceof NeonDbError`
- * rather than an unchecked cast, so a plain `{ code: '23P01' }` object no
- * longer satisfies it — tests simulating a DB exclusion-constraint race must
- * throw an actual `NeonDbError`.
- */
-function makeNeonDbError(code: string): NeonDbError {
-  const error = new NeonDbError('exclusion constraint violation')
-  error.code = code
-  return error
-}
+import { createSqlMock, hasExactSelectColumns, neonDbError, parseStatement, whereColumnHasOperator, whereConditionCount, whereHasColumn } from '../helpers/sql-mock'
+import type { NeonDbError } from '@neondatabase/serverless'
 
 // Mirrors `RESERVATION_COLUMNS` in `lib/server/reservations-service.ts` — the
 // `date::text AS date` cast is load-bearing (an uncast `date` column parses
@@ -975,7 +962,7 @@ describe('reservations service', () => {
 
     it('maps database exclusion conflicts to SLOT_TAKEN when the insert races', async () => {
       const { createReservationForSession } = await loadReservationModules()
-      reservationInsertError = makeNeonDbError('23P01')
+      reservationInsertError = neonDbError('23P01', 'exclusion constraint violation')
 
       await expect(createReservationForSession(memberSession, {
         tableId: 't2',
@@ -1717,7 +1704,7 @@ describe('reservations service', () => {
 
     it('maps database exclusion conflicts to SLOT_TAKEN when update races', async () => {
       const { updateReservationForSession } = await loadReservationModules()
-      reservationUpdateError = makeNeonDbError('23P01')
+      reservationUpdateError = neonDbError('23P01', 'exclusion constraint violation')
 
       await expect(updateReservationForSession(memberSession, 'r1', {
         date: '2026-12-31',
