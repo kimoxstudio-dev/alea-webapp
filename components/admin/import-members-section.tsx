@@ -84,7 +84,7 @@ export function ImportMembersSection({ inDialog = false }: ImportMembersSectionP
                 <p className="text-base font-semibold text-foreground">{t('importMembersDropLabel')}</p>
                 <p id="member-import-meta" className="mt-2 text-sm text-muted-foreground">{t('importMembersMeta')}</p>
                 {importFile && (
-                  <p id="member-import-selected-file" className="mt-4 rounded-full border border-primary/20 bg-primary/10 px-3 py-1 text-xs text-primary">
+                  <p id="member-import-selected-file" className="mt-4 max-w-full break-words rounded-full border border-primary/20 bg-primary/10 px-3 py-1 text-xs text-primary">
                     {t('importMembersSelectedFile', { name: importFile.name })}
                   </p>
                 )}
@@ -129,10 +129,14 @@ export function ImportMembersSection({ inDialog = false }: ImportMembersSectionP
 
           {importResult.issues.length > 0 && (
             <div className="mt-4 space-y-2">
-              <p className="text-sm font-medium text-foreground">{t('importMembersIssues')}</p>
-              <ul className="space-y-1 text-xs text-muted-foreground">
+              <p id="import-issues-heading" className="text-sm font-medium text-foreground">{t('importMembersIssues')}</p>
+              <ul
+                className="max-h-40 space-y-1 overflow-y-auto overflow-x-hidden text-xs text-muted-foreground"
+                tabIndex={0}
+                aria-labelledby="import-issues-heading"
+              >
                 {importResult.issues.slice(0, 8).map((issue) => (
-                  <li key={`${issue.rowNumber}-${issue.memberNumber ?? 'missing'}`}>
+                  <li key={`${issue.rowNumber}-${issue.memberNumber ?? 'missing'}`} className="break-words">
                     {t('importMembersIssueRow', { row: issue.rowNumber })}: {t(`importMembersIssueCodes.${issue.code}`)}
                   </li>
                 ))}
@@ -142,10 +146,14 @@ export function ImportMembersSection({ inDialog = false }: ImportMembersSectionP
 
           {importResult.normalizedRows.length > 0 && (
             <div className="mt-4 space-y-2">
-              <p className="text-sm font-medium text-foreground">{t('importMembersNormalizedPreview')}</p>
-              <ul className="space-y-1 text-xs text-muted-foreground">
+              <p id="import-preview-heading" className="text-sm font-medium text-foreground">{t('importMembersNormalizedPreview')}</p>
+              <ul
+                className="max-h-40 space-y-1 overflow-y-auto overflow-x-hidden text-xs text-muted-foreground"
+                tabIndex={0}
+                aria-labelledby="import-preview-heading"
+              >
                 {importResult.normalizedRows.slice(0, 5).map((row) => (
-                  <li key={`${row.rowNumber}-${row.memberNumber}`}>
+                  <li key={`${row.rowNumber}-${row.memberNumber}`} className="break-words">
                     {row.memberNumber} · {row.fullName}{row.email ? ` · ${row.email}` : ''}{row.phone ? ` · ${row.phone}` : ''}
                   </li>
                 ))}

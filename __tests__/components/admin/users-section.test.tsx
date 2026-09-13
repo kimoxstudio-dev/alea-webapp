@@ -62,6 +62,7 @@ vi.mock('@/lib/hooks/use-admin', () => ({
   useAdminPatchUser: () => patchMutationState,
   useAdminGenerateActivationLink: () => ({ isPending: false, mutateAsync: vi.fn(), variables: undefined }),
   useAdminGenerateRecoveryLink: () => ({ isPending: false, mutateAsync: vi.fn(), variables: undefined }),
+  useAdminImportUsers: () => ({ isPending: false, isError: false, mutate: vi.fn() }),
 }))
 
 // The fixed-size wrapper span is what keeps the button's width constant —
@@ -191,5 +192,24 @@ describe('UsersSection — pending buttons reserve loader space without animatin
     const button = screen.getByRole('button', { name: 'delete' })
     expect(getIconSlot(button)).not.toBeNull()
     expect(queryLoader(button)).not.toBeNull()
+  })
+})
+
+// #395 — `overflow-y-auto` alone leaves `overflow-x` computed as `auto` per
+// the CSS spec, which is the horizontal scrollbar from the bug screenshot.
+// `overflow-x-hidden` is the class that actually fixes done-when #1.
+describe('UsersSection — import dialog does not leak horizontal overflow (#395)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('import-members DialogContent carries overflow-x-hidden alongside overflow-y-auto', async () => {
+    const user = userEvent.setup()
+    render(<UsersSection />)
+    await user.click(screen.getByRole('button', { name: 'openImportMembers' }))
+
+    const dialogContent = screen.getByRole('dialog')
+
+    expect(dialogContent).toHaveClass('overflow-y-auto', 'overflow-x-hidden')
   })
 })

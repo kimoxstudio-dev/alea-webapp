@@ -457,7 +457,7 @@ export function UsersSection() {
 
       {/* Edit Dialog */}
       <Dialog open={isImportModalOpen} onOpenChange={setIsImportModalOpen}>
-        <DialogContent className="max-h-[90vh] max-w-4xl overflow-y-auto p-0 sm:max-h-[85vh]">
+        <DialogContent className="max-h-[90vh] max-w-4xl overflow-y-auto overflow-x-hidden p-0 sm:max-h-[85vh]">
           <DialogHeader className="border-b border-border px-6 pb-4 pt-6">
             <DialogTitle>{t('importMembersTitle')}</DialogTitle>
             <DialogDescription>{t('importMembersDescription')}</DialogDescription>
