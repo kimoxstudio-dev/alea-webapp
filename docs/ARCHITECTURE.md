@@ -121,7 +121,7 @@ Each service module maps to a domain:
 
 ## Auth Flow
 
-Auth identity is owned entirely by Clerk. There is no password column on `profiles` and no app-level credential store — `lib/server/session.ts` reads the Clerk session directly from Next.js's request context via `auth()`/`currentUser()`, and `clerkMiddleware()` (wired in `middleware.ts`) populates that context on every matched request, including `/api`.
+Auth identity is owned entirely by Clerk. There is no password column on `profiles` and no app-level credential store — `lib/server/session.ts` reads the Clerk session directly from Next.js's request context via `auth()`/`currentUser()`, and `clerkMiddleware()` (wired in `middleware.ts`) populates that context on every matched request *except* the exact locale-root landing paths (`/`, `/es`, `/en` — the public landing page, #414), which run i18n routing and CSRF cookie issuance only, with no Clerk wrapping at all. Calling `auth()`/`currentUser()` anywhere in the landing page's render tree throws, since there is no `clerkMiddleware()` context to read — see the landing-route exclusion note under Middleware below.
 
 Members have **no email** and there is **no open self-registration** (closed issues #206/#207). Every member must already exist as an admin-imported `profiles` row (`is_active = false`) before they can ever sign in. The only way a profile becomes active — and the only way its Clerk identity is ever created — is by claiming an admin-issued activation link.
 
@@ -131,7 +131,7 @@ Members have **no email** and there is **no open self-registration** (closed iss
 4. **Activation**: an admin generates a single-use, 24h activation token (`generateActivationLink()`) for a pre-registered, inactive profile. The member claims it via `activateAccount()`, which atomically claims the token, creates the member's Clerk identity (username + password, no email), and flips `profiles.is_active = true`. Every failure path (Clerk create fails, or the DB update fails after Clerk succeeds) compensates: the token claim is restored, and on a DB failure the just-created Clerk user is deleted best-effort — if that delete itself fails, the orphaned Clerk identity is a known, admin-recoverable state rather than blocking retry.
 5. **Recovery**: an admin generates a recovery link the same way; `recoverAccount()` claims the token and calls Clerk's `updateUser()` to set a new password on the member's *existing* Clerk identity (looked up by username, since no Clerk user id is persisted on `profiles`). This is a password reset, not identity creation.
 6. **Logout**: `logout()` (`auth-service.ts`) revokes the current Clerk session server-side via `clerkClient().sessions.revokeSession()`. The client-side Clerk SDK (`useClerk().signOut()`) clears the browser cookie separately.
-7. `middleware.ts` does not refresh any session cookie itself (that role moved entirely to `clerkMiddleware()`) — it only wraps requests with Clerk's auth context, routes locale pages through `next-intl`, and issues the CSRF cookie.
+7. `middleware.ts` does not refresh any session cookie itself (that role moved entirely to `clerkMiddleware()`) — it only wraps requests with Clerk's auth context (except the locale-root landing paths, which skip Clerk entirely — see `middleware.ts`), routes locale pages through `next-intl`, and issues the CSRF cookie.
 
 Mutating auth routes (e.g. login) still run `enforceMutationSecurity()` (CSRF double-submit + same-origin `Origin` + Fetch Metadata check) and `enforceRateLimit()` before any handler logic, even where the handler itself just returns `410`.
 
@@ -205,6 +205,8 @@ It is a tagged-template function backed by Neon's HTTP driver (no connection poo
 
 `middleware.ts` runs on matched page and API requests (Edge Runtime). Its matcher skips Next.js/Vercel internals and static files, while `middleware.ts` returns API requests before locale routing and CSRF cookie setup. This still lets Clerk initialize request auth context for Route Handlers.
 
+**Landing route exclusion (#414):** every matched path gets wrapped in `clerkMiddleware()` *except* the exact locale-root landing paths — `/`, `/es`, `/en` (the public landing page). Those three run `handleI18nRouting` + `ensureCsrfCookie()` directly, with no Clerk involvement at all, removing the handshake overhead Clerk's wrapping adds for anonymous visitors on a development instance. A consequence: `auth()`/`currentUser()` must never be called anywhere in the landing page's render tree (`app/[locale]/page.tsx`, `components/landing/*`) — there is no `clerkMiddleware()` context there for them to read, and calling them throws at runtime rather than failing at build time. `__tests__/app/landing-scoped-off-clerk.test.ts` scans those files for stray Clerk imports as a regression guard.
+
 What middleware does:
 
 1. **Locale routing**: Delegates to `next-intl/middleware` (`handleI18nRouting`) to inject locale prefixes and resolve the active locale.
@@ -212,7 +214,7 @@ What middleware does:
 
 What middleware does NOT do:
 - It does not enforce authentication or redirect unauthenticated users. Protected Server Components call `getSessionFromServerCookies()` and Route Handlers call `requireAuth()` / `requireAdmin()` at the resource boundary.
-- It does not refresh any session cookie itself. Session cookie handling is entirely `clerkMiddleware()`'s job — session identity comes from Clerk (`lib/server/auth.ts`, `lib/server/session.ts`).
+- It does not refresh any session cookie itself. Session cookie handling is entirely `clerkMiddleware()`'s job — session identity comes from Clerk (`lib/server/auth.ts`, `lib/server/session.ts`) — on every route except the landing paths noted above.
 - It does not run locale routing or CSRF setup for `/api/` routes.
 
 ---

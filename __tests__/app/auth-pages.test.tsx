@@ -100,37 +100,6 @@ describe('auth page guards', () => {
     consoleErrorSpy.mockRestore()
   })
 
-  it('root page redirects valid sessions directly to rooms', async () => {
-    getSessionFromServerCookiesMock.mockResolvedValueOnce({ id: 'session-1', role: 'member' })
-    getCurrentUserMock.mockResolvedValueOnce({ id: 'user-1' })
-
-    const { default: RootPage } = await import('@/app/page')
-    await RootPage()
-
-    expect(redirectMock).toHaveBeenCalledWith('/es/rooms')
-  })
-
-  it('root page falls through to the public landing page for stale sessions', async () => {
-    getSessionFromServerCookiesMock.mockResolvedValueOnce({ id: 'session-1', role: 'member' })
-    getCurrentUserMock.mockRejectedValueOnce(new Error('stale'))
-
-    const { default: RootPage } = await import('@/app/page')
-    await RootPage()
-
-    expect(redirectMock).toHaveBeenCalledWith('/es')
-    expect(redirectMock).not.toHaveBeenCalledWith('/es/login')
-  })
-
-  it('root page falls through to the public landing page when there is no session', async () => {
-    getSessionFromServerCookiesMock.mockResolvedValueOnce(null)
-
-    const { default: RootPage } = await import('@/app/page')
-    await RootPage()
-
-    expect(redirectMock).toHaveBeenCalledWith('/es')
-    expect(getCurrentUserMock).not.toHaveBeenCalled()
-  })
-
   it('admin page preserves deep links for signed-out users', async () => {
     getSessionFromServerCookiesMock.mockResolvedValueOnce(null)
     const { default: AdminPage } = await import('@/app/[locale]/(app)/admin/page')

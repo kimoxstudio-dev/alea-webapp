@@ -1,6 +1,6 @@
 import createMiddleware from 'next-intl/middleware'
 import { clerkMiddleware } from '@clerk/nextjs/server'
-import { NextResponse, type NextRequest } from 'next/server'
+import { NextResponse, type NextFetchEvent, type NextRequest } from 'next/server'
 import { ensureCsrfCookie } from './lib/server/security-edge'
 import { locales, defaultLocale } from './lib/i18n/config'
 
@@ -11,7 +11,33 @@ const handleI18nRouting = createMiddleware({
 })
 
 /**
- * Clerk middleware + CSRF cookie issuance.
+ * Exact locale-root paths, e.g. `/`, `/es` and `/en` — the public landing
+ * page (#414). Bare `/` must be included: it's what a real visitor types,
+ * it matches `config.matcher` just like `/es`/`/en`, and `handlePageRequest()`
+ * (via `handleI18nRouting`) is what turns it into the 307 redirect to the
+ * default locale — that redirect must not be Clerk-wrapped either.
+ */
+const LANDING_ROOT_PATHS = new Set(['/', ...locales.map((locale) => `/${locale}`)])
+
+function isLandingRoot(pathname: string): boolean {
+  return LANDING_ROOT_PATHS.has(pathname)
+}
+
+/**
+ * i18n routing + CSRF cookie issuance, with no Clerk involvement.
+ *
+ * Shared by both branches of the default export below: the landing route
+ * (which skips `clerkMiddleware()` entirely) and, indirectly, every other
+ * page route (via the `clerkMiddleware()`-wrapped handler, which calls this
+ * same logic after Clerk's auth context has been populated).
+ */
+function handlePageRequest(request: NextRequest): NextResponse {
+  const response = handleI18nRouting(request)
+  return ensureCsrfCookie(request, response)
+}
+
+/**
+ * Clerk middleware + CSRF cookie issuance, with the landing route excluded.
  *
  * Clerk is installed and wired here (#297) so `auth()` / `currentUser()`
  * (lib/server/session.ts) are populated. Protected Server Components and
@@ -20,9 +46,9 @@ const handleI18nRouting = createMiddleware({
  * deprecated because their URL matching can diverge from Next.js routing.
  *
  * `clerkMiddleware()` still wraps every matched request, including `/api`
- * (see `config.matcher` below), so `auth()` /
- * `currentUser()` (lib/server/session.ts) are populated for any Route
- * Handler that opts into reading a Clerk session.
+ * (see `config.matcher` below), except the locale-root landing paths (see
+ * below), so `auth()` / `currentUser()` (lib/server/session.ts) are
+ * populated for any Route Handler that opts into reading a Clerk session.
  *
  * The handler also calls `ensureCsrfCookie()` on page requests, issuing a
  * non-`httpOnly` CSRF token cookie (or reusing a valid existing one) that
@@ -43,16 +69,41 @@ const handleI18nRouting = createMiddleware({
  * a bare `https:`/`http:` scheme wildcard that allows a script from any
  * HTTP(S) origin — see `next.config.ts` for the full rationale and the
  * Clerk Frontend API host derivation.
+ *
+ * **Landing route exclusion (#414):** `clerkMiddleware()` runs
+ * `authenticateRequest` on every request it wraps, regardless of whether the
+ * handler calls `auth()`. On a development Clerk instance, an anonymous
+ * visitor's first request triggers a handshake redirect that carries its own
+ * `Set-Cookie` and `Cache-Control: no-store` response headers — that's the
+ * overhead #414's original Lighthouse evidence captured on the public
+ * landing page, and it's Clerk's own cost, not the handler's. Excluding a
+ * route from `config.matcher` is Clerk's documented mechanism for avoiding
+ * it (https://clerk.com/docs/references/nextjs/clerk-middleware), but this
+ * file's matcher also gates i18n routing and CSRF cookie issuance, which the
+ * landing page still needs (`/`, `/es`/`/en` still require locale
+ * resolution). Narrowing the matcher itself would have dropped those too.
+ * Instead, the default export below branches on the exact locale-root path
+ * *before* invoking `clerkMiddleware()`: the landing route runs
+ * `handlePageRequest()` directly (i18n + CSRF, no Clerk), and every other
+ * matched path — every authenticated route, `/api` included — goes through
+ * `clerkMiddleware()` exactly as before. `config.matcher` itself is
+ * unchanged.
  */
-export default clerkMiddleware(async (_auth, request: NextRequest) => {
+const withClerk = clerkMiddleware(async (_auth, request: NextRequest) => {
   if (request.nextUrl.pathname.startsWith('/api')) {
     return NextResponse.next()
   }
 
-  const response = handleI18nRouting(request)
-
-  return ensureCsrfCookie(request, response)
+  return handlePageRequest(request)
 })
+
+export default function middleware(request: NextRequest, event: NextFetchEvent) {
+  if (isLandingRoot(request.nextUrl.pathname)) {
+    return handlePageRequest(request)
+  }
+
+  return withClerk(request, event)
+}
 
 export const config = {
   matcher: ['/((?!_next|_vercel|.*\\..*).*)'],

@@ -93,9 +93,9 @@ its removal in the Supabase-cleanup commit; `ls lib/supabase/` now contains only
   `process.env.CLERK_SECRET_KEY` read** — `@clerk/nextjs` reads it directly from the
   environment inside its own SDK code. The app-code call sites that depend on it being
   correctly set are:
-  - `middleware.ts:38` — `clerkMiddleware()` wraps every matched request (see
-    `config.matcher`, `middleware.ts:48-50`), populating `auth()`/`currentUser()` for the
-    rest of the app.
+  - `middleware.ts:92` — `clerkMiddleware()` wraps every matched request except the
+    locale-root landing paths (see `config.matcher`, `middleware.ts:108-109`), populating
+    `auth()`/`currentUser()` for the rest of the app.
   - `lib/server/auth-service.ts:6` imports `clerkClient` from `@clerk/nextjs/server`; it is
     called at `lib/server/auth-service.ts:395` (account activation — `client.users.createUser()`),
     `:432` (rollback cleanup — `client.users.deleteUser()`), `:518` and `:530` (recovery —
