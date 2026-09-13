@@ -1,3 +1,4 @@
+import Image from 'next/image'
 import Link from 'next/link'
 import { getTranslations } from 'next-intl/server'
 
@@ -20,8 +21,7 @@ export async function LandingFooterSection({ locale }: LandingFooterSectionProps
       <div className="mod-foot-grid">
         <div>
           <div className="mod-logo">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
+            <Image
               src="/alea-logo.png"
               alt="Alea"
               width={40}

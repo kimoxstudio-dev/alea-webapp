@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useState } from 'react'
+import Image from 'next/image'
 import Link from 'next/link'
 import { usePathname, useSearchParams } from 'next/navigation'
 import { useTranslations } from 'next-intl'
@@ -58,12 +59,12 @@ export function LandingNav({ locale }: LandingNavProps) {
     <>
       <header className="mod-nav">
         <a href="#top" className="mod-logo" data-egg-tap title="Alea Las Palmas">
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img
+          <Image
             src="/alea-logo.png"
             alt="Alea"
             width={40}
             height={40}
+            priority
           />
           <span>
             <strong>ALEA</strong>

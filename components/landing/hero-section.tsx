@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import Image from 'next/image'
 import Link from 'next/link'
 import { useTranslations } from 'next-intl'
 import type { ClubEvent } from '@/lib/types'
@@ -63,12 +64,15 @@ export function HeroSection({ locale, upcomingEvents, onPickEvent }: HeroSection
 
   return (
     <section className="mod-hero" id="top">
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img
+      <Image
         className="mod-hero-bg-img"
         src="/fondo-oscuro.png"
         alt=""
         aria-hidden="true"
+        fill
+        sizes="100vw"
+        priority
+        fetchPriority="high"
       />
       <div className="mod-hero-grid">
         <div className="mod-hero-left">
