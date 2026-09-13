@@ -17,9 +17,16 @@ function LangToggle({ locale, className }: { locale: string; className?: string 
   const pathWithoutLocale = pathname.replace(/^\/[a-z]{2}(?=\/|$)/, '')
   const qs = searchParams.toString()
   const href = `/${otherLocale}${pathWithoutLocale}${qs ? `?${qs}` : ''}`
+  const currentLangName = locale === 'es' ? 'Español' : 'English'
+  const otherLangName = otherLocale === 'es' ? 'Español' : 'English'
+  const switchLabel = t('switchLocaleFull', { current: currentLangName, other: otherLangName })
 
   return (
-    <Link href={href} className={`alea-lang-toggle ${className ?? ''}`} aria-label={t('switchLocale', { locale: otherLocale })}>
+    <Link
+      href={href}
+      className={`alea-lang-toggle ${className ?? ''}`}
+      aria-label={`ES · EN — ${switchLabel}`}
+    >
       <span className={locale === 'es' ? 'on' : undefined}>ES</span>
       <span aria-hidden="true">·</span>
       <span className={locale === 'en' ? 'on' : undefined}>EN</span>

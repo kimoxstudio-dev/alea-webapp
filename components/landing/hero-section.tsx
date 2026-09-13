@@ -127,6 +127,7 @@ export function HeroSection({ locale, upcomingEvents, onPickEvent }: HeroSection
               onClick={() => {
                 if (pick && !nat20) onPickEvent(pick)
               }}
+              aria-hidden={!pick && !nat20 ? true : undefined}
               aria-label={pick && !nat20 && pickTitle ? `${locale === 'en' ? 'See' : 'Ver'} ${pickTitle}` : undefined}
             >
               {nat20 ? (
@@ -148,6 +149,9 @@ export function HeroSection({ locale, upcomingEvents, onPickEvent }: HeroSection
                 )
               )}
             </button>
+            <span role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+              {nat20 ? t('egg.title') : pick && pickTitle ? `${t('roll.you')} ${pickTitle}` : ''}
+            </span>
           </div>
         </div>
       </div>

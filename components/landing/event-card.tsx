@@ -23,14 +23,13 @@ export function EventCard({ event, locale, onSelect }: EventCardProps) {
         type="button"
         className="mod-event-btn"
         onClick={() => onSelect(event)}
-        aria-label={title}
         draggable="false"
         onDragStart={(e) => e.preventDefault()}
       >
         <span className="mod-event-img">
           {event.imageUrl ? (
             // eslint-disable-next-line @next/next/no-img-element
-            <img src={event.imageUrl} alt={title} loading="lazy" draggable="false" onDragStart={(e) => e.preventDefault()} />
+            <img src={event.imageUrl} alt="" loading="lazy" draggable="false" onDragStart={(e) => e.preventDefault()} />
           ) : (
             <span className="mod-event-img-placeholder" aria-hidden="true" />
           )}
@@ -41,7 +40,9 @@ export function EventCard({ event, locale, onSelect }: EventCardProps) {
           <span className="mod-event-blurb">{blurb}</span>
           <span className="mod-event-foot">
             <span className="mod-event-meta" />
-            <span className="mod-event-link">{t('events.cta')} →</span>
+            <span className="mod-event-link">
+              {t('events.cta')} <span aria-hidden="true">→</span>
+            </span>
           </span>
         </span>
       </button>

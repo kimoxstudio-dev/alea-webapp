@@ -345,7 +345,7 @@
 .mod-footer { position: relative; z-index: 2; padding: 80px 32px 40px; border-top: 1px solid rgba(200,162,91,0.18); }
 .mod-foot-grid { max-width: 1400px; margin: 0 auto; display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr; gap: 40px; }
 .mod-foot-tag { font-size: 14px; opacity: 0.7; margin: 16px 0 6px; }
-.mod-foot-grid h5 { font-size: 11px; letter-spacing: 3px; text-transform: uppercase; color: var(--gold); margin: 0 0 12px; }
+.mod-foot-grid h3 { font-family: "Space Grotesk", "Inter Tight", system-ui, sans-serif; font-size: 11px; letter-spacing: 3px; text-transform: uppercase; color: var(--gold); margin: 0 0 12px; }
 .mod-foot-grid p { font-size: 14px; opacity: 0.78; margin: 6px 0; }
 .mod-foot-grid p a { color: inherit; text-decoration: none; border-bottom: 1px dotted rgba(244,234,213,0.3); transition: border-color .2s, color .2s; }
 .mod-foot-grid p a:hover { color: var(--gold-2); border-color: var(--gold-2); }
