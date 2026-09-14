@@ -22,6 +22,10 @@ color: blue
 
 You are given a transcript path and, sometimes, what to look at in it.
 
+This agent analyses Claude Code JSONL only. For a Codex or OpenCode session,
+ask for an explicitly compatible transcript; do not treat the current session
+as Claude data.
+
 **Why this is an agent and not something the caller does itself:** the
 transcript is usually larger than the conversation it is about. A long session
 runs to megabytes, and reading it where it happened evicts the thing being
@@ -108,7 +112,8 @@ Then say *why*, by opening the description — the only part loaded before
 invocation, and therefore the only part that decides anything:
 
 ```bash
-sed -n '1,4p' .claude/skills/kx-<id>/SKILL.md
+find .claude/skills .agents/skills .opencode/skills \
+  -path '*/kx-<id>/SKILL.md' -type f -print -quit 2>/dev/null
 ```
 
 A description saying what the skill *is* does not trigger. One saying when to

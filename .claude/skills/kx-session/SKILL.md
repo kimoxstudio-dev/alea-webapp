@@ -10,7 +10,7 @@ disable-model-invocation: true
 
 # Session Orchestrator
 
-Request: $ARGUMENTS
+Request: the user's request for this skill. If absent, ask what to orchestrate.
 
 You are orchestrating this request. **You do not implement it.**
 
@@ -74,17 +74,12 @@ REPO=$(basename "$(git rev-parse --show-toplevel)")
 git worktree add -b "kx/<slug>" "$HOME/.kx/worktrees/$REPO/<slug>" "origin/$BASE"
 ```
 
-Then `EnterWorktree` with `path` set to that directory. It switches the
-session's working directory, so every subagent you spawn inherits the right
-tree without being told a path.
+Set every later command and delegated task to this worktree path. Use the
+host's explicit working-directory field where it has one; otherwise pass the
+path in the task. Never assume a session-wide directory switch.
 
-Two reasons to create the worktree yourself rather than letting `EnterWorktree`
-make one:
-
-- It would place it in `.claude/worktrees/`, inside the repo.
-- Its base ref follows the `worktree.baseRef` setting. A project configured
-  with `head` would silently branch from local HEAD, breaking the promise
-  above. Resolving `origin/HEAD` here makes the base explicit.
+Create the worktree yourself: the base must stay explicitly `origin/HEAD`, not
+follow a host setting or local HEAD.
 
 `<slug>` is a short kebab-case name for the task. If the branch already exists,
 pick a new slug — do not reuse or force it.
@@ -131,8 +126,8 @@ Work where they are sitting. Nothing to create, nothing to enter, nothing to
 bootstrap — the checkout already has its dependencies and `.env`. Do not run
 the worktree checks above; they answer a question nobody asked.
 
-`EnterWorktree` is off the table, and so is `isolation: "worktree"` on any
-agent you spawn — one tree per session, and this session's tree is the repo.
+Do not create per-agent worktrees — one tree per session, and this session's
+tree is the repo.
 
 ---
 
@@ -255,8 +250,9 @@ to leave out a skill the phase actually needs. Be deliberate because an
 irrelevant skill is noise the developer has to reconcile, not because you are
 saving room.
 
-Look at what the project has — `ls .claude/skills/`, or `.agents/skills/`
-under Codex — and decide per phase:
+Locate the installed KX skills in the host's skill directory —
+`.claude/skills/`, `.agents/skills/`, or `.opencode/skills/` — and decide per
+phase:
 
 | The phase | Name |
 |---|---|

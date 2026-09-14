@@ -88,7 +88,7 @@ stack, written from that codebase rather than from theory:
 `kx-capacitor`
 
 A project only gets the ones its stack lists, so what is present in
-`.claude/skills/` is what applies here. **Read the ones relevant to the phase
+The host's installed KX skill directory is what applies here. **Read the ones relevant to the phase
 before writing**, the same way you read `kx-design` for UI.
 
 Two things to expect in them, because they change how you use them:

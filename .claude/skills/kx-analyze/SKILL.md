@@ -77,7 +77,7 @@ jq -r 'select(.type=="assistant") | [.message.model, .effort] | @tsv' -- "$F" \
   | sort | uniq -c
 ```
 
-**When the target is this session, add a third:**
+**When the target is a Claude Code session in this host, add a third:**
 
 > **It is grading its own work.** The same model that made these choices is
 > judging them, so a decision that felt right at the time will read as right
@@ -101,7 +101,8 @@ One `kx-analyst`, given the path and nothing it would have to guess:
 - whether it is analysing the live session, and if so, that the last turn is
   absent
 - the focus from `$ARGUMENTS`, if there was one
-- where the skills it will quote actually live: `.claude/skills/kx-<id>/`
+- where the skills it will quote actually live: the selected host's
+  `.claude/skills/`, `.agents/skills/`, or `.opencode/skills/` directory
 
 It returns the tables and the findings. Print them as they came — they are
 already terse, and a summary of a ranked list is a worse ranked list. Add only

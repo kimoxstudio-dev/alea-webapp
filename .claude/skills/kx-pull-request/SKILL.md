@@ -121,7 +121,9 @@ The script lives beside this file. It talks to GitHub through `gh` so that
 you do not: one call waits for the next comment, one call closes it.
 
 ```bash
-S=.claude/skills/kx-pull-request/scripts/pr-comments.mjs   # .agents/skills/… under Codex
+S=$(find .claude/skills .agents/skills .opencode/skills \
+  -path '*/kx-pull-request/scripts/pr-comments.mjs' -type f -print -quit 2>/dev/null)
+test -n "$S" || { echo "KX pull-request script not found" >&2; exit 1; }
 
 node $S status [--pr <n>]                 # the request, what is pending, what was answered, the rate limit
 node $S wait   [--pr <n>] [--timeout <s>] # block until one is pending; react 👀; print it
