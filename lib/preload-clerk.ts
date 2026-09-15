@@ -10,18 +10,34 @@ let started = false
  * starts fetching Clerk's client SDK, which shows up as a multi-second delay
  * before the sign-in form becomes usable.
  *
- * Call this from `onMouseEnter`/`onFocus` on a CTA that navigates to
- * `/sign-in`, so the fetch happens during the hover/focus dwell time instead
- * of entirely after the click. Dynamically importing `@clerk/nextjs` — the
- * same module `ClerkProvider` is imported from — warms the browser's fetch
- * of that chunk without mounting the provider anywhere new.
+ * Call this from `onMouseEnter`/`onFocus`/`onTouchStart` on a CTA that
+ * navigates to `/sign-in`, so the fetch happens during the hover/focus/touch
+ * dwell time instead of entirely after the click. Dynamically importing
+ * `@clerk/nextjs` — the same module `ClerkProvider` is imported from — warms
+ * the browser's fetch of that chunk without mounting the provider anywhere
+ * new; this assumes the package has no problematic top-level side effects
+ * beyond that fetch, which holds today but isn't statically guaranteed.
  *
- * Idempotent per page load: only the first call actually triggers the
- * import, so repeated hovers on the same or different CTA instances are a
- * no-op after that.
+ * Idempotent per page load: only the first successful call actually
+ * triggers the import, so repeated hovers on the same or different CTA
+ * instances are a no-op after that. If the import fails, the flag resets so
+ * a later intent signal can retry. Skips the import entirely (without
+ * flipping the flag) when the user has data-saver mode on, re-checking that
+ * condition on every call.
  */
 export function preloadClerkOnIntent(): void {
   if (started) return
+
+  const connection = (
+    navigator as Navigator & {
+      connection?: { saveData?: boolean }
+    }
+  ).connection
+
+  if (connection?.saveData) return
+
   started = true
-  void import('@clerk/nextjs')
+  void import('@clerk/nextjs').catch(() => {
+    started = false
+  })
 }
