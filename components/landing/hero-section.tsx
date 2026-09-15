@@ -2,10 +2,10 @@
 
 import { useState } from 'react'
 import Image from 'next/image'
-import Link from 'next/link'
 import { useTranslations } from 'next-intl'
 import type { ClubEvent } from '@/lib/types'
 import { D20 } from './d20'
+import { SignInCtaLink } from './sign-in-cta-link'
 import { formatClubEventDate } from '@/lib/club-events-format'
 
 interface HeroSectionProps {
@@ -92,9 +92,9 @@ export function HeroSection({ locale, upcomingEvents, onPickEvent }: HeroSection
             <span className="mod-badge">{t('hero.badgeFee')}</span>
           </div>
           <div className="mod-hero-cta">
-            <Link className="mod-btn mod-btn-primary" href={`/${locale}/sign-in`}>
+            <SignInCtaLink className="mod-btn mod-btn-primary" href={`/${locale}/sign-in`}>
               {t('cta.join')}
-            </Link>
+            </SignInCtaLink>
             <a className="mod-btn mod-btn-ghost" href="#events">
               {t('cta.discover')}
             </a>

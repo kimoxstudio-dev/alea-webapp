@@ -5,6 +5,7 @@ import Image from 'next/image'
 import Link from 'next/link'
 import { usePathname, useSearchParams } from 'next/navigation'
 import { useTranslations } from 'next-intl'
+import { SignInCtaLink } from './sign-in-cta-link'
 
 interface LandingNavProps {
   locale: string
@@ -81,9 +82,9 @@ export function LandingNav({ locale }: LandingNavProps) {
           ))}
         </nav>
 
-        <Link className="mod-cta" href={`/${locale}/sign-in`}>
+        <SignInCtaLink className="mod-cta" href={`/${locale}/sign-in`}>
           {t('cta.join')} →
-        </Link>
+        </SignInCtaLink>
 
         <button
           className={`mod-burger ${open ? 'open' : ''}`}
