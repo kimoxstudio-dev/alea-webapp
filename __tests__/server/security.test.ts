@@ -326,6 +326,12 @@ describe('server security helpers', () => {
   })
 
   it('does not trust x-forwarded-for unless proxy header trust is explicitly enabled', async () => {
+    // Explicitly disabled (not just "not stubbed") because the ambient shell/
+    // .env.local environment may set TRUST_PROXY_HEADERS=true for local dev —
+    // vi.unstubAllEnvs() in beforeEach restores that ambient value, it does not
+    // clear it. This test's entire premise is TRUST_PROXY_HEADERS being off, so
+    // it must pin that explicitly rather than relying on it being unset.
+    vi.stubEnv('TRUST_PROXY_HEADERS', 'false')
     vi.stubEnv('TRUSTED_PROXY_CIDRS', '127.0.0.1/32')
     const { enforceRateLimit } = await import('@/lib/server/security')
     const policy = { bucket: 'test-proxy-trust-disabled', limit: 1, windowMs: 60_000 }
