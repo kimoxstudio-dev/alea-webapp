@@ -2,10 +2,20 @@
  * Animated hex-grid SVG background from the design source (ModernHexGrid).
  * Uses a seeded pseudo-random function (not Math.random) so server and
  * client render identical markup — avoids hydration mismatches.
+ *
+ * Integer-only PRNG (mulberry32 variant): only ever uses integer bitwise
+ * ops, which are bit-identical across every JS engine. `Math.sin`-based
+ * approaches are NOT safe here — floating-point transcendental functions
+ * can differ in their last few bits between engines/platforms (e.g. Node
+ * server vs browser client), and those tiny differences get amplified by
+ * the multipliers below into visibly different `dur`/`begin` values,
+ * causing a React hydration mismatch.
  */
 function seededRandom(seed: number): number {
-  const x = Math.sin(seed) * 10000
-  return x - Math.floor(x)
+  let t = (Math.floor(seed * 1000) + 0x6d2b79f5) | 0
+  t = Math.imul(t ^ (t >>> 15), t | 1)
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296
 }
 
 export function HexGridBackground() {
