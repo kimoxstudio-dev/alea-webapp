@@ -21,6 +21,15 @@ function stubConnection(saveData: boolean | undefined) {
   })
 }
 
+// A dynamic import never resolves synchronously or within a single
+// microtask — asserting `not.toHaveBeenCalled()` right after calling
+// `preloadClerkOnIntent()` passes even with the guard removed, since the
+// mock couldn't have been invoked yet either way. Flushing a real macrotask
+// first proves the call stays absent, not just "hasn't happened yet".
+async function flushMacrotask() {
+  await new Promise((resolve) => setTimeout(resolve, 0))
+}
+
 describe('preloadClerkOnIntent', () => {
   afterEach(() => {
     // @ts-expect-error — cleaning up a test-only property
@@ -56,6 +65,7 @@ describe('preloadClerkOnIntent', () => {
     const { preloadClerkOnIntent, importClerkMock } = await setup()
 
     preloadClerkOnIntent()
+    await flushMacrotask()
 
     expect(importClerkMock).not.toHaveBeenCalled()
   })
@@ -74,6 +84,7 @@ describe('preloadClerkOnIntent', () => {
     const { preloadClerkOnIntent, importClerkMock } = await setup()
 
     preloadClerkOnIntent()
+    await flushMacrotask()
     expect(importClerkMock).not.toHaveBeenCalled()
 
     stubConnection(false)
