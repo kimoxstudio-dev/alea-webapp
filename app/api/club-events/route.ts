@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { revalidateTag } from 'next/cache'
 import { requireAdmin } from '@/lib/server/auth'
 import { createClubEvent, listAdminClubEvents } from '@/lib/server/club-events-service'
 import { toServiceErrorResponse } from '@/lib/server/http-error'
@@ -31,5 +32,8 @@ export async function POST(request: NextRequest) {
     return admin.applyCookies(NextResponse.json(event, { status: 201 }))
   } catch (error) {
     return admin.applyCookies(toServiceErrorResponse(error))
+  } finally {
+    // Event writes can commit before a read-back or compensation fails (#424).
+    revalidateTag('landing-club-events')
   }
 }
