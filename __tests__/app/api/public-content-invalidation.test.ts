@@ -75,12 +75,25 @@ describe.each([
     }
   })
 
-  it.each(['POST', 'PUT', 'DELETE'] as const)('%s preserves admin, security, and rate-limit gates', async (method) => {
+  it.each(['POST', 'PUT', 'DELETE'] as const)('%s preserves the rejected admin gate', async (method) => {
     mocks.requireAdmin.mockResolvedValue(new NextResponse(null, { status: 403 }))
     expect((await invoke(method)).status).toBe(403)
+    expect(mocks.create).not.toHaveBeenCalled()
+    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.remove).not.toHaveBeenCalled()
+    expect(mocks.revalidateTag).not.toHaveBeenCalled()
+  })
+
+  it.each(['POST', 'PUT', 'DELETE'] as const)('%s preserves the rejected security gate', async (method) => {
     mocks.security.mockReturnValue(new NextResponse(null, { status: 403 }))
     expect((await invoke(method)).status).toBe(403)
-    mocks.security.mockReturnValue(null)
+    expect(mocks.create).not.toHaveBeenCalled()
+    expect(mocks.update).not.toHaveBeenCalled()
+    expect(mocks.remove).not.toHaveBeenCalled()
+    expect(mocks.revalidateTag).not.toHaveBeenCalled()
+  })
+
+  it.each(['POST', 'PUT', 'DELETE'] as const)('%s preserves the rejected rate-limit gate', async (method) => {
     mocks.rateLimit.mockResolvedValue(new NextResponse(null, { status: 429 }))
     expect((await invoke(method)).status).toBe(429)
     expect(mocks.create).not.toHaveBeenCalled()
