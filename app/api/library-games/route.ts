@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { revalidateTag } from 'next/cache'
 import { requireAdmin } from '@/lib/server/auth'
 import { createLibraryGame, listAdminLibraryGames } from '@/lib/server/library-games-service'
 import { toServiceErrorResponse } from '@/lib/server/http-error'
@@ -28,6 +29,7 @@ export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
     const game = await createLibraryGame(admin.session, body)
+    revalidateTag('landing-library-games')
     return admin.applyCookies(NextResponse.json(game, { status: 201 }))
   } catch (error) {
     return admin.applyCookies(toServiceErrorResponse(error))

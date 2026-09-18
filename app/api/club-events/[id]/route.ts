@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { revalidateTag } from 'next/cache'
 import { requireAdmin } from '@/lib/server/auth'
 import { deleteClubEvent, updateClubEvent } from '@/lib/server/club-events-service'
 import { toServiceErrorResponse } from '@/lib/server/http-error'
@@ -19,6 +20,9 @@ export async function PUT(request: NextRequest, { params }: { params: Promise<{ 
     return admin.applyCookies(NextResponse.json(await updateClubEvent(admin.session, id, body)))
   } catch (error) {
     return admin.applyCookies(toServiceErrorResponse(error))
+  } finally {
+    // Event writes can commit before a read-back or compensation fails (#424).
+    revalidateTag('landing-club-events')
   }
 }
 
@@ -38,5 +42,7 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
     return admin.applyCookies(new NextResponse(null, { status: 204 }))
   } catch (error) {
     return admin.applyCookies(toServiceErrorResponse(error))
+  } finally {
+    revalidateTag('landing-club-events')
   }
 }
