@@ -201,6 +201,12 @@ if they want.
 
 ## Step 3 — Plan
 
+Delegate the plan to `kx-planner`. Give it the request, the grill's evidence,
+and any decisions the human already made. It produces the phased plan; you
+check it against the evidence, resolve only clear omissions, and bring any
+open decision back to the human. You retain approval, delegation, and
+arbitration — planning is the planner's responsibility.
+
 Produce phases. Each one:
 
 ```
