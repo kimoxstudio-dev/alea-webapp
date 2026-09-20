@@ -33,12 +33,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const rootDir = join(__dirname, "..");
 const schemaDir = join(rootDir, "lib", "db", "schema");
 
-// Postgres-internal schemas that are always present in every database and
-// are not evidence of leftover state from another stack/project. Anything
-// else besides "public" (this project's own schema) fails the preflight
-// check — an allowlist, not a denylist of specific known-bad names, so an
-// arbitrary unlisted schema (e.g. "legacy") is caught too.
-const SYSTEM_SCHEMAS = ["pg_catalog", "information_schema", "pg_toast"];
+// Postgres-internal and Neon-managed schemas that are not evidence of
+// leftover state from another stack/project. Anything else besides "public"
+// (this project's own schema) fails the preflight check — an allowlist, not a
+// denylist of specific known-bad names, so an arbitrary unlisted schema (e.g.
+// "legacy") is caught too.
+const ALLOWED_SCHEMAS = ["pg_catalog", "information_schema", "pg_toast", "pgbouncer"];
 
 // Ledger table (#328) tracking which schema files have been applied and
 // with what content checksum, so a table already existing can be told apart
@@ -201,23 +201,23 @@ async function assertDatabaseIsCleanOrOwned(sql, expectedTables, { allowUnexpect
 
   console.log("Running preflight check (target database must be empty or already owned by this schema)...");
 
-  // 1. Schema allowlist: only "public" plus Postgres-internal system schemas
-  // are acceptable. Any other schema at all — a known leftover stack schema
-  // (auth, storage, drizzle, ...) or an arbitrary one (legacy, ...) — means
-  // the target database is not a fresh/owned-by-us database.
+  // 1. Schema allowlist: only "public" plus Postgres-internal or Neon-managed
+  // schemas are acceptable. Any other schema at all — a known leftover stack
+  // schema (auth, storage, drizzle, ...) or an arbitrary one (legacy, ...)
+  // means the target database is not a fresh/owned-by-us database.
   const unexpectedSchemas = await sql.query(
     `SELECT "nspname" FROM "pg_catalog"."pg_namespace"
      WHERE "nspname" <> 'public'
        AND "nspname" <> ALL($1)
        AND "nspname" !~ '^pg_temp_'
        AND "nspname" !~ '^pg_toast_temp_'`,
-    [SYSTEM_SCHEMAS],
+    [ALLOWED_SCHEMAS],
   );
   if (unexpectedSchemas.length > 0) {
     const names = unexpectedSchemas.map((row) => row.nspname).join(", ");
     console.error(
       `Preflight check failed: target database has unexpected schema(s) not owned by this project: ${names}.\n` +
-        'Only "public" plus Postgres-internal system schemas are allowed.\n' +
+        'Only "public" plus Postgres-internal or Neon-managed schemas are allowed.\n' +
         "Run it against a fresh empty database, or pass --force / set ALLOW_NON_EMPTY_DB=1 if you have already verified this is expected.",
     );
     process.exit(1);

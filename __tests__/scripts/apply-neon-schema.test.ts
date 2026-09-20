@@ -63,9 +63,12 @@ function createFakeSql(options: FakeSqlOptions = {}) {
   const queryCalls: QueryCall[] = []
   const txnQueryCalls: QueryCall[] = []
 
-  function respond(text: string): unknown {
+  function respond(text: string, params: unknown[] = []): unknown {
     if (text.includes('pg_namespace')) {
-      return options.unexpectedSchemas ?? []
+      const allowedSchemas = Array.isArray(params[0]) ? params[0] : []
+      return (options.unexpectedSchemas ?? []).filter(
+        ({ nspname }) => !allowedSchemas.includes(nspname),
+      )
     }
     if (text.includes('information_schema') && text.includes('columns')) {
       const columns = options.ledgerTableColumns ?? ['filename', 'checksum', 'applied_at']
@@ -107,13 +110,13 @@ function createFakeSql(options: FakeSqlOptions = {}) {
     if (options.failDeferredDelete && text.includes('DELETE FROM "schema_migrations"')) {
       throw new Error('injected deferred-delete failure')
     }
-    return respond(text)
+    return respond(text, params)
   })
 
   const transaction = vi.fn(async (fn: (txn: { query: Mock }) => Promise<unknown>[]) => {
     const txnQuery = vi.fn(async (text: string, params: unknown[] = []) => {
       txnQueryCalls.push({ text, params })
-      return respond(text)
+      return respond(text, params)
     })
     const results = fn({ query: txnQuery })
     return Promise.all(results)
@@ -603,6 +606,32 @@ describe('scripts/apply-neon-schema.mjs — checksum-ledger drift detection (#32
   })
 
   describe('main() — preflight check (assertDatabaseIsCleanOrOwned) and the ledger table exemption', () => {
+    it('allows Neon\'s pgbouncer schema during preflight', async () => {
+      mockSchemaFiles({})
+
+      const fakeSql = createFakeSql({ unexpectedSchemas: [{ nspname: 'pgbouncer' }] })
+      neonMock.mockReturnValue(fakeSql)
+
+      const { main } = await import('../../scripts/apply-neon-schema.mjs')
+      await main()
+
+      expect(exitSpy).not.toHaveBeenCalled()
+      expect(consoleErrorSpy).not.toHaveBeenCalled()
+    })
+
+    it('still rejects an arbitrary non-system schema during preflight', async () => {
+      mockSchemaFiles({})
+
+      const fakeSql = createFakeSql({ unexpectedSchemas: [{ nspname: 'legacy' }] })
+      neonMock.mockReturnValue(fakeSql)
+
+      const { main } = await import('../../scripts/apply-neon-schema.mjs')
+
+      await expect(main()).rejects.toThrow(ProcessExitError)
+      expect(exitSpy).toHaveBeenCalledWith(1)
+      expect(String(consoleErrorSpy.mock.calls[0]?.[0])).toContain('legacy')
+    })
+
     it('does not row-count-check the ledger table itself, even though it is an expected table', async () => {
       mockSchemaFiles({}) // no schema files — isolates the exemption from unrelated table logic
 
