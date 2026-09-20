@@ -2,48 +2,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { NextRequest } from 'next/server'
 
-// ---------------------------------------------------------------------------
-// @upstash/redis + @upstash/ratelimit mocks (KIM-401 Redis-backed rate limit)
-//
-// `enforceRateLimit` dynamically imports these packages only when
-// UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN are set. `vi.mock` is
-// hoisted above imports, so it intercepts the dynamic `import()` calls too.
-// ---------------------------------------------------------------------------
-
-const mockLimit = vi.fn()
-const mockRedisConstructor = vi.fn()
-const mockRatelimitConstructor = vi.fn()
-const mockSlidingWindow = vi.fn().mockReturnValue({ type: 'sliding-window-mock' })
-
-vi.mock('@upstash/redis', () => ({
-  Redis: class {
-    constructor(...args: unknown[]) {
-      mockRedisConstructor(...args)
-    }
-  },
-}))
-
-vi.mock('@upstash/ratelimit', () => ({
-  Ratelimit: Object.assign(
-    class {
-      limit: typeof mockLimit
-      constructor(...args: unknown[]) {
-        mockRatelimitConstructor(...args)
-        this.limit = mockLimit
-      }
-    },
-    { slidingWindow: mockSlidingWindow },
-  ),
-}))
-
 describe('server security helpers', () => {
   beforeEach(async () => {
     vi.resetModules()
     vi.unstubAllEnvs()
-    mockLimit.mockReset()
-    mockRedisConstructor.mockReset()
-    mockRatelimitConstructor.mockReset()
-    mockSlidingWindow.mockClear()
     const { resetRateLimitStoreForTests } = await import('@/lib/server/security')
     resetRateLimitStoreForTests()
   })
@@ -361,261 +323,22 @@ describe('server security helpers', () => {
     expect(second?.status).toBe(429)
   })
 
-  describe('Redis-backed rate limiting (Upstash)', () => {
-    beforeEach(() => {
-      vi.stubEnv('UPSTASH_REDIS_REST_URL', 'https://example.upstash.io')
-      vi.stubEnv('UPSTASH_REDIS_REST_TOKEN', 'test-token')
-    })
-
-    it('allows the request through when Upstash reports the client is within limits', async () => {
-      mockLimit.mockResolvedValueOnce({
-        success: true,
-        limit: 5,
-        remaining: 4,
-        reset: Date.now() + 60_000,
-      })
-
-      const { enforceRateLimit } = await import('@/lib/server/security')
-      const policy = { bucket: 'test-redis-allowed', limit: 5, windowMs: 60_000 }
-
-      const result = await enforceRateLimit(
-        new NextRequest('http://localhost:3000/api/auth/login', {
-          method: 'POST',
-          headers: { 'x-real-ip': '203.0.113.90' },
-        }),
-        policy,
-      )
-
-      expect(result).toBeNull()
-      expect(mockRedisConstructor).toHaveBeenCalledWith(
-        expect.objectContaining({
-          url: 'https://example.upstash.io',
-          token: 'test-token',
-        }),
-      )
-      expect(mockSlidingWindow).toHaveBeenCalledWith(policy.limit, `${policy.windowMs}ms`)
-      expect(mockLimit).toHaveBeenCalledWith('203.0.113.90')
-    })
-
-    it('returns 429 with the Upstash-derived Retry-After header when the client is blocked', async () => {
-      const resetAt = Date.now() + 42_000
-      mockLimit.mockResolvedValueOnce({
-        success: false,
-        limit: 5,
-        remaining: 0,
-        reset: resetAt,
-      })
-
-      const { enforceRateLimit } = await import('@/lib/server/security')
-      const policy = { bucket: 'test-redis-blocked', limit: 5, windowMs: 60_000 }
-
-      const result = await enforceRateLimit(
-        new NextRequest('http://localhost:3000/api/auth/login', {
-          method: 'POST',
-          headers: { 'x-real-ip': '203.0.113.91' },
-        }),
-        policy,
-      )
-
-      expect(result?.status).toBe(429)
-      const retryAfter = Number(result?.headers.get('retry-after'))
-      expect(retryAfter).toBeGreaterThan(0)
-      expect(retryAfter).toBeLessThanOrEqual(42)
-    })
-
-    it('reuses a single Redis client and per-bucket Ratelimit instance across requests', async () => {
-      mockLimit.mockResolvedValue({
-        success: true,
-        limit: 5,
-        remaining: 4,
-        reset: Date.now() + 60_000,
-      })
-
-      const { enforceRateLimit } = await import('@/lib/server/security')
-      const policy = { bucket: 'test-redis-singleton', limit: 5, windowMs: 60_000 }
-      const makeRequest = () =>
-        new NextRequest('http://localhost:3000/api/auth/login', {
-          method: 'POST',
-          headers: { 'x-real-ip': '203.0.113.92' },
-        })
-
-      await enforceRateLimit(makeRequest(), policy)
-      await enforceRateLimit(makeRequest(), policy)
-
-      expect(mockRedisConstructor).toHaveBeenCalledTimes(1)
-      expect(mockRatelimitConstructor).toHaveBeenCalledTimes(1)
-      expect(mockLimit).toHaveBeenCalledTimes(2)
-    })
-
-    it('persists rate-limit counter state across a simulated serverless cold start', async () => {
-      // `sharedCounter` stands in for the real Upstash Redis server: it lives
-      // in the *test file's* module scope, which `vi.resetModules()` does not
-      // clear. This is what a real cold start's persistent Redis store would
-      // be relative to two independent Lambda/Edge instances.
-      const sharedCounter = new Map<string, number>()
-      const LIMIT = 2
-
-      mockLimit.mockImplementation(async (identifier: string) => {
-        const newCount = (sharedCounter.get(identifier) ?? 0) + 1
-        sharedCounter.set(identifier, newCount)
-
-        return {
-          success: newCount <= LIMIT,
-          limit: LIMIT,
-          remaining: Math.max(0, LIMIT - newCount),
-          reset: Date.now() + 60_000,
-        }
-      })
-
-      const policy = { bucket: 'test-cold-start-persist', limit: LIMIT, windowMs: 60_000 }
-      const clientIp = '203.0.113.95'
-      const makeRequest = () =>
-        new NextRequest('http://localhost:3000/api/test', {
-          method: 'POST',
-          headers: { 'x-real-ip': clientIp },
-        })
-
-      // --- "Instance A": first serverless invocation ---
-      // vi.resetModules() clears the module registry, exactly like a fresh
-      // cold start discards the previous instance's module-level
-      // `_redisClient` / `_ratelimitCache` singletons. Re-importing gives us
-      // a brand-new module instance to exercise.
-      vi.resetModules()
-      const instanceA = await import('@/lib/server/security')
-
-      const resultA1 = await instanceA.enforceRateLimit(makeRequest(), policy)
-      const resultA2 = await instanceA.enforceRateLimit(makeRequest(), policy)
-
-      expect(resultA1).toBeNull() // count=1, allowed
-      expect(resultA2).toBeNull() // count=2, allowed (at limit)
-
-      // --- "Instance B": second serverless invocation (new cold start) ---
-      // Reset the module registry again and re-import. `instanceB` has its
-      // own fresh `_redisClient` / `_ratelimitCache` module-level bindings —
-      // if `enforceRateLimit` regressed to counting requests in local module
-      // memory instead of delegating to the (mocked) Upstash-backed
-      // `ratelimit.limit()` call, this fresh instance would start back at
-      // zero and wrongly allow the next request.
-      vi.resetModules()
-      const instanceB = await import('@/lib/server/security')
-
-      // Sanity check that this really is a distinct module instance and not
-      // the same cached export object.
-      expect(instanceB.enforceRateLimit).not.toBe(instanceA.enforceRateLimit)
-
-      const resultB1 = await instanceB.enforceRateLimit(makeRequest(), policy)
-
-      // The externally persisted (mocked Upstash) counter is already at the
-      // limit from Instance A, so Instance B — despite being a fresh module
-      // with no local memory of prior requests — must still reject.
-      expect(resultB1?.status).toBe(429)
-      expect(sharedCounter.get(clientIp)).toBe(3)
-      expect(mockLimit).toHaveBeenCalledTimes(3)
-    })
-  })
-
-  // ---------------------------------------------------------------------------
-  // #383 — critical policies must not silently degrade to the in-memory
-  // limiter in production when Redis is not configured.
-  // ---------------------------------------------------------------------------
-  describe('critical policy fallback (#383)', () => {
-    // Hand-rolled literals for the "critical: false" (explicit) shape.
-    const criticalPolicy = { bucket: 'test-critical', limit: 5, windowMs: 60_000, critical: true }
-    const explicitlyNonCriticalPolicy = {
-      bucket: 'test-non-critical',
-      limit: 5,
-      windowMs: 60_000,
-      critical: false,
-    }
-
-    const makeRequest = () =>
-      new NextRequest('http://localhost:3000/api/auth/login', {
+  it('enforces auth activation limits in production without a shared store', async () => {
+    vi.stubEnv('NODE_ENV', 'production')
+    const { enforceRateLimit, RATE_LIMIT_POLICIES } = await import('@/lib/server/security')
+    const request = () =>
+      new NextRequest('http://localhost:3000/api/auth/activate', {
         method: 'POST',
         headers: { 'x-real-ip': '203.0.113.50' },
       })
 
-    it('throws instead of falling back to in-memory when a critical policy has no Redis in production', async () => {
-      vi.stubEnv('NODE_ENV', 'production')
-      const { enforceRateLimit } = await import('@/lib/server/security')
+    for (let attempt = 0; attempt < RATE_LIMIT_POLICIES.authActivate.limit; attempt += 1) {
+      await expect(enforceRateLimit(request(), RATE_LIMIT_POLICIES.authActivate)).resolves.toBeNull()
+    }
 
-      await expect(enforceRateLimit(makeRequest(), criticalPolicy)).rejects.toThrow(
-        /Critical rate limit policy "test-critical" is running in-memory in production/,
-      )
-    })
+    const blocked = await enforceRateLimit(request(), RATE_LIMIT_POLICIES.authActivate)
 
-    it('still falls back to in-memory without throwing for an explicitly non-critical policy in production with no Redis', async () => {
-      vi.stubEnv('NODE_ENV', 'production')
-      const { enforceRateLimit } = await import('@/lib/server/security')
-
-      const result = await enforceRateLimit(makeRequest(), explicitlyNonCriticalPolicy)
-
-      expect(result).toBeNull()
-    })
-
-    it('never throws for a critical policy outside production even without Redis', async () => {
-      vi.stubEnv('NODE_ENV', 'test')
-      const { enforceRateLimit } = await import('@/lib/server/security')
-
-      const result = await enforceRateLimit(makeRequest(), criticalPolicy)
-
-      expect(result).toBeNull()
-    })
-
-    it('never throws for a critical policy in production when Redis IS configured', async () => {
-      vi.stubEnv('NODE_ENV', 'production')
-      vi.stubEnv('UPSTASH_REDIS_REST_URL', 'https://example.upstash.io')
-      vi.stubEnv('UPSTASH_REDIS_REST_TOKEN', 'test-token')
-      mockLimit.mockResolvedValue({ success: true, reset: Date.now() + 60_000 })
-      const { enforceRateLimit } = await import('@/lib/server/security')
-
-      const result = await enforceRateLimit(makeRequest(), criticalPolicy)
-
-      expect(result).toBeNull()
-      expect(mockLimit).toHaveBeenCalledTimes(1)
-    })
-
-    // Real RATE_LIMIT_POLICIES table, not hand-rolled literals — proves the
-    // `critical` flag is actually wired on the exported policies, and that
-    // policies which omit the key entirely (the real shape, not `critical:
-    // false`) still resolve instead of throwing.
-    describe('real RATE_LIMIT_POLICIES table', () => {
-      it('throws for RATE_LIMIT_POLICIES.authActivate in production with no Redis (real token-validation surface)', async () => {
-        vi.stubEnv('NODE_ENV', 'production')
-        const { enforceRateLimit, RATE_LIMIT_POLICIES } = await import('@/lib/server/security')
-
-        await expect(
-          enforceRateLimit(makeRequest(), RATE_LIMIT_POLICIES.authActivate),
-        ).rejects.toThrow(/Critical rate limit policy "auth-activate" is running in-memory in production/)
-      })
-
-      it('does not throw for RATE_LIMIT_POLICIES.authLogin in production with no Redis (disabled 410 stub, no brute-force surface)', async () => {
-        vi.stubEnv('NODE_ENV', 'production')
-        const { enforceRateLimit, RATE_LIMIT_POLICIES } = await import('@/lib/server/security')
-
-        const result = await enforceRateLimit(makeRequest(), RATE_LIMIT_POLICIES.authLogin)
-
-        expect(result).toBeNull()
-      })
-
-      it('does not throw for RATE_LIMIT_POLICIES.authRegister in production with no Redis (disabled 410 stub, no brute-force surface)', async () => {
-        vi.stubEnv('NODE_ENV', 'production')
-        const { enforceRateLimit, RATE_LIMIT_POLICIES } = await import('@/lib/server/security')
-
-        const result = await enforceRateLimit(makeRequest(), RATE_LIMIT_POLICIES.authRegister)
-
-        expect(result).toBeNull()
-      })
-
-      it('resolves null for RATE_LIMIT_POLICIES.adminMutation in production with no Redis, where `critical` is omitted (undefined), not set to false', async () => {
-        vi.stubEnv('NODE_ENV', 'production')
-        const { enforceRateLimit, RATE_LIMIT_POLICIES } = await import('@/lib/server/security')
-
-        expect(RATE_LIMIT_POLICIES.adminMutation).not.toHaveProperty('critical')
-
-        const result = await enforceRateLimit(makeRequest(), RATE_LIMIT_POLICIES.adminMutation)
-
-        expect(result).toBeNull()
-      })
-    })
+    expect(blocked?.status).toBe(429)
+    expect(blocked?.headers.get('retry-after')).toBeTruthy()
   })
 })

@@ -1,8 +1,6 @@
 import 'server-only'
 import { timingSafeEqual, createHash } from 'crypto'
 import { NextRequest, NextResponse } from 'next/server'
-import type { Redis } from '@upstash/redis'
-import type { Ratelimit } from '@upstash/ratelimit'
 
 // Re-export all Edge-safe helpers so that existing route-handler imports from
 // `@/lib/server/security` continue to work without any call-site changes.
@@ -23,12 +21,6 @@ export type RateLimitPolicy = {
   bucket: string
   limit: number
   windowMs: number
-  /**
-   * Marks a policy as security-critical (gates credential/token guessing).
-   * When true and production falls back to the in-memory limiter (no Redis
-   * configured), `enforceRateLimit` throws instead of silently degrading.
-   */
-  critical?: boolean
 }
 
 type RateLimitEntry = {
@@ -56,7 +48,7 @@ const TRUSTED_PROXY_CIDRS_ENV = 'TRUSTED_PROXY_CIDRS'
 const DEFAULT_TRUSTED_PROXY_CIDRS = ['127.0.0.1/32', '::1/128'] as const
 
 // ---------------------------------------------------------------------------
-// Rate limit store (in-memory fallback)
+// Rate limit store
 // ---------------------------------------------------------------------------
 
 const RATE_LIMIT_STORE_KEY = '__aleaRateLimitStore'
@@ -352,109 +344,23 @@ export function enforceMutationSecurity(request: NextRequest): NextResponse | nu
 // ---------------------------------------------------------------------------
 // Rate limiting (KIM-401)
 //
-// When UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN are both set, uses
-// @upstash/ratelimit with a sliding-window algorithm backed by Upstash Redis —
-// shared across all serverless instances.
-//
-// Otherwise falls back to the in-memory Map on globalThis. In production
-// without Redis the fallback emits a one-time console.warn (per instance)
-// because rate limit state is not shared across instances.
+// State is held in a per-instance global Map. Serverless instances do not
+// share counters, so platform-level abuse controls remain necessary.
 // ---------------------------------------------------------------------------
 
 export const RATE_LIMIT_POLICIES = {
-  // authLogin and authRegister are NOT critical: both routes are permanently
-  // disabled stubs that unconditionally return 410 with no credential check,
-  // so there is no brute-force surface to protect. authActivate is critical
-  // because it (and auth/recover, which reuses it) performs real token
-  // validation.
   authLogin: { bucket: 'auth-login', limit: 5, windowMs: 60_000 },
-  authActivate: { bucket: 'auth-activate', limit: 5, windowMs: 60_000, critical: true },
+  authActivate: { bucket: 'auth-activate', limit: 5, windowMs: 60_000 },
   authRegister: { bucket: 'auth-register', limit: 3, windowMs: 60_000 },
   authLogout: { bucket: 'auth-logout', limit: 10, windowMs: 60_000 },
   adminMutation: { bucket: 'admin-mutation', limit: 30, windowMs: 60_000 },
   reservationMutation: { bucket: 'reservation-mutation', limit: 20, windowMs: 60_000 },
 } satisfies Record<string, RateLimitPolicy>
 
-// One-time warning flag (per process instance) for the in-memory fallback path.
-let _warnedAboutInMemoryRateLimit = false
-
-function isRedisRateLimitConfigured(): boolean {
-  return !!(
-    process.env.UPSTASH_REDIS_REST_URL &&
-    process.env.UPSTASH_REDIS_REST_TOKEN
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Redis + Ratelimit singletons (lazy, module-level)
-//
-// Dynamic imports keep @upstash/* tree-shaken from builds that don't set the
-// Redis env vars. Once initialised the same Redis client and per-bucket
-// Ratelimit instances are reused across requests — no reconnect overhead.
-// ---------------------------------------------------------------------------
-
-let _redisClient: Redis | null = null
-const _ratelimitCache = new Map<string, Ratelimit>()
-
-async function getRatelimitForPolicy(policy: RateLimitPolicy): Promise<Ratelimit> {
-  const { Redis } = await import('@upstash/redis')
-  const { Ratelimit } = await import('@upstash/ratelimit')
-
-  if (!_redisClient) {
-    _redisClient = new Redis({
-      url: process.env.UPSTASH_REDIS_REST_URL!,
-      token: process.env.UPSTASH_REDIS_REST_TOKEN!,
-    })
-  }
-
-  let ratelimit = _ratelimitCache.get(policy.bucket)
-  if (!ratelimit) {
-    ratelimit = new Ratelimit({
-      redis: _redisClient,
-      limiter: Ratelimit.slidingWindow(policy.limit, `${policy.windowMs}ms`),
-      prefix: `alea:rl:${policy.bucket}`,
-    })
-    _ratelimitCache.set(policy.bucket, ratelimit)
-  }
-
-  return ratelimit
-}
-
-async function enforceRateLimitRedis(
-  request: NextRequest,
-  policy: RateLimitPolicy,
-): Promise<NextResponse | null> {
-  const ratelimit = await getRatelimitForPolicy(policy)
-  const identifier = getClientAddress(request)
-  const result = await ratelimit.limit(identifier)
-
-  if (!result.success) {
-    const retryAfterSeconds = Math.max(1, Math.ceil((result.reset - Date.now()) / 1000))
-    return tooManyRequests(retryAfterSeconds)
-  }
-
-  return null
-}
-
 function enforceRateLimitMemory(
   request: NextRequest,
   policy: RateLimitPolicy,
 ): NextResponse | null {
-  if (process.env.NODE_ENV === 'production' && policy.critical) {
-    throw new Error(
-      `Critical rate limit policy "${policy.bucket}" is running in-memory in production — ` +
-        'configure UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN.',
-    )
-  }
-
-  if (!_warnedAboutInMemoryRateLimit && process.env.NODE_ENV === 'production') {
-    _warnedAboutInMemoryRateLimit = true
-    console.warn(
-      '[security] Rate limiting is running in-memory (per-instance). ' +
-        'Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN to enable a shared rate limit store.',
-    )
-  }
-
   const store = getRateLimitStore()
   const now = Date.now()
 
@@ -489,16 +395,11 @@ function enforceRateLimitMemory(
 /**
  * Enforces a rate limit policy for the incoming request.
  *
- * When UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN are set, uses
- * Upstash Redis (shared across serverless instances).
- * Otherwise uses the in-memory fallback (per-instance, sufficient for dev/test).
+ * Uses the in-memory per-instance store.
  */
 export async function enforceRateLimit(
   request: NextRequest,
   policy: RateLimitPolicy,
 ): Promise<NextResponse | null> {
-  if (isRedisRateLimitConfigured()) {
-    return enforceRateLimitRedis(request, policy)
-  }
   return enforceRateLimitMemory(request, policy)
 }

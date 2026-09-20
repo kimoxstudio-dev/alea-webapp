@@ -126,7 +126,6 @@ Ensure these variables are correctly set in the target environment before deploy
 | `NEXT_PUBLIC_API_URL` | No | Optional API base URL override for the frontend; defaults to `/api`. |
 | `NEXT_PUBLIC_ASSOCIATION_URL` | No | External URL for the association link in the footer. |
 | `CLUB_TIMEZONE` | No | IANA timezone override; defaults to `'Atlantic/Canary'` (`lib/club-time.ts:1`). `NEXT_PUBLIC_CLUB_TIMEZONE` takes precedence over this value. |
-| `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | No | When both are set, rate limiting uses shared Upstash Redis instead of an in-memory Map. |
 | `CRON_SECRET` | No | Not currently a bearer token anything checks: the `/api/cron/cancel-pending` stub route (unconditional `410 Gone`, never read this value) was removed (#387) — it is effectively unused by app runtime code as of this writing; see `docs/SECRET-ROTATION-CHECKLIST.md` for the fuller note on this gap. |
 
 > **Security:** `CLERK_SECRET_KEY`, `AUTH_SESSION_SECRET`, and `DATABASE_URL` must never be exposed to the browser or committed to git. Unlike a Supabase project URL, Neon's `DATABASE_URL` embeds a password — treat a leaked connection string as a credential exposure, not just a config leak.

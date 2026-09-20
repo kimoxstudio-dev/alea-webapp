@@ -40,8 +40,6 @@ Scope:
 | `NEXT_PUBLIC_ASSOCIATION_URL` | browser | Optional | External association link shown in the footer (`components/layout/footer.tsx:17,81-86`). The link always renders — `href={associationUrl ?? '#'}` — unset only means it points at `#` instead of a real URL; `target="_blank"`/`rel`/the external-link icon are what's conditional on it being set | The club's association URL |
 | `CLUB_TIMEZONE` | server | Optional | IANA timezone override (`lib/club-time.ts:8-11`). Default: `'Atlantic/Canary'` — a hardcoded fallback, not the server's system timezone. `vitest.config.mts`'s `test.env` pins only `CLUB_TIMEZONE` to `'Europe/Madrid'`; `NEXT_PUBLIC_CLUB_TIMEZONE` is unpinned, which is inert today only because Vitest never loads `.env.local` (no `dotenv`/`loadEnv` anywhere in `vitest.config.mts`/`vitest.setup.ts`) — a shell-exported `NEXT_PUBLIC_CLUB_TIMEZONE` would win over the pin, since `lib/club-time.ts:9` reads it first | Set to the club's IANA timezone name |
 | `NEXT_PUBLIC_CLUB_TIMEZONE` | browser + server | Optional | Same override, exposed to the browser — `lib/club-time.ts` is imported by client components (e.g. `components/rooms/rooms-view.tsx`), so a server-only `CLUB_TIMEZONE` is invisible to them. Takes precedence over `CLUB_TIMEZONE` when both are set | Same |
-| `UPSTASH_REDIS_REST_URL` | server | Optional | Rate limiter backing store (`lib/server/security.ts`). When set together with the token below, rate limiting is shared across serverless instances via Upstash Redis; otherwise it falls back to an in-memory `Map` (per-instance only, bypassable in production by rotating instances) | Upstash console → Redis database → REST API |
-| `UPSTASH_REDIS_REST_TOKEN` | server | Optional | Paired with `UPSTASH_REDIS_REST_URL` | Same |
 | `CRON_SECRET` | server | Present but unused | The `/api/cron/cancel-pending` stub route (unconditional `410`, never read this) was removed (#387). Kept defined pending a decision on whether a cron route is revived — see `docs/SECRET-ROTATION-CHECKLIST.md` | Not applicable while unused |
 | `ALLOW_NON_EMPTY_DB` | script | Optional | `scripts/apply-neon-schema.mjs`: skips the empty-database guard, applying schema files even when tables already exist (`apply-neon-schema.mjs:197`; the `--force` CLI flag is the equivalent). Default: guard fails closed. **Never put this in `.env.local`** — `main()` calls `loadEnvLocal()` before this check runs, so a `.env.local` entry would silently disarm the guard on every future run, not just an explicit one-off | Pass inline in the shell: `ALLOW_NON_EMPTY_DB=1 node scripts/apply-neon-schema.mjs` |
 | `SEED_ADMIN_PASSWORD` | script | Required to run the script | `scripts/seed-dev.mjs`: initial password for the seeded admin Clerk identity | Choose a local-only password |
@@ -55,7 +53,13 @@ Scope:
 | `PLAYWRIGHT_QA_SECONDARY_USER` | e2e | Required (cancellation, equipment runners) | Member number of a regular, non-admin QA member | Same |
 | `PLAYWRIGHT_QA_SECONDARY_PASSWORD` | e2e | Required (cancellation, equipment runners) | Password for the secondary user | Same |
 | `DATABASE_URL` (e2e context) | e2e | Required | Same variable as above — the E2E runners connect directly for fixture setup/teardown | Same as the app's `DATABASE_URL` |
-| `NODE_ENV` | server, script, framework-managed | N/A | Standard Next.js/Node variable. Gates `scripts/seed-dev.mjs` (refuses in production), the `COOKIE_SECURE` default, and a one-time console warning in `lib/server/security.ts:441` when the in-memory rate limiter is used in production | Set by the runtime, not by a developer |
+| `NODE_ENV` | server, script, framework-managed | N/A | Standard Next.js/Node variable. Gates `scripts/seed-dev.mjs` (refuses in production) and the `COOKIE_SECURE` default | Set by the runtime, not by a developer |
+
+## Rate limiting
+
+`enforceRateLimit()` has no environment configuration. It keeps counters in an
+in-memory `Map` per application instance; serverless instances do not share
+them. Keep platform-level abuse controls enabled for production.
 
 ### Optional SDK customization, not part of this inventory
 
@@ -124,9 +128,6 @@ app actually read" comes from the table above.
   `COOKIE_SECURE` — these describe the club/deployment posture, not a
   per-environment secret, and can hold the same value in both unless the
   club timezone or ingress setup genuinely differs.
-- `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` — can point at one
-  shared Redis database, or be split per environment; either is fine
-  since rate-limit state doesn't need to be shared across environments.
 
 ### Gap: shared between Preview and Production but must differ
 
@@ -176,13 +177,6 @@ document is read-only per this repo's DDL/secrets rules.
   read `NEXT_PUBLIC_CLUB_TIMEZONE`, not set, so they fall through to the
   hardcoded default) will compute day boundaries in two different
   timezones. Not harmless if `CLUB_TIMEZONE`'s actual value is non-default.
-- `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` — absent. Without
-  both, the rate limiter falls back to the in-memory `Map`, which this
-  document's own variable table calls "bypassable in production by
-  rotating instances." Not harmless — this is the difference between a
-  real production rate limit and one an attacker can reset by triggering
-  new serverless instances. Tracked for action under issue #336 Phase 4
-  item 6 (production cutover, user-only).
 
 ### Gap: set on Vercel, nothing reads it
 
