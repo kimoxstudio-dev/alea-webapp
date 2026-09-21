@@ -53,25 +53,25 @@ describe('LoginForm', () => {
     } as unknown as ReturnType<typeof useSignIn>)
   })
 
-  // #391: the fix has two parts, and this test only proves the first.
-  // `router.refresh()` makes `app/[locale]/(app)/layout.tsx` re-run and
-  // produce a fresh `initialUser` prop for `AuthProvider` — that part is
-  // asserted here.
-  // Whether `AuthProvider` actually *adopts* that new prop into its `user`
-  // state (the part that determines if the header renders) is a separate
-  // question, covered in `__tests__/lib/auth-context.test.tsx`
-  // (`describe('AuthProvider adopting a refreshed initialUser (#391)')`)
-  // against `AuthProvider` + `Header` directly, since mocking
-  // `router.refresh()` in this test can't observe it.
-  it('calls router.refresh() after router.push() on a successful sign-in (#391)', async () => {
+  it('uses Clerk navigation after a successful sign-in', async () => {
     mockSignInCreate.mockResolvedValue({ status: 'complete', createdSessionId: 'sess-1' })
 
     render(<LoginForm locale="es" />)
     await fillAndSubmit()
 
-    expect(mockPush).toHaveBeenCalledWith('/es/rooms')
-    expect(mockRefresh).toHaveBeenCalled()
-    expect(mockPush.mock.invocationCallOrder[0]).toBeLessThan(mockRefresh.mock.invocationCallOrder[0])
+    expect(mockSetActive).toHaveBeenCalledWith({
+      session: 'sess-1',
+      navigate: expect.any(Function),
+    })
+
+    const navigate = mockSetActive.mock.calls[0][0].navigate
+    const decorateUrl = vi.fn(() => '#after-login')
+    navigate({ decorateUrl })
+
+    expect(decorateUrl).toHaveBeenCalledWith('/es/rooms')
+    expect(window.location.hash).toBe('#after-login')
+    expect(mockPush).not.toHaveBeenCalled()
+    expect(mockRefresh).not.toHaveBeenCalled()
   })
 
   // #405: a re-submit while already authenticated (session established by

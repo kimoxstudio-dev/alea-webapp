@@ -110,10 +110,13 @@ export function LoginForm({ locale, redirectUrl }: LoginFormProps) {
         return
       }
 
-      await setActive({ session: attempt.createdSessionId })
       const target = resolveSafeRedirect(redirectUrl, `/${locale}/rooms`)
-      router.push(target)
-      router.refresh()
+      await setActive({
+        session: attempt.createdSessionId,
+        navigate: ({ decorateUrl }) => {
+          window.location.assign(decorateUrl(target))
+        },
+      })
     } catch (error) {
       // Defense-in-depth for the isSignedIn guard above: isSignedIn is React
       // state that updates asynchronously after setActive() resolves, so a
