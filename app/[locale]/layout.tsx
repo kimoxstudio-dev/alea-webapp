@@ -29,6 +29,9 @@ export default async function LocaleLayout({ children, params }: LocaleLayoutPro
 
   return (
     <html lang={locale} className="dark">
+      <head>
+        <link rel="icon" type="image/png" href="/ico.png?v=1" />
+      </head>
       <body className="min-h-screen bg-background antialiased flex flex-col">
         <NextIntlClientProvider messages={messages}>{children}</NextIntlClientProvider>
       </body>
