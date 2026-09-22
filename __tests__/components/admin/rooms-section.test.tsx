@@ -7,10 +7,12 @@ vi.mock('next-intl', () => ({
   useTranslations: () => (key: string) => key,
 }))
 
-const { createRoomState, updateRoomState, setRoomDefaultEquipmentState } = vi.hoisted(() => ({
+const { createRoomState, updateRoomState, setRoomDefaultEquipmentState, tablesState, regenerateTableQrState } = vi.hoisted(() => ({
   createRoomState: { isPending: false },
   updateRoomState: { isPending: false },
   setRoomDefaultEquipmentState: { isPending: false },
+  tablesState: { data: [] as Array<{ id: string; roomId: string; name: string; type: 'small'; qrCode: string }> },
+  regenerateTableQrState: { mutateAsync: vi.fn(), isPending: false },
 }))
 
 // A row is needed so the edit dialog is reachable.
@@ -20,7 +22,6 @@ const roomFixture = [{ id: 'room-1', name: 'Main Hall', tableCount: 2, descripti
 // (see the "Initialize selectedEquipmentIds" effect), so returning a fresh
 // `[]` on every mock call would re-trigger those effects every render and
 // infinite-loop.
-const emptyTables: never[] = []
 const emptyEquipment: never[] = []
 const emptyRoomEquipment: never[] = []
 
@@ -28,9 +29,9 @@ vi.mock('@/lib/hooks/use-admin', () => ({
   useAdminRooms: () => ({ data: roomFixture, isLoading: false }),
   useAdminUpdateRoom: () => ({ mutateAsync: vi.fn(), isPending: updateRoomState.isPending }),
   useAdminCreateRoom: () => ({ mutateAsync: vi.fn(), isPending: createRoomState.isPending }),
-  useAdminRoomTables: () => ({ data: emptyTables, isLoading: false }),
+  useAdminRoomTables: () => ({ data: tablesState.data, isLoading: false }),
   useAdminCreateTable: () => ({ mutateAsync: vi.fn(), isPending: false }),
-  useAdminRegenerateTableQr: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useAdminRegenerateTableQr: () => regenerateTableQrState,
   useAdminEquipment: () => ({ data: emptyEquipment, isLoading: false }),
   useAdminRoomDefaultEquipment: () => ({ data: emptyRoomEquipment, isLoading: false }),
   useAdminSetRoomDefaultEquipment: () => ({ mutateAsync: vi.fn(), isPending: setRoomDefaultEquipmentState.isPending }),
@@ -47,6 +48,9 @@ describe('RoomsSection — pending buttons reserve loader space without animatin
     createRoomState.isPending = false
     updateRoomState.isPending = false
     setRoomDefaultEquipmentState.isPending = false
+    tablesState.data = []
+    regenerateTableQrState.mutateAsync.mockReset()
+    regenerateTableQrState.isPending = false
   })
 
   function getIconSlot(button: HTMLElement) {
@@ -123,5 +127,22 @@ describe('RoomsSection — pending buttons reserve loader space without animatin
     expect(queryLoader(button)).not.toBeNull()
     expect(button).toBeDisabled()
     expect(button).toHaveAttribute('aria-busy', 'true')
+  })
+
+  it('reloads the regenerated QR image and download without changing its stored URL', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(123)
+    tablesState.data = [{ id: 'table-1', roomId: 'room-1', name: 'Table 1', type: 'small', qrCode: '/api/tables/table-1/qr/image' }]
+    regenerateTableQrState.mutateAsync.mockResolvedValue({ qr_code: '/api/tables/table-1/qr/image', qr_code_inf: null })
+    const user = userEvent.setup()
+    render(<RoomsSection />)
+
+    await user.click(screen.getByRole('button', { name: 'Main Hall' }))
+    await user.click(screen.getByRole('button', { name: 'qrCode' }))
+    const imageBefore = screen.getByAltText('QR Table 1')
+    await user.click(screen.getByRole('button', { name: 'regenerateQr' }))
+
+    expect(screen.getByAltText('QR Table 1')).not.toBe(imageBefore)
+    expect(screen.getByAltText('QR Table 1')).toHaveAttribute('src', '/api/tables/table-1/qr/image')
+    expect(screen.getByRole('link', { name: 'save' })).toHaveAttribute('href', '/api/tables/table-1/qr/image')
   })
 })

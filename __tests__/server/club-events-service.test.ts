@@ -21,7 +21,7 @@ import { ERROR_CODES } from '@/lib/types/error-codes'
  * - updateClubEvent with partial updates and room block toggling (admin-only)
  * - deleteClubEvent removes event and cancels conflicting reservations (admin-only)
  * - Non-admin users get 403 Forbidden from every CRUD endpoint
- * - URL hardening: validateOptionalUrl rejects javascript:, data:, relative URLs
+ * - URL hardening: validateOptionalUrl rejects unsafe URLs and accepts generated media paths for imageUrl
  * - Room blocking is optional: events without blocksRooms don't create event_room_blocks rows
  * - Upcoming/past split derived from date_kind and end_date at read time
  */
@@ -557,6 +557,20 @@ describe('club-events-service', () => {
       expect(result.status).toBe('upcoming')
       expect(result.blocksRooms).toBe(false)
       expect(result.roomBlocks.length).toBe(0)
+    })
+
+    it('persists a generated landing-media path as imageUrl', async () => {
+      addCreateInsertHandler()
+      const { createClubEvent } = await loadClubEventsService()
+      const imageUrl = '/api/media/events/123e4567-e89b-12d3-a456-426614174000.png'
+
+      await expect(createClubEvent(createAdminSession(), {
+        titleEs: 'Event',
+        titleEn: 'Event',
+        date: '2026-05-01',
+        dateKind: 'single',
+        imageUrl,
+      })).resolves.toMatchObject({ imageUrl })
     })
 
     it('non-admin member gets 403 Forbidden', async () => {
@@ -1231,6 +1245,17 @@ describe('club-events-service', () => {
       })
 
       expect(result.id).toBe('evt-1')
+    })
+
+    it('persists a generated landing-media path on imageUrl update', async () => {
+      addCurrentEventSelectHandler(currentEventRow())
+      addUpdateEventHandler((values) => [currentEventRow({ image_url: values[13] as string })])
+      addEventRoomBlocksSelectHandler([])
+      addEventMaterialsSelectHandler([])
+      const { updateClubEvent } = await loadClubEventsService()
+      const imageUrl = '/api/media/events/123e4567-e89b-12d3-a456-426614174000.png'
+
+      await expect(updateClubEvent(createAdminSession(), 'evt-1', { imageUrl })).resolves.toMatchObject({ imageUrl })
     })
 
     it('non-admin member gets 403 Forbidden on update', async () => {

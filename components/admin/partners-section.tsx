@@ -51,7 +51,7 @@ interface PartnerFieldError {
 function getPartnerFieldError(form: PartnerFormState): PartnerFieldError | null {
   if (!form.name.trim()) return { field: 'name', kind: 'required' }
   if (!form.imageUrl.trim()) return { field: 'imageUrl', kind: 'required' }
-  if (!isValidOptionalUrl(form.imageUrl)) return { field: 'imageUrl', kind: 'invalidUrl' }
+  if (!isValidOptionalUrl(form.imageUrl, true)) return { field: 'imageUrl', kind: 'invalidUrl' }
   if (!isValidOptionalUrl(form.linkUrl)) return { field: 'linkUrl', kind: 'invalidUrl' }
   return null
 }

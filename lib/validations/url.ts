@@ -1,8 +1,9 @@
 import { serviceError } from '@/lib/server/service-error'
-import { ALLOWED_URL_PROTOCOLS } from '@/lib/validations/url-client'
+import { ALLOWED_URL_PROTOCOLS, isLandingMediaPath } from '@/lib/validations/url-client'
 
 /**
- * Validate an optional, user-supplied absolute http(s) URL.
+ * Validate an optional, user-supplied absolute http(s) URL or generated
+ * same-origin landing-media path.
  *
  * Server-only (imports `serviceError`) — the client-safe shape check this
  * shares its accept rule with (`isValidOptionalUrl`) lives in
@@ -12,21 +13,22 @@ import { ALLOWED_URL_PROTOCOLS } from '@/lib/validations/url-client'
  *
  * Returns `null` when the value is empty/undefined/null (URL is optional).
  * Throws a 400 ServiceError via `serviceError` when the value is present but
- * is not a valid absolute http(s) URL.
+ * is not a valid absolute http(s) URL or generated landing-media path.
  */
 export function validateOptionalUrl(value: unknown, field: string): string | null {
   if (value === undefined || value === null) return null
   const str = String(value).trim()
   if (str === '') return null
+  if (field === 'imageUrl' && isLandingMediaPath(str)) return str
 
   let parsed: URL
   try {
     parsed = new URL(str)
   } catch {
-    serviceError(`${field} must be an absolute http(s) URL`, 400)
+    serviceError(`${field} must be a valid URL`, 400)
   }
   if (!ALLOWED_URL_PROTOCOLS.has(parsed.protocol)) {
-    serviceError(`${field} must be an absolute http(s) URL`, 400)
+    serviceError(`${field} must be a valid URL`, 400)
   }
   return str
 }

@@ -157,6 +157,7 @@ const validCreateBody = {
   active: true,
   imageUrl: '',
 }
+const landingMediaPath = '/api/media/library-games/123e4567-e89b-12d3-a456-426614174000.png'
 
 describe('library-games-service (Neon raw SQL)', () => {
   beforeEach(() => {
@@ -312,6 +313,13 @@ describe('library-games-service (Neon raw SQL)', () => {
       await expect(createLibraryGame(adminSession, validCreateBody)).resolves.toEqual({ ...mappedGame, active: true })
     })
 
+    it('persists a generated landing-media path as imgUrl', async () => {
+      addInsertHandler((values) => [{ ...adminGameRow, img_url: values[8] }])
+      const { createLibraryGame } = await loadService()
+
+      await expect(createLibraryGame(adminSession, { ...validCreateBody, imageUrl: landingMediaPath })).resolves.toMatchObject({ imgUrl: landingMediaPath })
+    })
+
     it('maps a 23502/22P02/23514 write failure to 400', async () => {
       addInsertHandler(() => { throw neonDbError('23502', 'null value in column "title" violates not-null constraint') })
       const { createLibraryGame } = await loadService()
@@ -408,6 +416,14 @@ describe('library-games-service (Neon raw SQL)', () => {
 
       const { updateLibraryGame } = await loadService()
       await expect(updateLibraryGame(adminSession, 'game-1', { title: 'Renamed' })).resolves.toMatchObject({ title: 'Renamed' })
+    })
+
+    it('persists a generated landing-media path on imgUrl update', async () => {
+      addCurrentRowHandler(() => [adminGameRow])
+      addUpdateHandler((values) => [{ ...adminGameRow, img_url: values[8] }])
+      const { updateLibraryGame } = await loadService()
+
+      await expect(updateLibraryGame(adminSession, 'game-1', { imageUrl: landingMediaPath })).resolves.toMatchObject({ imgUrl: landingMediaPath })
     })
 
     it('maps a 23502/22P02/23514 write failure to 400', async () => {

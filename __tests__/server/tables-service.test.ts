@@ -316,11 +316,11 @@ describe('getTableAvailability (Neon raw SQL)', () => {
 })
 
 describe('generateTableQrCode', () => {
-  it('returns the Vercel Blob public URL containing the table id', async () => {
+  it('returns the authenticated QR delivery URL containing the table id', async () => {
     const { generateTableQrCode } = await loadTablesService()
 
     await expect(generateTableQrCode(TABLE_ID)).resolves.toBe(
-      `${BLOB_BASE_URL}/table-qr-codes/${TABLE_ID}.png`,
+      `/api/tables/${TABLE_ID}/qr/image`,
     )
   })
 
@@ -358,7 +358,7 @@ describe('generateTableQrCode', () => {
       `table-qr-codes/${TABLE_ID}.png`,
       Buffer.from('fake-png-data'),
       {
-        access: 'public',
+        access: 'private',
         contentType: 'image/png',
         addRandomSuffix: false,
         allowOverwrite: true,
@@ -393,7 +393,7 @@ describe('regenerateQrCodes (Neon raw SQL + Vercel Blob)', () => {
     const result = await regenerateQrCodes(LARGE_TABLE_ID)
 
     expect(result).toEqual({
-      qr_code: `${BLOB_BASE_URL}/table-qr-codes/${LARGE_TABLE_ID}.png`,
+      qr_code: `/api/tables/${LARGE_TABLE_ID}/qr/image`,
       qr_code_inf: null,
     })
   })
@@ -416,7 +416,7 @@ describe('regenerateQrCodes (Neon raw SQL + Vercel Blob)', () => {
       match: (stmt) => stmt.table === 'tables' && whereHasColumn(stmt, 'id'),
       respond: (stmt) => {
         expect(stmt.values).toEqual([
-          `${BLOB_BASE_URL}/table-qr-codes/${LARGE_TABLE_ID}.png`,
+          `/api/tables/${LARGE_TABLE_ID}/qr/image`,
           LARGE_TABLE_ID,
         ])
         expect(/qr_code_inf = null/.test(stmt.text)).toBe(true)

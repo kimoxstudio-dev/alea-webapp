@@ -15,7 +15,7 @@ type EventBlockRow = Tables<'event_room_blocks'>
 
 const QR_CODE_PREFIX = 'table-qr-codes'
 
-async function uploadQrCodeToBlob(url: string, blobPath: string): Promise<string> {
+async function uploadQrCodeToBlob(url: string, blobPath: string): Promise<void> {
   const buffer = await qrcode.toBuffer(url, { errorCorrectionLevel: 'M', width: 400, type: 'png' })
 
   try {
@@ -26,14 +26,13 @@ async function uploadQrCodeToBlob(url: string, blobPath: string): Promise<string
     // which the old Supabase Storage call relied on implicitly. Without this,
     // @vercel/blob's put() defaults to 30 days, so a regenerated QR (same
     // URL, no cache-busting) would serve the stale PNG far longer than before.
-    const blob = await put(`${QR_CODE_PREFIX}/${blobPath}`, buffer, {
-      access: 'public',
+    await put(`${QR_CODE_PREFIX}/${blobPath}`, buffer, {
+      access: 'private',
       contentType: 'image/png',
       addRandomSuffix: false,
       allowOverwrite: true,
       cacheControlMaxAge: 3600,
     })
-    return blob.url
   } catch (error) {
     console.error(
       '[tables-service] Vercel Blob QR upload failed:',
@@ -50,7 +49,8 @@ export async function generateTableQrCode(tableId: string): Promise<string> {
   const appUrl = (process.env.NEXT_PUBLIC_APP_URL ?? '').replace(/\/$/, '')
   if (!appUrl) serviceError('NEXT_PUBLIC_APP_URL is not set — cannot generate QR code URL', 500)
   const url = `${appUrl}/check-in/${tableId}`
-  return uploadQrCodeToBlob(url, `${tableId}.png`)
+  await uploadQrCodeToBlob(url, `${tableId}.png`)
+  return `/api/tables/${tableId}/qr/image`
 }
 
 export async function regenerateQrCodes(tableId: string): Promise<{ qr_code: string; qr_code_inf: string | null }> {
@@ -76,7 +76,8 @@ export async function regenerateQrCodes(tableId: string): Promise<{ qr_code: str
   const appUrl = (process.env.NEXT_PUBLIC_APP_URL ?? '').replace(/\/$/, '')
   if (!appUrl) serviceError('NEXT_PUBLIC_APP_URL is not set — cannot generate QR code URL', 500)
 
-  const qr_code = await uploadQrCodeToBlob(`${appUrl}/check-in/${tableId}`, `${tableId}.png`)
+  await uploadQrCodeToBlob(`${appUrl}/check-in/${tableId}`, `${tableId}.png`)
+  const qr_code = `/api/tables/${tableId}/qr/image`
 
   try {
     await sql`
