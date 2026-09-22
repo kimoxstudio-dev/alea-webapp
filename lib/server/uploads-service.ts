@@ -8,7 +8,7 @@ import { startsWithSignature } from '@/lib/server/bytes'
 // Image uploads to Vercel Blob (#310, ported off Supabase Storage / OIR-207)
 //
 // Privilege checks (role === 'admin') live here in the service layer, not in
-// the route handler, same pattern as the other admin services. Vercel Blob
+// the route handler, same pattern as the other admin services. Private Vercel Blob
 // has no RLS-equivalent client policy layer — the write is authorized by
 // possessing BLOB_READ_WRITE_TOKEN (server-only env var), which the admin
 // check above gates access to.
@@ -69,9 +69,9 @@ function requireValidFolder(folder: unknown): UploadFolder {
 //
 // `File.type` is a client-supplied MIME type — a caller can set it to
 // "image/png" while sending an arbitrary (or malicious) byte stream. Because
-// the uploaded object is written with public access and later rendered
+// the uploaded object is served through a public route and later rendered
 // directly (landing page / admin previews), we must not trust that value
-// alone. Before writing anything to Blob we re-derive the type from the
+// alone. Before writing anything to Blob or serving it through the image route, we re-derive the type from the
 // first bytes of the actual body and require it to match one of the allowed
 // image formats *and* match the MIME type the client declared.
 //
@@ -147,10 +147,11 @@ function requireValidFile(file: UploadFileLike | null): { file: UploadFileLike; 
 
 /**
  * Validate and upload an admin-supplied image to Vercel Blob, returning its
- * public URL. Used to back the image field of club events, partners and
+ * private Blob pathname. The route handler turns it into the scoped same-origin
+ * delivery path used by club events, partners and
  * library games from the admin dashboard.
  */
-export async function uploadLandingMediaImage(session: SessionUser, input: UploadInput): Promise<{ url: string }> {
+export async function uploadLandingMediaImage(session: SessionUser, input: UploadInput): Promise<{ pathname: string }> {
   requireAdminSession(session)
 
   const folder = requireValidFolder(input.folder)
@@ -169,11 +170,11 @@ export async function uploadLandingMediaImage(session: SessionUser, input: Uploa
     // buffer `new Uint8Array(await file.arrayBuffer())` was constructed from,
     // so this is a type-satisfying reinterpretation, not a copy.
     const blob = await put(objectPath, bytes.buffer, {
-      access: 'public',
+      access: 'private',
       contentType: file.type,
       addRandomSuffix: false,
     })
-    return { url: blob.url }
+    return { pathname: blob.pathname }
   } catch (error) {
     // Do NOT swallow the underlying Blob error — log it server-side so
     // failures (missing token, store outage, etc.) are diagnosable. Only a

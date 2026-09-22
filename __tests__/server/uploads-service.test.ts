@@ -10,7 +10,7 @@ import type { ServiceError } from '@/lib/server/service-error'
  *
  * Key scenarios tested:
  * - Happy path: admin + valid PNG file → put() called with pathname matching
- *   /^landing-media\/events\/[0-9a-f-]+\.png$/, contentType/access set, returns { url }
+ *   /^landing-media\/events\/[0-9a-f-]+\.png$/, contentType/access set, returns { pathname }
  * - Privilege: non-admin → 403 Forbidden before any put() call
  * - Validation matrix (each → 400, no put() call):
  *   - missing file
@@ -125,7 +125,7 @@ describe('uploads-service', () => {
   })
 
   describe('happy path — admin upload', () => {
-    it('admin uploads valid PNG file → put() called, returns the URL put() resolved', async () => {
+    it('admin uploads valid PNG file privately and returns its pathname', async () => {
       const adminSession = createAdminSession()
       const mockFile = createMockFile(1024, 'image/png')
       const expectedBytes = new Uint8Array(await mockFile.arrayBuffer())
@@ -145,12 +145,10 @@ describe('uploads-service', () => {
       // still pass every other assertion here.
       expect(new Uint8Array(body as ArrayBuffer)).toEqual(expectedBytes)
       expect(options.contentType).toBe('image/png')
-      expect(options.access).toBe('public')
+      expect(options.access).toBe('private')
       expect(options.addRandomSuffix).toBe(false)
 
-      // The returned URL must be exactly what put() resolved, not just any
-      // string that happens to contain the expected path segments.
-      await expect(putMock.mock.results[0].value).resolves.toMatchObject({ url: result.url })
+      expect(result.pathname).toBe(pathname)
     })
 
     it('admin uploads valid JPEG file → extension .jpg derived from MIME', async () => {
@@ -380,7 +378,7 @@ describe('uploads-service', () => {
         folder: 'events',
       })
 
-      expect(result.url).toBeDefined()
+      expect(result.pathname).toBeDefined()
       expect(putMock).toHaveBeenCalled()
     })
   })
@@ -482,7 +480,7 @@ describe('uploads-service', () => {
         folder: 'events',
       })
 
-      expect(result.url).toBeDefined()
+      expect(result.pathname).toBeDefined()
       expect(putMock).toHaveBeenCalled()
     })
 
@@ -497,7 +495,7 @@ describe('uploads-service', () => {
         folder: 'events',
       })
 
-      expect(result.url).toBeDefined()
+      expect(result.pathname).toBeDefined()
       expect(putMock).toHaveBeenCalled()
     })
   })

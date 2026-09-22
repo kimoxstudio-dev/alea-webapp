@@ -28,10 +28,11 @@ export async function POST(request: NextRequest) {
       throw new ServiceError('Invalid upload payload', 400)
     }
 
-    const { url } = await uploadLandingMediaImage(admin.session, {
+    const { pathname } = await uploadLandingMediaImage(admin.session, {
       file: toUploadFileLike(formData.get('file')),
       folder: formData.get('folder'),
     })
+    const url = `/api/media/${pathname.slice('landing-media/'.length)}`
     return admin.applyCookies(NextResponse.json({ url }, { status: 201 }))
   } catch (error) {
     return admin.applyCookies(toServiceErrorResponse(error))

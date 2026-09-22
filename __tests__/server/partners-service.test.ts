@@ -24,7 +24,7 @@ import {
  * - Non-admin session gets 403 Forbidden before any DB call on every admin op
  * - Validate-before-write: invalid input (missing name/imageUrl, bad URL
  *   scheme, non-integer sortOrder) never reaches the DB
- * - URL hardening via validateOptionalUrl (javascript:/data:/relative rejected)
+ * - URL hardening via validateOptionalUrl (unsafe URLs rejected; generated media paths allowed only for imageUrl)
  * - descriptionEn bilingual-fallback resolution (auto-copy vs deliberate edit)
  * - mapWriteError: 23514/22P02/23502 -> 400, everything else -> 500
  * - updatePartner: 404 when the initial SELECT finds no row
@@ -153,6 +153,7 @@ const validCreateBody = {
   sortOrder: 0,
   active: true,
 }
+const landingMediaPath = '/api/media/partners/123e4567-e89b-12d3-a456-426614174000.png'
 
 describe('partners-service (Neon raw SQL)', () => {
   beforeEach(() => {
@@ -280,6 +281,19 @@ describe('partners-service (Neon raw SQL)', () => {
         await expect(createPartner(adminSession, { ...validCreateBody, imageUrl })).resolves.toMatchObject({ imageUrl })
       },
     )
+
+    it('persists a generated landing-media path as imageUrl', async () => {
+      addInsertHandler((values) => [{ ...adminPartnerRow, img_url: values[1] }])
+      const { createPartner } = await loadService()
+
+      await expect(createPartner(adminSession, { ...validCreateBody, imageUrl: landingMediaPath })).resolves.toMatchObject({ imageUrl: landingMediaPath })
+    })
+
+    it('rejects a landing-media path as linkUrl', async () => {
+      const { createPartner } = await loadService()
+      await expect(createPartner(adminSession, { ...validCreateBody, linkUrl: landingMediaPath })).rejects.toMatchObject({ statusCode: 400 })
+      expect(sqlMock.sql).not.toHaveBeenCalled()
+    })
 
     it('accepts a null linkUrl (optional)', async () => {
       addInsertHandler((values) => [{ ...adminPartnerRow, link_url: values[2] }])
@@ -451,6 +465,14 @@ describe('partners-service (Neon raw SQL)', () => {
 
       const { updatePartner } = await loadService()
       await expect(updatePartner(adminSession, 'partner-1', { name: 'Renamed' })).resolves.toMatchObject({ imageUrl: adminPartnerRow.img_url })
+    })
+
+    it('persists a generated landing-media path on imageUrl update', async () => {
+      addCurrentRowHandler(() => [adminPartnerRow])
+      addUpdateHandler((values) => [{ ...adminPartnerRow, img_url: values[1] }])
+      const { updatePartner } = await loadService()
+
+      await expect(updatePartner(adminSession, 'partner-1', { imageUrl: landingMediaPath })).resolves.toMatchObject({ imageUrl: landingMediaPath })
     })
 
     it('rejects an out-of-range sortOrder override', async () => {

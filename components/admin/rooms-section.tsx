@@ -44,10 +44,12 @@ function TableQrPanel({ table, roomId }: { table: GameTable; roomId: string }) {
   const tc = useTranslations('common')
   const regenerateQr = useAdminRegenerateTableQr()
   const [qrCode, setQrCode] = useState<string>(table.qrCode)
+  const [qrVersion, setQrVersion] = useState(0)
 
   async function handleRegenerate() {
     const result = await regenerateQr.mutateAsync({ tableId: table.id, roomId })
     setQrCode(result.qr_code)
+    setQrVersion(Date.now())
   }
 
   return (
@@ -61,6 +63,7 @@ function TableQrPanel({ table, roomId }: { table: GameTable; roomId: string }) {
           {qrCode ? (
             <div className="flex flex-col gap-2">
               <Image
+                key={qrVersion}
                 src={qrCode}
                 alt={`QR ${table.name}`}
                 width={128}
